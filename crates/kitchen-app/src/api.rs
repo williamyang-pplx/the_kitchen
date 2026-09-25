@@ -344,7 +344,88 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({"path": a.path}))
         }
 
+        "worktree.list" | "worktree.sync_readonly" | "worktree.remove" => worktree(engine, method, params, caller),
+
         _ => crate::review::dispatch(engine, method, params, caller)
-            .unwrap_or_else(|| Err(anyhow!("unknown method {method:?}; see `kitchenctl help`"))),
+            .unwrap_or_else(|| Err(anyhow!("unknown method {method:?}; see `kitchenctl --help`"))),
+    }
+}
+
+/// `worktree.*`: inspect and tidy the repo's worktrees.
+fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) -> Result<Value> {
+    use kitchen_core::git::{READONLY_SUFFIX, Repo};
+
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct P {
+        workspace: Option<String>,
+        path: Option<String>,
+        force: bool,
+        /// Include a dirty flag per worktree (runs `git status` in each).
+        status: bool,
+    }
+    let a: P = p(params)?;
+    let ws_id = engine.resolve_workspace(a.workspace.as_deref(), caller)?;
+    let ws = engine.workspace(&ws_id).context("workspace vanished")?;
+    let host = ws.host();
+    let repo = Repo::new(&host, &ws.row.repo_path);
+    let tab_for = |path: &str| ws.tabs.iter().find(|t| t.row.worktree == path).map(|t| t.row.id.clone());
+
+    match method {
+        "worktree.list" => {
+            let list = repo.worktrees()?;
+            let out: Vec<Value> = list
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    // git lists the main checkout first.
+                    let role = if i == 0 {
+                        "main"
+                    } else if w.path.ends_with(READONLY_SUFFIX) || w.path.contains("-kitchen-review-") {
+                        "readonly"
+                    } else {
+                        "edit"
+                    };
+                    let dirty = a.status.then(|| repo.is_dirty(&w.path).ok()).flatten();
+                    json!({"path": w.path, "branch": w.branch, "head": w.head, "role": role, "tab": tab_for(&w.path), "dirty": dirty})
+                })
+                .collect();
+            Ok(Value::Array(out))
+        }
+        "worktree.sync_readonly" => {
+            repo.fetch().context("git fetch origin")?;
+            let base = match &ws.row.default_branch {
+                Some(b) => b.clone(),
+                None => repo.default_branch()?,
+            };
+            let wt = repo.sync_readonly_worktree(&repo.readonly_path(), &format!("origin/{base}"))?;
+            Ok(json!({"path": wt.path, "head": wt.head}))
+        }
+        "worktree.remove" => {
+            let given = host.expand_home(&a.path.context("path is required")?)?;
+            let list = repo.worktrees()?;
+            // Match git's canonical spelling of the path (e.g. /private/tmp).
+            let top = host
+                .run_ok(&["git", "-C", &given, "rev-parse", "--show-toplevel"], None)
+                .map(|s| s.trim().to_string())
+                .ok();
+            let idx = list
+                .iter()
+                .position(|w| w.path == given || Some(&w.path) == top.as_ref())
+                .with_context(|| format!("{given} is not a worktree of {}", ws.row.repo_path))?;
+            let wt = &list[idx];
+            if idx == 0 {
+                bail!("refusing to remove the main checkout {}", wt.path);
+            }
+            if let Some(tab) = tab_for(&wt.path) {
+                bail!("tab {tab} uses {}; close it first (kitchenctl tab close --tab {tab})", wt.path);
+            }
+            if !a.force && repo.is_dirty(&wt.path)? {
+                bail!("{} has uncommitted changes; pass --force to discard them", wt.path);
+            }
+            repo.remove_worktree(&wt.path, a.force)?;
+            Ok(json!({"removed": wt.path, "branch": wt.branch}))
+        }
+        _ => unreachable!("routed by dispatch"),
     }
 }

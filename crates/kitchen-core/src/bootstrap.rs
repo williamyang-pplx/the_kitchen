@@ -44,13 +44,47 @@ pub fn bootstrap_host(host: &Host, opts: &Options) -> Result<Report> {
     };
     link_skills(host, &dotfiles, &mut report)?;
     probe_tools(host, &mut report)?;
-    if !host.is_local() {
+    if host.is_local() {
+        // An isolated test kitchen (KITCHEN_STATE_DIR) must not repoint the real install.
+        if std::env::var_os("KITCHEN_STATE_DIR").is_none() {
+            if let Err(e) = link_local_cli(&mut report) {
+                report.warnings.push(format!("kitchenctl not linked: {e:#}"));
+            }
+        }
+    } else {
         match install_cli(host) {
             Ok(installed) => report.cli_installed = installed,
             Err(e) => report.warnings.push(format!("kitchenctl not installed: {e:#}")),
         }
     }
     Ok(report)
+}
+
+/// Point `~/.local/bin/kitchenctl` at the kitchenctl built next to the app.
+/// Never replaces a real file, only a missing entry or an existing symlink.
+fn link_local_cli(report: &mut Report) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let Some(cli) = exe.parent().map(|d| d.join("kitchenctl")).filter(|p| p.exists()) else {
+        return Ok(()); // not built alongside the app (e.g. a bare `cargo run`)
+    };
+    let home = std::env::var("HOME").context("HOME unset")?;
+    let dest = std::path::Path::new(&home).join(".local/bin/kitchenctl");
+    match std::fs::symlink_metadata(&dest) {
+        Ok(m) if m.file_type().is_symlink() => {
+            if std::fs::read_link(&dest)? == cli {
+                return Ok(());
+            }
+            std::fs::remove_file(&dest)?;
+        }
+        Ok(_) => {
+            report.warnings.push(format!("{} is not a symlink; left alone", dest.display()));
+            return Ok(());
+        }
+        Err(_) => std::fs::create_dir_all(dest.parent().expect("has parent"))?,
+    }
+    std::os::unix::fs::symlink(&cli, &dest)?;
+    report.cli_installed = true;
+    Ok(())
 }
 
 /// `git pull` the dotfiles checkout, cloning it first when missing.

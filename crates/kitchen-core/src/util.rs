@@ -15,7 +15,9 @@ pub fn new_id() -> String {
 
 /// Quote one word for a POSIX shell (bash, zsh and sh all accept this form).
 pub fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&b)) {
+    // A leading `=` is zsh "equals expansion" (`=cmd` -> its path); devbox
+    // login shells are zsh, so such words must be quoted.
+    if !s.is_empty() && !s.starts_with('=') && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&b)) {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -58,6 +60,8 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("=kt_a_b"), "'=kt_a_b'", "zsh equals expansion");
+        assert_eq!(shell_quote("K=V"), "K=V");
     }
 
     #[test]
