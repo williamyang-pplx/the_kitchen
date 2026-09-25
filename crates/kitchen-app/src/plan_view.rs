@@ -47,6 +47,8 @@ pub struct PlanView {
     view: ViewState,
     editor: Option<Editor>,
     status: Option<(String, bool)>,
+    /// ⌘Enter arrived; submit once the editor has seen this frame's input.
+    submit_pending: bool,
 }
 
 impl PlanView {
@@ -71,6 +73,7 @@ impl PlanView {
             view: ViewState::default(),
             editor: None,
             status: None,
+            submit_pending: false,
         }
     }
 
@@ -154,6 +157,24 @@ impl PlanView {
             .collect()
     }
 
+    /// Save the open comment field as a plan comment.
+    fn submit_comment(&mut self) {
+        let Some(ed) = self.editor.take() else { return };
+        let body = ed.text.trim().to_string();
+        if body.is_empty() {
+            self.editor = Some(ed);
+            return;
+        }
+        let quote = self.doc.lines.get(ed.start).map(|l| l.text.clone()).unwrap_or_default();
+        let end = (ed.end > ed.start).then_some(ed.end as i64 + 1);
+        match self.engine.add_plan_comment(&self.tab_id, ed.start as i64 + 1, end, &quote, &body) {
+            Ok(id) => self.status = Some((format!("comment #{id} saved · ⌘Enter (no field open) sends open comments to the agent"), false)),
+            Err(e) => self.status = Some((format!("{e:#}"), true)),
+        }
+        self.vim.anchor = None;
+        self.reload_comments();
+    }
+
     pub fn command(&mut self, cmd: PanelCmd, _engine: &Arc<Engine>) {
         match cmd {
             PanelCmd::Comment => {
@@ -171,37 +192,22 @@ impl PlanView {
                     needs_focus: true,
                 });
             }
-            PanelCmd::Submit => match self.editor.take() {
-                Some(ed) => {
-                    let body = ed.text.trim().to_string();
-                    if body.is_empty() {
-                        self.editor = Some(ed);
-                        return;
-                    }
-                    let quote = self.doc.lines.get(ed.start).map(|l| l.text.clone()).unwrap_or_default();
-                    let end = (ed.end > ed.start).then_some(ed.end as i64 + 1);
-                    match self.engine.add_plan_comment(&self.tab_id, ed.start as i64 + 1, end, &quote, &body) {
-                        Ok(id) => self.status = Some((format!("comment #{id} saved · ⌘Enter sends all open comments to the agent"), false)),
-                        Err(e) => self.status = Some((format!("{e:#}"), true)),
-                    }
-                    self.vim.anchor = None;
-                    self.reload_comments();
+            // Submit after this frame's typing reaches the editor.
+            PanelCmd::Submit if self.editor.is_some() => self.submit_pending = true,
+            PanelCmd::Submit => {
+                let open = self.comments.iter().filter(|c| c.state == "open").count();
+                if open == 0 {
+                    self.status = Some(("no open comments to send (⌘M to comment)".into(), false));
+                    return;
                 }
-                None => {
-                    let open = self.comments.iter().filter(|c| c.state == "open").count();
-                    if open == 0 {
-                        self.status = Some(("no open comments to send (⌘M to comment)".into(), false));
-                        return;
-                    }
-                    self.status = Some((format!("sending {open} comment(s)…"), false));
-                    let (engine, tab, tx) = (self.engine.clone(), self.tab_id.clone(), self.tx.clone());
-                    std::thread::spawn(move || {
-                        let r = engine.send_plan_feedback(&tab).map_err(|e| format!("{e:#}"));
-                        let _ = tx.send(Msg::Sent(r));
-                        engine.ctx.request_repaint();
-                    });
-                }
-            },
+                self.status = Some((format!("sending {open} comment(s)…"), false));
+                let (engine, tab, tx) = (self.engine.clone(), self.tab_id.clone(), self.tx.clone());
+                std::thread::spawn(move || {
+                    let r = engine.send_plan_feedback(&tab).map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::Sent(r));
+                    engine.ctx.request_repaint();
+                });
+            }
             PanelCmd::Reload => {
                 self.reload_comments();
                 self.poll_file(true);
@@ -274,8 +280,12 @@ impl PlanView {
             if out.cancel_editor {
                 self.editor = None;
             }
+            if std::mem::take(&mut self.submit_pending) {
+                self.submit_comment();
+            }
         }
 
+        let busy = self.vim.search_input.is_some() || self.vim.message.is_some() || self.status.is_some() || self.vim.anchor.is_some();
         let mut f = ui.new_child(egui::UiBuilder::new().max_rect(footer));
         f.horizontal_centered(|ui| {
             ui.add_space(8.0);
@@ -291,7 +301,9 @@ impl PlanView {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 ui.label(RichText::new(format!("L{}", self.vim.line + 1)).monospace().size(11.0).color(theme::DIM));
-                ui.label(RichText::new("⌘M comment · ⌘Enter submit / send all to agent").size(10.5).color(theme::DIM));
+                if !busy {
+                    ui.label(RichText::new("⌘M comment · ⌘Enter submit / send all to agent").size(10.5).color(theme::DIM));
+                }
             });
         });
         ui.advance_cursor_after_rect(full);

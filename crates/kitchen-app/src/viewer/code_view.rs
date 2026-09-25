@@ -268,7 +268,9 @@ impl CodeView<'_> {
                     .hint_text("Write a comment…   ⌘Enter submit · Esc cancel")
                     .desired_rows(4)
                     .desired_width(er.width())
-                    .font(FontId::proportional(font_size));
+                    .font(FontId::proportional(font_size))
+                    .background_color(theme::BG)
+                    .text_color(theme::TEXT);
                 let r = child.add(te);
                 if ed.needs_focus {
                     r.request_focus();

@@ -110,6 +110,8 @@ pub struct Viewer {
     show_files: bool,
     status: Option<(String, bool)>,
     pending_def: Option<(String, Loc, Vec<(String, Symbol)>)>,
+    /// ⌘Enter arrived; submit once the editor has seen this frame's input.
+    submit_pending: bool,
 }
 
 impl Viewer {
@@ -149,6 +151,7 @@ impl Viewer {
             show_files: true,
             status: None,
             pending_def: None,
+            submit_pending: false,
         };
         v.load_file_list();
         v
@@ -462,6 +465,11 @@ impl Viewer {
         let has_base = self.bases.contains_key(&path);
         let key = (path.clone(), self.diff && has_base, self.outline, self.files.contains_key(&path));
         if self.doc_key.as_ref() == Some(&key) {
+            if self.files.contains_key(&path) {
+                if let Some((line, col)) = self.pending_goto.take() {
+                    self.place_cursor(line, col);
+                }
+            }
             return;
         }
         // Keep the cursor on the same source line across rebuilds.
@@ -503,17 +511,26 @@ impl Viewer {
             Doc::plain(&file.text, file.spans.as_deref())
         };
         if let Some((line, col)) = keep {
-            let idx = if self.outline {
-                self.outline_lines.iter().rposition(|&l| l <= line).unwrap_or(0)
-            } else {
-                self.doc.index_of_new(line).unwrap_or(self.doc.lines.len().saturating_sub(1))
-            };
-            self.vim.set_cursor(idx, col);
-            self.view.top = idx.saturating_sub(self.view.rows / 3);
+            self.place_cursor(line, col);
         }
         self.vim.anchor = None;
         if self.outline {
             self.request_summaries(&path);
+        }
+    }
+
+    /// Put the cursor on source line `line` (1-based), scrolling if needed.
+    fn place_cursor(&mut self, line: usize, col: usize) {
+        let idx = if self.outline {
+            self.outline_lines.iter().rposition(|&l| l <= line).unwrap_or(0)
+        } else {
+            self.doc.index_of_new(line).unwrap_or(self.doc.lines.len().saturating_sub(1))
+        };
+        self.vim.set_cursor(idx, col);
+        // rows is 0 before the first frame: assume a typical viewport.
+        let rows = if self.view.rows == 0 { 30 } else { self.view.rows };
+        if idx < self.view.top || idx >= self.view.top + rows {
+            self.view.top = idx.saturating_sub(rows / 3);
         }
     }
 
@@ -675,7 +692,8 @@ impl Viewer {
             PanelCmd::Comment => self.open_editor(),
             PanelCmd::Submit => {
                 if self.editor.is_some() {
-                    self.submit_editor();
+                    // Submit after this frame's typing reaches the editor.
+                    self.submit_pending = true;
                 } else {
                     self.status = Some(("⌘M opens a comment field first".into(), false));
                 }
@@ -733,6 +751,10 @@ impl Viewer {
 
     pub fn ui(&mut self, ui: &mut Ui, cx: &mut PanelCtx) {
         self.poll();
+        // The base may only become known after the file was opened.
+        if let (true, Some(p)) = (self.diff, self.current.clone()) {
+            self.ensure_base(&p);
+        }
         self.rebuild_doc();
         if ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(ui.max_rect()) {
             cx.clicked = true;
@@ -831,9 +853,13 @@ impl Viewer {
                 self.editor = None;
             }
             self.handle_actions(out.actions);
+            if std::mem::take(&mut self.submit_pending) {
+                self.submit_editor();
+            }
         }
 
         // Status line.
+        let busy = self.vim.search_input.is_some() || self.vim.message.is_some() || self.status.is_some() || self.vim.anchor.is_some();
         let mut footer = ui.new_child(egui::UiBuilder::new().max_rect(footer_rect));
         footer.horizontal_centered(|ui| {
             ui.add_space(8.0);
@@ -850,7 +876,9 @@ impl Viewer {
                 ui.add_space(8.0);
                 let pos = format!("{}  L{}:{}", self.vim.pending_display(), self.current_source_line().unwrap_or(0), self.vim.col + 1);
                 ui.label(RichText::new(pos).monospace().size(11.0).color(theme::DIM));
-                ui.label(RichText::new("gd def · ^o back · ]c hunk · ]f file · ⌘D ⌘O ⌘M").size(10.5).color(theme::DIM));
+                if !busy {
+                    ui.label(RichText::new("gd def · ^o back · ]c hunk · ]f file · ⌘D ⌘O ⌘M").size(10.5).color(theme::DIM));
+                }
             });
         });
         ui.advance_cursor_after_rect(body);
@@ -876,7 +904,7 @@ impl Viewer {
                 job.append(&format!("{} ", c.status), 0.0, f(color, 11.0));
                 job.append(name, 0.0, f(if sel { theme::TEXT } else { theme::TEXT.gamma_multiply(0.85) }, 12.0));
                 job.append(&format!("  +{} −{}", c.added, c.removed), 0.0, f(theme::DIM, 10.5));
-                let r = ui.selectable_label(sel, job).on_hover_text(&c.path);
+                let r = list_row(ui, sel, job).on_hover_text(&c.path);
                 if r.clicked() && c.status != 'D' {
                     open = Some(c.path.clone());
                 }
@@ -887,7 +915,8 @@ impl Viewer {
             ui.label(RichText::new(format!("  ALL FILES ({})", rest.len())).size(10.5).strong().color(theme::DIM));
             for p in rest.iter().take(2000) {
                 let sel = self.current.as_deref() == Some(p.as_str());
-                if ui.selectable_label(sel, RichText::new(p.as_str()).size(11.5).color(theme::DIM)).clicked() {
+                let color = if sel { theme::TEXT } else { theme::DIM };
+                if list_row(ui, sel, RichText::new(p.as_str()).size(11.5).color(color)).clicked() {
                     open = Some((*p).clone());
                 }
             }
@@ -900,6 +929,12 @@ impl Viewer {
             self.open(&p, None, true);
         }
     }
+}
+
+/// A full-width, flat row in the file list.
+pub(crate) fn list_row(ui: &mut Ui, selected: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let fill = if selected { theme::SELECTED } else { egui::Color32::TRANSPARENT };
+    ui.add(egui::Button::new(text).fill(fill).stroke(egui::Stroke::NONE).min_size(egui::vec2(ui.available_width(), 0.0)).wrap_mode(egui::TextWrapMode::Truncate))
 }
 
 fn picker_path(changed: &[ChangedFile], all: &[String], i: usize) -> String {

@@ -119,7 +119,7 @@ impl Picker {
                     let sel = row == self.selected;
                     let text = RichText::new(label).monospace().size(12.5).color(if sel { theme::TEXT } else { theme::DIM });
                     let resp = ui.horizontal(|ui| {
-                        let r = ui.selectable_label(sel, text);
+                        let r = super::list_row(ui, sel, text);
                         if !detail.is_empty() {
                             ui.label(RichText::new(detail).size(11.0).color(theme::DIM));
                         }
