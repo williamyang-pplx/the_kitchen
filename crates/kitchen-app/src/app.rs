@@ -52,6 +52,8 @@ pub struct KitchenApp {
     inbox: crate::inbox::Inbox,
     dialog: Option<Dialog>,
     screenshots: Vec<(String, Sender<Result<(), String>>)>,
+    /// ⌘Q pressed; closes the window at the end of the frame.
+    quit_requested: bool,
     /// Test hook: take a screenshot after a delay, then exit.
     auto_shot: Option<(Instant, String)>,
 }
@@ -77,6 +79,7 @@ impl KitchenApp {
             inbox,
             dialog: None,
             screenshots: Vec::new(),
+            quit_requested: false,
             auto_shot,
         }
     }
@@ -209,6 +212,9 @@ impl KitchenApp {
                 engine.select_tab_index(n);
                 self.focus = Focus::Terminal;
             }
+            Action::PrevTab => engine.cycle_tab(-1),
+            Action::NextTab => engine.cycle_tab(1),
+            Action::Quit => self.quit_requested = true,
             Action::NewEditTab => {
                 if ws.is_some() {
                     self.dialog = Some(Dialog::new_edit_tab());
@@ -436,7 +442,7 @@ impl KitchenApp {
                 ui.add_space(8.0);
                 for (kind, label, action) in [
                     (SideKind::Inbox, "Inbox ⌘I", Action::OpenInbox),
-                    (SideKind::Plan, "Plan ⌘L", Action::OpenPlan),
+                    (SideKind::Plan, "Plan ⌘⇧R", Action::OpenPlan),
                     (SideKind::Viewer, "Files ⌘P", Action::OpenViewer),
                 ] {
                     let on = self.side == Some(kind);
@@ -475,7 +481,7 @@ impl KitchenApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("⌘J/K workspace · ⌘1-9 tab · ⌘` focus · ⌘M comment · ⌘D diff · ⌘O outline")
+                    RichText::new("⌘J/K workspace · ⌘H/L or ⌘1-9 tab · ⌘` focus · ⌘M comment · ⌘D diff · ⌘O outline")
                         .size(10.5)
                         .color(theme::DIM),
                 );
@@ -650,6 +656,9 @@ impl eframe::App for KitchenApp {
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });
         self.save_screenshots(&ctx);
+        if self.quit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

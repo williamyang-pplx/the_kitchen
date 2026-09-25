@@ -263,7 +263,7 @@ impl NewEditTab {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
         ui.heading("New edit tab");
         ui.label(
-            RichText::new("Gets its own worktree + branch off the latest origin. With a task, the agent starts in the planning phase (/low-level-plan) and writes the plan for review (⌘L).")
+            RichText::new("Gets its own worktree + branch off the latest origin. With a task, the agent starts in the planning phase (/low-level-plan) and writes the plan for review (⌘⇧R).")
                 .color(theme::DIM)
                 .size(12.0),
         );

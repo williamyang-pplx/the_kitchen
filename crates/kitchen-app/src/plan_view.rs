@@ -1,4 +1,4 @@
-//! Plan reviewer (⌘L): the tab's low-level plan as a vim-navigable
+//! Plan reviewer (⌘⇧R): the tab's low-level plan as a vim-navigable
 //! document with inline comments. ⌘M comments on the cursor line or visual
 //! selection, ⌘Enter submits it; ⌘Enter with no comment open sends every
 //! open comment to the tab's agent in one message. The file is re-read

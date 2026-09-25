@@ -26,6 +26,12 @@ fn main() -> eframe::Result {
             .with_title("the kitchen")
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([800.0, 480.0]),
+        // No default macOS menu: its ⌘H (Hide) and ⌘Q items would swallow
+        // those chords before the kitchen sees them. ⌘Q is handled in keymap.rs.
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::macos::EventLoopBuilderExtMacOS;
+            builder.with_default_menu(false);
+        })),
         ..Default::default()
     };
     eframe::run_native(

@@ -6,7 +6,6 @@
 //! lock, so a slow devbox never freezes the window. Keyboard shortcuts and
 //! `kitchenctl` commands end up calling the same methods here.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -627,6 +626,18 @@ impl Engine {
         if let Some(id) = id {
             self.select_tab(&id);
         }
+    }
+
+    /// ⌘H / ⌘L: previous / next tab of the selected workspace, wrapping.
+    pub fn cycle_tab(&self, delta: isize) {
+        let Some(ws) = self.selected_workspace() else { return };
+        let n = ws.tabs.len();
+        if n == 0 {
+            return;
+        }
+        let cur = ws.selected().and_then(|t| ws.tabs.iter().position(|x| x.row.id == t.row.id)).unwrap_or(0);
+        let next = ws.tabs[((cur as isize + delta).rem_euclid(n as isize)) as usize].row.id.clone();
+        self.select_tab(&next);
     }
 
     pub fn rename_tab(&self, tab_id: &str, title: &str) -> Result<()> {

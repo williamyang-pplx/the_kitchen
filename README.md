@@ -9,7 +9,7 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   from it, and installs `kitchenctl`.
 - **Edit tabs**: one PR each, in a fresh worktree + branch cut from the latest
   `origin/<default>`. Given a task, the agent starts with `/low-level-plan` and
-  writes a plan you comment on inline (⌘L).
+  writes a plan you comment on inline (⌘⇧R).
 - **Read-only tabs**: code review and understanding, on a shared read-only
   worktree kept at the latest `origin/<default>`.
 - File viewer with vim navigation, diff/plain mode, jump-to-definition and an
@@ -52,11 +52,12 @@ keys (`gd`, `Ctrl-o`, …).
 | ⌘N | new workspace |
 | ⌘J / ⌘K | next / previous workspace |
 | ⌘1 … ⌘9 | go to tab N of the current workspace |
+| ⌘H / ⌘L | previous / next tab |
 | ⌘E | new edit (read/write) tab — own worktree |
 | ⌘R | new read-only tab — shared read-only worktree |
 | ⌘W | close tab |
 | ⌘P | file viewer (again: file picker) |
-| ⌘L | plan reviewer |
+| ⌘⇧R | plan reviewer |
 | ⌘I | agent-review inbox |
 | ⌘` | switch focus terminal ↔ side panel |
 | ⌘M | comment on the cursor line / selection |

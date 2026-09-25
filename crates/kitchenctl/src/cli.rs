@@ -304,7 +304,7 @@ pub enum PlanCmd {
         #[command(flatten)]
         target: TabTarget,
     },
-    /// Show the plan in the plan reviewer (⌘L).
+    /// Show the plan in the plan reviewer (⌘⇧R).
     Open {
         #[command(flatten)]
         target: TabTarget,
