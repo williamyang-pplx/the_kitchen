@@ -47,6 +47,7 @@ fn main() -> eframe::Result {
 /// Background setup on launch: relink local skills, refresh every devbox
 /// (pull dotfiles, relink skills, update kitchenctl, start its relay).
 fn startup(engine: &Arc<engine::Engine>) {
+    review::start_poller(engine);
     engine.spawn("local setup", |e| {
         let s = e.settings();
         let report = kitchen_core::bootstrap::bootstrap_host(
