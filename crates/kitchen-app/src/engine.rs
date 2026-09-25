@@ -844,6 +844,3 @@ fn local_socket_env(host: &Host) -> Option<(String, String)> {
 fn applescript_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
-
-/// Tab ids to their live terminal sessions — owned by the UI thread.
-pub type Sessions = HashMap<String, crate::terminal::TermSession>;

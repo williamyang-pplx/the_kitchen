@@ -7,7 +7,7 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::CursorShape;
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, CornerRadius, EventFilter, FontId, Key, Modifiers, PointerButton, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
+use egui::{Color32, CornerRadius, EventFilter, FontId, Modifiers, PointerButton, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 
 use super::colors::{self, BACKGROUND, CURSOR, SELECTION};
 use super::input::{key_bytes, paste_bytes, sgr_mouse};
