@@ -536,7 +536,9 @@ impl Engine {
             } else {
                 match kind {
                     TabKind::Edit => Some(self.edit_agent_command(&host, &worktree, &settings, opts.task.as_deref(), plan_file.as_deref())?),
-                    TabKind::Readonly => settings.autostart_readonly_agent.then(|| settings.readonly_agent_command.clone()),
+                    TabKind::Readonly => settings.autostart_readonly_agent.then(|| {
+                        format!("{} --settings {}", settings.readonly_agent_command, shell_quote(&agent_settings_json(false)))
+                    }),
                 }
             };
             Tmux::new(&host).new_session(&session, &worktree, &env, command.as_deref())?;
@@ -584,10 +586,7 @@ impl Engine {
         task: Option<&str>,
         plan_file: Option<&str>,
     ) -> Result<String> {
-        let base = settings.edit_agent_command.clone();
-        // Plan mode writes into .kitchen/plans so the plan reviewer sees it.
-        let plans_settings = r#"{"plansDirectory":".kitchen/plans"}"#;
-        let base = format!("{base} --settings {}", shell_quote(plans_settings));
+        let base = format!("{} --settings {}", settings.edit_agent_command, shell_quote(&agent_settings_json(true)));
         let Some(task) = task.map(str::trim).filter(|t| !t.is_empty()) else {
             return Ok(base);
         };
@@ -774,6 +773,22 @@ impl Engine {
         self.repaint();
         Ok(())
     }
+}
+
+/// `--settings` for agents the kitchen starts: plan files land where the
+/// plan reviewer looks (edit tabs), and Stop/Notification hooks badge the
+/// tab through `kitchenctl notify` so a finished or blocked agent is visible
+/// from any workspace.
+fn agent_settings_json(plans: bool) -> String {
+    let hook = |title: &str| {
+        serde_json::json!([{ "hooks": [{ "type": "command",
+            "command": format!("command -v kitchenctl >/dev/null && kitchenctl notify --title '{title}' --body \"$(basename \"$PWD\")\" >/dev/null 2>&1; true") }] }])
+    };
+    let mut v = serde_json::json!({ "hooks": { "Stop": hook("agent finished"), "Notification": hook("agent needs you") } });
+    if plans {
+        v["plansDirectory"] = serde_json::json!(".kitchen/plans");
+    }
+    v.to_string()
 }
 
 fn tab_infos(w: &Workspace) -> Vec<TabInfo> {
