@@ -1,0 +1,18 @@
+[package]
+name = "kitchen-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+kitchen-proto.workspace = true
+kitchen-symbols.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+blake3 = "1"
+rand = "0.9"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
