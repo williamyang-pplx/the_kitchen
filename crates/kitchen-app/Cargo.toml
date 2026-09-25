@@ -14,3 +14,8 @@ serde_json.workspace = true
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "persistence"] }
 egui = "0.36"
 alacritty_terminal = "0.26"
+png = "0.18"
+kitchen-core.workspace = true
+kitchen-proto.workspace = true
+log = "0.4"
+env_logger = "0.11"

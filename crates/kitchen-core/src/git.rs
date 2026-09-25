@@ -116,7 +116,7 @@ impl<'a> Repo<'a> {
         Ok(self.worktrees()?.into_iter().find(|w| w.branch.as_deref() == Some(branch)))
     }
 
-    fn local_branch_exists(&self, branch: &str) -> bool {
+    pub fn local_branch_exists(&self, branch: &str) -> bool {
         self.git(&["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
     }
 

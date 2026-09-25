@@ -138,7 +138,7 @@ impl Host {
 
     /// argv for a pty that attaches to a tmux session on this host.
     pub fn tmux_attach_argv(&self, session: &str) -> Vec<String> {
-        let tmux = ["tmux", "attach-session", "-t", session];
+        let tmux = ["tmux", "-L", crate::tmux::SOCKET_NAME, "attach-session", "-t", session];
         match self {
             Host::Local => tmux.iter().map(|s| s.to_string()).collect(),
             Host::Ssh(alias) => {
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn ssh_attach_argv_quotes_remote_command() {
         let argv = Host::Ssh("box".into()).tmux_attach_argv("kt_a_b");
-        assert_eq!(argv.last().unwrap(), "tmux attach-session -t kt_a_b");
+        assert_eq!(argv.last().unwrap(), "tmux -L kitchen attach-session -t kt_a_b");
         assert!(argv.contains(&"-tt".to_string()));
     }
 }

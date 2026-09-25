@@ -9,6 +9,13 @@ use crate::util::shell_join;
 
 pub const SESSION_PREFIX: &str = "kt_";
 
+/// The kitchen runs its own tmux server (`tmux -L kitchen`) on every host,
+/// isolated from any personal tmux server and its state.
+pub const SOCKET_NAME: &str = "kitchen";
+
+/// `tmux -L kitchen` as argv, for building commands.
+pub const TMUX: [&str; 3] = ["tmux", "-L", SOCKET_NAME];
+
 pub fn session_name(workspace_id: &str, tab_id: &str) -> String {
     format!("{SESSION_PREFIX}{workspace_id}_{tab_id}")
 }
@@ -35,14 +42,14 @@ impl<'a> Tmux<'a> {
     }
 
     fn tmux(&self, args: &[&str]) -> Result<String> {
-        let mut argv = vec!["tmux"];
+        let mut argv = TMUX.to_vec();
         argv.extend_from_slice(args);
         self.host.run_ok(&argv, None)
     }
 
     pub fn has_session(&self, name: &str) -> bool {
         let target = format!("={name}");
-        self.host.run(&["tmux", "has-session", "-t", &target], None).map(|o| o.ok()).unwrap_or(false)
+        self.host.run(&[TMUX[0], TMUX[1], TMUX[2], "has-session", "-t", &target], None).map(|o| o.ok()).unwrap_or(false)
     }
 
     /// Create a detached session in `cwd` with `env`, then type `command`
@@ -60,7 +67,7 @@ impl<'a> Tmux<'a> {
             // One round trip for all options.
             let mut script = Vec::new();
             for (opt, val) in SESSION_OPTIONS {
-                script.push(shell_join(&["tmux", "set-option", "-t", name, opt, val]));
+                script.push(shell_join(&[TMUX[0], TMUX[1], TMUX[2], "set-option", "-t", name, opt, val]));
             }
             let _ = self.host.sh(&script.join("; "), None);
         }
@@ -85,7 +92,7 @@ impl<'a> Tmux<'a> {
         if text.contains('\n') {
             let buf = format!("kt-{}", crate::util::new_id());
             let script = format!(
-                "tmux load-buffer -b {b} - && tmux paste-buffer -p -d -b {b} -t {t}",
+                "tmux -L {SOCKET_NAME} load-buffer -b {b} - && tmux -L {SOCKET_NAME} paste-buffer -p -d -b {b} -t {t}",
                 b = buf,
                 t = crate::util::shell_quote(name)
             );
@@ -123,7 +130,7 @@ impl<'a> Tmux<'a> {
 
     /// Names of live kitchen sessions on this host.
     pub fn list_kitchen_sessions(&self) -> Result<Vec<String>> {
-        let out = self.host.run(&["tmux", "list-sessions", "-F", "#{session_name}"], None)?;
+        let out = self.host.run(&[TMUX[0], TMUX[1], TMUX[2], "list-sessions", "-F", "#{session_name}"], None)?;
         if !out.ok() {
             return Ok(Vec::new()); // no server running
         }

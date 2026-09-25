@@ -21,8 +21,12 @@ pub const ENV_TAB_KIND: &str = "KITCHEN_TAB_KIND";
 pub const ENV_READONLY: &str = "KITCHEN_READONLY";
 pub const ENV_PLAN_FILE: &str = "KITCHEN_PLAN_FILE";
 
-/// `~/.kitchen` on every host (mac and devbox alike).
+/// `~/.kitchen` on every host (mac and devbox alike). `KITCHEN_STATE_DIR`
+/// overrides it (tests run an isolated kitchen this way).
 pub fn state_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("KITCHEN_STATE_DIR") {
+        return PathBuf::from(d);
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
     home.join(".kitchen")
 }
