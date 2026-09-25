@@ -41,6 +41,8 @@ enum TermSlot {
 pub struct KitchenApp {
     engine: Arc<Engine>,
     slots: HashMap<String, TermSlot>,
+    /// Consecutive failed attach attempts per tab (drives the retry backoff).
+    attempts: HashMap<String, u32>,
     attach_tx: Sender<(String, anyhow::Result<bool>)>,
     attach_rx: Receiver<(String, anyhow::Result<bool>)>,
     focus: Focus,
@@ -65,6 +67,7 @@ impl KitchenApp {
         Self {
             engine,
             slots: HashMap::new(),
+            attempts: HashMap::new(),
             attach_tx,
             attach_rx,
             focus: Focus::Terminal,
@@ -91,10 +94,9 @@ impl KitchenApp {
         if !needs_prepare {
             return;
         }
-        let attempts = match self.slots.get(&id) {
-            Some(TermSlot::Failed { attempts, .. }) => *attempts,
-            _ => 0,
-        };
+        if let Some(TermSlot::Failed { attempts, .. }) = self.slots.get(&id) {
+            self.attempts.insert(id.clone(), *attempts);
+        }
         self.slots.insert(id.clone(), TermSlot::Preparing);
         let engine = self.engine.clone();
         let tx = self.attach_tx.clone();
@@ -104,7 +106,7 @@ impl KitchenApp {
             let _ = tx.send((id, r));
             ctx2.request_repaint();
         });
-        let _ = (ws, attempts);
+        let _ = ws;
     }
 
     fn poll_attach(&mut self, ctx: &egui::Context) {
@@ -113,14 +115,17 @@ impl KitchenApp {
                 self.slots.remove(&tab_id);
                 continue;
             };
-            let prev_attempts = 0;
+            let prev_attempts = self.attempts.get(&tab_id).copied().unwrap_or(0);
             let slot = match result {
                 Ok(true) => {
                     let argv = ws.host().tmux_attach_argv(&tab.row.tmux_session);
                     let mut env = HashMap::new();
                     env.insert("LANG".into(), std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()));
                     match TermSession::spawn(ctx, &argv, Some(&home()), env) {
-                        Ok(s) => TermSlot::Live(s),
+                        Ok(s) => {
+                            self.attempts.remove(&tab_id);
+                            TermSlot::Live(s)
+                        }
                         Err(e) => TermSlot::Failed {
                             msg: format!("spawn failed: {e:#}"),
                             retry_at: Instant::now() + Duration::from_secs(3),
