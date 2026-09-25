@@ -69,6 +69,15 @@ impl<'a> TerminalView<'a> {
         if let Some(text) = session.take_clipboard() {
             ui.ctx().copy_text(text);
         }
+        if session.predictor.pending() {
+            let cursor_row = live_cursor(session).map(|(r, _)| r);
+            let term = session.term.lock();
+            session.predictor.validate(|row, col| term.grid()[Point::new(Line(row as i32), Column(col))].c, cursor_row);
+            drop(term);
+            if session.predictor.pending() {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
         paint(ui, rect, session, &geom, &font, has_focus);
         resp
     }
@@ -101,6 +110,16 @@ impl Geom {
     }
 }
 
+/// The cursor's viewport cell when it is visible on the live screen.
+fn live_cursor(session: &TermSession) -> Option<(usize, usize)> {
+    let term = session.term.lock();
+    if term.grid().display_offset() != 0 || !term.mode().contains(TermMode::SHOW_CURSOR) {
+        return None;
+    }
+    let p = term.grid().cursor.point;
+    Some((p.line.0.max(0) as usize, p.column.0))
+}
+
 fn handle_keyboard(ui: &mut Ui, session: &mut TermSession) {
     let events = ui.input(|i| i.events.clone());
     let mode = *session.term.lock().mode();
@@ -113,6 +132,7 @@ fn handle_keyboard(ui: &mut Ui, session: &mut TermSession) {
                     continue; // Cmd chords are kitchen shortcuts.
                 }
                 if let Some(bytes) = key_bytes(key, modifiers, mode) {
+                    session.predictor.reset();
                     session.write(bytes);
                     wrote = true;
                     // Option/Ctrl combos also emit a composed Text event; drop it.
@@ -126,6 +146,9 @@ fn handle_keyboard(ui: &mut Ui, session: &mut TermSession) {
                 if ui.input(|i| i.modifiers.mac_cmd) {
                     continue;
                 }
+                let cursor = live_cursor(session);
+                let cols = session.size().cols;
+                session.predictor.typed(&text, cursor, cols);
                 session.write(text.into_bytes());
                 wrote = true;
             }
@@ -134,6 +157,7 @@ fn handle_keyboard(ui: &mut Ui, session: &mut TermSession) {
                 wrote = true;
             }
             egui::Event::Paste(text) => {
+                session.predictor.reset();
                 session.write(paste_bytes(&text, mode));
                 wrote = true;
             }
@@ -331,6 +355,21 @@ fn paint(ui: &mut Ui, rect: Rect, session: &TermSession, geom: &Geom, font: &Fon
         painter.text(r.left_top(), egui::Align2::LEFT_TOP, c, font.clone(), color);
     }
 
+    // Predicted (not yet echoed) characters, underlined; the cursor is drawn after them.
+    let preds = session.predictor.visible();
+    for p in preds {
+        if p.row < geom.rows && p.col < geom.cols {
+            let r = geom.cell_rect(p.col, p.row, 1);
+            painter.rect_filled(r, CornerRadius::ZERO, BACKGROUND);
+            painter.text(r.left_top(), egui::Align2::LEFT_TOP, p.c, font.clone(), colors::FOREGROUND);
+            painter.hline(r.x_range(), r.bottom() - 1.0, Stroke::new(1.0, colors::FOREGROUND.gamma_multiply(0.5)));
+        }
+    }
+    let mut cursor = cursor;
+    if let Some(last) = preds.last() {
+        cursor.point = Point::new(Line(last.row as i32 - offset), Column((last.col + 1).min(geom.cols - 1)));
+    }
+
     // Cursor (only on the live screen).
     let cursor_row = cursor.point.line.0 + offset;
     if cursor.shape != CursorShape::Hidden && cursor_row >= 0 && (cursor_row as usize) < geom.rows {
@@ -377,4 +416,140 @@ fn append_char(job: &mut LayoutJob, c: char, fmt: TextFormat) {
     }
     let mut buf = [0u8; 4];
     job.append(c.encode_utf8(&mut buf), 0.0, fmt);
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// `cargo test --release -p kitchen-app bench_frame -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_frame() {
+        let ctx = egui::Context::default();
+        let mut session = TermSession::spawn(
+            &ctx,
+            &["sh".into(), "-c".into(), "for i in $(seq 1 60); do printf '\\033[3%dmline %d the quick brown fox \\033[1mjumps\\033[0m over the lazy dog 0123456789 ✓ 日本\\n' $((i%7)) $i; done; sleep 30".into()],
+            None,
+            HashMap::new(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 860.0))),
+            ..Default::default()
+        };
+        let mut run = |n: usize, mutate: bool| {
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                if mutate {
+                    // Simulate typing: one cell changes per frame.
+                    let c = char::from(b'a' + (i % 26) as u8);
+                    session.term.lock().grid_mut()[Point::new(Line(10), Column(i % 80))].c = c;
+                }
+                let _ = ctx.run_ui(input(), |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        TerminalView::new(&mut session).focused(true).show(ui);
+                    });
+                });
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / n as f64
+        };
+        run(5, false);
+        println!("static frame: {:.3} ms", run(200, false));
+        println!("typing frame: {:.3} ms", run(200, true));
+    }
+}
+
+#[cfg(test)]
+mod latency {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Echo latency through a real attach command:
+    /// `KT_ATTACH='ssh ... tmux attach -t x' cargo test --release -p kitchen-app echo_latency -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn echo_latency() {
+        let Ok(cmd) = std::env::var("KT_ATTACH") else { return };
+        let ctx = egui::Context::default();
+        let session = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), cmd], None, HashMap::new()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let count = |s: &TermSession| {
+            let t = s.term.lock();
+            let mut n = 0;
+            for row in t.grid().display_iter() {
+                if row.cell.c == 'q' {
+                    n += 1;
+                }
+            }
+            n
+        };
+        let mut samples = Vec::new();
+        for _ in 0..15 {
+            let before = count(&session);
+            let t = std::time::Instant::now();
+            session.write(&b"q"[..]);
+            while count(&session) == before && t.elapsed().as_secs() < 3 {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("echo ms: median {:.1} p90 {:.1} max {:.1}", samples[7], samples[13], samples[14]);
+        session.write(&b"\x15"[..]);
+    }
+}
+
+#[cfg(test)]
+mod perceived {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Keypress-to-drawn latency through TerminalView, prediction on:
+    /// `KT_ATTACH=... cargo test --release -p kitchen-app perceived_latency -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perceived_latency() {
+        let Ok(cmd) = std::env::var("KT_ATTACH") else { return };
+        let ctx = egui::Context::default();
+        let mut s = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), cmd], None, HashMap::new()).unwrap();
+        s.set_predictive_echo(true);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let frame = |s: &mut TermSession, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    TerminalView::new(s).focused(true).show(ui);
+                });
+            });
+        };
+        let shown = |s: &TermSession, n: usize| {
+            let t = s.term.lock();
+            let echoed = t.grid().display_iter().filter(|c| c.cell.c == 'q').count();
+            echoed + s.predictor.visible().iter().filter(|p| p.c == 'q').count() >= n
+        };
+        let mut out = Vec::new();
+        for i in 0..12 {
+            let before = { let t = s.term.lock(); t.grid().display_iter().filter(|c| c.cell.c == 'q').count() };
+            let t0 = std::time::Instant::now();
+            frame(&mut s, vec![egui::Event::Text("q".into())]);
+            while !shown(&s, before + 1) && t0.elapsed().as_secs() < 3 {
+                frame(&mut s, vec![]);
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+            out.push((i, t0.elapsed().as_secs_f64() * 1000.0));
+            // Let the echo land before the next key (steady typing).
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            frame(&mut s, vec![]);
+        }
+        println!("{}", out.iter().map(|(i, ms)| format!("#{i}:{ms:.1}ms")).collect::<Vec<_>>().join(" "));
+        s.write(&b"\x15"[..]);
+    }
 }

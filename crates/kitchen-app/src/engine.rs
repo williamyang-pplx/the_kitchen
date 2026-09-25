@@ -27,6 +27,17 @@ pub struct Workspace {
     /// Transient status shown under the workspace name ("bootstrapping…").
     pub status: Option<String>,
     pub error: Option<String>,
+    /// Tabs being created right now, shown in the tab strip immediately.
+    pub pending: Vec<PendingTab>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingTab {
+    pub id: String,
+    pub title: String,
+    pub kind: TabKind,
+    /// The new tab will take focus; the terminal area shows its progress.
+    pub focus: bool,
 }
 
 impl Workspace {
@@ -107,6 +118,9 @@ pub struct Engine {
     state: Mutex<State>,
     ui_cmds: Mutex<Vec<UiCommand>>,
     settings: Mutex<Settings>,
+    /// Tabs whose tmux session was just created: the first attach can skip
+    /// the "does the session still exist?" round trip.
+    fresh_sessions: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Engine {
@@ -119,7 +133,7 @@ impl Engine {
         for row in db.workspaces()? {
             let tabs = db.tabs(&row.id)?.into_iter().map(|row| Tab { row, unread: false }).collect();
             let selected_tab = db.setting(&format!("selected_tab:{}", row.id))?;
-            state.workspaces.push(Workspace { row, tabs, selected_tab, status: None, error: None });
+            state.workspaces.push(Workspace { row, tabs, selected_tab, status: None, error: None, pending: Vec::new() });
         }
         state.selected = db.setting("selected_workspace")?.filter(|id| state.workspaces.iter().any(|w| &w.row.id == id));
         if state.selected.is_none() {
@@ -131,6 +145,7 @@ impl Engine {
             state: Mutex::new(state),
             ui_cmds: Mutex::new(Vec::new()),
             settings: Mutex::new(settings),
+            fresh_sessions: Mutex::new(Default::default()),
         }))
     }
 
@@ -353,6 +368,7 @@ impl Engine {
                 selected_tab: None,
                 status: Some("setting up…".into()),
                 error: None,
+                pending: Vec::new(),
             });
         }
         self.select_workspace(&row.id);
@@ -387,7 +403,37 @@ impl Engine {
         if let Host::Ssh(alias) = ws.host() {
             crate::relay::ensure_relay(self, &alias);
         }
+        self.refill_spare(ws_id);
         Ok(())
+    }
+
+    /// Re-create the workspace's spare worktree in the background (it is
+    /// consumed by every new-branch edit tab).
+    pub fn refill_spare(self: &Arc<Self>, ws_id: &str) {
+        let Some(ws) = self.workspace(ws_id) else { return };
+        let Some(base) = ws.row.default_branch.clone() else { return };
+        self.spawn("spare worktree", move |_| {
+            let host = ws.host();
+            Repo::new(&host, &ws.row.repo_path).ensure_spare_worktree(&base)
+        });
+    }
+
+    fn set_pending(&self, ws_id: &str, tab: Option<PendingTab>) {
+        let mut st = self.state();
+        if let (Some(w), Some(t)) = (st.workspaces.iter_mut().find(|w| w.row.id == ws_id), tab) {
+            w.pending.push(t);
+        }
+        drop(st);
+        self.repaint();
+    }
+
+    fn clear_pending(&self, ws_id: &str, tab_id: &str) {
+        let mut st = self.state();
+        if let Some(w) = st.workspaces.iter_mut().find(|w| w.row.id == ws_id) {
+            w.pending.retain(|p| p.id != tab_id);
+        }
+        drop(st);
+        self.repaint();
     }
 
     fn set_ws_status(&self, ws_id: &str, status: Option<&str>, error: Option<String>) {
@@ -468,15 +514,25 @@ impl Engine {
         let repo = Repo::new(&host, &ws.row.repo_path);
         let settings = self.settings();
         let tab_id = new_id();
-        let busy = format!("{} tab…", if kind == TabKind::Edit { "creating edit" } else { "opening read-only" });
-        self.set_ws_status(ws_id, Some(&busy), None);
+        let pending_title = opts
+            .title
+            .clone()
+            .or_else(|| opts.task.as_deref().and_then(|t| t.lines().next()).map(String::from))
+            .or_else(|| opts.pr.map(|n| format!("#{n}")))
+            .or_else(|| opts.branch.clone())
+            .unwrap_or_else(|| if kind == TabKind::Edit { "new tab".into() } else { "read-only".into() });
+        self.set_pending(ws_id, Some(PendingTab { id: tab_id.clone(), title: pending_title, kind, focus: opts.focus.unwrap_or(true) }));
         let result = (|| -> Result<TabRow> {
-            // Always start from what is on the remote right now.
-            repo.fetch().context("git fetch origin")?;
+            // Every path below fetches from origin first, so tabs always start
+            // from what is on the remote right now. The common paths (new
+            // branch, read-only main) do it inside a single host round trip.
             let base = match &ws.row.default_branch {
                 Some(b) => b.clone(),
                 None => repo.default_branch()?,
             };
+            if opts.pr.is_some() || opts.branch.as_deref().is_some_and(|b| !b.is_empty()) {
+                repo.fetch().context("git fetch origin")?;
+            }
             let pr = match (opts.pr, &ws.row.github_slug) {
                 (Some(n), Some(slug)) => Some(gh::Gh::default().pr_view(slug, n)?),
                 (Some(_), None) => bail!("workspace has no GitHub remote; cannot open a PR"),
@@ -492,9 +548,13 @@ impl Engine {
                     } else {
                         let label = opts.title.clone().or(opts.task.clone()).unwrap_or_else(|| format!("tab-{tab_id}"));
                         let first = label.lines().next().unwrap_or(&label).to_string();
-                        let slug = unique_slug(&repo, &slugify(&first, 40), &settings.branch_prefix, &tab_id);
-                        let branch = format!("{}{slug}", settings.branch_prefix);
-                        (repo.add_worktree_new_branch(&branch, &repo.sibling_path(&slug), &base)?, first)
+                        let mut slug = slugify(&first, 40);
+                        if slug.is_empty() {
+                            slug = format!("tab-{tab_id}");
+                        }
+                        let wt = repo.create_edit_worktree(&base, &settings.branch_prefix, &slug)?;
+                        self.refill_spare(ws_id);
+                        (wt, first)
                     };
                     (wt.path.clone(), wt.branch.clone(), title)
                 }
@@ -507,13 +567,16 @@ impl Engine {
                         let wt = repo.sync_readonly_worktree(&path, &rev)?;
                         (wt.path, Some(pr.head_ref.clone()), format!("review #{} {}", pr.number, pr.title))
                     } else {
-                        let wt = repo.sync_readonly_worktree(&repo.readonly_path(), &format!("origin/{base}"))?;
+                        let wt = repo.sync_readonly_worktree_fetching(&repo.readonly_path(), &format!("origin/{base}"), Some(&base))?;
                         (wt.path, None, opts.title.clone().unwrap_or_else(|| format!("read-only {base}")))
                     }
                 }
             };
             let title = opts.title.clone().unwrap_or(title);
-            plan::ensure_excluded(&host, &worktree)?;
+            if pr.is_some() || opts.branch.is_some() {
+                // (new-branch worktrees were excluded by their creation script)
+                plan::ensure_excluded(&host, &worktree)?;
+            }
             let plan_file = (kind == TabKind::Edit).then(|| plan::plan_file_for(&worktree));
 
             let session = tmux::session_name(ws_id, &tab_id);
@@ -529,19 +592,25 @@ impl Engine {
             if let Some(p) = &plan_file {
                 env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), p.clone()));
             }
+            let mut setup = None;
             let command = if opts.no_agent {
                 None
             } else if let Some(c) = opts.command.clone() {
                 Some(c)
             } else {
                 match kind {
-                    TabKind::Edit => Some(self.edit_agent_command(&host, &worktree, &settings, opts.task.as_deref(), plan_file.as_deref())?),
+                    TabKind::Edit => {
+                        let (cmd, prompt_setup) = edit_agent_command(&worktree, &settings, opts.task.as_deref(), plan_file.as_deref())?;
+                        setup = prompt_setup;
+                        Some(cmd)
+                    }
                     TabKind::Readonly => settings.autostart_readonly_agent.then(|| {
                         format!("{} --settings {}", settings.readonly_agent_command, shell_quote(&agent_settings_json(false)))
                     }),
                 }
             };
-            Tmux::new(&host).new_session(&session, &worktree, &env, command.as_deref())?;
+            Tmux::new(&host).new_session_with_setup(&session, &worktree, &env, command.as_deref(), setup.as_deref())?;
+            self.fresh_sessions.lock().unwrap().insert(tab_id.clone());
 
             let row = TabRow {
                 id: tab_id.clone(),
@@ -558,7 +627,7 @@ impl Engine {
             self.db().insert_tab(&row)?;
             Ok(row)
         })();
-        self.set_ws_status(ws_id, None, None);
+        self.clear_pending(ws_id, &tab_id);
         let row = result?;
         {
             let mut st = self.state();
@@ -574,26 +643,6 @@ impl Engine {
         }
         self.repaint();
         Ok(row)
-    }
-
-    /// The shell command that starts an edit tab's agent. With a task, the
-    /// agent begins in the planning phase (`/low-level-plan`).
-    fn edit_agent_command(
-        &self,
-        host: &Host,
-        worktree: &str,
-        settings: &Settings,
-        task: Option<&str>,
-        plan_file: Option<&str>,
-    ) -> Result<String> {
-        let base = format!("{} --settings {}", settings.edit_agent_command, shell_quote(&agent_settings_json(true)));
-        let Some(task) = task.map(str::trim).filter(|t| !t.is_empty()) else {
-            return Ok(base);
-        };
-        let plan_file = plan_file.context("edit tab without plan file")?;
-        let prompt_path = format!("{worktree}/{}/prompt.md", plan::KITCHEN_DIR);
-        host.write_file(&prompt_path, &plan::planning_prompt(task, plan_file))?;
-        Ok(format!("{base} \"$(cat {})\"", shell_quote(&prompt_path)))
     }
 
     pub fn select_tab(&self, tab_id: &str) {
@@ -698,15 +747,11 @@ impl Engine {
     /// Make sure a tab's tmux session exists (recreating a dead one in the
     /// same worktree). Returns false when the worktree itself is gone.
     pub fn ensure_session(&self, tab_id: &str) -> Result<bool> {
+        if self.fresh_sessions.lock().unwrap().remove(tab_id) {
+            return Ok(true); // created moments ago by create_tab
+        }
         let (ws, tab) = self.find_tab(tab_id).context("no such tab")?;
         let host = ws.host();
-        let t = Tmux::new(&host);
-        if t.has_session(&tab.row.tmux_session) {
-            return Ok(true);
-        }
-        if !host.exists(&tab.row.worktree) {
-            return Ok(false);
-        }
         let mut env = vec![
             (kitchen_proto::ENV_WORKSPACE.to_string(), ws.row.id.clone()),
             (kitchen_proto::ENV_TAB.to_string(), tab.row.id.clone()),
@@ -719,8 +764,7 @@ impl Engine {
         if let Some(p) = &tab.row.plan_file {
             env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), p.clone()));
         }
-        t.new_session(&tab.row.tmux_session, &tab.row.worktree, &env, None)?;
-        Ok(true)
+        Tmux::new(&host).ensure_session(&tab.row.tmux_session, &tab.row.worktree, &env)
     }
 
     // ================================================================ notifications
@@ -788,6 +832,32 @@ impl Engine {
     }
 }
 
+/// The shell command that starts an edit tab's agent, plus a setup snippet
+/// that writes the planning prompt file (run in the same host round trip as
+/// the tmux session). With a task, the agent begins in the planning phase
+/// (`/low-level-plan`).
+fn edit_agent_command(
+    worktree: &str,
+    settings: &Settings,
+    task: Option<&str>,
+    plan_file: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let base = format!("{} --settings {}", settings.edit_agent_command, shell_quote(&agent_settings_json(true)));
+    let Some(task) = task.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok((base, None));
+    };
+    let plan_file = plan_file.context("edit tab without plan file")?;
+    let dir = format!("{worktree}/{}", plan::KITCHEN_DIR);
+    let prompt_path = format!("{dir}/prompt.md");
+    let setup = format!(
+        "mkdir -p {} && printf %s {} > {}",
+        shell_quote(&dir),
+        shell_quote(&plan::planning_prompt(task, plan_file)),
+        shell_quote(&prompt_path)
+    );
+    Ok((format!("{base} \"$(cat {})\"", shell_quote(&prompt_path)), Some(setup)))
+}
+
 /// `--settings` for agents the kitchen starts: plan files land where the
 /// plan reviewer looks (edit tabs), and Stop/Notification hooks badge the
 /// tab through `kitchenctl notify` so a finished or blocked agent is visible
@@ -823,17 +893,6 @@ fn tab_infos(w: &Workspace) -> Vec<TabInfo> {
             unread: t.unread,
         })
         .collect()
-}
-
-/// `slug`, or `slug-2`, `slug-3`… — the first whose worktree dir and branch
-/// are both free.
-fn unique_slug(repo: &Repo, slug: &str, prefix: &str, fallback: &str) -> String {
-    let slug = if slug.is_empty() { format!("tab-{fallback}") } else { slug.to_string() };
-    let free = |s: &str| !repo.host.exists(&repo.sibling_path(s)) && !repo.local_branch_exists(&format!("{prefix}{s}"));
-    if free(&slug) {
-        return slug;
-    }
-    (2..100).map(|n| format!("{slug}-{n}")).find(|s| free(s)).unwrap_or_else(|| format!("{slug}-{fallback}"))
 }
 
 /// `path`, or `path-2`, `path-3`… — the first that does not exist yet.

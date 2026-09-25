@@ -65,7 +65,10 @@ impl Host {
                 c
             }
         };
-        run_command(&mut cmd, stdin).with_context(|| format!("[{}] {}", self.label(), shell_join(argv)))
+        let start = std::time::Instant::now();
+        let out = run_command(&mut cmd, stdin).with_context(|| format!("[{}] {}", self.label(), shell_join(argv)));
+        log::debug!(target: "kitchen::exec", "{:>6.0}ms [{}] {}", start.elapsed().as_secs_f64() * 1000.0, self.label(), shell_join(argv).chars().take(160).collect::<String>());
+        out
     }
 
     /// Like [`Host::run`] but turns a non-zero exit into an error carrying stderr.
@@ -143,7 +146,7 @@ impl Host {
             Host::Local => tmux.iter().map(|s| s.to_string()).collect(),
             Host::Ssh(alias) => {
                 let mut v = vec!["ssh".to_string()];
-                v.extend(ssh_base_args());
+                v.extend(ssh_tty_args());
                 v.push("-tt".into());
                 v.push(alias.clone());
                 v.push("--".into());
@@ -203,13 +206,24 @@ pub fn ssh_control_dir() -> PathBuf {
 /// Options shared by every ssh invocation: multiplexed, non-interactive,
 /// with keepalives so a sleeping laptop notices a dead link quickly.
 pub fn ssh_base_args() -> Vec<String> {
+    ssh_args_with_control("%C")
+}
+
+/// Like [`ssh_base_args`] but on a second multiplexed connection reserved
+/// for interactive terminals, so bulk traffic on the exec connection (git
+/// fetches, file reads, the API relay) never queues in front of keystrokes.
+pub fn ssh_tty_args() -> Vec<String> {
+    ssh_args_with_control("%C-tty")
+}
+
+fn ssh_args_with_control(name: &str) -> Vec<String> {
     let dir = ssh_control_dir();
     let _ = std::fs::create_dir_all(&dir);
     vec![
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
-        format!("ControlPath={}/%C", dir.display()),
+        format!("ControlPath={}/{name}", dir.display()),
         "-o".into(),
         "ControlPersist=30m".into(),
         "-o".into(),

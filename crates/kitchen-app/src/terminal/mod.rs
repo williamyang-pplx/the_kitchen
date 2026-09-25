@@ -3,6 +3,7 @@
 
 mod colors;
 mod input;
+mod predict;
 mod render;
 
 use std::borrow::Cow;
@@ -86,6 +87,8 @@ pub struct TermSession {
     pub(crate) scroll_acc: f32,
     pub(crate) focused: bool,
     pub(crate) mouse_buttons_down: u8,
+    /// Local echo prediction (enabled for devbox tabs).
+    pub(crate) predictor: predict::Predictor,
 }
 
 impl TermSession {
@@ -113,7 +116,22 @@ impl TermSession {
         let sender = event_loop.channel();
         let _ = sender_cell.set(sender.clone());
         event_loop.spawn();
-        Ok(Self { term, sender, shared, size, cell, scroll_acc: 0.0, focused: false, mouse_buttons_down: 0 })
+        Ok(Self {
+            term,
+            sender,
+            shared,
+            size,
+            cell,
+            scroll_acc: 0.0,
+            focused: false,
+            mouse_buttons_down: 0,
+            predictor: Default::default(),
+        })
+    }
+
+    /// Show typed characters before the (remote) echo arrives.
+    pub fn set_predictive_echo(&mut self, on: bool) {
+        self.predictor.enabled = on;
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {

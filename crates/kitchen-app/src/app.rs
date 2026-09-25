@@ -125,8 +125,9 @@ impl KitchenApp {
                     let mut env = HashMap::new();
                     env.insert("LANG".into(), std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()));
                     match TermSession::spawn(ctx, &argv, Some(&home()), env) {
-                        Ok(s) => {
+                        Ok(mut s) => {
                             self.attempts.remove(&tab_id);
+                            s.set_predictive_echo(!ws.host().is_local());
                             TermSlot::Live(s)
                         }
                         Err(e) => TermSlot::Failed {
@@ -431,6 +432,12 @@ impl KitchenApp {
                     self.dialog = Some(Dialog::confirm_close(tab));
                 }
             }
+            for p in &ws.pending {
+                let color = if p.kind == TabKind::Edit { theme::GREEN } else { theme::CYAN };
+                let label = RichText::new(format!("⋯ {}", p.title.chars().take(28).collect::<String>())).size(12.5).color(color).italics();
+                ui.add(egui::Button::new(label).fill(if p.focus { theme::SELECTED } else { Color32::TRANSPARENT }).corner_radius(5.0).min_size(egui::vec2(0.0, 24.0)))
+                    .on_hover_text("fetching origin and preparing the worktree…");
+            }
             ui.add_space(8.0);
             if ui.add(egui::Button::new(RichText::new("＋ edit ⌘E").size(11.5).color(theme::GREEN)).frame(false)).clicked() {
                 self.run_action(Action::NewEditTab);
@@ -581,6 +588,7 @@ impl KitchenApp {
 
 impl eframe::App for KitchenApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let frame_start = Instant::now();
         let ctx = ui.ctx().clone();
         self.poll_attach(&ctx);
         self.handle_ui_commands(&ctx);
@@ -647,7 +655,14 @@ impl eframe::App for KitchenApp {
                     });
             }
         }
+        let creating = ws.as_ref().and_then(|w| w.pending.iter().rev().find(|p| p.focus).cloned());
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {
+            (Some(ws), _) if creating.is_some() => {
+                let p = creating.as_ref().unwrap();
+                let what = if p.kind == TabKind::Edit { "edit tab" } else { "read-only tab" };
+                centered_note(ui, &format!("creating {what} “{}” on {}…\nfetching origin · preparing worktree · starting tmux", p.title, ws.row.host), theme::DIM);
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();
@@ -656,6 +671,11 @@ impl eframe::App for KitchenApp {
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });
         self.save_screenshots(&ctx);
+        if profiling() {
+            let ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+            let events = ctx.input(|i| i.events.len());
+            log::info!("frame {ms:.2}ms events={events}");
+        }
         if self.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -670,6 +690,12 @@ fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
     ui.centered_and_justified(|ui| {
         ui.label(RichText::new(text).color(color).size(13.0));
     });
+}
+
+/// `KITCHEN_PROFILE=1` logs the build time of every frame.
+fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KITCHEN_PROFILE").is_some())
 }
 
 fn home() -> String {

@@ -8,9 +8,14 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::host::Host;
+use crate::util::shell_quote;
 
 /// Directory name of the shared read-only worktree, next to the repo.
 pub const READONLY_SUFFIX: &str = "kitchen-readonly";
+
+/// A spare detached worktree kept checked out next to the repo, so a new
+/// edit tab can take it over instead of paying for a full checkout.
+pub const SPARE_SUFFIX: &str = "kitchen-spare";
 
 pub struct Repo<'a> {
     pub host: &'a Host,
@@ -151,25 +156,82 @@ impl<'a> Repo<'a> {
         self.describe(path)
     }
 
-    /// Detached, read-only worktree at `rev`. Re-used and moved when it exists.
-    /// Files are made non-writable so edits fail loudly.
+    /// Detached, read-only worktree at `rev`, re-used and moved when it
+    /// exists. Files are made non-writable so edits fail loudly. With
+    /// `fetch = Some(branch)`, `git fetch origin <branch>` runs first. One
+    /// round trip to the host.
     pub fn sync_readonly_worktree(&self, path: &str, rev: &str) -> Result<Worktree> {
-        let exists = self.host.exists(path) && self.describe(path).is_ok();
-        if exists {
-            self.set_writable(path, true)?;
-            let r = self
-                .git_in(path, &["checkout", "--quiet", "--detach", "--force", rev])
-                .and_then(|_| self.git_in(path, &["clean", "-fdq"]));
-            self.set_writable(path, false)?;
-            r?;
-        } else {
-            if self.host.exists(path) {
-                bail!("{path} exists but is not a worktree of {}", self.path);
-            }
-            self.git(&["worktree", "add", "--detach", path, rev])?;
-            self.set_writable(path, false)?;
-        }
-        self.describe(path)
+        self.sync_readonly_worktree_fetching(path, rev, None)
+    }
+
+    pub fn sync_readonly_worktree_fetching(&self, path: &str, rev: &str, fetch: Option<&str>) -> Result<Worktree> {
+        let (r, p, rv) = (shell_quote(self.path), shell_quote(path), shell_quote(rev));
+        let fetch = fetch.map(|b| format!("{} || exit 11\n", fetch_branch_cmd(&r, b))).unwrap_or_default();
+        let script = format!(
+            r#"{fetch}lock() {{ find {p} -path {p}/.git -prune -o -exec chmod "$1" {{}} + 2>/dev/null; true; }}
+if [ -e {p} ]; then
+  git -C {p} rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "{path} exists but is not a git worktree" >&2; exit 12; }}
+  lock u+w
+  git -C {p} checkout --quiet --detach --force {rv} && git -C {p} clean -fdq; rc=$?
+  lock a-w
+  [ $rc = 0 ] || exit $rc
+else
+  git -C {r} worktree add --quiet --detach {p} {rv} || exit 13
+  lock a-w
+fi
+{report}"#,
+            report = report_snippet(&p),
+        );
+        parse_report(&self.host.sh_ok(&script, None)?)
+    }
+
+    /// New branch `<prefix><slug>` (first free slug: `slug`, `slug-2`, …)
+    /// off freshly fetched `origin/<base>`, checked out in the sibling
+    /// worktree `<repo>-<slug>`, with `.kitchen/` git-excluded. One round
+    /// trip to the host.
+    pub fn create_edit_worktree(&self, base: &str, prefix: &str, slug: &str) -> Result<Worktree> {
+        let (r, b, pf, sl) = (shell_quote(self.path), shell_quote(base), shell_quote(prefix), shell_quote(slug));
+        let parent = shell_quote(self.parent_dir());
+        let name = shell_quote(self.repo_name());
+        let script = format!(
+            r#"{fetch} || exit 11
+s={sl}; n=1
+while [ -e {parent}/{name}-"$s" ] || git -C {r} rev-parse --verify --quiet "refs/heads/"{pf}"$s" >/dev/null; do
+  n=$((n+1)); s={sl}-$n
+done
+P={parent}/{name}-"$s"
+SP={parent}/{name}-{spare}
+# Take over the pre-checked-out spare (instant), else check out from scratch.
+if [ -e "$SP/.git" ] && git -C {r} worktree move "$SP" "$P" 2>/dev/null; then
+  if [ "$(git -C "$P" rev-parse HEAD)" = "$(git -C {r} rev-parse origin/{b})" ]; then
+    # Same commit: pure ref updates, no index refresh (~0.6s saved on big repos).
+    git -C "$P" branch --no-track {pf}"$s" origin/{b} && git -C "$P" symbolic-ref HEAD refs/heads/{pf}"$s" || exit 13
+  else
+    git -C "$P" checkout --quiet --no-track -b {pf}"$s" origin/{b} || exit 13
+  fi
+else
+  git -C {r} worktree add --quiet --no-track -b {pf}"$s" "$P" origin/{b} || exit 13
+fi
+{exclude}
+{report}"#,
+            spare = SPARE_SUFFIX,
+            fetch = fetch_branch_cmd(&r, base),
+            exclude = exclude_snippet("\"$P\""),
+            report = report_snippet("\"$P\""),
+        );
+        parse_report(&self.host.sh_ok(&script, None)?)
+    }
+
+    /// Check out the spare worktree (detached at `origin/<base>`) if it is
+    /// missing. Slow on big repos; run it in the background.
+    pub fn ensure_spare_worktree(&self, base: &str) -> Result<()> {
+        let sp = shell_quote(&self.sibling_path(SPARE_SUFFIX));
+        let script = format!(
+            "[ -e {sp}/.git ] || git -C {r} worktree add --quiet --detach {sp} origin/{b}",
+            r = shell_quote(self.path),
+            b = shell_quote(base)
+        );
+        self.host.sh_ok(&script, None).map(|_| ())
     }
 
     /// Toggle write permission on every file and directory under `path`,
@@ -258,6 +320,46 @@ impl<'a> Repo<'a> {
         let out = self.host.run(&["git", "-C", dir, "show", &spec], None)?;
         Ok(if out.ok() { Some(out.stdout) } else { None })
     }
+}
+
+/// Fetch exactly one branch into its remote-tracking ref: no tags, no
+/// FETCH_HEAD, no other refs (big repos have thousands). `repo` is quoted.
+fn fetch_branch_cmd(repo: &str, branch: &str) -> String {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    format!("git -C {repo} fetch --quiet --no-tags --no-write-fetch-head origin {}", shell_quote(&refspec))
+}
+
+/// Shell lines that append `.kitchen/` to the repo's shared `info/exclude`
+/// (idempotent). `dir` is an already-quoted worktree path.
+pub fn exclude_snippet(dir: &str) -> String {
+    format!(
+        r#"f="$(git -C {dir} rev-parse --path-format=absolute --git-common-dir)/info/exclude"; mkdir -p "$(dirname "$f")"; grep -qxF '.kitchen/' "$f" 2>/dev/null || echo '.kitchen/' >> "$f""#
+    )
+}
+
+/// Shell lines printing `KT_PATH=`/`KT_HEAD=`/`KT_BRANCH=` for [`parse_report`].
+fn report_snippet(dir: &str) -> String {
+    format!(
+        r#"echo "KT_PATH=$(git -C {dir} rev-parse --show-toplevel)"; echo "KT_HEAD=$(git -C {dir} rev-parse HEAD)"; echo "KT_BRANCH=$(git -C {dir} symbolic-ref --quiet --short HEAD)""#
+    )
+}
+
+fn parse_report(out: &str) -> Result<Worktree> {
+    let mut wt = Worktree { path: String::new(), head: String::new(), branch: None, detached: false };
+    for line in out.lines() {
+        if let Some(v) = line.strip_prefix("KT_PATH=") {
+            wt.path = v.to_string();
+        } else if let Some(v) = line.strip_prefix("KT_HEAD=") {
+            wt.head = v.to_string();
+        } else if let Some(v) = line.strip_prefix("KT_BRANCH=") {
+            wt.branch = Some(v.to_string()).filter(|b| !b.is_empty());
+        }
+    }
+    wt.detached = wt.branch.is_none();
+    if wt.path.is_empty() {
+        bail!("worktree script produced no path: {out}");
+    }
+    Ok(wt)
 }
 
 pub fn parse_github_slug(url: &str) -> Option<String> {
@@ -412,5 +514,22 @@ mod tests {
         let again = repo.add_worktree_existing_branch("william/feature", "/nonexistent").unwrap();
         assert!(again.path.ends_with("/repo-feature"), "{}", again.path);
         repo.remove_worktree(&ro, true).unwrap();
+
+        // One-shot edit worktree: slug collisions get -2, .kitchen/ excluded;
+        // the first takes over the spare worktree, the second checks out fresh.
+        repo.ensure_spare_worktree("main").unwrap();
+        let spare = repo.sibling_path(SPARE_SUFFIX);
+        assert!(std::path::Path::new(&spare).join("c.txt").exists());
+        let a = repo.create_edit_worktree("main", "william/", "fast").unwrap();
+        assert!(!std::path::Path::new(&spare).exists(), "spare was moved into the new tab");
+        assert!(std::path::Path::new(&a.path).join("c.txt").exists());
+        let b = repo.create_edit_worktree("main", "william/", "fast").unwrap();
+        assert!(a.path.ends_with("/repo-fast") && b.path.ends_with("/repo-fast-2"), "{} {}", a.path, b.path);
+        assert_eq!(b.branch.as_deref(), Some("william/fast-2"));
+        let excl = std::fs::read_to_string(root.join("repo/.git/info/exclude")).unwrap();
+        assert_eq!(excl.matches(".kitchen/").count(), 1);
+        // Read-only sync with a fetch in the same round trip.
+        let ro2 = repo.sync_readonly_worktree_fetching(&repo.readonly_path(), "origin/main", Some("main")).unwrap();
+        assert!(ro2.detached);
     }
 }

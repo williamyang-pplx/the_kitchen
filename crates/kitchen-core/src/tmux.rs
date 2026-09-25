@@ -5,7 +5,7 @@
 use anyhow::Result;
 
 use crate::host::Host;
-use crate::util::shell_join;
+use crate::util::{shell_join, shell_quote};
 
 pub const SESSION_PREFIX: &str = "kt_";
 
@@ -52,50 +52,44 @@ impl<'a> Tmux<'a> {
         self.host.run(&[TMUX[0], TMUX[1], TMUX[2], "has-session", "-t", &target], None).map(|o| o.ok()).unwrap_or(false)
     }
 
-    /// Create a detached session in `cwd` with `env`, then type `command`
-    /// (if any) into its shell, so the shell survives the command exiting.
+    /// Create a detached session in `cwd` with `env` (unless it exists),
+    /// then type `command` (if any) into its shell, so the shell survives the
+    /// command exiting.
+    ///
+    /// Everything runs as one script on the host — one ssh round trip for a
+    /// devbox — including waiting for the shell prompt, since keystrokes
+    /// typed while a shell is still initializing get discarded.
     pub fn new_session(&self, name: &str, cwd: &str, env: &[(String, String)], command: Option<&str>) -> Result<()> {
-        if !self.has_session(name) {
-            let mut args: Vec<String> =
-                ["new-session", "-d", "-s", name, "-c", cwd, "-x", "200", "-y", "50"].iter().map(|s| s.to_string()).collect();
-            for (k, v) in env {
-                args.push("-e".into());
-                args.push(format!("{k}={v}"));
-            }
-            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            self.tmux(&refs)?;
-            // One round trip for all options.
-            let mut script = Vec::new();
-            for (opt, val) in SESSION_OPTIONS {
-                script.push(shell_join(&[TMUX[0], TMUX[1], TMUX[2], "set-option", "-t", name, opt, val]));
-            }
-            let _ = self.host.sh(&script.join("; "), None);
-        }
-        if let Some(cmd) = command.filter(|c| !c.trim().is_empty()) {
-            // Keystrokes typed while the shell is still initializing get
-            // discarded, so wait for the prompt first.
-            self.wait_for_prompt(name, std::time::Duration::from_secs(8));
-            self.send_text(name, cmd, true)?;
-        }
-        Ok(())
+        self.new_session_with_setup(name, cwd, env, command, None)
     }
 
-    /// Wait until the pane shows something and has stopped changing for a
-    /// moment (the shell printed its prompt), or `timeout` passes.
-    pub fn wait_for_prompt(&self, name: &str, timeout: std::time::Duration) {
-        let start = std::time::Instant::now();
-        let mut last = String::new();
-        let mut stable_since = std::time::Instant::now();
-        while start.elapsed() < timeout {
-            let screen = self.capture(name, None).unwrap_or_default();
-            if screen != last {
-                last = screen;
-                stable_since = std::time::Instant::now();
-            } else if !last.trim().is_empty() && stable_since.elapsed() >= std::time::Duration::from_millis(400) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+    /// [`Tmux::new_session`], running the shell snippet `setup` first in the
+    /// same round trip (e.g. writing a prompt file the command reads).
+    pub fn new_session_with_setup(
+        &self,
+        name: &str,
+        cwd: &str,
+        env: &[(String, String)],
+        command: Option<&str>,
+        setup: Option<&str>,
+    ) -> Result<()> {
+        let mut script = new_session_script(name, cwd, env, command);
+        if let Some(setup) = setup {
+            script = format!("{setup} || exit 21\n{script}");
         }
+        self.host.sh_ok(&script, None).map(|_| ())
+    }
+
+    /// Make sure session `name` exists, recreating it in `cwd` when it died.
+    /// Returns `false` (and creates nothing) when `cwd` no longer exists.
+    /// One round trip.
+    pub fn ensure_session(&self, name: &str, cwd: &str, env: &[(String, String)]) -> Result<bool> {
+        let script = format!(
+            "if [ ! -d {} ]; then echo KT_GONE; else {}; fi",
+            shell_quote(cwd),
+            new_session_script(name, cwd, env, None)
+        );
+        Ok(!self.host.sh_ok(&script, None)?.contains("KT_GONE"))
     }
 
     pub fn kill_session(&self, name: &str) -> Result<()> {
@@ -161,6 +155,41 @@ impl<'a> Tmux<'a> {
     pub fn set_environment(&self, name: &str, key: &str, value: &str) -> Result<()> {
         self.tmux(&["set-environment", "-t", name, key, value]).map(|_| ())
     }
+}
+
+/// Shell script behind [`Tmux::new_session`].
+fn new_session_script(name: &str, cwd: &str, env: &[(String, String)], command: Option<&str>) -> String {
+    let t = format!("tmux -L {SOCKET_NAME}");
+    let s = shell_quote(name);
+    let mut create: Vec<String> =
+        ["new-session", "-d", "-s", name, "-c", cwd, "-x", "200", "-y", "50"].iter().map(|x| x.to_string()).collect();
+    for (k, v) in env {
+        create.push("-e".into());
+        create.push(format!("{k}={v}"));
+    }
+    let options = SESSION_OPTIONS
+        .iter()
+        .map(|(opt, val)| format!("set-option -t {s} {opt} {val}"))
+        .collect::<Vec<_>>()
+        .join(" \\; ");
+    let mut script = format!(
+        "if ! {t} has-session -t ={s} 2>/dev/null; then {t} {create} && {t} {options} >/dev/null; fi",
+        create = shell_join(&create),
+    );
+    if let Some(cmd) = command.filter(|c| !c.trim().is_empty()) {
+        // Wait (on the host, 50ms polls) until the pane is non-blank and has
+        // been unchanged for 300ms, capped at 8s; then type the command.
+        script.push_str(&format!(
+            "; last=; stable=0; i=0; while [ $i -lt 160 ]; do \
+               cur=$({t} capture-pane -p -t {s}); \
+               if [ \"$cur\" = \"$last\" ] && [ -n \"$(printf %s \"$cur\" | tr -d '[:space:]')\" ]; then \
+                 stable=$((stable+1)); [ $stable -ge 6 ] && break; else stable=0; fi; \
+               last=$cur; i=$((i+1)); sleep 0.05; done; \
+             {t} send-keys -t {s} -l {cmd} && {t} send-keys -t {s} Enter",
+            cmd = shell_quote(cmd)
+        ));
+    }
+    script
 }
 
 #[cfg(test)]
