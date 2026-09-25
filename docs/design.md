@@ -1,0 +1,45 @@
+# the kitchen — design
+
+A cmux-style macOS app, written entirely in Rust (eframe/egui + alacritty_terminal),
+for agent-driven PR work across local repos and Perplexity devboxes.
+
+## Crates
+
+| crate | role |
+|---|---|
+| `kitchen-proto` | wire types for the socket API (`Request`/`Response`, `WorkspaceInfo`, env var names) |
+| `kitchen-symbols` | tree-sitter symbol extraction (outline, jump-to-definition); also compiled into `kitchenctl` so devboxes index locally |
+| `kitchen-core` | host abstraction (local / ssh with ControlMaster), git worktrees, tmux (`tmux -L kitchen`), gh, SQLite, plan helpers, bootstrap |
+| `kitchenctl` | the public CLI agents use; talks newline-JSON to `~/.kitchen/kitchen.sock` |
+| `kitchen-app` | the GUI + API server |
+
+## Model
+
+- **Workspace** = repo on a host (`local` or ssh alias). Sidebar, ⌘J/⌘K.
+- **Tab** = tmux session `kt_<ws>_<tab>` on that host, attached through a pty.
+  - *edit* tab: new worktree `<repo>-<slug>` on branch `william/<slug>` off fresh
+    `origin/<default>` (or an existing PR/branch). With a task, the agent starts with
+    `/low-level-plan` and writes `.kitchen/plan.md`.
+  - *read-only* tab: shared detached worktree `<repo>-kitchen-readonly`, re-synced to
+    `origin/<default>` (after `git fetch`) whenever a read-only tab opens; files are
+    chmod a-w; agent runs in plan mode without edit tools. PR reviews use
+    `<repo>-kitchen-review-<N>` the same way.
+- `.kitchen/` inside each worktree is git-excluded and holds kitchen files.
+
+## Threads
+
+`Engine` (Arc, short locks) is shared by the UI thread, API connection threads and
+background jobs. Slow work never holds a lock. The UI owns terminals and panel state;
+the engine asks it to do UI things through `UiCommand`s.
+
+## Remote
+
+Devbox gateway blocks ssh port/socket forwarding, so devbox `kitchenctl` reaches the app
+through `kitchenctl __relay`, run by the app over ssh: it listens on the devbox's
+`~/.kitchen/kitchen.sock` and tunnels request lines over its stdio.
+
+## Review invariant
+
+Agent-written review comments are drafts in SQLite. The only path to GitHub is a
+keypress in the inbox/viewer (`review::approve_draft`); the socket API has no publish
+method.
