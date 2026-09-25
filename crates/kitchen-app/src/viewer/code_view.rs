@@ -1,0 +1,393 @@
+//! Read-only code widget with vim navigation, used by the file viewer and
+//! the plan reviewer. It paints a [`Doc`], inline blocks (review threads,
+//! drafts, plan comments) and an optional comment editor, and turns plain
+//! keys into [`Vim`] motions while focused.
+
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Color32, CornerRadius, FontId, Key, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+
+use super::doc::{Doc, LineKind};
+use super::vim::{Vim, VimAction, VimKey, Viewport};
+use crate::theme;
+
+/// Scroll position; owned by the panel so it survives frames.
+#[derive(Debug, Default, Clone)]
+pub struct ViewState {
+    pub top: usize,
+    pub left: usize,
+    /// Text rows that fit, from the last frame.
+    pub rows: usize,
+    wheel: f32,
+}
+
+/// A note drawn under a line.
+#[derive(Debug, Clone)]
+pub struct Block {
+    /// Doc index it follows; `None` = above the first line (file-level).
+    pub after: Option<usize>,
+    pub title: String,
+    pub body: String,
+    pub color: Color32,
+    pub dim: bool,
+}
+
+/// The ⌘M comment field.
+#[derive(Debug, Clone)]
+pub struct Editor {
+    /// First and last doc index the comment covers.
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub label: String,
+    pub needs_focus: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct Output {
+    pub actions: Vec<VimAction>,
+    pub clicked: bool,
+    /// Esc pressed inside the editor.
+    pub cancel_editor: bool,
+}
+
+pub struct CodeView<'a> {
+    pub doc: &'a Doc,
+    pub vim: &'a mut Vim,
+    pub state: &'a mut ViewState,
+    pub blocks: &'a [Block],
+    pub editor: Option<&'a mut Editor>,
+    pub focused: bool,
+    pub font_size: f32,
+    /// Show base-side line numbers too (diff mode).
+    pub two_gutters: bool,
+    pub id: egui::Id,
+}
+
+const EDITOR_HEIGHT: f32 = 118.0;
+
+impl CodeView<'_> {
+    pub fn show(self, ui: &mut Ui) -> Output {
+        let CodeView { doc, vim, state, blocks, mut editor, focused, font_size, two_gutters, id } = self;
+        let mut out = Output::default();
+        let rect = ui.available_rect_before_wrap();
+        let resp = ui.interact(rect, id.with("area"), Sense::click());
+        let font = FontId::monospace(font_size);
+        let (cw, ch) = ui.ctx().fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+        let row_h = ch + 2.0;
+        let n = doc.lines.len();
+        state.rows = ((rect.height() / row_h).floor() as usize).max(1);
+
+        let editor_id = id.with("editor");
+        let editor_focused = ui.memory(|m| m.has_focus(editor_id));
+        let lines = doc.texts();
+
+        // ---- keys -> vim
+        if focused && !editor_focused && n > 0 {
+            for key in collect_keys(ui) {
+                let acts = vim.key(key, &lines, Viewport { top: state.top, rows: state.rows });
+                for a in acts {
+                    match a {
+                        VimAction::ScrollBy(d) => state.top = (state.top as isize + d).clamp(0, n.saturating_sub(1) as isize) as usize,
+                        VimAction::Center => state.top = vim.line.saturating_sub(state.rows / 2),
+                        VimAction::Top => state.top = vim.line,
+                        VimAction::Bottom => state.top = (vim.line + 1).saturating_sub(state.rows),
+                        other => out.actions.push(other),
+                    }
+                }
+            }
+        }
+
+        // ---- wheel
+        if resp.hovered() || resp.contains_pointer() {
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            let dx = ui.input(|i| i.smooth_scroll_delta.x);
+            state.wheel -= dy / row_h;
+            let whole = state.wheel.trunc() as isize;
+            if whole != 0 {
+                state.wheel -= whole as f32;
+                state.top = (state.top as isize + whole).clamp(0, n.saturating_sub(1) as isize) as usize;
+                // Keep the cursor inside the viewport, like vim does.
+                if vim.line < state.top {
+                    vim.set_cursor(state.top, vim.col);
+                } else if vim.line >= state.top + state.rows {
+                    vim.set_cursor(state.top + state.rows - 1, vim.col);
+                }
+            }
+            if dx.abs() > 4.0 {
+                state.left = (state.left as isize - (dx / cw) as isize).max(0) as usize;
+            }
+        }
+
+        // ---- keep cursor visible
+        if vim.line < state.top {
+            state.top = vim.line;
+        }
+        if vim.line >= state.top + state.rows {
+            state.top = vim.line + 1 - state.rows;
+        }
+
+        let max_no = doc.lines.iter().filter_map(|l| l.new_no.max(l.old_no)).max().unwrap_or(1);
+        let digits = max_no.to_string().len().max(3) as f32;
+        let one_gutter = digits * cw + 12.0;
+        let gutter = if two_gutters { one_gutter * 2.0 } else { one_gutter };
+        let text_x = rect.left() + gutter + 6.0;
+        let visible_cols = (((rect.right() - text_x) / cw).floor() as usize).max(8);
+        if vim.col < state.left {
+            state.left = vim.col;
+        } else if vim.col >= state.left + visible_cols {
+            state.left = vim.col + 1 - visible_cols;
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, CornerRadius::ZERO, theme::BG);
+        painter.rect_filled(Rect::from_min_size(rect.min, Vec2::new(gutter, rect.height())), CornerRadius::ZERO, theme::PANEL);
+
+        let visual = vim.anchor.map(|(al, ac, linewise)| {
+            let (s, e) = if (al, ac) <= (vim.line, vim.col) { ((al, ac), (vim.line, vim.col)) } else { ((vim.line, vim.col), (al, ac)) };
+            (s, e, linewise)
+        });
+
+        let mut y = rect.top();
+        let mut row_hits: Vec<(Rect, usize)> = Vec::new();
+        let mut cursor_drawn = false;
+        let block_width = rect.width() - gutter - 24.0;
+        let mut editor_rect: Option<Rect> = None;
+
+        let draw_blocks = |after: Option<usize>, y: &mut f32, ui: &mut Ui| {
+            for b in blocks.iter().filter(|b| b.after == after) {
+                if *y > rect.bottom() {
+                    break;
+                }
+                *y += draw_block(ui, &painter, b, Pos2::new(rect.left() + gutter + 10.0, *y + 2.0), block_width) + 6.0;
+            }
+        };
+
+        if state.top == 0 {
+            draw_blocks(None, &mut y, ui);
+        }
+        for idx in state.top..n {
+            if y + row_h > rect.bottom() + row_h {
+                break;
+            }
+            let line = &doc.lines[idx];
+            let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_h));
+            row_hits.push((row, idx));
+            let bg = match line.kind {
+                LineKind::Added => Some(theme::ADDED_BG),
+                LineKind::Removed => Some(theme::REMOVED_BG),
+                LineKind::Normal => None,
+            };
+            if let Some(bg) = bg {
+                painter.rect_filled(row, CornerRadius::ZERO, bg);
+            }
+            if idx == vim.line {
+                painter.rect_filled(row, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0x7a, 0xa2, 0xf7, 18));
+            }
+            // Visual selection.
+            if let Some(((sl, sc), (el, ec), linewise)) = visual {
+                if idx >= sl && idx <= el {
+                    let len = line.text.chars().count().max(1);
+                    let (c0, c1) = if linewise {
+                        (0, len)
+                    } else {
+                        (if idx == sl { sc } else { 0 }, if idx == el { ec + 1 } else { len })
+                    };
+                    let x0 = text_x + (c0.saturating_sub(state.left)) as f32 * cw;
+                    let x1 = text_x + (c1.saturating_sub(state.left)) as f32 * cw;
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + cw), y + row_h)),
+                        CornerRadius::ZERO,
+                        Color32::from_rgb(0x33, 0x46, 0x7c),
+                    );
+                }
+            }
+            // Gutter numbers.
+            let num_color = if idx == vim.line { theme::TEXT } else { theme::DIM };
+            let small = FontId::monospace(font_size - 1.0);
+            if two_gutters {
+                if let Some(o) = line.old_no.filter(|_| line.kind != LineKind::Added) {
+                    painter.text(Pos2::new(rect.left() + one_gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, o, small.clone(), num_color);
+                }
+                if let Some(nn) = line.new_no {
+                    painter.text(Pos2::new(rect.left() + gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, nn, small.clone(), num_color);
+                }
+                let marker = match line.kind {
+                    LineKind::Added => "+",
+                    LineKind::Removed => "-",
+                    LineKind::Normal => "",
+                };
+                painter.text(Pos2::new(rect.left() + gutter + 1.0, y + 1.0), egui::Align2::LEFT_TOP, marker, small, if line.kind == LineKind::Added { theme::GREEN } else { theme::RED });
+            } else if let Some(nn) = line.new_no {
+                painter.text(Pos2::new(rect.left() + gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, nn, small, num_color);
+            }
+            // Text.
+            let job = line_job(line, state.left, &font);
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            painter.galley(Pos2::new(text_x, y + 1.0), galley, theme::TEXT);
+            if let Some(suffix) = &line.suffix {
+                let x = text_x + (line.text.chars().count().saturating_sub(state.left) + 2) as f32 * cw;
+                painter.text(Pos2::new(x, y + 1.0), egui::Align2::LEFT_TOP, suffix, FontId::proportional(font_size - 0.5), theme::DIM);
+            }
+            // Cursor.
+            if idx == vim.line && vim.col >= state.left {
+                let x = text_x + (vim.col - state.left) as f32 * cw;
+                let r = Rect::from_min_size(Pos2::new(x, y + 1.0), Vec2::new(cw, ch));
+                if focused && !editor_focused {
+                    painter.rect_filled(r, CornerRadius::ZERO, theme::TEXT.gamma_multiply(0.8));
+                    if let Some(c) = line.text.chars().nth(vim.col).filter(|c| !c.is_whitespace()) {
+                        painter.text(r.min, egui::Align2::LEFT_TOP, c, font.clone(), theme::BG);
+                    }
+                } else {
+                    painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, theme::DIM), egui::StrokeKind::Inside);
+                }
+                cursor_drawn = y + row_h <= rect.bottom();
+            }
+            y += row_h;
+            draw_blocks(Some(idx), &mut y, ui);
+            if let Some(ed) = editor.as_deref() {
+                if ed.end == idx {
+                    editor_rect = Some(Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, y + 2.0), Vec2::new(block_width, EDITOR_HEIGHT)));
+                    y += EDITOR_HEIGHT + 8.0;
+                }
+            }
+        }
+        if n == 0 {
+            painter.text(Pos2::new(text_x, rect.top() + 8.0), egui::Align2::LEFT_TOP, "(empty)", font.clone(), theme::DIM);
+        }
+
+        // ---- editor
+        if let (Some(ed), Some(er)) = (editor.as_deref_mut(), editor_rect) {
+            let er = er.intersect(rect);
+            if er.height() > 30.0 {
+                painter.rect_filled(er.expand(3.0), 5.0, theme::PANEL);
+                painter.rect_stroke(er.expand(3.0), 5.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Outside);
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(er));
+                child.label(egui::RichText::new(&ed.label).size(11.0).color(theme::ACCENT));
+                let te = egui::TextEdit::multiline(&mut ed.text)
+                    .id(editor_id)
+                    .hint_text("Write a comment…   ⌘Enter submit · Esc cancel")
+                    .desired_rows(4)
+                    .desired_width(er.width())
+                    .font(FontId::proportional(font_size))
+                    .background_color(theme::BG)
+                    .text_color(theme::TEXT);
+                let r = child.add(te);
+                if ed.needs_focus {
+                    r.request_focus();
+                    ed.needs_focus = false;
+                }
+                if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(Key::Escape)) {
+                    out.cancel_editor = true;
+                }
+            }
+        }
+
+        // ---- scroll correction when blocks pushed the cursor below the fold
+        if !cursor_drawn && vim.line >= state.top && n > 0 && editor.is_none() {
+            state.top += 1;
+            ui.ctx().request_repaint();
+        }
+
+        // ---- mouse
+        if resp.clicked() {
+            out.clicked = true;
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some((_, idx)) = row_hits.iter().find(|(r, _)| r.contains(pos)) {
+                    let col = (((pos.x - text_x) / cw).max(0.0) as usize) + state.left;
+                    vim.set_cursor(*idx, col.min(doc.lines[*idx].text.chars().count().saturating_sub(1)));
+                }
+            }
+        }
+        ui.advance_cursor_after_rect(rect);
+        out
+    }
+}
+
+/// Layout for one line from its spans, starting at char column `left`.
+fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let text = &line.text;
+    let start = text.char_indices().nth(left).map(|(b, _)| b).unwrap_or(text.len());
+    let fmt = |c: Color32| TextFormat { font_id: font.clone(), color: c, ..Default::default() };
+    if line.spans.is_empty() {
+        let color = if line.kind == LineKind::Removed { theme::TEXT.gamma_multiply(0.8) } else { theme::TEXT };
+        job.append(&text[start..], 0.0, fmt(color));
+        return job;
+    }
+    let mut pos = start;
+    for (range, color) in &line.spans {
+        if range.end <= pos {
+            continue;
+        }
+        let s = range.start.max(pos);
+        if s > pos {
+            job.append(&text[pos..s], 0.0, fmt(theme::TEXT));
+        }
+        let e = range.end.min(text.len());
+        if e > s && text.is_char_boundary(s) && text.is_char_boundary(e) {
+            job.append(&text[s..e], 0.0, fmt(*color));
+        }
+        pos = e;
+    }
+    if pos < text.len() {
+        job.append(&text[pos..], 0.0, fmt(theme::TEXT));
+    }
+    job
+}
+
+fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32) -> f32 {
+    let title_font = FontId::proportional(11.5);
+    let body_font = FontId::proportional(12.5);
+    let text_color = if b.dim { theme::DIM } else { theme::TEXT };
+    let title = ui.fonts_mut(|f| f.layout(b.title.clone(), title_font, b.color, width - 16.0));
+    let body = ui.fonts_mut(|f| f.layout(b.body.clone(), body_font, text_color, width - 16.0));
+    let h = title.size().y + body.size().y + 12.0;
+    let r = Rect::from_min_size(at, Vec2::new(width, h));
+    painter.rect_filled(r, 5.0, if b.dim { theme::PANEL } else { theme::SELECTED });
+    painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, h)), 2.0, b.color);
+    let th = title.size().y;
+    painter.galley(at + Vec2::new(10.0, 5.0), title, b.color);
+    painter.galley(at + Vec2::new(10.0, 7.0 + th), body, text_color);
+    h
+}
+
+/// This frame's plain keys as vim keys (Cmd chords were consumed upstream).
+fn collect_keys(ui: &Ui) -> Vec<VimKey> {
+    let mut out = Vec::new();
+    ui.input(|i| {
+        for e in &i.events {
+            match e {
+                egui::Event::Key { key, pressed: true, modifiers, .. } if !modifiers.command || modifiers.ctrl && !modifiers.mac_cmd => {
+                    if modifiers.ctrl {
+                        let c = match key {
+                            Key::CloseBracket => Some(']'),
+                            k => k.name().chars().next().filter(|_| k.name().len() == 1).map(|c| c.to_ascii_lowercase()),
+                        };
+                        if let Some(c) = c {
+                            out.push(VimKey::Ctrl(c));
+                        }
+                        continue;
+                    }
+                    let k = match key {
+                        Key::Escape => VimKey::Esc,
+                        Key::Enter => VimKey::Enter,
+                        Key::Backspace => VimKey::Backspace,
+                        Key::ArrowUp => VimKey::Up,
+                        Key::ArrowDown => VimKey::Down,
+                        Key::ArrowLeft => VimKey::Left,
+                        Key::ArrowRight => VimKey::Right,
+                        Key::PageUp => VimKey::PageUp,
+                        Key::PageDown => VimKey::PageDown,
+                        Key::Home => VimKey::Home,
+                        Key::End => VimKey::End,
+                        _ => continue,
+                    };
+                    out.push(k);
+                }
+                egui::Event::Text(t) if !i.modifiers.ctrl && !i.modifiers.mac_cmd => out.extend(t.chars().map(VimKey::Char)),
+                _ => {}
+            }
+        }
+    });
+    out
+}
