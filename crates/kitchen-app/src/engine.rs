@@ -523,6 +523,7 @@ impl Engine {
                 (kitchen_proto::ENV_TAB.to_string(), tab_id.clone()),
                 (kitchen_proto::ENV_TAB_KIND.to_string(), kind.as_str().to_string()),
             ];
+            env.extend(local_socket_env(&host));
             if kind == TabKind::Readonly {
                 env.push((kitchen_proto::ENV_READONLY.to_string(), "1".into()));
             }
@@ -700,6 +701,7 @@ impl Engine {
             (kitchen_proto::ENV_TAB.to_string(), tab.row.id.clone()),
             (kitchen_proto::ENV_TAB_KIND.to_string(), tab.row.kind.clone()),
         ];
+        env.extend(local_socket_env(&host));
         if tab.kind() == TabKind::Readonly {
             env.push((kitchen_proto::ENV_READONLY.to_string(), "1".into()));
         }
@@ -829,6 +831,14 @@ fn unique_path(host: &Host, path: &str) -> String {
         return path.to_string();
     }
     (2..100).map(|n| format!("{path}-{n}")).find(|p| !host.exists(p)).unwrap_or_else(|| format!("{path}-{}", new_id()))
+}
+
+/// Local tabs point kitchenctl at this app's socket explicitly (it differs
+/// from the default when the app runs with `KITCHEN_STATE_DIR`). Devbox tabs
+/// use the relay's default socket there.
+fn local_socket_env(host: &Host) -> Option<(String, String)> {
+    host.is_local()
+        .then(|| (kitchen_proto::ENV_SOCKET.to_string(), kitchen_proto::default_socket_path().display().to_string()))
 }
 
 fn applescript_string(s: &str) -> String {
