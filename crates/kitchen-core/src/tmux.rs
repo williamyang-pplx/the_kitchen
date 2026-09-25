@@ -72,9 +72,30 @@ impl<'a> Tmux<'a> {
             let _ = self.host.sh(&script.join("; "), None);
         }
         if let Some(cmd) = command.filter(|c| !c.trim().is_empty()) {
+            // Keystrokes typed while the shell is still initializing get
+            // discarded, so wait for the prompt first.
+            self.wait_for_prompt(name, std::time::Duration::from_secs(8));
             self.send_text(name, cmd, true)?;
         }
         Ok(())
+    }
+
+    /// Wait until the pane shows something and has stopped changing for a
+    /// moment (the shell printed its prompt), or `timeout` passes.
+    pub fn wait_for_prompt(&self, name: &str, timeout: std::time::Duration) {
+        let start = std::time::Instant::now();
+        let mut last = String::new();
+        let mut stable_since = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            let screen = self.capture(name, None).unwrap_or_default();
+            if screen != last {
+                last = screen;
+                stable_since = std::time::Instant::now();
+            } else if !last.trim().is_empty() && stable_since.elapsed() >= std::time::Duration::from_millis(400) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     pub fn kill_session(&self, name: &str) -> Result<()> {
