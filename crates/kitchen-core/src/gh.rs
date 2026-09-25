@@ -254,6 +254,19 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
             .collect())
     }
 
+    /// Logins that requested reviews on the PR (ReviewRequestedEvent actors).
+    pub fn review_requesters(&self, slug: &str, number: u64) -> Result<Vec<String>> {
+        let (owner, name) = split_slug(slug)?;
+        let q = "query=query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { \
+                 pullRequest(number: $number) { timelineItems(last: 50, itemTypes: [REVIEW_REQUESTED_EVENT]) { \
+                 nodes { ... on ReviewRequestedEvent { actor { login } } } } } } }";
+        let o = format!("owner={owner}");
+        let nm = format!("name={name}");
+        let num = format!("number={number}");
+        let v = self.gh_json(&["api", "graphql", "-f", q, "-f", &o, "-f", &nm, "-F", &num])?;
+        Ok(parse_requesters(&v))
+    }
+
     /// Unified diff of the PR (for hunk membership checks).
     pub fn pr_diff(&self, slug: &str, number: u64) -> Result<String> {
         let n = number.to_string();
@@ -311,6 +324,18 @@ fn thread_from_json(t: &Value) -> ReviewThread {
             })
             .collect(),
     }
+}
+
+fn parse_requesters(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = v["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n["actor"]["login"].as_str().map(String::from))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn posted_from_json(v: &Value) -> Result<PostedComment> {
@@ -389,6 +414,16 @@ mod tests {
         assert!(dl.contains("x.rs", "LEFT", 2));
         assert!(!dl.contains("x.rs", "RIGHT", 9));
         assert!(!dl.contains("y.rs", "RIGHT", 1));
+    }
+
+    #[test]
+    fn requesters_parse() {
+        let v: Value = serde_json::from_str(
+            r#"{"data":{"repository":{"pullRequest":{"timelineItems":{"nodes":[
+                {"actor":{"login":"bob"}},{"actor":{"login":"amy"}},{"actor":{"login":"bob"}},{}]}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_requesters(&v), vec!["amy".to_string(), "bob".to_string()]);
     }
 
     #[test]

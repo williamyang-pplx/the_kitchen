@@ -621,14 +621,24 @@ impl eframe::App for KitchenApp {
                 .show(ui, |ui| self.tab_strip(ui, ws));
         }
         if self.side.is_some() {
-            if let Some(ws) = &ws {
+            // The inbox is global; the viewer and plan need a workspace.
+            if ws.is_some() || self.side == Some(SideKind::Inbox) {
                 let width = ui.available_width();
                 egui::Panel::right("side")
                     .resizable(true)
                     .default_size(width * 0.5)
                     .size_range(280.0..=width - 200.0)
                     .frame(egui::Frame::NONE.fill(theme::BG).stroke(egui::Stroke::new(1.0, if self.focus == Focus::Side { theme::ACCENT } else { theme::BORDER })))
-                    .show(ui, |ui| self.side_area(ui, ws, tab.as_ref()));
+                    .show(ui, |ui| match &ws {
+                        Some(ws) => self.side_area(ui, ws, tab.as_ref()),
+                        None => {
+                            let mut cx = PanelCtx { engine: &self.engine, focused: self.focus == Focus::Side && self.dialog.is_none(), clicked: false };
+                            self.inbox.ui(ui, &mut cx);
+                            if cx.clicked {
+                                self.focus = Focus::Side;
+                            }
+                        }
+                    });
             }
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {

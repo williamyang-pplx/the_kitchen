@@ -486,6 +486,25 @@ impl Db {
         Ok(st.query_map([status], run_from)?.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Re-queue a failed (or crash-orphaned queued) run of this exact head (manual retry).
+    pub fn requeue_failed_run(&self, slug: &str, pr: i64, head_sha: &str) -> Result<Option<i64>> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM review_runs WHERE github_slug = ?1 AND pr_number = ?2 AND head_sha = ?3 AND status IN ('failed', 'queued')",
+                params![slug, pr, head_sha],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = id {
+            self.conn.execute(
+                "UPDATE review_runs SET status = 'queued', error = NULL, started_at = NULL, finished_at = NULL WHERE id = ?1",
+                [id],
+            )?;
+        }
+        Ok(id)
+    }
+
     pub fn start_review_run(&self, id: i64, workspace_id: &str, worktree: &str, session: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE review_runs SET status = 'running', workspace_id = ?2, worktree = ?3, tmux_session = ?4, started_at = ?5
@@ -539,6 +558,15 @@ impl Db {
             .conn
             .prepare(&format!("SELECT {DRAFT_COLS} FROM drafts WHERE state = ?1 ORDER BY github_slug, pr_number, path, line, id"))?;
         Ok(st.query_map([state], draft_from)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn drafts_for_run(&self, run_id: i64) -> Result<Vec<Draft>> {
+        let mut st = self.conn.prepare(&format!("SELECT {DRAFT_COLS} FROM drafts WHERE run_id = ?1 ORDER BY path, line, id"))?;
+        Ok(st.query_map([run_id], draft_from)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn count_drafts(&self, state: &str) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM drafts WHERE state = ?1", [state], |r| r.get(0))?)
     }
 
     pub fn draft(&self, id: i64) -> Result<Option<Draft>> {
@@ -708,6 +736,21 @@ mod tests {
         let r2 = db.insert_review_run("o/r", 5, "sha2", None, None, None).unwrap().unwrap();
         assert_eq!(db.review_run(r1.unwrap()).unwrap().unwrap().status, "superseded");
         assert_eq!(db.review_run(r2).unwrap().unwrap().status, "queued");
+    }
+
+    #[test]
+    fn requeue_only_failed_or_orphaned() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.insert_review_run("o/r", 1, "s", None, None, None).unwrap().unwrap();
+        db.start_review_run(id, "w", "/wt", "sess").unwrap();
+        assert_eq!(db.requeue_failed_run("o/r", 1, "s").unwrap(), None, "running runs are not retried");
+        db.finish_review_run(id, "failed", Some("boom")).unwrap();
+        assert_eq!(db.requeue_failed_run("o/r", 1, "s").unwrap(), Some(id));
+        let run = db.review_run(id).unwrap().unwrap();
+        assert_eq!((run.status.as_str(), run.error), ("queued", None));
+        db.add_draft(&NewDraft { run_id: Some(id), github_slug: "o/r".into(), pr_number: 1, path: "a".into(), body: "b".into(), ..Default::default() }).unwrap();
+        assert_eq!(db.drafts_for_run(id).unwrap().len(), 1);
+        assert_eq!(db.count_drafts("draft").unwrap(), 1);
     }
 
     #[test]
