@@ -14,6 +14,8 @@ pub const RED: Color32 = Color32::from_rgb(0xf7, 0x76, 0x8e);
 pub const YELLOW: Color32 = Color32::from_rgb(0xe0, 0xaf, 0x68);
 pub const PURPLE: Color32 = Color32::from_rgb(0xbb, 0x9a, 0xf7);
 pub const CYAN: Color32 = Color32::from_rgb(0x7d, 0xcf, 0xff);
+/// Bright violet marking the focused pane.
+pub const FOCUS: Color32 = Color32::from_rgb(0xb2, 0x6b, 0xff);
 pub const SELECTED: Color32 = Color32::from_rgb(0x28, 0x2d, 0x44);
 pub const ADDED_BG: Color32 = Color32::from_rgb(0x1f, 0x33, 0x2a);
 pub const REMOVED_BG: Color32 = Color32::from_rgb(0x3b, 0x22, 0x2a);

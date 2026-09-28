@@ -641,15 +641,16 @@ impl eframe::App for KitchenApp {
                 .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(0, 4)))
                 .show(ui, |ui| self.tab_strip(ui, ws));
         }
+        let mut side_rect = None;
         if self.side.is_some() {
             // The inbox is global; the viewer and plan need a workspace.
             if ws.is_some() || self.side == Some(SideKind::Inbox) {
                 let width = ui.available_width();
-                egui::Panel::right("side")
+                let shown = egui::Panel::right("side")
                     .resizable(true)
                     .default_size(width * 0.5)
                     .size_range(280.0..=width - 200.0)
-                    .frame(egui::Frame::NONE.fill(theme::BG).stroke(egui::Stroke::new(1.0, if self.focus == Focus::Side { theme::ACCENT } else { theme::BORDER })))
+                    .frame(egui::Frame::NONE.fill(theme::BG).stroke(egui::Stroke::new(1.0, theme::BORDER)))
                     .show(ui, |ui| match &ws {
                         Some(ws) => self.side_area(ui, ws, tab.as_ref()),
                         None => {
@@ -660,10 +661,11 @@ impl eframe::App for KitchenApp {
                             }
                         }
                     });
+                side_rect = Some(shown.response.rect);
             }
         }
         let creating = ws.as_ref().and_then(|w| w.pending.iter().rev().find(|p| p.focus).cloned());
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {
+        let central = egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {
             (Some(ws), _) if creating.is_some() => {
                 let p = creating.as_ref().unwrap();
                 let what = if p.kind == TabKind::Edit { "edit tab" } else { "read-only tab" };
@@ -677,6 +679,13 @@ impl eframe::App for KitchenApp {
             }
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });
+        if self.dialog.is_none() {
+            let focused = match (self.focus, side_rect) {
+                (Focus::Side, Some(r)) => r,
+                _ => central.response.rect,
+            };
+            paint_focus_glow(&ctx, focused);
+        }
         self.save_screenshots(&ctx);
         if profiling() {
             let ms = frame_start.elapsed().as_secs_f64() * 1000.0;
@@ -691,6 +700,20 @@ impl eframe::App for KitchenApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG.to_normalized_gamma_f32()
     }
+}
+
+/// A bright violet glow just inside the focused pane: a crisp 2px edge
+/// with a soft falloff inward, drawn above the pane's content.
+fn paint_focus_glow(ctx: &egui::Context, rect: egui::Rect) {
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("focus-glow")));
+    let rect = rect.shrink(1.0);
+    const WIDTH: usize = 16;
+    for i in 0..WIDTH {
+        let alpha = (170.0 * (1.0 - i as f32 / WIDTH as f32).powi(2)) as u8;
+        let c = Color32::from_rgba_unmultiplied(theme::FOCUS.r(), theme::FOCUS.g(), theme::FOCUS.b(), alpha);
+        painter.rect_stroke(rect.shrink(2.0 + i as f32), 6.0, egui::Stroke::new(1.0, c), egui::StrokeKind::Inside);
+    }
+    painter.rect_stroke(rect, 6.0, egui::Stroke::new(3.0, theme::FOCUS), egui::StrokeKind::Inside);
 }
 
 fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
