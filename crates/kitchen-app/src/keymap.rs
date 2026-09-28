@@ -13,6 +13,7 @@
 //! | ⌘P          | file viewer (again: file picker)              |
 //! | ⌘⇧R         | plan reviewer                                 |
 //! | ⌘I          | agent-review inbox                            |
+//! | ⌘⇧H / ⌘⇧L   | focus the left (terminal) / right (side) pane |
 //! | ⌘`          | switch focus terminal ↔ side panel            |
 //! | ⌘M          | comment on the cursor line / selection        |
 //! | ⌘Enter      | submit comment (plan: send comments to agent) |
@@ -39,6 +40,9 @@ pub enum Action {
     OpenPlan,
     OpenInbox,
     ToggleFocus,
+    /// Tiling-style pane focus: terminal is the left pane, side panel the right.
+    FocusLeft,
+    FocusRight,
     Comment,
     Submit,
     ToggleDiff,
@@ -49,7 +53,8 @@ pub enum Action {
 
 /// Chords that need Shift, checked before the plain ⌘ table (egui matches
 /// ⌘R against ⌘⇧R too, so the shifted chord must be consumed first).
-pub const SHIFT_BINDINGS: &[(Key, Action)] = &[(Key::R, Action::OpenPlan)];
+pub const SHIFT_BINDINGS: &[(Key, Action)] =
+    &[(Key::R, Action::OpenPlan), (Key::H, Action::FocusLeft), (Key::L, Action::FocusRight)];
 
 pub const BINDINGS: &[(Key, Action)] = &[
     (Key::N, Action::NewWorkspace),
@@ -94,4 +99,32 @@ pub fn collect(ctx: &egui::Context) -> Vec<Action> {
         }
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(key: Key, modifiers: Modifiers) -> Vec<Action> {
+        let ctx = egui::Context::default();
+        let event = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let mut out = Vec::new();
+        let _ = ctx.run_ui(egui::RawInput { events: vec![egui::Event::ModifiersChanged(modifiers), event], ..Default::default() }, |ui| {
+            out = collect(ui.ctx());
+        });
+        out
+    }
+
+    #[test]
+    fn shifted_chords_do_not_trigger_plain_ones() {
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        assert_eq!(press(Key::H, cmd_shift), vec![Action::FocusLeft]);
+        assert_eq!(press(Key::L, cmd_shift), vec![Action::FocusRight]);
+        assert_eq!(press(Key::R, cmd_shift), vec![Action::OpenPlan]);
+        assert_eq!(press(Key::H, Modifiers::COMMAND), vec![Action::PrevTab]);
+        assert_eq!(press(Key::L, Modifiers::COMMAND), vec![Action::NextTab]);
+        assert_eq!(press(Key::R, Modifiers::COMMAND), vec![Action::NewReadonlyTab]);
+        assert_eq!(press(Key::Num3, Modifiers::COMMAND), vec![Action::GoToTab(3)]);
+        assert!(press(Key::H, Modifiers::NONE).is_empty(), "plain keys belong to the terminal/viewer");
+    }
 }

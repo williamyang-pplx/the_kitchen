@@ -59,6 +59,7 @@ keys (`gd`, `Ctrl-o`, …).
 | ⌘P | file viewer (again: file picker) |
 | ⌘⇧R | plan reviewer |
 | ⌘I | agent-review inbox |
+| ⌘⇧H / ⌘⇧L | focus the terminal pane (left) / side panel (right) |
 | ⌘` | switch focus terminal ↔ side panel |
 | ⌘M | comment on the cursor line / selection |
 | ⌘Enter | submit comment (plan: send comments to agent) |

@@ -249,6 +249,13 @@ impl KitchenApp {
                     (Focus::Side, _) => Focus::Terminal,
                 }
             }
+            Action::FocusLeft => self.focus = Focus::Terminal,
+            Action::FocusRight => {
+                if self.side.is_none() {
+                    self.side = Some(SideKind::Viewer);
+                }
+                self.focus = Focus::Side;
+            }
             Action::OpenViewer => self.open_side(SideKind::Viewer, Some(PanelCmd::FilePicker)),
             Action::OpenPlan => self.open_side(SideKind::Plan, Some(PanelCmd::Reload)),
             Action::OpenInbox => self.open_side(SideKind::Inbox, None),
@@ -488,7 +495,7 @@ impl KitchenApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("⌘J/K workspace · ⌘H/L or ⌘1-9 tab · ⌘` focus · ⌘M comment · ⌘D diff · ⌘O outline")
+                    RichText::new("⌘J/K workspace · ⌘H/L or ⌘1-9 tab · ⌘⇧H/L pane · ⌘M comment · ⌘D diff · ⌘O outline")
                         .size(10.5)
                         .color(theme::DIM),
                 );
