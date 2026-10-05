@@ -266,12 +266,6 @@ which is tried before the extension. Grammars run on syntect, which ignores
 `extends`, `branch_point`/`fail` and `pop: N`; a grammar that fails to
 compile is logged and skipped. A plugin can be grammars only: no `init.lua`.
 
-Put Sublime syntax tests in `tests/syntax_test_*` (first line
-`# SYNTAX TEST "Packages/X/Name.sublime-syntax"`, where `Name` is the
-grammar's file name; then `# ^^^ scope` / `# <- scope` assertions);
-`cargo test -p kitchen-app plugin_syntax_tests` runs every bundled
-plugin's tests (`KITCHEN_PLUGIN_TEST=<name>` runs one plugin's).
-
 A `themes/*.tmTheme` replaces the default color theme (the first one found
 in an enabled plugin); only foreground colors are used.
 

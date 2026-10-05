@@ -34,7 +34,6 @@ languages rejected (ecosystem). Cost: ~10 s build, ~0.5 MB.
   lua/**.lua                      require() path
   syntaxes/*.sublime-syntax       extra grammars (loaded at startup; restart to change)
   themes/*.tmTheme                color theme (first enabled one wins; startup)
-  tests/syntax_test_*             Sublime syntax tests (cargo test plugin_syntax_tests)
 ~/.kitchen/plugins.toml           [<name>] enabled = false / config overrides
 ~/.kitchen/logs/plugins/<name>.log
 ```
