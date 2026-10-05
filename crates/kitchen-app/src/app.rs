@@ -610,21 +610,18 @@ impl KitchenApp {
             let sel = ws.selected().map(|t| t.row.id.clone());
             for (i, tab) in ws.tabs.iter().enumerate() {
                 let is_sel = sel.as_deref() == Some(&tab.row.id);
-                let (badge, badge_color) = match tab.kind() {
-                    TabKind::Edit => ("RW", theme::GREEN),
-                    TabKind::Readonly => ("RO", theme::CYAN),
-                };
+                // The tint says the kind: green = edit (read-write), blue = read-only.
+                let kind_color = if tab.kind() == TabKind::Edit { theme::GREEN } else { theme::ACCENT };
                 let title: String = tab.row.title.chars().take(28).collect();
                 let mut job = egui::text::LayoutJob::default();
                 let fmt = |c: Color32, size: f32| egui::TextFormat { font_id: theme::ui_font(size), color: c, valign: Align::Center, ..Default::default() };
                 job.append(&format!("{} ", i + 1), 0.0, fmt(theme::MUTED, 11.0));
-                job.append(badge, 0.0, egui::TextFormat { font_id: theme::ui_font_semibold(10.0), ..fmt(badge_color, 10.0) });
-                job.append(&format!("  {title}"), 0.0, fmt(if is_sel { theme::TEXT } else { theme::MUTED }, 12.5));
+                job.append(&format!(" {title}"), 0.0, fmt(if is_sel { theme::TEXT } else { theme::MUTED }, 12.5));
                 if tab.unread {
                     job.append("  ●", 0.0, fmt(theme::YELLOW, 10.5));
                 }
                 let btn = egui::Button::new(job)
-                    .fill(if is_sel { theme::SELECTED } else { Color32::TRANSPARENT })
+                    .fill(kind_color.gamma_multiply(if is_sel { 0.35 } else { 0.12 }))
                     .corner_radius(5.0)
                     .min_size(egui::vec2(0.0, 24.0));
                 let resp = ui.add(btn).on_hover_text(format!(
@@ -641,7 +638,7 @@ impl KitchenApp {
                 }
             }
             for p in &ws.pending {
-                let color = if p.kind == TabKind::Edit { theme::GREEN } else { theme::CYAN };
+                let color = if p.kind == TabKind::Edit { theme::GREEN } else { theme::ACCENT };
                 let label = RichText::new(format!("⋯ {}", p.title.chars().take(28).collect::<String>())).font(theme::ui_font(12.5)).color(color).italics();
                 ui.add(egui::Button::new(label).fill(if p.focus { theme::SELECTED } else { Color32::TRANSPARENT }).corner_radius(5.0).min_size(egui::vec2(0.0, 24.0)))
                     .on_hover_text("fetching origin and preparing the worktree…");
@@ -650,7 +647,7 @@ impl KitchenApp {
             if ui.add(egui::Button::new(RichText::new("＋ edit ⌘E").font(theme::ui_font(11.0)).color(theme::GREEN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewEditTab);
             }
-            if ui.add(egui::Button::new(RichText::new("＋ read-only ⌘I").font(theme::ui_font(11.0)).color(theme::CYAN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
+            if ui.add(egui::Button::new(RichText::new("＋ read-only ⌘I").font(theme::ui_font(11.0)).color(theme::ACCENT)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewReadonlyTab);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
