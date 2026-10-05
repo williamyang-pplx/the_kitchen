@@ -79,8 +79,8 @@ struct Entry {
 enum Msg {
     /// HEAD and the changes; `quiet` = a background refresh (keep the view as is).
     Files { listing: Listing, quiet: bool },
-    /// Every file of the worktree at `head` (or why it couldn't be listed).
-    Tree { head: String, result: Result<Arc<Vec<String>>, String> },
+    /// Every file of the worktree at index checksum `index` (or why it couldn't be listed).
+    Tree { index: String, result: Result<Arc<Vec<String>>, String> },
     FilesFailed(String),
     File { path: String, result: Result<FileData, String> },
     Base { path: String, data: BaseData },
@@ -124,9 +124,9 @@ pub struct Viewer {
     files_state: Option<Result<(), String>>,
     /// Merge base of HEAD and origin/<default>, for diffs.
     merge_base: Option<String>,
-    /// HEAD of the last listing, and the HEAD `all` was listed at.
-    head: Option<String>,
-    all_head: Option<String>,
+    /// Index checksum of the last listing, and the one `all` was listed at.
+    index: Option<String>,
+    all_index: Option<String>,
 
     current: Option<String>,
     /// Folder shown in the file list, and in the main area while browsing.
@@ -213,8 +213,8 @@ impl Viewer {
             all: Arc::default(),
             files_state: None,
             merge_base: None,
-            head: None,
-            all_head: None,
+            index: None,
+            all_index: None,
             current: None,
             dir: String::new(),
             browsing: true,
@@ -277,7 +277,9 @@ impl Viewer {
         }
         // Cleared when the listing lands; no re-list starts meanwhile.
         self.changes_pending = true;
-        let known = quiet.then(|| (self.all_head.clone(), self.changed.clone()));
+        // A quiet re-list that finds the same index and changes sends no file
+        // list, unless the last one failed (then it is what recovers).
+        let known = (quiet && matches!(self.files_state, Some(Ok(())))).then(|| (self.all_index.clone(), self.changed.clone()));
         let (host, wt, base_ref, untracked, tx, ctx) =
             (self.host.clone(), self.worktree.clone(), self.base_ref.clone(), self.live, self.tx.clone(), self.engine.ctx.clone());
         std::thread::spawn(move || {
@@ -290,15 +292,15 @@ impl Viewer {
                 }
             };
             changes_tree::sort(&mut listing.changed);
-            let same = known.is_some_and(|(head, changed)| head.as_deref() == Some(listing.head.as_str()) && changed == listing.changed);
-            let (head, changed) = (listing.head.clone(), listing.changed.clone());
+            let same = known.is_some_and(|(index, changed)| index.as_deref() == Some(listing.index.as_str()) && changed == listing.changed);
+            let (index, changed) = (listing.index.clone(), listing.changed.clone());
             let _ = tx.send(Msg::Files { listing, quiet });
             ctx.request_repaint();
             if same {
                 return;
             }
-            let result = tracked_files(&host, &wt, &head).map(|t| merge_all(&t, &changed)).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Msg::Tree { head, result });
+            let result = tracked_files(&host, &wt, &index).map(|t| merge_all(&t, &changed)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Tree { index, result });
             ctx.request_repaint();
         });
     }
@@ -361,7 +363,7 @@ impl Viewer {
             match msg {
                 Msg::Files { listing, quiet: true } => {
                     self.changes_pending = false;
-                    self.head = Some(listing.head);
+                    self.index = Some(listing.index);
                     let base_moved = self.merge_base.as_deref() != Some(listing.base.as_str());
                     if !base_moved && listing.changed == self.changed {
                         continue;
@@ -381,7 +383,7 @@ impl Viewer {
                     self.changes_pending = false;
                     self.changed = listing.changed;
                     self.merge_base = Some(listing.base);
-                    self.head = Some(listing.head);
+                    self.index = Some(listing.index);
                     self.doc_key = None;
                     // A diff needs only the changes; an empty list waits for the files.
                     if !self.changed.is_empty() && !std::mem::replace(&mut self.routed, true) && self.current.is_none() {
@@ -389,8 +391,8 @@ impl Viewer {
                     }
                     self.refresh_picker_items();
                 }
-                Msg::Tree { head, result } => {
-                    if self.head.as_deref() != Some(head.as_str()) {
+                Msg::Tree { index, result } => {
+                    if self.index.as_deref() != Some(index.as_str()) {
                         continue; // an older listing's
                     }
                     match result {
@@ -400,7 +402,7 @@ impl Viewer {
                                 self.select_entry = self.entries.get(self.vim.line).map(|e| e.path.clone());
                             }
                             self.all = all;
-                            self.all_head = Some(head);
+                            self.all_index = Some(index);
                             self.files_state = Some(Ok(()));
                         }
                         Err(e) => self.files_state = Some(Err(e)),
@@ -1517,14 +1519,13 @@ fn parent_dir(path: &str) -> &str {
 }
 
 /// Rows of folder `dir`: `../`, subfolders, then files (both sorted).
-/// Tracked files of `worktree` at `head`, shared by every viewer on it (the
-/// read-only tabs of a repo share one worktree). Keyed by HEAD; files staged
-/// since come in through the changes (see [`merge_all`]).
-fn tracked_files(host: &Host, worktree: &str, head: &str) -> anyhow::Result<Arc<Vec<String>>> {
+/// Tracked files of `worktree` while its index checksum is `index`, shared
+/// by every viewer on it (the read-only tabs of a repo share one worktree).
+fn tracked_files(host: &Host, worktree: &str, index: &str) -> anyhow::Result<Arc<Vec<String>>> {
     type Trees = Mutex<Vec<((Host, String, String), Arc<Vec<String>>)>>;
     static TREES: OnceLock<Trees> = OnceLock::new();
     let trees = TREES.get_or_init(Default::default);
-    let key = (host.clone(), worktree.to_string(), head.to_string());
+    let key = (host.clone(), worktree.to_string(), index.to_string());
     if let Some((_, t)) = trees.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
         return Ok(t.clone());
     }
@@ -1763,7 +1764,7 @@ mod tests {
         };
         settle(&mut v);
         assert!(v.browsing && v.dir == "aster", "no changes: opens on the default folder");
-        assert!(v.changes_pending == false && v.head.is_some());
+        assert!(!v.changes_pending && v.index.is_some());
         let first = v.all.clone();
         // Nothing changed: the quiet re-list keeps the very same file list.
         v.changes_at = std::time::Instant::now() - std::time::Duration::from_secs(10);

@@ -190,16 +190,17 @@ git -C {r} rev-parse --verify --quiet {rv} >/dev/null || {{ echo "unknown revisi
 unlock() {{ find {p} -path {p}/.git -prune -o -type d ! -perm -200 -exec chmod u+w {{}} + 2>/dev/null; true; }}
 lock() {{ find {p} -path {p}/.git -prune -o -type d -perm -200 -exec chmod a-w {{}} + 2>/dev/null; true; }}
 {take_spare}
-if [ -e {p} ] && [ "$(git -C {p} rev-parse HEAD 2>/dev/null)" = "$(git -C {r} rev-parse --verify --quiet {rv})" ]; then
+if [ -e {p} ] && [ "$(git -C {p} rev-parse HEAD 2>/dev/null)" = "$(git -C {r} rev-parse --verify --quiet {rv})" ] && git -C {p} diff --quiet 2>/dev/null; then
   moved=0
 elif [ -e {p} ]; then
+  # (also at `rev` already, but with files edited in place: put them back)
   git -C {p} rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "{path} exists but is not a git worktree" >&2; exit 12; }}
   unlock
   git -C {p} checkout --quiet --detach --force {rv} && git -C {p} clean -fdq; rc=$?
   lock
   [ $rc = 0 ] || exit $rc
 elif take_spare {p}; then
-  git -C {p} checkout --quiet --detach --force {rv} && git -C {p} clean -fdq || exit 13
+  git -C {p} checkout --quiet --detach --force {rv} && git -C {p} clean -fdq || {{ give_back {p}; exit 13; }}
   lock
 else
   git -C {r} worktree add --quiet --detach {p} {rv} || exit 13
@@ -236,9 +237,9 @@ P={parent}/{name}-"$s"
 if take_spare "$P"; then
   if [ "$(git -C "$P" rev-parse HEAD)" = "$(git -C {r} rev-parse origin/{b})" ]; then
     # Same commit: pure ref updates, no index refresh (~0.6s saved on big repos).
-    git -C "$P" branch --no-track {pf}"$s" origin/{b} && git -C "$P" symbolic-ref HEAD refs/heads/{pf}"$s" || exit 13
+    git -C "$P" branch --no-track {pf}"$s" origin/{b} && git -C "$P" symbolic-ref HEAD refs/heads/{pf}"$s" || {{ give_back "$P"; exit 13; }}
   else
-    git -C "$P" checkout --quiet --no-track -b {pf}"$s" origin/{b} || exit 13
+    git -C "$P" checkout --quiet --no-track -b {pf}"$s" origin/{b} || {{ git -C {r} branch -D {pf}"$s" >/dev/null 2>&1; give_back "$P"; exit 13; }}
   fi
 else
   git -C {r} worktree add --quiet --no-track -b {pf}"$s" "$P" origin/{b} || exit 13
@@ -275,21 +276,28 @@ fi
         let (r, b) = (shell_quote(self.path), shell_quote(base));
         let spares: Vec<String> = self.spare_paths().iter().map(|p| shell_quote(p)).collect();
         let script = format!(
-            r#"for SP in {spares}; do
+            r#"err=
+for SP in {spares}; do
   if [ ! -e "$SP/.git" ]; then
     [ -e "$SP" ] && continue
-    {NICE} git -C {r} worktree add --quiet --detach "$SP" origin/{b} || exit 13
+    # (--force: the folder may be gone while git still has it registered)
+    {NICE} git -C {r} worktree add --force --quiet --detach "$SP" origin/{b} || err=13
     continue
   fi
+  A="$(git -C "$SP" rev-parse --absolute-git-dir)"
   # A lock of ours outlived its refresh (the app quit mid-way).
-  [ "$(cat "$(git -C "$SP" rev-parse --git-dir)/locked" 2>/dev/null)" = {reason} ] && git -C {r} worktree unlock "$SP"
+  [ "$(cat "$A/locked" 2>/dev/null)" = {reason} ] && git -C {r} worktree unlock "$SP"
   git -C "$SP" symbolic-ref -q HEAD >/dev/null && continue
+  # Nothing works in an unlocked spare but us: an index.lock is left over
+  # from a git that was killed; reset it to HEAD before going on.
+  [ -e "$A/locked" ] || [ ! -e "$A/index.lock" ] || {{ rm -f "$A/index.lock"; git -C "$SP" reset -q --hard HEAD 2>/dev/null; }}
   [ "$(git -C "$SP" rev-parse HEAD)" = "$(git -C {r} rev-parse origin/{b})" ] && continue
   git -C {r} worktree lock --reason {reason} "$SP" 2>/dev/null || continue
   {NICE} git -C "$SP" checkout --quiet --detach origin/{b}; rc=$?
   git -C {r} worktree unlock "$SP"
-  [ $rc = 0 ] || exit $rc
-done"#,
+  [ $rc = 0 ] || err=$rc
+done
+exit ${{err:-0}}"#,
             spares = spares.join(" "),
             reason = REFRESH_LOCK,
         );
@@ -359,7 +367,8 @@ true"#
     }
 
     /// Everything the file viewer needs but the tracked-file list, in one
-    /// round trip: HEAD, the merge base of HEAD and `base_ref`, and the files
+    /// round trip: HEAD, a checksum of the index's file list (~60 ms on agi),
+    /// the merge base of HEAD and `base_ref`, and the files
     /// changed since it. `untracked` adds untracked files (as added); read-only
     /// worktrees are cleaned and locked, so they skip that scan (~0.5 s on agi).
     pub fn listing(&self, dir: &str, base_ref: &str, untracked: bool) -> Result<Listing> {
@@ -368,6 +377,7 @@ true"#
         let script = format!(
             "cd {d} || exit 3\n\
              git rev-parse HEAD | tr -d '\\n'; printf '\\036'\n\
+             git ls-files --cached -z | cksum | tr -d '\\n'; printf '\\036'\n\
              base=$(git merge-base HEAD {b} 2>/dev/null) || base={b}\n\
              printf '%s' \"$base\"; printf '\\036'\n\
              git diff -M --name-status -z \"$base\"; printf '\\036'\n\
@@ -431,14 +441,18 @@ pub fn exclude_snippet(dir: &str) -> String {
     )
 }
 
-/// Shell function `take_spare DEST`: moves the first available spare to
-/// DEST and succeeds only if one was moved. `git worktree move` refuses a
-/// locked spare (being refreshed); spares on a branch are not spares.
-/// `repo` is quoted.
+/// Shell functions `take_spare DEST`, which moves the first available spare
+/// to DEST and succeeds only if one was moved, and `give_back DEST`, which
+/// moves it back (a checkout after the takeover failed). `git worktree move`
+/// refuses a locked spare (being refreshed); spares on a branch are not
+/// spares, and one with an `index.lock` (a git killed mid-way) is left to
+/// the next refresh. `repo` is quoted.
 fn take_spare_snippet(repo: &str, spares: &[String]) -> String {
     let spares: Vec<String> = spares.iter().map(|p| shell_quote(p)).collect();
     format!(
-        r#"take_spare() {{ for SP in {}; do [ -e "$SP/.git" ] || continue; git -C "$SP" symbolic-ref -q HEAD >/dev/null && continue; git -C {repo} worktree move "$SP" "$1" 2>/dev/null && return 0; done; return 1; }}"#,
+        r#"TAKEN=
+take_spare() {{ for SP in {}; do [ -e "$SP/.git" ] || continue; git -C "$SP" symbolic-ref -q HEAD >/dev/null && continue; [ -e "$(git -C "$SP" rev-parse --absolute-git-dir)/index.lock" ] && continue; git -C {repo} worktree move "$SP" "$1" 2>/dev/null && TAKEN=$SP && return 0; done; return 1; }}
+give_back() {{ [ -n "$TAKEN" ] && git -C {repo} worktree move "$1" "$TAKEN" 2>/dev/null; true; }}"#,
         spares.join(" ")
     )
 }
@@ -520,6 +534,9 @@ pub fn parse_worktree_porcelain(s: &str) -> Vec<Worktree> {
 pub struct Listing {
     /// The worktree's HEAD.
     pub head: String,
+    /// Checksum of the index's file list: [`Repo::tracked_files`] is the
+    /// same while it is.
+    pub index: String,
     /// Merge base of HEAD and the base ref (the base ref itself when there is none).
     pub base: String,
     /// Largest change first; untracked files count as added.
@@ -528,7 +545,7 @@ pub struct Listing {
 
 fn parse_listing(out: &str) -> Result<Listing> {
     let parts: Vec<&str> = out.split('\x1e').collect();
-    let [head, base, status, numstat, others] = parts[..] else {
+    let [head, index, base, status, numstat, others] = parts[..] else {
         bail!("unexpected listing output ({} sections)", parts.len());
     };
     let mut changed = parse_name_status_z(status);
@@ -545,7 +562,7 @@ fn parse_listing(out: &str) -> Result<Listing> {
         }
     }
     changed.sort_by(|a, b| (b.added + b.removed).cmp(&(a.added + a.removed)).then(a.path.cmp(&b.path)));
-    Ok(Listing { head: head.trim().to_string(), base: base.trim().to_string(), changed })
+    Ok(Listing { head: head.trim().to_string(), index: index.trim().to_string(), base: base.trim().to_string(), changed })
 }
 
 fn parse_name_status_z(s: &str) -> Vec<ChangedFile> {
@@ -637,6 +654,13 @@ mod tests {
         let l = repo.listing(&dir, "origin/main", true).unwrap();
         assert_eq!(l.head.len(), 40, "{:?}", l.head);
         assert_eq!(l.base, l.head, "nothing committed: the merge base is HEAD");
+        assert!(!l.index.is_empty());
+        sh(root.join("repo").as_path(), "git add 'aster/sp ace.rs'");
+        let staged = repo.listing(&dir, "origin/main", true).unwrap();
+        assert_ne!(staged.index, l.index, "staging a file changes the index checksum");
+        assert_eq!(staged.head, l.head);
+        sh(root.join("repo").as_path(), "git rm -q --cached 'aster/sp ace.rs'");
+        assert_eq!(repo.listing(&dir, "origin/main", true).unwrap().index, l.index);
         let changed: Vec<&str> = l.changed.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(changed, vec!["aster/src/a.rs", "aster/sp ace.rs"]);
         assert_eq!(l.changed[0].added, 1);
@@ -707,6 +731,12 @@ mod tests {
         assert!(std::fs::write(format!("{ro}/d/new.txt"), "x").is_err(), "new folders are locked too");
         assert!(!exists(&format!("{ro}/stray")));
         assert!(repo.sync_readonly_worktree(&ro, "origin/nope").unwrap_err().to_string().contains("exit 14"));
+        // Folders-only lock: an in-place edit is possible, and the next sync
+        // at the same commit puts the file back.
+        std::fs::OpenOptions::new().append(true).open(format!("{ro}/a.txt")).map(|mut f| std::io::Write::write_all(&mut f, b"edit")).unwrap().unwrap();
+        let (_, moved) = repo.sync_readonly_worktree_fetching(&ro, "origin/main", &[]).unwrap();
+        assert!(moved, "restoring edited files counts as moved");
+        assert_eq!(std::fs::read_to_string(format!("{ro}/a.txt")).unwrap(), "one\n");
 
         // Re-opening an existing branch reuses its worktree.
         let again = repo.add_worktree_existing_branch("william/feature", "/nonexistent").unwrap();
@@ -757,6 +787,23 @@ mod tests {
         let f = repo.create_edit_worktree("main", "william/", "unlocked").unwrap();
         assert!(exists(&f.path));
         assert!(!exists(&spares[0]) || !exists(&spares[1]), "a spare was taken");
+
+        // A spare with a leftover index.lock (a git killed mid-way) isn't
+        // taken over; the next refresh clears it.
+        repo.ensure_spare_worktree("main").unwrap();
+        let lock = |sp: &str| format!("{}/index.lock", repo.git_in(sp, &["rev-parse", "--absolute-git-dir"]).unwrap().trim());
+        let l0 = lock(&spares[0]);
+        std::fs::write(&l0, "").unwrap();
+        let g = repo.create_edit_worktree("main", "william/", "lockfile").unwrap();
+        assert!(exists(&spares[0]) && exists(&l0), "spare with index.lock left alone");
+        assert!(exists(&g.path));
+        repo.ensure_spare_worktree("main").unwrap();
+        assert!(!exists(&l0), "refresh cleared the stale index.lock");
+        // A spare folder deleted behind git's back is re-created, and the
+        // other spare is still refreshed.
+        sh(root, &format!("rm -rf {}", shell_quote(&spares[1])));
+        repo.ensure_spare_worktree("main").unwrap();
+        assert!(spares.iter().all(|s| exists(&format!("{s}/.git"))), "deleted spare re-created");
 
         // Read-only sync with a fetch in the same round trip.
         let (ro2, _) = repo.sync_readonly_worktree_fetching(&repo.readonly_path(), "origin/main", &[branch_refspec("main")]).unwrap();
