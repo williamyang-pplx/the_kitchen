@@ -83,8 +83,7 @@ pub struct TermSession {
     shared: Arc<Shared>,
     size: GridSize,
     cell: (u16, u16),
-    /// Scroll remainder (in lines) carried between wheel events.
-    pub(crate) scroll_acc: f32,
+    pub(crate) wheel: input::Wheel,
     pub(crate) focused: bool,
     pub(crate) mouse_buttons_down: u8,
     /// Local echo prediction (enabled for devbox tabs).
@@ -122,7 +121,7 @@ impl TermSession {
             shared,
             size,
             cell,
-            scroll_acc: 0.0,
+            wheel: Default::default(),
             focused: false,
             mouse_buttons_down: 0,
             predictor: Default::default(),
@@ -132,6 +131,12 @@ impl TermSession {
     /// Show typed characters before the (remote) echo arrives.
     pub fn set_predictive_echo(&mut self, on: bool) {
         self.predictor.enabled = on;
+    }
+
+    /// Batch wheel reports to the program into at most one send per
+    /// `interval` (each report is a full redraw sent back over ssh).
+    pub fn set_wheel_interval(&mut self, interval: std::time::Duration) {
+        self.wheel.interval = interval;
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {

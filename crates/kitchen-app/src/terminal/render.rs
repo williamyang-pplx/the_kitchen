@@ -186,6 +186,7 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
     let (col, row, side) = geom.cell_at(pos);
     // Shift bypasses mouse reporting so local selection always works.
     let report = mode.intersects(TermMode::MOUSE_MODE) && !mods.shift;
+    let now = std::time::Instant::now();
 
     if hovered {
         let (lines, unit_is_line) = ui.input(|i| {
@@ -199,30 +200,35 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
             }
             (dy, line_unit)
         });
-        if lines != 0.0 {
-            session.scroll_acc += if unit_is_line { lines } else { lines / geom.ch };
-            let whole = session.scroll_acc.trunc() as i32;
-            session.scroll_acc -= whole as f32;
-            if whole != 0 {
-                let n = whole.unsigned_abs() as usize;
-                let up = whole > 0;
-                if report {
-                    for _ in 0..n {
-                        session.write(sgr_mouse(if up { 64 } else { 65 }, col, row, true, false, mods));
-                    }
-                } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
-                    let seq: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
-                        (true, true) => b"\x1bOA",
-                        (true, false) => b"\x1b[A",
-                        (false, true) => b"\x1bOB",
-                        (false, false) => b"\x1b[B",
-                    };
-                    session.write(seq.repeat(n));
-                } else {
-                    session.term.lock().scroll_display(Scroll::Delta(whole));
-                }
-            }
+        session.wheel.feed(if unit_is_line { lines } else { lines / geom.ch }, now);
+    }
+    // Wheel steps the program draws are paced; our own scrollback is not.
+    let alt_scroll = mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL);
+    let whole = session.wheel.take(now, report || alt_scroll);
+    if whole != 0 {
+        let n = whole.unsigned_abs() as usize;
+        let up = whole > 0;
+        if report {
+            // Claude Code drops the first wheel report after a change of
+            // direction, so a gesture's first line would cost a round trip
+            // and show nothing: send one more.
+            let n = n + session.wheel.turns(up) as usize;
+            // One write, so the program reads (and draws) the batch at once.
+            session.write(sgr_mouse(if up { 64 } else { 65 }, col, row, true, false, mods).repeat(n));
+        } else if alt_scroll {
+            let seq: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1b[A",
+                (false, true) => b"\x1bOB",
+                (false, false) => b"\x1b[B",
+            };
+            session.write(seq.repeat(n));
+        } else {
+            session.term.lock().scroll_display(Scroll::Delta(whole));
         }
+    }
+    if let Some(wait) = session.wheel.due_in(now) {
+        ui.ctx().request_repaint_after(wait);
     }
 
     if report {

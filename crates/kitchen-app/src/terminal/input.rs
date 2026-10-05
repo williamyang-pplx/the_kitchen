@@ -3,6 +3,8 @@
 //! Cmd chords never reach here: they belong to the kitchen. Option acts as
 //! Meta (ESC prefix), which is what shells and vim want.
 
+use std::time::{Duration, Instant};
+
 use alacritty_terminal::term::TermMode;
 use egui::{Key, Modifiers};
 
@@ -121,6 +123,78 @@ pub fn paste_bytes(text: &str, mode: TermMode) -> Vec<u8> {
         format!("\x1b[200~{safe}\x1b[201~").into_bytes()
     } else {
         body.into_bytes()
+    }
+}
+
+/// Turns wheel deltas into whole-line scroll steps.
+///
+/// A fullscreen program (Claude Code) redraws its whole screen for every
+/// wheel report, and on a devbox each report is a round trip. So the first
+/// step of a gesture goes out at once (no waiting for a full line of
+/// trackpad travel), and later steps can be paced: whatever accumulates in
+/// `interval` goes out as one batch, which the program draws once.
+#[derive(Default)]
+pub(crate) struct Wheel {
+    /// Fractional lines carried between events.
+    acc: f32,
+    /// Whole lines not sent yet (positive = up).
+    pending: i32,
+    /// The gesture has not produced a line yet.
+    first_step: bool,
+    /// Direction of the last report: 1 up, -1 down, 0 none yet.
+    last_dir: i8,
+    last_event: Option<Instant>,
+    last_sent: Option<Instant>,
+    /// Minimum time between sends; zero sends every frame.
+    pub interval: Duration,
+}
+
+/// A wheel pause longer than this starts a new gesture.
+const GESTURE_GAP: Duration = Duration::from_millis(150);
+/// Travel (in lines) that sends the first step of a gesture.
+const FIRST_STEP: f32 = 0.25;
+
+impl Wheel {
+    /// Add `lines` of wheel travel (positive = up).
+    pub fn feed(&mut self, lines: f32, now: Instant) {
+        if lines == 0.0 {
+            return;
+        }
+        if self.last_event.is_none_or(|t| now - t > GESTURE_GAP) {
+            self.acc = 0.0;
+            self.first_step = true;
+        }
+        self.last_event = Some(now);
+        self.acc += lines;
+        if self.first_step && self.acc.abs() >= FIRST_STEP {
+            self.acc = self.acc.signum() * self.acc.abs().max(1.0);
+            self.first_step = false;
+        }
+        let whole = self.acc.trunc();
+        self.acc -= whole;
+        self.pending += whole as i32;
+    }
+
+    /// Lines to scroll now (positive = up). `paced` holds them back until
+    /// `interval` has passed since the last send.
+    pub fn take(&mut self, now: Instant, paced: bool) -> i32 {
+        if self.pending == 0 || paced && self.last_sent.is_some_and(|t| now - t < self.interval) {
+            return 0;
+        }
+        self.last_sent = Some(now);
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Whether a step `up` (or down) turns around from the last reported
+    /// one (the first report counts as a turn).
+    pub fn turns(&mut self, up: bool) -> bool {
+        let dir = if up { 1 } else { -1 };
+        std::mem::replace(&mut self.last_dir, dir) != dir
+    }
+
+    /// How long until held-back lines can go out.
+    pub fn due_in(&self, now: Instant) -> Option<Duration> {
+        (self.pending != 0).then(|| self.last_sent.map_or(Duration::ZERO, |t| self.interval.saturating_sub(now - t)))
     }
 }
 

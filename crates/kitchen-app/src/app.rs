@@ -137,6 +137,10 @@ impl KitchenApp {
                         Ok(mut s) => {
                             self.attempts.remove(&tab_id);
                             s.set_predictive_echo(!ws.host().is_local());
+                            if !ws.host().is_local() {
+                                // Claude Code redraws ~6KB per wheel step; batch them per 25ms.
+                                s.set_wheel_interval(Duration::from_millis(25));
+                            }
                             TermSlot::Live(s)
                         }
                         Err(e) => TermSlot::Failed {
