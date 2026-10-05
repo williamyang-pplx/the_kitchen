@@ -389,7 +389,9 @@ impl NewEditTab {
         ui.label("…or an existing branch (optional)");
         ui.add(egui::TextEdit::singleline(&mut self.target).hint_text("william/my-branch").desired_width(500.0));
         ui.add_space(10.0);
-        let submit = ui.input(|i| i.key_pressed(Key::Enter) && (i.modifiers.command || !task.has_focus()));
+        // Outside `ui.input`: `has_focus` re-locks the egui context, which deadlocks inside it.
+        let task_focused = task.has_focus();
+        let submit = ui.input(|i| i.key_pressed(Key::Enter) && (i.modifiers.command || !task_focused));
         let mut out = DialogOutcome::Open;
         ui.horizontal(|ui| {
             if ui.button("Create  ⌘⏎").clicked() || submit {
@@ -424,5 +426,29 @@ mod tests {
         let h = parse_ssh_config(cfg);
         assert_eq!(h.len(), 3);
         assert!(h[0].devbox && h[1].devbox && !h[2].devbox);
+    }
+
+    /// Plain Enter in the task field once re-locked the egui context inside
+    /// `ui.input` and hung the app; it must just stay open (newline).
+    #[test]
+    fn edit_tab_enter_does_not_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = egui::Context::default();
+            let engine = Engine::new(ctx.clone(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
+            let mut dialog = Dialog::new_edit_tab();
+            let mut step = |events: Vec<egui::Event>| {
+                let mut outcome = DialogOutcome::Closed;
+                let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| outcome = dialog.show(ui.ctx(), &engine));
+                out.textures_delta.clear();
+                outcome
+            };
+            step(vec![]);
+            step(vec![]);
+            let enter = egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+            tx.send(matches!(step(vec![enter]), DialogOutcome::Open)).unwrap();
+        });
+        let open = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("Enter in the edit tab dialog deadlocked");
+        assert!(open, "plain Enter in the task field should not submit");
     }
 }
