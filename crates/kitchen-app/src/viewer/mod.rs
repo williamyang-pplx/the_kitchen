@@ -15,6 +15,8 @@ mod nav;
 pub mod picker;
 mod plugin_glue;
 pub mod vim;
+#[cfg(test)]
+mod e2e;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
