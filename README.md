@@ -34,9 +34,12 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   viewer diagnostics/highlights, `gd`/`gr` providers, and jobs or
   long-running processes (language servers) on the tab's devbox. Ships with
   `ruff` (Python lint), `python` (`gd` / `gr` from the ty language server),
-  `github` (PR links in ⌘I, PR review comments), `todo` and `prune-worktrees`
+  `github` (PR links in ⌘I, PR review comments), `todo`, `prune-worktrees`
   (hourly, removes the worktrees of merged/closed PRs that no tab uses and
-  that hold nothing unpushed). ⌘⇧P is the command palette.
+  that hold nothing unpushed) and `dashboard`. ⌘⇧P is the command palette.
+- **Dashboard** (⌘D, or the grid at the right end of the tab strip): each
+  plugin timer's runs (last fired, next due, stats), and the workspace's
+  worktrees, disk and RAM on its host, from the `dashboard` plugin.
   See [docs/plugins.md](docs/plugins.md).
 - **`kitchenctl`**: the public CLI, so agents can do everything you do from
   the keyboard. See [docs/cli.md](docs/cli.md) or run `kitchenctl guide`.
@@ -67,8 +70,9 @@ the next workspace setup.
 ## Keybindings
 
 Every app shortcut is ⌘+key, and acts on the focused pane: tab keys (⌘E ⌘I
-⌘W ⌘1-9 ⌘H/L) only when the terminal is focused, panel keys (⌘M ⌘D ⌘O
-⌘Enter) only in a focused side panel; the rest are global. Terminals get all other keys; the viewer uses vim
+⌘W ⌘1-9 ⌘H/L) only when the terminal is focused, panel keys (⌘M ⌘O
+⌘Enter) only in a focused side panel; the rest are global (⌘D: diff in a
+focused side panel, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
 keys (`gd` definition, `gr` references, `Ctrl-o` back, `]d` next diagnostic, …).
 `gd`/`gr` ask a plugin's language server when there is one (Python: ty) and
 fall back to text search; a slow one (over 0.4s) shows the text matches until it answers.
@@ -93,7 +97,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘` | switch focus terminal ↔ side panel |
 | ⌘M | comment on the cursor line / selection (viewer, PR tab: posted to the PR on GitHub; on a commented line: a reply) |
 | ⌘Enter | submit comment (plan: send comments to agent) |
-| ⌘D | toggle diff / plain file |
+| ⌘D | workspace dashboard; in a focused side panel: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |
 | ⌘. | open the file viewer; close the side panel if one is open |
 | ⌘C / ⌘V | copy / paste |

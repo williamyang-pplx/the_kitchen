@@ -1,7 +1,7 @@
 //! The window: workspace sidebar, tab strip, terminal, side panel
 //! (viewer / plan), dialogs, and the Cmd keymap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -62,6 +62,10 @@ pub struct KitchenApp {
     auto_shot: Option<(Instant, String)>,
     /// ⌘⇧P command palette.
     palette: Option<(Vec<PaletteItem>, crate::viewer::picker::Picker)>,
+    /// Workspaces whose dashboard (⌘D) replaces the terminal area.
+    dashboard: HashSet<String>,
+    /// The workspace plugins were last told has its dashboard on screen.
+    dashboard_shown: Option<String>,
 }
 
 #[derive(Clone)]
@@ -94,6 +98,8 @@ impl KitchenApp {
             quit_requested: false,
             auto_shot,
             palette: None,
+            dashboard: HashSet::new(),
+            dashboard_shown: None,
         }
     }
 
@@ -230,6 +236,7 @@ impl KitchenApp {
             Action::PrevWorkspace => engine.cycle_workspace(-1),
             Action::GoToTab(n) => {
                 engine.select_tab_index(n);
+                self.hide_dashboard();
                 self.focus = Focus::Terminal;
             }
             // Inside a focused viewer, ⌘H / ⌘L move between its file list and code.
@@ -237,8 +244,14 @@ impl KitchenApp {
             Action::NextTab if self.viewer_focused() => self.side_command(PanelCmd::FocusCode),
             Action::Palette => self.open_palette(),
             Action::Plugin(_) => {} // resolved in `ui` against the registry snapshot
-            Action::PrevTab => engine.cycle_tab(-1),
-            Action::NextTab => engine.cycle_tab(1),
+            Action::PrevTab => {
+                engine.cycle_tab(-1);
+                self.hide_dashboard();
+            }
+            Action::NextTab => {
+                engine.cycle_tab(1);
+                self.hide_dashboard();
+            }
             Action::Quit => self.quit_requested = true,
             Action::NewEditTab => {
                 if let Some(ws) = &ws {
@@ -301,12 +314,11 @@ impl KitchenApp {
             Action::OpenPlan => self.open_side(SideKind::Plan, Some(PanelCmd::Reload)),
             Action::Comment => self.side_command(PanelCmd::Comment),
             Action::Submit => self.side_command(PanelCmd::Submit),
-            Action::ToggleDiff => {
-                if self.side().is_none() {
-                    self.set_side(Some(SideKind::Viewer));
+            Action::DiffOrDashboard if self.focus == Focus::Side && self.side().is_some() => self.side_command(PanelCmd::ToggleDiff),
+            Action::DiffOrDashboard => {
+                if let Some(ws) = &ws {
+                    self.toggle_dashboard(&ws.row.id);
                 }
-                self.focus = Focus::Side;
-                self.side_command(PanelCmd::ToggleDiff);
             }
             Action::ToggleOutline => {
                 if self.side().is_none() {
@@ -325,6 +337,37 @@ impl KitchenApp {
                 }
             }
         }
+    }
+
+    fn toggle_dashboard(&mut self, ws: &str) {
+        if !self.dashboard.remove(ws) {
+            self.dashboard.insert(ws.to_string());
+        }
+        self.focus = Focus::Terminal;
+    }
+
+    /// Back to the terminal: the selected workspace's dashboard goes away.
+    fn hide_dashboard(&mut self) {
+        if let Some(ws) = self.engine.selected_workspace() {
+            self.dashboard.remove(&ws.row.id);
+        }
+    }
+
+    /// Tell plugins which workspace's dashboard is on screen (at most the selected one).
+    fn sync_dashboard(&mut self, selected: Option<&str>) {
+        let now = selected.filter(|id| self.dashboard.contains(*id)).map(str::to_string);
+        if now == self.dashboard_shown {
+            return;
+        }
+        if let Some(plugins) = self.engine.plugins() {
+            if let Some(old) = &self.dashboard_shown {
+                plugins.dashboard_shown(old, false);
+            }
+            if let Some(new) = &now {
+                plugins.dashboard_shown(new, true);
+            }
+        }
+        self.dashboard_shown = now;
     }
 
     /// Open (or, when it is already open and focused, re-trigger) a side panel.
@@ -655,6 +698,7 @@ impl KitchenApp {
                 ));
                 if resp.clicked_by(egui::PointerButton::Primary) {
                     self.engine.select_tab(&tab.row.id);
+                    self.dashboard.remove(&ws.row.id);
                     self.focus = Focus::Terminal;
                 }
                 if resp.middle_clicked() {
@@ -676,6 +720,12 @@ impl KitchenApp {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
+                // Rightmost: the dashboard (⌘D).
+                let on = self.dashboard.contains(&ws.row.id);
+                if crate::dashboard_view::button(ui, on).clicked_by(egui::PointerButton::Primary) {
+                    self.toggle_dashboard(&ws.row.id);
+                }
+                ui.add_space(4.0);
                 for (kind, label, action) in [
                     (SideKind::Plan, "Plan ⌘⇧I", Action::OpenPlan),
                     (SideKind::Viewer, "Files ⌘.", Action::ToggleFiles),
@@ -876,6 +926,7 @@ impl eframe::App for KitchenApp {
 
         let ws = self.engine.selected_workspace();
         let tab = ws.as_ref().and_then(|w| w.selected().cloned());
+        self.sync_dashboard(ws.as_ref().map(|w| w.row.id.as_str()));
 
         egui::Panel::top("titlebar")
             .exact_size(TITLEBAR_HEIGHT)
@@ -921,6 +972,7 @@ impl eframe::App for KitchenApp {
                 centered_note(ui, &format!("creating {what} “{}” on {}…\nfetching origin · preparing worktree · starting tmux", p.title, ws.row.host), theme::DIM);
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
+            (Some(ws), _) if self.dashboard.contains(&ws.row.id) => crate::dashboard_view::ui(ui, &self.engine, ws),
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();

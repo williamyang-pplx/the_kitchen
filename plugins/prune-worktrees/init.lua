@@ -120,22 +120,22 @@ local function prs_for(slug, wt)
   return v
 end
 
--- One pass over workspace `ws`; returns the removed worktree paths.
+-- One pass over workspace `ws`; returns the removed worktree paths and how many it kept.
 local function prune_workspace(ws)
   local log = function(...)
     kitchen.log("[" .. ws.name .. "]", ...)
   end
   if not ws.github_slug then
     log("not a GitHub repo, skipped")
-    return {}
+    return {}, 0
   end
   local res = sh({ host = "local", timeout = 60, sh = "kitchenctl --json worktree list -w " .. q(ws.id) })
   local ok, list = pcall(kitchen.json.decode, res.stdout)
   if res.code ~= 0 or not ok or type(list) ~= "table" then
     log("worktree list failed:", why(res))
-    return {}
+    error("worktree list failed: " .. why(res))
   end
-  local removed = {}
+  local removed, kept = {}, 0
   for _, wt in ipairs(M.candidates(list, ws.tabs)) do
     local prs, err = prs_for(ws.github_slug, wt)
     local v = prs and M.verdict(wt, prs) or { action = "keep", why = err }
@@ -148,6 +148,7 @@ local function prune_workspace(ws)
     end
     if v.action == "keep" then
       log("kept", wt.path, "(" .. v.why .. ")")
+      kept = kept + 1
     else
       -- Deleting a big checkout on a devbox takes minutes. A timeout only
       -- kills kitchenctl: the app carries on, so the outcome is unknown.
@@ -156,6 +157,7 @@ local function prune_workspace(ws)
         log("gave up waiting on", wt.path, "(" .. v.why .. "); the removal may still finish, branch kept")
       elseif rm.code ~= 0 then
         log("kept", wt.path, "(" .. v.why .. ", but remove refused: " .. why(rm) .. ")")
+        kept = kept + 1
       else
         log("removed", wt.path, "(" .. v.why .. ")")
         table.insert(removed, wt.path)
@@ -166,54 +168,51 @@ local function prune_workspace(ws)
       end
     end
   end
-  return removed
+  return removed, kept
 end
 
-local last = 0 -- os.time() of the last pass
+local manual = false -- the next pass was asked for with prune-worktrees.run
 
--- A pass over every workspace; `manual` reports even when nothing went.
-local function pass(manual)
-  last = os.time()
-  local removed = {}
+-- A pass over every workspace. Returns the stats the dashboard shows: the
+-- totals, and per workspace.
+local function pass()
+  local was_manual = manual
+  manual = false
+  local removed, totals, per_ws = {}, { removed = 0, kept = 0, failed_workspaces = 0 }, {}
   for _, ws in ipairs(kitchen.workspaces()) do
-    local ok, got = pcall(prune_workspace, ws)
+    local ok, got, kept = pcall(prune_workspace, ws)
     if ok then
       for _, p in ipairs(got) do
         table.insert(removed, basename(p))
       end
+      per_ws[ws.id] = { removed = #got, kept = kept }
+      totals.removed, totals.kept = totals.removed + #got, totals.kept + kept
     else
       kitchen.log("[" .. ws.name .. "] failed:", got)
+      per_ws[ws.id] = { failed = tostring(got):sub(1, 120) }
+      totals.failed_workspaces = totals.failed_workspaces + 1
     end
   end
   if #removed > 0 then
     kitchen.notify("pruned " .. #removed .. " worktree(s): " .. table.concat(removed, ", "))
-  elseif manual then
+  elseif was_manual then
     kitchen.notify("nothing to prune (kitchenctl plugin logs prune-worktrees says why)")
   end
+  return totals, per_ws
 end
 
--- The ticker: a sleep loop on the mac, each line it prints a tick. The
--- kitchen kills it on reload; if the kitchen dies without that, the next echo
--- fails on the closed pipe and the loop ends.
-kitchen.on("startup", function()
-  local secs = math.max(1, tonumber(kitchen.config.interval_minutes) or 60) * 60
-  kitchen.spawn({
-    host = "local",
-    sh = "sleep 60; while echo tick; do sleep " .. math.floor(secs) .. "; done",
-    on_stdout = function()
-      -- Ticks that queued up during a long pass would run back to back.
-      if os.time() - last >= secs / 2 then
-        pass(false)
-      end
-    end,
-    on_exit = function(code)
-      kitchen.log("ticker exited", code)
-    end,
-  })
-end)
+-- The kitchen runs it on schedule and never starts one while another is going.
+local timer = kitchen.every("pass", math.max(1, tonumber(kitchen.config.interval_minutes) or 60) * 60, pass, {
+  desc = "remove worktrees of merged/closed PRs",
+  first_delay = 60,
+})
 
 kitchen.command("run", function()
-  pass(true)
+  manual = true
+  if not timer:run() then
+    manual = false
+    kitchen.notify("a prune pass is already running")
+  end
 end, { desc = "prune worktrees of merged/closed PRs now" })
 
 return M

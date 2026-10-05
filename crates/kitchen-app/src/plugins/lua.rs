@@ -13,10 +13,12 @@ use std::time::Duration;
 
 use mlua::{Function, HookTriggers, Lua, LuaSerdeExt, Table, UserData, UserDataMethods, Value, Variadic, VmState};
 
+use super::dashboard::Section;
 use super::decor::{self, FileKey};
 use super::jobs::{self, JobSpec};
 use super::procs::{self, Proc, ProcSpec, Stream};
 use super::keys::Chord;
+use super::timers::{self, TimerSpec};
 use super::{ChordEntry, CommandEntry, FileEvent, LinkEntry, Location, MAX_TEXT, PROVIDER_KINDS, PluginHost, ProviderEntry, ToPlugin, ViewerMap, When};
 use crate::engine::UiCommand;
 
@@ -42,6 +44,8 @@ pub fn spawn(host: Arc<PluginHost>, name: String, dir: PathBuf, entry: String, c
             host.report_error(&name, &format!("crashed: {msg}"));
             host.mark_failed(&name, generation, format!("crashed: {msg}"));
         }
+        // Timer runs this load never finished (it stopped, crashed, or never got to them).
+        host.timers_released(&name, generation);
     });
     if let Err(e) = spawned {
         log::error!("plugin thread: {e}");
@@ -188,6 +192,25 @@ fn run(host: Arc<PluginHost>, name: &str, dir: &Path, entry: &str, config: serde
                     host.report_error(name, &format!("process exit: {e}"));
                 }
             }
+            ToPlugin::Timer { generation: g, name: timer, run } => {
+                let out = if g != generation {
+                    Err("sent to an older load of the plugin".to_string())
+                } else {
+                    (|| -> mlua::Result<(serde_json::Value, serde_json::Value)> {
+                        let timers: Table = state(&lua)?.get("timers")?;
+                        let Some(f) = timers.get::<Option<Function>>(timer.as_str())? else {
+                            return Err(mlua::Error::runtime(format!("timer {timer} is not defined")));
+                        };
+                        let (stats, per_ws): (Value, Value) = f.call(())?;
+                        Ok((lua.from_value(stats)?, lua.from_value(per_ws)?))
+                    })()
+                    .map_err(|e| e.to_string())
+                };
+                if let Err(e) = &out {
+                    host.report_error(name, &format!("timer {timer}: {e}"));
+                }
+                host.timer_done(name, &timer, run, out);
+            }
             ToPlugin::JobDone { generation: g, callback, result } => {
                 if g != generation {
                     continue; // from before a reload
@@ -304,6 +327,18 @@ impl UserData for ProcHandle {
     }
 }
 
+/// What `kitchen.every` returns: `t:run()` runs the timer now (false while a run is going).
+struct TimerHandle {
+    name: String,
+    cx: Rc<Ctx>,
+}
+
+impl UserData for TimerHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("run", |_, this, ()| Ok(this.cx.host.fire_timer(&this.cx.name, &this.name)));
+    }
+}
+
 fn job_spec(lua: &Lua, t: Table) -> mlua::Result<JobSpec> {
     let argv = argv_of(&t, "kitchen.run")?;
     let host: Option<String> = t.get("host")?;
@@ -325,6 +360,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
     st.set("callbacks", lua.create_table()?)?;
     st.set("providers", lua.create_table()?)?;
     st.set("procs", lua.create_table()?)?;
+    st.set("timers", lua.create_table()?)?;
     lua.set_named_registry_value("kitchen_state", st)?;
 
     // require() finds the plugin's lua/ dir, and the bundled kitchen.lint.
@@ -346,7 +382,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
         "on",
         lua.create_function(move |lua, (event, f): (String, Function)| {
             if !matches!(event.as_str(), "startup" | "file_opened" | "file_changed") && !super::EMITTED.contains(&event.as_str()) {
-                return Err(mlua::Error::runtime(format!("unknown event {event:?} (startup, file_opened, file_changed, open, comment)")));
+                return Err(mlua::Error::runtime(format!("unknown event {event:?} (startup, file_opened, file_changed, {})", super::EMITTED.join(", "))));
             }
             if super::EMITTED.contains(&event.as_str()) {
                 c.host.register_listener(&c.name, c.generation, &event);
@@ -545,6 +581,56 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
             Ok(())
         })?,
     )?;
+
+    // Timers: kitchen.every(name, secs, fn, { desc, first_delay }) → t, t:run().
+    let c = cx.clone();
+    k.set(
+        "every",
+        lua.create_function(move |lua, (name, secs, f, opts): (String, f64, Function, Option<Table>)| {
+            if !(secs.is_finite() && secs > 0.0) {
+                return Err(mlua::Error::runtime(format!("kitchen.every: interval must be > 0 seconds, got {secs}")));
+            }
+            let desc = opts.as_ref().and_then(|o| o.get::<Option<String>>("desc").ok().flatten()).unwrap_or_default();
+            let first_delay = opts.as_ref().and_then(|o| o.get::<Option<f64>>("first_delay").ok().flatten()).unwrap_or(secs).max(0.0);
+            state(lua)?.get::<Table>("timers")?.set(name.as_str(), f)?;
+            c.host.register_timer(TimerSpec {
+                plugin: c.name.clone(),
+                name: name.clone(),
+                desc,
+                interval: Duration::from_secs_f64(secs),
+                first_delay: Duration::from_secs_f64(first_delay),
+                generation: c.generation,
+                registered_at: timers::wall_now(),
+            });
+            Ok(TimerHandle { name, cx: c.clone() })
+        })?,
+    )?;
+
+    // Dashboard sections: kitchen.dashboard.set(ws, sections) / .clear(ws?) / .showing().
+    let dash = lua.create_table()?;
+    let c = cx.clone();
+    dash.set(
+        "set",
+        lua.create_function(move |lua, (ws, sections): (String, Value)| {
+            let sections: Vec<Section> = serde_json::from_value(to_json(lua, sections)?)
+                .map_err(|e| mlua::Error::runtime(format!("kitchen.dashboard.set: expected {{ {{ title, note?, rows = {{ {{ label, value?, fraction?, mark? }} }} }} }}: {e}")))?;
+            c.host.dashboard.set(&c.name, &ws, sections);
+            repaint(&c);
+            Ok(())
+        })?,
+    )?;
+    let c = cx.clone();
+    dash.set(
+        "clear",
+        lua.create_function(move |_, ws: Option<String>| {
+            c.host.dashboard.clear(&c.name, ws.as_deref());
+            repaint(&c);
+            Ok(())
+        })?,
+    )?;
+    let c = cx.clone();
+    dash.set("showing", lua.create_function(move |_, ()| Ok(c.host.dashboard.showing()))?)?;
+    k.set("dashboard", dash)?;
 
     // UI.
     let c = cx.clone();

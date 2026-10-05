@@ -127,6 +127,7 @@ fn plugin_dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &C
     let ext = |ns: &str| format!("ext.{}", ns.trim_start_matches("ext."));
     match method {
         "plugin.list" => Ok(serde_json::to_value(host.list())?),
+        "plugin.timers" => Ok(serde_json::to_value(host.timers_info())?),
         "plugin.reload" => {
             if remote {
                 bail!("plugin.reload is only allowed from this mac");

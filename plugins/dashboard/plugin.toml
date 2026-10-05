@@ -1,0 +1,14 @@
+name = "dashboard"
+version = "0.1.0"
+description = "Worktrees, disk and RAM of each workspace's host, on its dashboard (⌘D)"
+api = 6
+
+[config]
+# Seconds between refreshes of worktrees and RAM, for the dashboard on screen.
+refresh_seconds = 30
+# Minutes between disk measurements (du over big devbox checkouts takes minutes; it runs in the background).
+disk_minutes = 30
+# Rows in the disk and RAM lists.
+top = 10
+# Where kitchenctl lives when the kitchen was started from Finder (minimal PATH).
+path = "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"

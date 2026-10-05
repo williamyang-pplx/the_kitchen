@@ -275,6 +275,8 @@ pub enum PluginCmd {
         #[command(flatten)]
         target: TabTarget,
     },
+    /// Plugin timers (`kitchen.every`): interval, runs, last fired, next due, last stats.
+    Timers,
     /// Print the end of a plugin's log (~/.kitchen/logs/plugins/<name>.log; no app needed).
     Logs {
         name: String,
@@ -543,6 +545,7 @@ impl Cli {
             },
             Command::Plugin(c) => match c {
                 PluginCmd::List => api("plugin.list", json!({})),
+                PluginCmd::Timers => api("plugin.timers", json!({})),
                 PluginCmd::Reload { name } => api("plugin.reload", json!({"name": name})),
                 PluginCmd::Run { command, target } => api("plugin.run", merge(tab(target), json!({"command": command}))),
                 PluginCmd::Logs { name, lines } => Call::PluginLogs { name: name.clone(), lines: *lines },

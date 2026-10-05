@@ -6,15 +6,17 @@
 //! [`decor::DecorStore`]). The host tracks everything a plugin registers, so
 //! a reload (or crash) cleans up without the plugin's help.
 
+pub mod dashboard;
 pub mod decor;
 pub mod jobs;
 pub mod keys;
 mod lua;
 pub mod procs;
+pub mod timers;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -23,18 +25,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
+use dashboard::DashboardStore;
 use decor::{DecorStore, FileKey};
 use keys::Chord;
+use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 5;
+pub const API_LEVEL: u32 = 6;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
-/// `open` (text typed into ⌘I), `comment` (a viewer comment to post).
-pub const EMITTED: &[&str] = &["open", "comment"];
+/// `open` (text typed into ⌘I), `comment` (a viewer comment to post),
+/// `dashboard` (a workspace's dashboard was shown or hidden).
+pub const EMITTED: &[&str] = &["open", "comment", "dashboard"];
 /// File text above this is not handed to plugins (`ev.text()` returns nil).
 pub const MAX_TEXT: usize = 2 * 1024 * 1024;
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -229,6 +234,8 @@ pub enum ToPlugin {
     Event { name: String, value: serde_json::Value },
     ProcOut { generation: u64, proc: u64, stream: procs::Stream, data: Vec<u8> },
     ProcExit { generation: u64, proc: u64, code: i32 },
+    /// Run timer `name` (a `kitchen.every` fn); report back with [`PluginHost::timer_done`].
+    Timer { generation: u64, name: String, run: u64 },
     Stop,
 }
 
@@ -269,6 +276,9 @@ pub struct PluginHost {
     slots: Mutex<Vec<Slot>>,
     next_generation: AtomicU64,
     pub decor: DecorStore,
+    pub timers: Timers,
+    pub dashboard: DashboardStore,
+    scheduler: AtomicBool,
     registry: Mutex<Arc<Registry>>,
     registry_gen: AtomicU64,
     /// Latest text of every file a viewer holds, replayed after a reload.
@@ -288,6 +298,9 @@ impl PluginHost {
             slots: Mutex::new(Vec::new()),
             next_generation: AtomicU64::new(1),
             decor: DecorStore::default(),
+            timers: Timers::default(),
+            dashboard: DashboardStore::default(),
+            scheduler: AtomicBool::new(false),
             registry: Mutex::new(Arc::new(Registry::default())),
             registry_gen: AtomicU64::new(0),
             open_files: Mutex::new(HashMap::new()),
@@ -314,6 +327,9 @@ impl PluginHost {
             slots: Mutex::new(Vec::new()),
             next_generation: AtomicU64::new(1),
             decor: DecorStore::default(),
+            timers: Timers::default(),
+            dashboard: DashboardStore::default(),
+            scheduler: AtomicBool::new(false),
             registry: Mutex::new(Arc::new(Registry::default())),
             registry_gen: AtomicU64::new(0),
             open_files: Mutex::new(HashMap::new()),
@@ -404,6 +420,8 @@ impl PluginHost {
             r.links.retain(|l| l.plugin != name);
         });
         self.decor.clear_owner(name);
+        self.timers.drop_plugin(name);
+        self.dashboard.clear_owner(name);
         self.fail_requests(name);
     }
 
@@ -663,6 +681,83 @@ impl PluginHost {
         });
     }
 
+    fn register_timer(self: &Arc<Self>, spec: TimerSpec) {
+        if !self.current(&spec.plugin, spec.generation) {
+            return;
+        }
+        let saved = self
+            .engine()
+            .and_then(|e| e.db().timer_state(&spec.plugin, &spec.name).ok().flatten())
+            .and_then(|s| serde_json::from_str::<TimerState>(&s).ok());
+        self.timers.register(spec, saved);
+        if !self.scheduler.swap(true, Ordering::AcqRel) {
+            let weak = Arc::downgrade(self);
+            std::thread::Builder::new().name("plugin-timers".into()).spawn(move || schedule(weak)).ok();
+        }
+        self.repaint();
+    }
+
+    /// Hand a started run to its plugin; if it can't take it, the run ends now.
+    fn send_fire(&self, fire: Fire) {
+        let tx = lock(&self.slots).iter().find(|s| s.name == fire.plugin && s.generation == fire.generation).and_then(|s| s.tx.clone());
+        let sent = tx.is_some_and(|tx| tx.send(ToPlugin::Timer { generation: fire.generation, name: fire.name.clone(), run: fire.run }).is_ok());
+        if !sent {
+            self.log(&fire.plugin, &format!("timer {}: the plugin is not running", fire.name));
+            self.timer_done(&fire.plugin, &fire.name, fire.run, Err("the plugin is not running".into()));
+        }
+    }
+
+    /// Run `plugin.name` now (`t:run()`); false while a run is in flight.
+    fn fire_timer(&self, plugin: &str, name: &str) -> bool {
+        match self.timers.fire_now(plugin, name, timers::wall_now()) {
+            Some(fire) => {
+                self.send_fire(fire);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A timer run ended: record and persist it.
+    fn timer_done(&self, plugin: &str, name: &str, run: u64, out: Result<(serde_json::Value, serde_json::Value), String>) {
+        if let Some(state) = self.timers.finish(plugin, name, run, out, timers::wall_now()) {
+            self.save_timer(plugin, name, &state);
+        }
+        self.repaint();
+    }
+
+    /// The thread of load `generation` ended; runs it held end with an error.
+    fn timers_released(&self, plugin: &str, generation: u64) {
+        for (name, state) in self.timers.release_generation(plugin, generation, timers::wall_now()) {
+            self.save_timer(plugin, &name, &state);
+        }
+    }
+
+    fn save_timer(&self, plugin: &str, name: &str, state: &TimerState) {
+        let (Some(e), Ok(json)) = (self.engine(), serde_json::to_string(state)) else { return };
+        if let Err(err) = e.db().put_timer_state(plugin, name, &json) {
+            log::warn!("plugin {plugin}: save timer {name}: {err:#}");
+        }
+    }
+
+    /// Every registered timer and what its runs did.
+    pub fn timers_info(&self) -> Vec<TimerInfo> {
+        self.timers.list()
+    }
+
+    /// The UI showed or hid workspace `ws`'s dashboard; tell the plugins.
+    pub fn dashboard_shown(&self, ws: &str, open: bool) {
+        if self.dashboard.set_showing(ws, open) {
+            self.emit("dashboard", serde_json::json!({ "workspace": ws, "open": open }));
+        }
+    }
+
+    fn repaint(&self) {
+        if let Some(e) = self.engine() {
+            e.ctx.request_repaint();
+        }
+    }
+
     pub fn list(&self) -> Vec<PluginInfo> {
         let reg = self.registry();
         lock(&self.slots)
@@ -751,6 +846,17 @@ fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             collect_sources(&p, out, depth + 1);
         } else if name == "plugin.toml" || name.ends_with(".lua") {
             out.push(p);
+        }
+    }
+}
+
+/// Start timers as they come due (never one whose last run is still going).
+fn schedule(host: Weak<PluginHost>) {
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let Some(h) = host.upgrade() else { return };
+        for fire in h.timers.due(timers::wall_now()) {
+            h.send_fire(fire);
         }
     }
 }
@@ -882,7 +988,7 @@ mod tests {
     fn prune_plugin_decides_what_to_remove() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
-        lua.load("kitchen = { on = function() end, command = function() end, config = {}, json = {} }").exec().unwrap();
+        lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/prune-worktrees/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
@@ -937,14 +1043,135 @@ mod tests {
         assert_eq!(del, r#"[ "$(git rev-parse --verify -q 'refs/heads/william/x'\''y')" = 'abc' ] && git branch -D 'william/x'\''y'"#);
     }
 
+    /// dashboard plugin: parsing `ps`/`df`/`du` output (macOS and Linux) and
+    /// turning it into sections.
+    #[test]
+    fn dashboard_plugin_measures_and_lays_out() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {}, dashboard = {} }").exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/dashboard/init.lua");
+        let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
+        let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
+        let parse: mlua::Function = m.get("parse").unwrap();
+        let text = "mem 33554432 16777216\nproc 1048576 claude\nproc 2097152 Comet Helper (Renderer)\ndf 1000000000 400000000 /System/Volumes/Data\ndu 52428800 /home/dev/agi\ndu 1048576 /home/dev/air-worktrees\n";
+        let p = to_json(parse.call(text).unwrap());
+        assert_eq!(p["mem"], serde_json::json!({"total": 33554432, "used": 16777216}));
+        assert_eq!(p["procs"][0]["name"], "Comet Helper (Renderer)", "biggest first, names with spaces");
+        assert_eq!(p["df"]["mount"], "/System/Volumes/Data");
+        assert_eq!(p["dirs"][1]["path"], "/home/dev/air-worktrees");
+
+        let list = lua
+            .to_value(&serde_json::json!([
+                { "path": "/r/a", "role": "main" },
+                { "path": "/r/a-x", "role": "edit", "tab": "t1" },
+                { "path": "/r/a-y", "role": "edit" },
+                { "path": "/r/a-kitchen-ro-pr-12", "role": "readonly" },
+                { "path": "/r/a-kitchen-readonly", "role": "readonly" },
+                { "path": "/r/a-kitchen-spare", "role": "spare" },
+            ]))
+            .unwrap();
+        let counts = m.get::<mlua::Function>("worktree_counts").unwrap().call::<mlua::Value>(list).unwrap();
+        assert_eq!(to_json(counts.clone()), serde_json::json!({"total": 6, "edit": 2, "edit_tabs": 1, "review": 1, "readonly": 1, "spare": 1}));
+
+        let parsed: mlua::Value = parse.call(text).unwrap();
+        let paths = lua.to_value(&serde_json::json!(["/home/dev/air-worktrees/ast-1"])).unwrap();
+        let sections = to_json(m.get::<mlua::Function>("sections").unwrap().call((counts, parsed.clone(), parsed, paths, 1, 0)).unwrap());
+        let titles: Vec<&str> = sections.as_array().unwrap().iter().map(|s| s["title"].as_str().unwrap()).collect();
+        assert_eq!(titles, ["Worktrees", "Disk", "RAM"]);
+        assert_eq!(sections[0]["rows"][0], serde_json::json!({"label": "edit", "value": "2 (1 with tabs)"}));
+        let disk = &sections[1]["rows"];
+        assert_eq!((disk[0]["value"].as_str(), disk.as_array().unwrap().len()), (Some("381.5G / 953.7G"), 2), "the volume, then `top` = 1 folder");
+        assert_eq!((disk[1]["label"].as_str(), disk[1]["mark"].as_bool()), (Some("agi"), Some(false)));
+        assert_eq!(sections[2]["rows"][0]["value"], "16.0G / 32.0G");
+        let none = to_json(m.get::<mlua::Function>("sections").unwrap().call((mlua::Value::Nil, mlua::Value::Nil, mlua::Value::Nil, mlua::Value::Nil, 5)).unwrap());
+        assert_eq!((none[0]["title"].as_str(), none.as_array().unwrap().len()), (Some("Disk"), 1));
+        let rows: crate::plugins::dashboard::Section = serde_json::from_value(none[0].clone()).unwrap();
+        assert!(rows.rows.is_empty(), "an empty Lua table is an empty row list");
+    }
+
+    /// `kitchen.every` runs on schedule and records its runs (stats, errors,
+    /// SQLite); `t:run()` starts one now; a reload never overlaps a run that is
+    /// still going. `kitchen.dashboard` sections follow the dashboard event.
+    #[test]
+    fn plugin_timers_and_dashboard() {
+        let root = std::env::temp_dir().join(format!("kt-timers-{}", kitchen_core::util::new_id()));
+        let dir = root.join("tick");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = root.join("slow.txt");
+        std::fs::write(dir.join("plugin.toml"), format!("name = \"tick\"\napi = 6\n[config]\nout = {:?}\n", out.display().to_string())).unwrap();
+        std::fs::write(
+            dir.join("init.lua"),
+            r#"
+local n = 0
+kitchen.every("fast", 0.05, function()
+  n = n + 1
+  if n == 1 then error("boom") end
+  return { n = n }, { w1 = { here = n } }
+end, { desc = "fast one", first_delay = 0 })
+local function note(s)
+  local f = io.open(kitchen.config.out, "a"); f:write(s .. "\n"); f:close()
+end
+local slow = kitchen.every("slow", 3600, function()
+  note("start")
+  kitchen.run_sync({ sh = "sleep 0.6" })
+  note("end")
+  return { ok = 1 }
+end, { first_delay = 3600 })
+kitchen.command("slow", function() slow:run() end)
+kitchen.on("dashboard", function(ev)
+  if ev.open then
+    kitchen.dashboard.set(ev.workspace, { { title = "T", rows = { { label = "a", value = "1", fraction = 0.5 } } } })
+  end
+end)
+"#,
+        )
+        .unwrap();
+        let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
+        let host = host_with(&engine, vec![root.clone()]);
+        let info = |name: &str| host.timers_info().into_iter().find(|t| t.name == name);
+        wait(&|| info("fast").is_some_and(|t| t.state.runs >= 3 && t.state.last_error.is_none()));
+        let fast = info("fast").unwrap();
+        assert_eq!((fast.desc.as_str(), fast.interval_secs), ("fast one", 0.05));
+        assert!(fast.state.stats["n"].as_i64().unwrap() >= 2 && fast.state.workspaces["w1"]["here"].is_number());
+        assert!(engine.state().toasts.iter().any(|t| t.text.contains("boom")), "a failing run is reported");
+        let saved = engine.db().timer_state("tick", "fast").unwrap().unwrap();
+        assert!(serde_json::from_str::<TimerState>(&saved).unwrap().runs >= 2, "{saved}");
+
+        // Start the slow one; while it runs, reload and ask the new load to run it again.
+        let read = || std::fs::read_to_string(&out).unwrap_or_default();
+        host.invoke("tick.slow", serde_json::json!({}), false).unwrap();
+        wait(&|| read() == "start\n");
+        host.reload(Some("tick")).unwrap();
+        wait(&|| {
+            let generation = lock(&host.slots)[0].generation;
+            host.registry().commands.iter().any(|c| c.name == "tick.slow") && host.current("tick", generation)
+        });
+        host.invoke("tick.slow", serde_json::json!({}), false).unwrap();
+        wait(&|| read() == "start\nend\n");
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(read(), "start\nend\n", "no second run while the first was going, none right after");
+        assert_eq!(info("slow").unwrap().state.runs, 1);
+        host.invoke("tick.slow", serde_json::json!({}), false).unwrap();
+        wait(&|| read() == "start\nend\nstart\nend\n");
+        wait(&|| info("slow").is_some_and(|t| t.state.runs == 2 && !t.running));
+
+        // Dashboard sections arrive when the dashboard opens and go with the plugin.
+        host.dashboard_shown("w1", true);
+        wait(&|| host.dashboard.get("w1").is_some());
+        assert_eq!(host.dashboard.get("w1").unwrap()[0].1[0].rows[0].fraction, Some(0.5));
+        assert_eq!(host.dashboard.showing(), ["w1"]);
+        host.reload(Some("tick")).unwrap();
+        assert!(host.dashboard.get("w1").is_none(), "cleared on unload");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn bundled_plugins() {
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        // The prune-worktrees ticker starts too; with no workspaces it never prunes, and
-        // once the test binary exits its next echo fails and it ends.
-        wait(&|| host.list().len() == 6 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        wait(&|| host.list().len() == 7 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);

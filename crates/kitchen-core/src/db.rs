@@ -79,6 +79,15 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at   INTEGER NOT NULL,
     read         INTEGER NOT NULL DEFAULT 0
 );
+
+-- Plugin timers (`kitchen.every`): what each one's runs did, as JSON, so
+-- runs and "last fired" survive restarts.
+CREATE TABLE IF NOT EXISTS plugin_timers (
+    plugin TEXT NOT NULL,
+    name   TEXT NOT NULL,
+    state  TEXT NOT NULL,
+    PRIMARY KEY (plugin, name)
+);
 "#;
 
 pub struct Db {
@@ -371,6 +380,17 @@ impl Db {
         Ok(())
     }
 
+    // ------------------------------------------------------------ plugin timers
+
+    pub fn timer_state(&self, plugin: &str, name: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT state FROM plugin_timers WHERE plugin = ?1 AND name = ?2", params![plugin, name], |r| r.get(0)).optional()?)
+    }
+
+    pub fn put_timer_state(&self, plugin: &str, name: &str, state: &str) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO plugin_timers (plugin, name, state) VALUES (?1, ?2, ?3)", params![plugin, name, state])?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------ notifications
 
     pub fn add_notification(&self, ws: Option<&str>, tab: Option<&str>, title: &str, body: &str) -> Result<i64> {
@@ -414,6 +434,15 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timer_state_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.timer_state("p", "t").unwrap(), None);
+        db.put_timer_state("p", "t", r#"{"runs":1}"#).unwrap();
+        db.put_timer_state("p", "t", r#"{"runs":2}"#).unwrap();
+        assert_eq!(db.timer_state("p", "t").unwrap().as_deref(), Some(r#"{"runs":2}"#));
+    }
 
     fn ws(id: &str, pos: i64) -> WorkspaceRow {
         WorkspaceRow {

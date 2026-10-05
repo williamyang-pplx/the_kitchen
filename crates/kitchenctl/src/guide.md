@@ -76,6 +76,7 @@ their files change.
 kitchenctl plugin list                      # status + commands
 kitchenctl plugin run ruff.explain          # run a plugin command in the caller's tab
 kitchenctl plugin logs ruff                 # print()/errors of a plugin
+kitchenctl plugin timers                    # kitchen.every timers: runs, last fired, next due, stats
 kitchenctl plugin reload [name]             # this mac only
 ```
 

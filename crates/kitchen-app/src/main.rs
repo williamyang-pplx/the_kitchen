@@ -2,6 +2,7 @@
 
 mod api;
 mod app;
+mod dashboard_view;
 mod engine;
 mod keymap;
 mod links;

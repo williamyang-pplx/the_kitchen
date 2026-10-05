@@ -3,9 +3,10 @@
 //! viewer never see these chords.
 //!
 //! Chords act on the focused pane only (see [`Action::scope`]): tab keys
-//! (⌘E ⌘I ⌘W ⌘1-9 ⌘H/L) work in the terminal, panel keys (⌘M ⌘D ⌘O ⌘Enter)
+//! (⌘E ⌘I ⌘W ⌘1-9 ⌘H/L) work in the terminal, panel keys (⌘M ⌘O ⌘Enter)
 //! in a focused side panel, ⌘P in a focused viewer; elsewhere they are
-//! swallowed. The rest is global.
+//! swallowed. The rest is global; ⌘D toggles diff in a focused side panel
+//! and the workspace dashboard elsewhere.
 //!
 //! | keys        | action                                        |
 //! |-------------|-----------------------------------------------|
@@ -27,7 +28,7 @@
 //! | ⌘`          | switch focus terminal ↔ side panel            |
 //! | ⌘M          | comment on the cursor line / selection        |
 //! | ⌘Enter      | submit comment (plan: send comments to agent) |
-//! | ⌘D          | toggle diff / plain file                      |
+//! | ⌘D          | dashboard (focused side panel: diff / plain)  |
 //! | ⌘O          | toggle outline (collapsed) mode               |
 //! | ⌘.          | open the file viewer / close the side panel   |
 //! | ⌘Q          | quit                                          |
@@ -57,7 +58,8 @@ pub enum Action {
     FocusRight,
     Comment,
     Submit,
-    ToggleDiff,
+    /// ⌘D: diff / plain in a focused side panel, else the workspace dashboard.
+    DiffOrDashboard,
     ToggleOutline,
     ToggleViewer,
     Quit,
@@ -80,7 +82,7 @@ impl Action {
     pub fn scope(self) -> Scope {
         match self {
             Action::NewEditTab | Action::NewReadonlyTab | Action::CloseTab | Action::GoToTab(_) | Action::PrevTab | Action::NextTab => Scope::Terminal,
-            Action::Comment | Action::Submit | Action::ToggleDiff | Action::ToggleOutline | Action::FilePicker => Scope::Side,
+            Action::Comment | Action::Submit | Action::ToggleOutline | Action::FilePicker => Scope::Side,
             _ => Scope::Global,
         }
     }
@@ -118,7 +120,7 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::Backtick, Action::ToggleFocus),
     (Key::M, Action::Comment),
     (Key::Enter, Action::Submit),
-    (Key::D, Action::ToggleDiff),
+    (Key::D, Action::DiffOrDashboard),
     (Key::O, Action::ToggleOutline),
     (Key::Period, Action::ToggleViewer),
     (Key::Q, Action::Quit),
@@ -215,7 +217,6 @@ mod tests {
         // Terminal focused: tab keys yes, panel keys no.
         assert!(Action::NewEditTab.allowed(false, false));
         assert!(Action::GoToTab(2).allowed(false, false));
-        assert!(!Action::ToggleDiff.allowed(false, false));
         assert!(!Action::Comment.allowed(false, false));
         assert!(!Action::FilePicker.allowed(false, false));
         // Viewer focused: panel keys yes, tab keys no — except ⌘H/⌘L (files ↔ code).
@@ -230,7 +231,7 @@ mod tests {
         assert!(Action::FilePicker.allowed(true, true) && !Action::FilePicker.allowed(true, false));
         // Global keys work everywhere.
         for (side, viewer) in [(false, false), (true, true), (true, false)] {
-            for a in [Action::NewWorkspace, Action::NextWorkspace, Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::FocusLeft, Action::FocusRight, Action::ToggleFocus, Action::ToggleViewer, Action::Quit] {
+            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::FocusLeft, Action::FocusRight, Action::ToggleFocus, Action::ToggleViewer, Action::Quit] {
                 assert!(a.allowed(side, viewer), "{a:?}");
             }
         }

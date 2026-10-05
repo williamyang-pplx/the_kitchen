@@ -36,10 +36,11 @@ Run commands from **⌘⇧P** (command palette), their keys, or
 
 Examples in the repo's `plugins/`: `ruff` (Python lint), `python` (`gd`/`gr`
 via the ty language server), `github` (PR links in ⌘I, PR review comments),
-`todo` (highlights), `hello` (commands, keys, jobs), `prune-worktrees` (a timer
-from `kitchen.spawn`; removes edit and PR review worktrees of merged/closed
-PRs). `install.sh` links `ruff`, `python`, `todo`, `github` and
-`prune-worktrees` into `~/.kitchen/plugins/`.
+`todo` (highlights), `hello` (commands, keys, jobs), `prune-worktrees` (a
+`kitchen.every` timer; removes edit and PR review worktrees of merged/closed
+PRs) and `dashboard` (worktrees, disk and RAM on the dashboard). `install.sh`
+links `ruff`, `python`, `todo`, `github`, `prune-worktrees` and `dashboard`
+into `~/.kitchen/plugins/`.
 
 ## Configuration
 
@@ -54,9 +55,10 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 5)
+## API (level 6)
 
-Level 5 added `kitchen.link` (see "Links"). Level 4 added `kitchen.comments`, the `comment` event and
+Level 6 added `kitchen.every`, `kitchen.dashboard` and the `dashboard` event
+(see "Timers" and "Dashboard"). Level 5 added `kitchen.link` (see "Links"). Level 4 added `kitchen.comments`, the `comment` event and
 `kitchen.workspaces()` (see "Comments"). Level 3 added `kitchen.tab_open` and the `open` event (see "Tabs"). Level 2 added `kitchen.spawn`, `kitchen.provide`, `kitchen.json.null`,
 `kitchen.lsp`, and `ctx.viewer.file` / `word`; `ctx.viewer.col` became a raw
 column. Plugins written for level 1 keep working.
@@ -69,6 +71,7 @@ kitchen.on("file_changed", function(ev) end)  -- …and it changed on disk since
 kitchen.on("startup", function() end)         -- after init.lua ran
 kitchen.on("open", function(ev) end)          -- text typed into ⌘I (see Tabs)
 kitchen.on("comment", function(ev) end)       -- ⌘M … ⌘Enter in the viewer (see Comments)
+kitchen.on("dashboard", function(ev) end)     -- a dashboard was shown / hidden (see Dashboard)
 ```
 
 `ev.file = {host, worktree, path, abs}` identifies the file (pass it back to
@@ -273,6 +276,48 @@ end)
 * `kitchen.workspaces()` returns the workspaces (and their tabs) as in the
   `open` event, e.g. to find the tab a file's worktree belongs to.
 * `plugins/github` uses this for PR review comments (stored on GitHub).
+
+### Timers
+
+```lua
+local t = kitchen.every("pass", 3600, function()
+  return { removed = 3, kept = 40 },          -- stats: name → number | string
+         { [ws_id] = { removed = 1 } }        -- optional, per workspace
+end, { desc = "remove done worktrees", first_delay = 60 })
+t:run()   -- run it now (false while a run is going)
+```
+
+The kitchen runs `fn` every `interval` seconds (the first time after
+`first_delay`, default one interval). It never starts a run while the last
+one is still going, including across a reload, when the old load may still
+be finishing it. Every run is recorded, kept across restarts (so a restart
+doesn't bring the next run forward), and shown on the dashboard: runs, when
+it last fired, how long it took, when it runs next, the error if it failed,
+and the stats `fn` returned. `kitchenctl plugin timers` lists them too. A
+long run may block in `kitchen.run_sync`; that's fine, but it holds up the
+plugin's other callbacks meanwhile.
+
+### Dashboard
+
+⌘D (with the terminal focused), or the small grid at the right end of the
+tab strip, shows the workspace's dashboard in place of the terminal: every
+plugin timer, then the sections plugins set for that workspace.
+
+```lua
+kitchen.dashboard.set(ws_id, {          -- replaces this plugin's sections there
+  { title = "Disk", note = "measured 15:20", rows = {
+      { label = "/System/Volumes/Data", value = "412G / 926G", fraction = 0.44 },
+      { label = "the_kitchen-notifications", value = "1.9G", mark = true },
+  } },
+})
+kitchen.dashboard.clear(ws_id_or_nil)
+kitchen.dashboard.showing()             -- ids of workspaces whose dashboard is on screen
+kitchen.on("dashboard", function(ev) end)  -- ev = { workspace, open }
+```
+
+`fraction` (0–1) draws a bar; `mark` highlights the row. Measure only what's
+on screen: refresh from a timer for `showing()` workspaces, and right away
+on the `dashboard` event. See `plugins/dashboard`.
 
 ### Misc
 

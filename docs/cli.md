@@ -62,6 +62,7 @@ app is not reachable.
 | `worktree list [--status] [-w W]` | `worktree.list` | role (main/edit/readonly), branch, owning tab, dirty with `--status` |
 | `worktree sync-readonly [-w W]` | `worktree.sync_readonly` | fetch + move the read-only worktree to `origin/<default>` |
 | `worktree remove PATH [--force] [-w W]` | `worktree.remove` | refuses the main checkout, worktrees an open tab uses, and dirty ones without `--force` |
+| `plugin timers` | `plugin.timers` | plugin timers (`kitchen.every`): interval, runs, last fired, next due, last error and stats |
 | `viewer open [PATH] [--line N] [--diff] [-t T]` | `viewer.open` | |
 | `plan path` / `open` / `ready` | `plan.path` / `.open` / `.ready` | `ready` reloads the reviewer and notifies William |
 | `plan comments [--all]` | `plan.comments` | open (and sent) comments; `--all` includes resolved |

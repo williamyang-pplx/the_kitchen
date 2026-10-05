@@ -130,6 +130,31 @@ pub fn render(method: &str, v: &Value) -> String {
                 out.push_str("no plugins (put them in ~/.kitchen/plugins/<name>/)\n");
             }
         }
+        "plugin.timers" => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            let ago = |t: &Value| t.as_f64().map(|t| format!("{:.0}s ago", now - t)).unwrap_or_else(|| "never".into());
+            for t in v.as_array().into_iter().flatten() {
+                let next = if t["running"].as_bool() == Some(true) { "running".to_string() } else { format!("next in {:.0}s", (t["next_due"].as_f64().unwrap_or(now) - now).max(0.0)) };
+                out.push_str(&format!(
+                    "{}.{}  every {:.0}s  runs {}  last {}  {}\n",
+                    s(&t["plugin"]),
+                    s(&t["name"]),
+                    t["interval_secs"].as_f64().unwrap_or(0.0),
+                    t["runs"],
+                    ago(&t["last_fired"]),
+                    next
+                ));
+                if let Some(e) = t["last_error"].as_str() {
+                    out.push_str(&format!("    error: {e}\n"));
+                }
+                if t["stats"].is_object() {
+                    out.push_str(&format!("    stats: {}\n", t["stats"]));
+                }
+            }
+            if out.is_empty() {
+                out.push_str("no plugin timers\n");
+            }
+        }
         "worktree.list" => {
             for w in v.as_array().into_iter().flatten() {
                 let role = s(&w["role"]);
