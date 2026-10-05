@@ -233,7 +233,7 @@ impl PlanView {
         let resolved = self.comments.iter().filter(|c| c.state == "resolved").count();
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(RichText::new("PLAN").size(10.5).strong().color(theme::BG).background_color(theme::YELLOW));
+            ui.label(RichText::new("PLAN").font(theme::ui_font_semibold(10.5)).color(theme::BG).background_color(theme::YELLOW));
             let path = self.path.as_deref().map(|p| p.strip_prefix(&format!("{}/", self.worktree)).unwrap_or(p).to_string());
             ui.label(RichText::new(path.unwrap_or_else(|| "—".into())).monospace().size(12.0));
             ui.label(RichText::new(format!("{open} open · {sent} sent · {resolved} resolved")).size(11.0).color(theme::DIM));

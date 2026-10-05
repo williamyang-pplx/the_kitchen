@@ -458,7 +458,7 @@ impl KitchenApp {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(RichText::new("WORKSPACES").font(theme::ui_font(12.0)).color(theme::MUTED).strong());
+            ui.label(RichText::new("WORKSPACES").font(theme::ui_font_semibold(12.0)).color(theme::MUTED));
         });
         ui.add_space(4.0);
         let pinned_count = workspaces.iter().filter(|w| w.row.pinned).count();
@@ -495,7 +495,7 @@ impl KitchenApp {
                 let x = rect.left() + 14.0;
                 let p = ui.painter();
                 let host_color = if ws.host().is_local() { theme::GREEN } else { theme::PURPLE };
-                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_semibold(15.0), if is_sel { theme::BRIGHT } else { theme::TEXT });
+                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_bold(15.0), if is_sel { theme::BRIGHT } else { theme::TEXT });
                 let unread = ws.tabs.iter().any(|t| t.unread);
                 if unread {
                     p.circle_filled(egui::pos2(rect.right() - 16.0, rect.top() + 15.0), 4.0, theme::YELLOW);
@@ -514,7 +514,7 @@ impl KitchenApp {
                 };
                 if !status.is_empty() {
                     let status: String = status.chars().take(40).collect();
-                    p.text(egui::pos2(x, rect.top() + 42.0), egui::Align2::LEFT_TOP, status, theme::ui_font(11.0), color);
+                    p.text(egui::pos2(x, rect.top() + 42.0), egui::Align2::LEFT_TOP, status, theme::ui_font_semibold(11.0), color);
                 }
                 if resp.clicked_by(egui::PointerButton::Primary) {
                     self.engine.select_workspace(&ws.row.id);
@@ -599,7 +599,7 @@ impl KitchenApp {
                 let mut job = egui::text::LayoutJob::default();
                 let fmt = |c: Color32, size: f32| egui::TextFormat { font_id: theme::ui_font(size), color: c, valign: Align::Center, ..Default::default() };
                 job.append(&format!("{} ", i + 1), 0.0, fmt(theme::MUTED, 12.5));
-                job.append(badge, 0.0, fmt(badge_color, 11.5));
+                job.append(badge, 0.0, egui::TextFormat { font_id: theme::ui_font_semibold(11.5), ..fmt(badge_color, 11.5) });
                 job.append(&format!("  {title}"), 0.0, fmt(if is_sel { theme::BRIGHT } else { theme::MUTED }, 14.0));
                 if tab.unread {
                     job.append("  ●", 0.0, fmt(theme::YELLOW, 12.0));
@@ -668,7 +668,7 @@ impl KitchenApp {
                 (Focus::Side, Some(SideKind::Plan)) => "PLAN",
                 (Focus::Side, None) => "TERMINAL",
             };
-            ui.label(RichText::new(focus).size(10.5).strong().color(theme::BG).background_color(theme::ACCENT));
+            ui.label(RichText::new(focus).font(theme::ui_font_semibold(10.5)).color(theme::BG).background_color(theme::ACCENT));
             if let Some(t) = toast {
                 ui.label(RichText::new(t.text).size(11.5).color(if t.error { theme::RED } else { theme::TEXT }));
             }

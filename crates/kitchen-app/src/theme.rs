@@ -47,9 +47,14 @@ pub fn ui_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui".into()))
 }
 
-/// Semibold `ui_font`, for workspace names.
+/// Semibold `ui_font`, for status lines, badges and section headers.
 pub fn ui_font_semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui-semibold".into()))
+}
+
+/// Bold `ui_font`, for workspace names and dialog headings.
+pub fn ui_font_bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("ui-bold".into()))
 }
 
 pub fn install(ctx: &egui::Context) {
@@ -68,7 +73,7 @@ pub fn install(ctx: &egui::Context) {
     }
     let proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let bytes = std::fs::read(UI_FONT).ok();
-    for (family, weight) in [("ui", 400.0), ("ui-semibold", 600.0)] {
+    for (family, weight) in [("ui", 400.0), ("ui-semibold", 600.0), ("ui-bold", 700.0)] {
         let mut list = proportional.clone();
         if let Some(bytes) = &bytes {
             let tweak = FontTweak { coords: VariationCoords::new([(b"opsz", UI_OPSZ), (b"wght", weight)]), ..Default::default() };
@@ -92,5 +97,6 @@ pub fn install(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
         s.interaction.selectable_labels = false;
+        s.text_styles.insert(egui::TextStyle::Heading, ui_font_bold(18.0));
     });
 }
