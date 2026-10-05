@@ -48,7 +48,8 @@ pub struct KitchenApp {
     attach_tx: Sender<(String, anyhow::Result<bool>)>,
     attach_rx: Receiver<(String, anyhow::Result<bool>)>,
     focus: Focus,
-    side: Option<SideKind>,
+    /// The open side panel per tab id; no entry = closed.
+    sides: HashMap<String, SideKind>,
     viewers: HashMap<String, crate::viewer::Viewer>,
     plans: HashMap<String, crate::plan_view::PlanView>,
     dialog: Option<Dialog>,
@@ -84,7 +85,7 @@ impl KitchenApp {
             attach_tx,
             attach_rx,
             focus: Focus::Terminal,
-            side: None,
+            sides: HashMap::new(),
             viewers: HashMap::new(),
             plans: HashMap::new(),
             dialog: None,
@@ -173,13 +174,11 @@ impl KitchenApp {
         for cmd in self.engine.take_ui_commands() {
             match cmd {
                 UiCommand::OpenViewer { tab_id, path, line, diff } => {
-                    self.side = Some(SideKind::Viewer);
-                    self.focus = Focus::Side;
+                    self.open_side_for(&tab_id, SideKind::Viewer);
                     self.panel_command_for(&tab_id, SideKind::Viewer, PanelCmd::Open { path, line, diff });
                 }
                 UiCommand::OpenPlan { tab_id } => {
-                    self.side = Some(SideKind::Plan);
-                    self.focus = Focus::Side;
+                    self.open_side_for(&tab_id, SideKind::Plan);
                     self.panel_command_for(&tab_id, SideKind::Plan, PanelCmd::Reload);
                 }
                 UiCommand::ResetViewer { tab_id } => {
@@ -274,10 +273,10 @@ impl KitchenApp {
                 }
             }
             Action::ToggleFocus => {
-                self.focus = match (self.focus, self.side) {
+                self.focus = match (self.focus, self.side()) {
                     (Focus::Terminal, Some(_)) => Focus::Side,
                     (Focus::Terminal, None) => {
-                        self.side = Some(SideKind::Viewer);
+                        self.set_side(Some(SideKind::Viewer));
                         Focus::Side
                     }
                     (Focus::Side, _) => Focus::Terminal,
@@ -285,14 +284,14 @@ impl KitchenApp {
             }
             Action::FocusLeft => self.focus = Focus::Terminal,
             Action::FocusRight => {
-                if self.side.is_none() {
-                    self.side = Some(SideKind::Viewer);
+                if self.side().is_none() {
+                    self.set_side(Some(SideKind::Viewer));
                 }
                 self.focus = Focus::Side;
             }
             // VS Code's ⌘B: the viewer's file list (opening the viewer if needed).
             Action::ToggleFiles => {
-                if self.side == Some(SideKind::Viewer) {
+                if self.side() == Some(SideKind::Viewer) {
                     self.side_command(PanelCmd::ToggleFiles);
                 } else {
                     self.open_side(SideKind::Viewer, None);
@@ -303,23 +302,23 @@ impl KitchenApp {
             Action::Comment => self.side_command(PanelCmd::Comment),
             Action::Submit => self.side_command(PanelCmd::Submit),
             Action::ToggleDiff => {
-                if self.side.is_none() {
-                    self.side = Some(SideKind::Viewer);
+                if self.side().is_none() {
+                    self.set_side(Some(SideKind::Viewer));
                 }
                 self.focus = Focus::Side;
                 self.side_command(PanelCmd::ToggleDiff);
             }
             Action::ToggleOutline => {
-                if self.side.is_none() {
-                    self.side = Some(SideKind::Viewer);
+                if self.side().is_none() {
+                    self.set_side(Some(SideKind::Viewer));
                 }
                 self.focus = Focus::Side;
                 self.side_command(PanelCmd::ToggleOutline);
             }
             // ⌘.: close whichever side panel is open, else open the file viewer.
             Action::ToggleViewer => {
-                if self.side.is_some() {
-                    self.side = None;
+                if self.side().is_some() {
+                    self.set_side(None);
                     self.focus = Focus::Terminal;
                 } else {
                     self.open_side(SideKind::Viewer, None);
@@ -330,16 +329,16 @@ impl KitchenApp {
 
     /// Open (or, when it is already open and focused, re-trigger) a side panel.
     fn open_side(&mut self, kind: SideKind, cmd_if_focused: Option<PanelCmd>) {
-        if self.side == Some(kind) && self.focus == Focus::Side {
+        if self.side() == Some(kind) && self.focus == Focus::Side {
             if let Some(cmd) = cmd_if_focused {
                 self.side_command(cmd);
             } else {
-                self.side = None;
+                self.set_side(None);
                 self.focus = Focus::Terminal;
             }
             return;
         }
-        self.side = Some(kind);
+        self.set_side(Some(kind));
         self.focus = Focus::Side;
         if kind == SideKind::Plan {
             self.side_command(PanelCmd::Reload);
@@ -349,7 +348,7 @@ impl KitchenApp {
     /// Where plugin chords apply right now.
     fn plugin_context(&self) -> crate::plugins::When {
         use crate::plugins::When;
-        match (self.focus, self.side) {
+        match (self.focus, self.side()) {
             (Focus::Side, Some(SideKind::Viewer)) => When::Viewer,
             (Focus::Side, Some(SideKind::Plan)) => When::Plan,
             _ => When::Terminal,
@@ -358,6 +357,29 @@ impl KitchenApp {
 
     fn selected_tab_id(&self) -> Option<String> {
         self.engine.selected_workspace().and_then(|w| w.selected().map(|t| t.row.id.clone()))
+    }
+
+    /// The side panel open on the selected tab.
+    fn side(&self) -> Option<SideKind> {
+        self.selected_tab_id().and_then(|id| self.sides.get(&id).copied())
+    }
+
+    /// Open `kind` on the selected tab, or close its panel (`None`).
+    fn set_side(&mut self, kind: Option<SideKind>) {
+        let Some(id) = self.selected_tab_id() else { return };
+        match kind {
+            Some(k) => self.sides.insert(id, k),
+            None => self.sides.remove(&id),
+        };
+    }
+
+    /// Open `kind` on `tab_id`; it takes the keyboard only if that tab is
+    /// the selected one.
+    fn open_side_for(&mut self, tab_id: &str, kind: SideKind) {
+        self.sides.insert(tab_id.to_string(), kind);
+        if self.selected_tab_id().as_deref() == Some(tab_id) {
+            self.focus = Focus::Side;
+        }
     }
 
     /// Plugin chords for the focused context (context-specific ones first).
@@ -436,7 +458,7 @@ impl KitchenApp {
                     }
                     Some(PaletteItem::Diagnostics) => {
                         if let Some(tab) = self.selected_tab_id() {
-                            self.side = Some(SideKind::Viewer);
+                            self.set_side(Some(SideKind::Viewer));
                             self.focus = Focus::Side;
                             self.panel_command_for(&tab, SideKind::Viewer, PanelCmd::Diagnostics);
                         }
@@ -448,11 +470,11 @@ impl KitchenApp {
     }
 
     fn viewer_focused(&self) -> bool {
-        self.focus == Focus::Side && self.side == Some(SideKind::Viewer)
+        self.focus == Focus::Side && self.side() == Some(SideKind::Viewer)
     }
 
     fn side_command(&mut self, cmd: PanelCmd) {
-        let Some(kind) = self.side else { return };
+        let Some(kind) = self.side() else { return };
         let Some(tab) = self.engine.selected_workspace().and_then(|w| w.selected().map(|t| t.row.id.clone())) else {
             return;
         };
@@ -658,11 +680,11 @@ impl KitchenApp {
                     (SideKind::Plan, "Plan ⌘⇧I", Action::OpenPlan),
                     (SideKind::Viewer, "Files ⌘.", Action::ToggleFiles),
                 ] {
-                    let on = self.side == Some(kind);
+                    let on = self.side() == Some(kind);
                     let text = RichText::new(label).font(theme::ui_font(11.0)).color(if on { theme::ACCENT } else { theme::MUTED });
                     if ui.add(egui::Button::new(text).frame(false)).clicked_by(egui::PointerButton::Primary) {
                         if on {
-                            self.side = None;
+                            self.set_side(None);
                             self.focus = Focus::Terminal;
                         } else {
                             self.run_action(action);
@@ -680,7 +702,7 @@ impl KitchenApp {
         };
         ui.horizontal_centered(|ui| {
             ui.add_space(8.0);
-            let focus = match (self.focus, self.side) {
+            let focus = match (self.focus, self.side()) {
                 (Focus::Terminal, _) => "TERMINAL",
                 (Focus::Side, Some(SideKind::Viewer)) => "VIEWER",
                 (Focus::Side, Some(SideKind::Plan)) => "PLAN",
@@ -693,7 +715,7 @@ impl KitchenApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new(match (self.focus, self.side) {
+                    RichText::new(match (self.focus, self.side()) {
                         (Focus::Side, Some(SideKind::Viewer)) => "⌘H/L files ↔ code · ⌘J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘D diff · ⌘O outline · ⌥H/L pane",
                         (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘J/K workspace",
                         _ => "⌘H/L or ⌘1-9 tab · ⌘E edit · ⌘I read-only · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
@@ -742,7 +764,7 @@ impl KitchenApp {
 
     fn side_area(&mut self, ui: &mut Ui, ws: &Workspace, tab: Option<&Tab>) {
         let focused = self.focus == Focus::Side && self.dialog.is_none() && self.palette.is_none();
-        let kind = self.side.unwrap_or(SideKind::Viewer);
+        let kind = self.side().unwrap_or(SideKind::Viewer);
         let mut cx = PanelCtx { engine: &self.engine, focused, clicked: false };
         match (kind, tab) {
             (SideKind::Viewer, Some(tab)) => self
@@ -796,6 +818,7 @@ impl KitchenApp {
         self.slots.retain(|id, _| live.contains(id));
         self.viewers.retain(|id, _| live.contains(id));
         self.plans.retain(|id, _| live.contains(id));
+        self.sides.retain(|id, _| live.contains(id));
     }
 }
 
@@ -826,7 +849,7 @@ impl eframe::App for KitchenApp {
             let (reg, chords) = self.plugin_chords();
             for action in keymap::collect(&ctx, &chords) {
                 // Chords belong to the focused pane; out-of-scope ones are swallowed.
-                let side_focused = self.focus == Focus::Side && self.side.is_some();
+                let side_focused = self.focus == Focus::Side && self.side().is_some();
                 if !action.allowed(side_focused, self.viewer_focused()) {
                     continue;
                 }
@@ -844,6 +867,11 @@ impl eframe::App for KitchenApp {
             if self.focus == Focus::Side && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Escape)) {
                 self.focus = Focus::Terminal;
             }
+        }
+        // The selected tab may have changed to one with no panel open;
+        // hand the keyboard back to its terminal.
+        if self.focus == Focus::Side && self.side().is_none() {
+            self.focus = Focus::Terminal;
         }
 
         let ws = self.engine.selected_workspace();
@@ -872,7 +900,7 @@ impl eframe::App for KitchenApp {
                 .show(ui, |ui| self.tab_strip(ui, ws));
         }
         let mut side_rect = None;
-        if self.side.is_some() {
+        if self.side().is_some() {
             // The viewer and plan need a workspace.
             if let Some(ws) = &ws {
                 let width = ui.available_width();
@@ -1030,6 +1058,52 @@ mod tests {
             step(&mut app, vec![egui::Event::Text("g".into())]);
             step(&mut app, vec![egui::Event::Text("g".into())]);
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The side panel belongs to the tab it was opened on: other tabs keep
+    /// theirs closed, and switching to one hands the keyboard back.
+    #[test]
+    fn side_panel_is_per_tab() {
+        let tmp = std::env::temp_dir().join(format!("kt-sides-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let d = tmp.display().to_string();
+        assert!(std::process::Command::new("sh").arg("-c").arg("git init -q -b main && git config user.email t@t && git config user.name t && echo 1 > a && git add . && git commit -qm i").current_dir(&d).status().unwrap().success());
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let db = kitchen_core::db::Db::open_in_memory().unwrap();
+        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
+        db.insert_workspace(&ws).unwrap();
+        for (i, id) in ["t1", "t2"].into_iter().enumerate() {
+            let tab = kitchen_core::db::TabRow { id: id.into(), workspace_id: "w".into(), kind: "readonly".into(), title: id.into(), worktree: d.clone(), branch: None, tmux_session: id.into(), plan_file: None, position: i as i64, diff_base: None };
+            db.insert_tab(&tab).unwrap();
+        }
+        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let mut app = KitchenApp::new(engine.clone());
+        for id in ["t1", "t2"] {
+            let term = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), "cat >/dev/null".into()], None, HashMap::new()).unwrap();
+            app.slots.insert(id.into(), TermSlot::Live(term));
+        }
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut step = |app: &mut KitchenApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        engine.select_tab_index(1);
+        step(&mut app, vec![]);
+        // ⌥L opens the viewer on t1 only.
+        step(&mut app, key(Key::L, Modifiers::ALT));
+        assert_eq!(app.sides.get("t1"), Some(&SideKind::Viewer));
+        assert_eq!(app.focus, Focus::Side);
+        engine.select_tab_index(2);
+        step(&mut app, vec![]);
+        assert_eq!(app.side(), None);
+        assert!(!app.sides.contains_key("t2"));
+        assert_eq!(app.focus, Focus::Terminal);
+        engine.select_tab_index(1);
+        step(&mut app, vec![]);
+        assert_eq!(app.side(), Some(SideKind::Viewer));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
