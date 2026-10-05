@@ -4,7 +4,8 @@
 //!
 //! Chords act on the focused pane only (see [`Action::scope`]): tab keys
 //! (⌘E ⌘I ⌘W ⌘1-9 ⌘H/L) work in the terminal, panel keys (⌘M ⌘D ⌘O ⌘Enter)
-//! in a focused side panel; elsewhere they are swallowed. The rest is global.
+//! in a focused side panel, ⌘P in a focused viewer; elsewhere they are
+//! swallowed. The rest is global.
 //!
 //! | keys        | action                                        |
 //! |-------------|-----------------------------------------------|
@@ -16,7 +17,7 @@
 //! | ⌘I          | new read-only tab (PR link, or empty = main)  |
 //! | ⌘R          | rename the current tab                        |
 //! | ⌘W          | close tab                                     |
-//! | ⌘P          | file viewer (again: file picker)              |
+//! | ⌘P          | fuzzy file picker (focused viewer only)       |
 //! | ⌘B          | show / hide the viewer's file list            |
 //! | ⌘⇧I         | plan reviewer                                 |
 //! | ⌘⇧R         | rename the current workspace                  |
@@ -27,7 +28,7 @@
 //! | ⌘Enter      | submit comment (plan: send comments to agent) |
 //! | ⌘D          | toggle diff / plain file                      |
 //! | ⌘O          | toggle outline (collapsed) mode               |
-//! | ⌘.          | close the side panel                          |
+//! | ⌘.          | open the file viewer / close the side panel   |
 //! | ⌘Q          | quit                                          |
 //! | ⌘C / ⌘V     | copy / paste (handled by the focused widget)  |
 
@@ -44,7 +45,7 @@ pub enum Action {
     NewEditTab,
     NewReadonlyTab,
     CloseTab,
-    OpenViewer,
+    FilePicker,
     ToggleFiles,
     OpenPlan,
     RenameTab,
@@ -57,7 +58,7 @@ pub enum Action {
     Submit,
     ToggleDiff,
     ToggleOutline,
-    CloseSide,
+    ToggleViewer,
     Quit,
     Palette,
     /// A plugin chord: index into the registry snapshot passed to [`collect`].
@@ -78,7 +79,7 @@ impl Action {
     pub fn scope(self) -> Scope {
         match self {
             Action::NewEditTab | Action::NewReadonlyTab | Action::CloseTab | Action::GoToTab(_) | Action::PrevTab | Action::NextTab => Scope::Terminal,
-            Action::Comment | Action::Submit | Action::ToggleDiff | Action::ToggleOutline => Scope::Side,
+            Action::Comment | Action::Submit | Action::ToggleDiff | Action::ToggleOutline | Action::FilePicker => Scope::Side,
             _ => Scope::Global,
         }
     }
@@ -89,7 +90,7 @@ impl Action {
         match self.scope() {
             Scope::Global => true,
             Scope::Terminal => !side_focused || (viewer && matches!(self, Action::PrevTab | Action::NextTab)),
-            Scope::Side => side_focused,
+            Scope::Side => side_focused && (viewer || !matches!(self, Action::FilePicker)),
         }
     }
 }
@@ -109,7 +110,7 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::I, Action::NewReadonlyTab),
     (Key::R, Action::RenameTab),
     (Key::W, Action::CloseTab),
-    (Key::P, Action::OpenViewer),
+    (Key::P, Action::FilePicker),
     (Key::B, Action::ToggleFiles),
     (Key::H, Action::PrevTab),
     (Key::L, Action::NextTab),
@@ -118,7 +119,7 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::Enter, Action::Submit),
     (Key::D, Action::ToggleDiff),
     (Key::O, Action::ToggleOutline),
-    (Key::Period, Action::CloseSide),
+    (Key::Period, Action::ToggleViewer),
     (Key::Q, Action::Quit),
 ];
 
@@ -215,6 +216,7 @@ mod tests {
         assert!(Action::GoToTab(2).allowed(false, false));
         assert!(!Action::ToggleDiff.allowed(false, false));
         assert!(!Action::Comment.allowed(false, false));
+        assert!(!Action::FilePicker.allowed(false, false));
         // Viewer focused: panel keys yes, tab keys no — except ⌘H/⌘L (files ↔ code).
         assert!(!Action::NewEditTab.allowed(true, true));
         assert!(!Action::NewReadonlyTab.allowed(true, true));
@@ -224,9 +226,10 @@ mod tests {
         assert!(Action::ToggleOutline.allowed(true, true));
         // Plan focused: no tab keys at all.
         assert!(!Action::NextTab.allowed(true, false));
+        assert!(Action::FilePicker.allowed(true, true) && !Action::FilePicker.allowed(true, false));
         // Global keys work everywhere.
         for (side, viewer) in [(false, false), (true, true), (true, false)] {
-            for a in [Action::NewWorkspace, Action::NextWorkspace, Action::OpenViewer, Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::FocusLeft, Action::FocusRight, Action::ToggleFocus, Action::CloseSide, Action::Quit] {
+            for a in [Action::NewWorkspace, Action::NextWorkspace, Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::FocusLeft, Action::FocusRight, Action::ToggleFocus, Action::ToggleViewer, Action::Quit] {
                 assert!(a.allowed(side, viewer), "{a:?}");
             }
         }
@@ -292,7 +295,8 @@ mod tests {
         assert_eq!(press(Key::I, Modifiers::COMMAND), vec![Action::NewReadonlyTab]);
         assert_eq!(press(Key::R, Modifiers::COMMAND), vec![Action::RenameTab]);
         assert_eq!(press(Key::P, cmd_shift), vec![Action::Palette]);
-        assert_eq!(press(Key::P, Modifiers::COMMAND), vec![Action::OpenViewer]);
+        assert_eq!(press(Key::P, Modifiers::COMMAND), vec![Action::FilePicker]);
+        assert_eq!(press(Key::Period, Modifiers::COMMAND), vec![Action::ToggleViewer]);
         assert_eq!(press(Key::Num3, Modifiers::COMMAND), vec![Action::GoToTab(3)]);
         assert!(press(Key::H, Modifiers::NONE).is_empty(), "plain keys belong to the terminal/viewer");
     }

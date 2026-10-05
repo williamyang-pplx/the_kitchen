@@ -289,7 +289,7 @@ impl KitchenApp {
                     self.open_side(SideKind::Viewer, None);
                 }
             }
-            Action::OpenViewer => self.open_side(SideKind::Viewer, Some(PanelCmd::FilePicker)),
+            Action::FilePicker => self.side_command(PanelCmd::FilePicker),
             Action::OpenPlan => self.open_side(SideKind::Plan, Some(PanelCmd::Reload)),
             Action::Comment => self.side_command(PanelCmd::Comment),
             Action::Submit => self.side_command(PanelCmd::Submit),
@@ -307,9 +307,14 @@ impl KitchenApp {
                 self.focus = Focus::Side;
                 self.side_command(PanelCmd::ToggleOutline);
             }
-            Action::CloseSide => {
-                self.side = None;
-                self.focus = Focus::Terminal;
+            // ⌘.: close whichever side panel is open, else open the file viewer.
+            Action::ToggleViewer => {
+                if self.side.is_some() {
+                    self.side = None;
+                    self.focus = Focus::Terminal;
+                } else {
+                    self.open_side(SideKind::Viewer, None);
+                }
             }
         }
     }
@@ -633,7 +638,7 @@ impl KitchenApp {
                 ui.add_space(8.0);
                 for (kind, label, action) in [
                     (SideKind::Plan, "Plan ⌘⇧I", Action::OpenPlan),
-                    (SideKind::Viewer, "Files ⌘P", Action::OpenViewer),
+                    (SideKind::Viewer, "Files ⌘.", Action::ToggleFiles),
                 ] {
                     let on = self.side == Some(kind);
                     let text = RichText::new(label).size(11.5).color(if on { theme::ACCENT } else { theme::DIM });
@@ -671,7 +676,7 @@ impl KitchenApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(match (self.focus, self.side) {
-                        (Focus::Side, Some(SideKind::Viewer)) => "⌘H/L files ↔ code · ⌘J/K changed file · ⌘M comment · ⌘B files · ⌘D diff · ⌘O outline · ⌥H/L pane",
+                        (Focus::Side, Some(SideKind::Viewer)) => "⌘H/L files ↔ code · ⌘J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘D diff · ⌘O outline · ⌥H/L pane",
                         (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘J/K workspace",
                         _ => "⌘H/L or ⌘1-9 tab · ⌘E edit · ⌘I read-only · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
                     })

@@ -18,14 +18,14 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   shows its diff against the PR's base (as on GitHub). Re-opening the link
   picks up new pushes. Empty = latest main.
 - File viewer. With changes (a PR tab, or an edit tab after the agent's
-  edits, followed live) ⌘P opens straight on the first changed file's diff,
+  edits, followed live) ⌘. opens straight on the first changed file's diff,
   next to a tree of just the changed files: j/k in the tree, or ⌘J/⌘K and
   `]c`/`[c` in the code, step through them; `a` in the list switches to the
   whole repo, ⌘B hides the list. In PR tabs the PR's review comments show
   under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
   commented line) to the PR on GitHub. Tabs without changes open on a folder view
   (`aster/`, set by `viewer_default_dirs`). Vim
-  navigation (`-` up a folder, Enter opens), an fzf-style ⌘P file finder
+  navigation (`-` up a folder, Enter opens), an fzf-style ⌘P file finder (in the viewer)
   (space-separated terms, smart case), diff/plain mode, jump-to-definition and an
   outline mode with model-written summaries.
 - **Plugins** (neovim-style Lua in `~/.kitchen/plugins/`): commands, keys,
@@ -79,7 +79,7 @@ fall back to text search.
 | ⌘I | new read-only tab: paste a PR link, or empty for latest main |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |
-| ⌘P | file viewer (again: file picker) |
+| ⌘P | fuzzy file picker (in a focused viewer) |
 | ⌘B | show / hide the viewer's file list |
 | ⌘⇧I | plan reviewer |
 | ⌘⇧R | rename the current workspace |
@@ -90,7 +90,7 @@ fall back to text search.
 | ⌘Enter | submit comment (plan: send comments to agent) |
 | ⌘D | toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |
-| ⌘. | close the side panel |
+| ⌘. | open the file viewer; close the side panel if one is open |
 | ⌘C / ⌘V | copy / paste |
 
 ## Layout
