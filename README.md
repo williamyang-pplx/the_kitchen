@@ -8,8 +8,9 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   latest dotfiles from `github.com/williamyang-pplx/dotfiles`, links skills
   from it, and installs `kitchenctl`. Drag workspaces to reorder them;
   right-click → Pin to top keeps one above the rest.
-- **Edit tabs**: one PR each, in a fresh worktree + branch cut from the latest
-  `origin/<default>`. Given a task, the agent starts with `/low-level-plan` and
+- **Edit tabs**: one PR each, in a fresh worktree + branch cut from
+  `origin/<default>` as last fetched (a background fetch every 5 minutes and
+  when ⌘E opens, so ⌘E never waits on the network). Given a task, the agent starts with `/low-level-plan` and
   writes a plan you comment on inline (⌘⇧I).
 - **Read-only tabs**: code review and understanding, on a shared read-only
   worktree kept at the latest `origin/<default>`. ⌘I asks for a PR link

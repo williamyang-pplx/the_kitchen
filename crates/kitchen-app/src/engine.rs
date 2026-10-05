@@ -20,6 +20,10 @@ use kitchen_proto::{Caller, TabInfo, TabKind, WorkspaceInfo};
 use crate::links::Link;
 use crate::settings::Settings;
 
+/// How often each workspace's warmer fetches `origin/<default>` and
+/// fast-forwards its spares (opening the ⌘E dialog also does it once).
+const SPARE_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub row: WorkspaceRow,
@@ -463,7 +467,7 @@ impl Engine {
         if let Host::Ssh(alias) = ws.host() {
             crate::relay::ensure_relay(self, &alias);
         }
-        self.refill_spare(ws_id);
+        self.keep_spares_warm(ws_id);
         let host = ws.host();
         match Repo::new(&host, &ws.row.repo_path).tune() {
             Ok(done) => done.iter().for_each(|d| log::info!("{}: {d}", ws.row.name)),
@@ -473,19 +477,25 @@ impl Engine {
     }
 
     /// Bring the workspace's spare worktrees to `origin/<default>` in the
-    /// background (create missing ones, fast-forward stale ones). Called after
-    /// every fetch of the default branch and whenever a spare was taken over.
-    /// One refresh per repo at a time; a request during one makes it run
-    /// once more when it is done (a spare may have been taken meanwhile).
-    pub fn refill_spare(self: &Arc<Self>, ws_id: &str) {
+    /// background (create missing ones, fast-forward stale ones); `fetch`
+    /// fetches it first, in the same round trip. Called by the workspace's
+    /// warmer, when the ⌘E dialog opens, after other fetches of the default
+    /// branch and whenever a spare was taken over. One refresh per repo at a
+    /// time; a request during one makes it run once more when it is done (a
+    /// spare may have been taken meanwhile), fetching if any request asked to.
+    pub fn refill_spare(self: &Arc<Self>, ws_id: &str, fetch: bool) {
         let Some(ws) = self.workspace(ws_id) else { return };
-        let Some(base) = ws.row.default_branch.clone() else { return };
         let key = format!("spares:{}:{}", ws.row.host, ws.row.repo_path);
-        let again = format!("{key}:again");
+        // Two flags: one plain "again" would lose a fetch asked for while a
+        // refill-only run was going.
+        let (again, again_fetch) = (format!("{key}:again"), format!("{key}:again-fetch"));
         {
             let mut opening = self.opening.lock().unwrap();
             if !opening.insert(key.clone()) {
                 opening.insert(again);
+                if fetch {
+                    opening.insert(again_fetch);
+                }
                 return;
             }
         }
@@ -495,13 +505,48 @@ impl Engine {
             .spawn(move || {
                 let _guard = OpeningGuard { engine: &me, path: key };
                 let host = ws.host();
+                let repo = Repo::new(&host, &ws.row.repo_path);
+                // (no cached default branch: without one the spares would never move)
+                let Some(base) = ws.row.default_branch.clone().or_else(|| repo.default_branch().ok()) else {
+                    log::warn!("{}: spare worktrees: no default branch", ws.row.name);
+                    return;
+                };
+                let mut fetch = fetch;
                 loop {
-                    if let Err(e) = Repo::new(&host, &ws.row.repo_path).ensure_spare_worktree(&base) {
+                    if let Err(e) = repo.ensure_spare_worktree(&base, fetch) {
                         log::warn!("{}: spare worktrees: {e:#}", ws.row.name);
                     }
-                    if !me.opening.lock().unwrap().remove(&again) {
+                    let (more, more_fetch) = {
+                        let mut opening = me.opening.lock().unwrap();
+                        (opening.remove(&again), opening.remove(&again_fetch))
+                    };
+                    if !more && !more_fetch {
                         break;
                     }
+                    fetch = more_fetch;
+                }
+            })
+            .expect("spawn thread");
+    }
+
+    /// Keep the workspace's spares hot so a new edit tab never waits on the
+    /// network: fetch and refresh them now and every [`SPARE_REFRESH`] until
+    /// the workspace is closed. One warmer per workspace; repeat calls do
+    /// nothing.
+    pub fn keep_spares_warm(self: &Arc<Self>, ws_id: &str) {
+        let key = format!("warm:{ws_id}");
+        if !self.opening.lock().unwrap().insert(key.clone()) {
+            return;
+        }
+        let me = self.clone();
+        let ws_id = ws_id.to_string();
+        std::thread::Builder::new()
+            .name("spare warmer".into())
+            .spawn(move || {
+                let _guard = OpeningGuard { engine: &me, path: key };
+                while me.workspace(&ws_id).is_some() {
+                    me.refill_spare(&ws_id, true);
+                    std::thread::sleep(SPARE_REFRESH);
                 }
             })
             .expect("spawn thread");
@@ -684,9 +729,11 @@ impl Engine {
             .unwrap_or_else(|| if kind == TabKind::Edit { "new tab".into() } else { "read-only".into() });
         self.set_pending(ws_id, Some(PendingTab { id: tab_id.clone(), title: pending_title, kind, focus: opts.focus.unwrap_or(true) }));
         let result = (|| -> Result<TabRow> {
-            // Every path below fetches from origin first, so tabs always start
-            // from what is on the remote right now. The common paths (new
-            // branch, read-only main) do it inside a single host round trip.
+            // New-branch edit tabs start from origin/<default> as the spare
+            // warmer last fetched it (at most SPARE_REFRESH old, usually
+            // fresher: opening ⌘E fetches), so they never wait on the network.
+            // Existing-branch and read-only tabs fetch first, read-only main
+            // inside the same host round trip as its checkout.
             let base = match &ws.row.default_branch {
                 Some(b) => b.clone(),
                 None => repo.default_branch()?,
@@ -708,7 +755,7 @@ impl Engine {
                             slug = format!("tab-{tab_id}");
                         }
                         let wt = repo.create_edit_worktree(&base, &settings.branch_prefix, &slug);
-                        self.refill_spare(ws_id);
+                        self.refill_spare(ws_id, false);
                         let wt = wt?;
                         (wt, first)
                     };
@@ -724,7 +771,7 @@ impl Engine {
                     let synced = repo.sync_readonly_worktree_fetching(&path, &rev, &fetch);
                     // The fetch may have moved origin/<default>, and a new rev
                     // worktree may have taken over a spare (even if it failed after).
-                    self.refill_spare(ws_id);
+                    self.refill_spare(ws_id, false);
                     let (wt, _) = synced?;
                     (wt.path, None, opts.title.clone().unwrap_or_else(|| format!("read-only {base}")))
                 }
@@ -851,7 +898,7 @@ impl Engine {
     fn resync_rev_tab(self: &Arc<Self>, ws: &Workspace, tab: &Tab, opts: &NewTab) -> Result<TabRow> {
         let rev = opts.rev.as_deref().unwrap_or_default();
         let (wt, moved) = Repo::new(&ws.host(), &ws.row.repo_path).sync_readonly_worktree_fetching(&tab.row.worktree, rev, &opts.fetch)?;
-        self.refill_spare(&ws.row.id);
+        self.refill_spare(&ws.row.id, false);
         let mut row = tab.row.clone();
         let base_changed = opts.diff_base.is_some() && opts.diff_base != row.diff_base;
         if base_changed {

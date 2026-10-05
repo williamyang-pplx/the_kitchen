@@ -80,6 +80,8 @@ fn startup(engine: &Arc<engine::Engine>) {
         Ok(())
     });
     for ws in engine.workspaces() {
+        // (local workspaces are not bootstrapped at start)
+        engine.keep_spares_warm(&ws.row.id);
         if !ws.host().is_local() {
             let id = ws.row.id.clone();
             engine.spawn("devbox setup", move |e| e.bootstrap_workspace(&id));

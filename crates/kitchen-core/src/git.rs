@@ -216,9 +216,9 @@ echo "KT_MOVED=$moved"
     }
 
     /// New branch `<prefix><slug>` (first free slug: `slug`, `slug-2`, …)
-    /// off freshly fetched `origin/<base>`, checked out in the sibling
-    /// worktree `<repo>-<slug>`, with `.kitchen/` git-excluded. One round
-    /// trip to the host (two when a concurrent fetch held the ref lock).
+    /// off `origin/<base>` as last fetched (the app's spare warmer keeps it
+    /// fresh), checked out in the sibling worktree `<repo>-<slug>`, with
+    /// `.kitchen/` git-excluded. One round trip to the host, no network.
     pub fn create_edit_worktree(&self, base: &str, prefix: &str, slug: &str) -> Result<Worktree> {
         // `<repo>-kitchen-*` names belong to the kitchen (spares, read-only trees).
         let slug = if slug.starts_with("kitchen") { format!("tab-{slug}") } else { slug.to_string() };
@@ -226,8 +226,7 @@ echo "KT_MOVED=$moved"
         let parent = shell_quote(self.parent_dir());
         let name = shell_quote(self.repo_name());
         let script = format!(
-            r#"{fetch} || exit 11
-s={sl}; n=1
+            r#"s={sl}; n=1
 while [ -e {parent}/{name}-"$s" ] || git -C {r} rev-parse --verify --quiet "refs/heads/"{pf}"$s" >/dev/null; do
   n=$((n+1)); s={sl}-$n
 done
@@ -245,18 +244,17 @@ else
   git -C {r} worktree add --quiet --no-track -b {pf}"$s" "$P" origin/{b} || exit 13
 fi
 {exclude}
+echo "KT_TAKEN=$TAKEN"
 {report}"#,
-            fetch = fetch_branch_cmd(&r, base),
             take_spare = take_spare_snippet(&r, &self.spare_paths()),
             exclude = exclude_snippet("\"$P\""),
             report = report_snippet("\"$P\""),
         );
-        let mut out = self.host.sh(&script, None)?;
-        if out.status == 11 {
-            // Another fetch of the same ref (a plugin, a second tab) held its lock.
-            out = self.host.sh(&script, None)?;
+        let out = self.host.sh(&script, None)?.into_result("create edit worktree")?;
+        if out.lines().any(|l| l == "KT_TAKEN=") {
+            log::info!(target: "kitchen::exec", "{}: no free spare, full checkout", self.repo_name());
         }
-        parse_report(&out.into_result("create edit worktree")?)
+        parse_report(&out)
     }
 
     /// The spare worktrees, first preferred: `<repo>-kitchen-spare`,
@@ -271,12 +269,25 @@ fi
     /// missing ones and fast-forward stale ones, so taking one over is pure
     /// ref updates. A spare being refreshed is `git worktree lock`ed, which
     /// makes takeovers skip it. Worktrees on a branch are never touched.
+    /// With `fetch`, `origin/<base>` is fetched first in the same round trip
+    /// (retried once: a concurrent fetch may hold the ref lock); a fetch that
+    /// still fails is logged and the spares go to the local ref anyway. The
+    /// fetch never prompts and gives up on a stalled transfer, so it cannot
+    /// hang the caller's refresh forever.
     /// Slow on big repos and niced; run it in the background, one at a time.
-    pub fn ensure_spare_worktree(&self, base: &str) -> Result<()> {
+    pub fn ensure_spare_worktree(&self, base: &str, fetch: bool) -> Result<()> {
         let (r, b) = (shell_quote(self.path), shell_quote(base));
         let spares: Vec<String> = self.spare_paths().iter().map(|p| shell_quote(p)).collect();
+        let fetch = if fetch {
+            format!(
+                "f() {{ GIT_TERMINAL_PROMPT=0 {NICE} git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 {}; }}\nf || {{ sleep 1; f; }} || echo KT_FETCH_FAILED\n",
+                fetch_branch_cmd(&r, base).trim_start_matches("git ")
+            )
+        } else {
+            String::new()
+        };
         let script = format!(
-            r#"err=
+            r#"{fetch}err=
 for SP in {spares}; do
   if [ ! -e "$SP/.git" ]; then
     [ -e "$SP" ] && continue
@@ -301,7 +312,11 @@ exit ${{err:-0}}"#,
             spares = spares.join(" "),
             reason = REFRESH_LOCK,
         );
-        self.host.sh_ok(&script, None).map(|_| ())
+        let out = self.host.sh_ok(&script, None)?;
+        if out.lines().any(|l| l == "KT_FETCH_FAILED") {
+            log::warn!("{}: fetch of origin/{base} failed; spares left at the local ref", self.repo_name());
+        }
+        Ok(())
     }
 
     /// Toggle write permission on every file and directory under `path`,
@@ -746,7 +761,7 @@ mod tests {
 
         // Spares: two, detached at origin/main. Edit tabs take them in turn
         // (slug collisions get -2, .kitchen/ excluded), then check out fresh.
-        repo.ensure_spare_worktree("main").unwrap();
+        repo.ensure_spare_worktree("main", false).unwrap();
         let spares = repo.spare_paths();
         assert_eq!(spares.len(), SPARE_COUNT);
         assert!(spares.iter().all(|s| exists(&format!("{s}/c.txt"))));
@@ -766,11 +781,11 @@ mod tests {
 
         // Refresh re-creates missing spares and fast-forwards stale ones;
         // a spare someone put on a branch is left alone.
-        repo.ensure_spare_worktree("main").unwrap();
+        repo.ensure_spare_worktree("main", false).unwrap();
         sh(root, "cd origin && echo five > f.txt && git add . && git commit -qm five");
         repo.fetch().unwrap();
         sh(std::path::Path::new(&spares[1]), "git switch -qc mine");
-        repo.ensure_spare_worktree("main").unwrap();
+        repo.ensure_spare_worktree("main", false).unwrap();
         assert!(exists(&format!("{}/f.txt", spares[0])), "stale spare fast-forwarded");
         assert!(!exists(&format!("{}/f.txt", spares[1])), "branch worktree untouched");
         let d = repo.create_edit_worktree("main", "william/", "skip").unwrap();
@@ -783,27 +798,42 @@ mod tests {
         let e = repo.create_edit_worktree("main", "william/", "locked").unwrap();
         assert!(exists(&spares[1]) && exists(&format!("{}/f.txt", e.path)));
         // ...and a stale lock of ours is cleared by the next refresh.
-        repo.ensure_spare_worktree("main").unwrap();
+        repo.ensure_spare_worktree("main", false).unwrap();
         let f = repo.create_edit_worktree("main", "william/", "unlocked").unwrap();
         assert!(exists(&f.path));
         assert!(!exists(&spares[0]) || !exists(&spares[1]), "a spare was taken");
 
         // A spare with a leftover index.lock (a git killed mid-way) isn't
         // taken over; the next refresh clears it.
-        repo.ensure_spare_worktree("main").unwrap();
+        repo.ensure_spare_worktree("main", false).unwrap();
         let lock = |sp: &str| format!("{}/index.lock", repo.git_in(sp, &["rev-parse", "--absolute-git-dir"]).unwrap().trim());
         let l0 = lock(&spares[0]);
         std::fs::write(&l0, "").unwrap();
         let g = repo.create_edit_worktree("main", "william/", "lockfile").unwrap();
         assert!(exists(&spares[0]) && exists(&l0), "spare with index.lock left alone");
         assert!(exists(&g.path));
-        repo.ensure_spare_worktree("main").unwrap();
+        repo.ensure_spare_worktree("main", false).unwrap();
         assert!(!exists(&l0), "refresh cleared the stale index.lock");
         // A spare folder deleted behind git's back is re-created, and the
         // other spare is still refreshed.
         sh(root, &format!("rm -rf {}", shell_quote(&spares[1])));
-        repo.ensure_spare_worktree("main").unwrap();
+        repo.ensure_spare_worktree("main", false).unwrap();
         assert!(spares.iter().all(|s| exists(&format!("{s}/.git"))), "deleted spare re-created");
+
+        // New edit tabs never fetch: a commit on origin reaches them once a
+        // spare refresh fetches it, which brings both spares along.
+        sh(root, "cd origin && echo six > s.txt && git add . && git commit -qm six");
+        let h = repo.create_edit_worktree("main", "william/", "nofetch").unwrap();
+        assert!(!exists(&format!("{}/s.txt", h.path)), "no fetch on the edit-tab path");
+        repo.ensure_spare_worktree("main", true).unwrap();
+        assert!(spares.iter().all(|s| exists(&format!("{s}/s.txt"))), "fetched and fast-forwarded");
+        // A failed fetch still brings the spares to the local origin/main.
+        sh(root, "cd origin && echo seven > v.txt && git add . && git commit -qm seven");
+        repo.fetch().unwrap();
+        sh(root, "git -C repo remote set-url origin file:///nonexistent && cd origin && echo eight > e.txt && git add . && git commit -qm eight");
+        repo.ensure_spare_worktree("main", true).unwrap();
+        assert!(spares.iter().all(|s| exists(&format!("{s}/v.txt")) && !exists(&format!("{s}/e.txt"))), "fetch failure tolerated");
+        sh(root, &format!("git -C repo remote set-url origin {}", shell_quote(&root.join("origin").display().to_string())));
 
         // Read-only sync with a fetch in the same round trip.
         let (ro2, _) = repo.sync_readonly_worktree_fetching(&repo.readonly_path(), "origin/main", &[branch_refspec("main")]).unwrap();
@@ -812,7 +842,7 @@ mod tests {
         // A PR-style ref (refs/pull/N/head on the remote) fetched and checked
         // out in one trip, in a spare when there is one; re-syncing at the
         // same commit does nothing.
-        repo.ensure_spare_worktree("main").unwrap();
+        repo.ensure_spare_worktree("main", false).unwrap();
         sh(root, "cd origin && git checkout -qb pr && echo pr > p.txt && git add . && git commit -qm pr \
                   && git update-ref refs/pull/7/head HEAD && git checkout -q main");
         let pr_path = repo.sibling_path("kitchen-ro-pr-7");

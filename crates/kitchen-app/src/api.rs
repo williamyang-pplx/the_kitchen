@@ -522,7 +522,7 @@ fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) 
             };
             let _held = engine.hold_readonly(&ws)?;
             let wt = repo.sync_readonly_worktree(&repo.readonly_path(), &format!("origin/{base}"))?;
-            engine.refill_spare(&ws_id);
+            engine.refill_spare(&ws_id, false);
             Ok(json!({"path": wt.path, "head": wt.head}))
         }
         "worktree.remove" => {

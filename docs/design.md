@@ -18,8 +18,9 @@ for agent-driven PR work across local repos and Perplexity devboxes.
 - **Workspace** = repo on a host (`local` or ssh alias). Sidebar, ⌘J/⌘K;
   drag to reorder, pinned workspaces (`workspaces.pinned`) sort above the rest.
 - **Tab** = tmux session `kt_<ws>_<tab>` on that host, attached through a pty.
-  - *edit* tab: new worktree `<repo>-<slug>` on branch `william/<slug>` off fresh
-    `origin/<default>` (or an existing branch). With a task, the agent starts with
+  - *edit* tab: new worktree `<repo>-<slug>` on branch `william/<slug>` off
+    `origin/<default>` as last fetched, no fetch of its own (or an existing branch,
+    fetched first). With a task, the agent starts with
     `/low-level-plan` and writes `.kitchen/plan.md`.
   - *read-only* tab: shared detached worktree `<repo>-kitchen-readonly`, re-synced to
     `origin/<default>` (after `git fetch`) whenever a read-only tab opens; directories
@@ -27,8 +28,10 @@ for agent-driven PR work across local repos and Perplexity devboxes.
     agent skips permission prompts (scratch writes to /tmp go through Bash) but has
     no edit tools.
   - *spares*: two detached worktrees `<repo>-kitchen-spare[-2]` kept at
-    `origin/<default>` (refreshed after every fetch of it). A new edit tab or PR
-    worktree takes one over instead of checking out the whole repo.
+    `origin/<default>`: a per-workspace warmer fetches it and fast-forwards them
+    every 5 minutes and when the ⌘E dialog opens (also after every other fetch of
+    it). A new edit tab or PR worktree takes one over instead of checking out the
+    whole repo.
 - `.kitchen/` inside each worktree is git-excluded and holds kitchen files.
 
 ## Threads

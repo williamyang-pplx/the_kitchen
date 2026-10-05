@@ -242,7 +242,9 @@ impl KitchenApp {
             Action::NextTab => engine.cycle_tab(1),
             Action::Quit => self.quit_requested = true,
             Action::NewEditTab => {
-                if ws.is_some() {
+                if let Some(ws) = &ws {
+                    // Fetch and refresh the spares while the name is typed.
+                    engine.refill_spare(&ws.row.id, true);
                     self.dialog = Some(Dialog::new_edit_tab());
                 } else {
                     engine.toast_err("create a workspace first (⌘N)");
