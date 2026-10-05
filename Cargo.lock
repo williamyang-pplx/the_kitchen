@@ -1451,6 +1451,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "flate2",
  "kitchen-proto",
  "kitchen-symbols",
  "log",
