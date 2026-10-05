@@ -5,7 +5,7 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use egui::Color32;
 
 pub const BACKGROUND: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x26);
-pub const FOREGROUND: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
+pub const FOREGROUND: Color32 = Color32::WHITE;
 pub const CURSOR: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
 pub const SELECTION: Color32 = Color32::from_rgb(0x33, 0x46, 0x7c);
 

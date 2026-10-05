@@ -1,18 +1,17 @@
 //! Fonts and colors.
 
-use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Visuals};
+use egui::epaint::text::VariationCoords;
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Visuals};
 
 pub const BG: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x26);
 pub const PANEL: Color32 = Color32::from_rgb(0x16, 0x16, 0x1e);
 pub const SIDEBAR: Color32 = Color32::from_rgb(0x13, 0x13, 0x1a);
 pub const BORDER: Color32 = Color32::from_rgb(0x29, 0x2e, 0x42);
-pub const TEXT: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
+pub const TEXT: Color32 = Color32::WHITE;
 pub const DIM: Color32 = Color32::from_rgb(0x56, 0x5f, 0x89);
 /// Secondary text that still has to be read: ~8:1 against `PANEL`, where
 /// `DIM` is under 3:1.
 pub const MUTED: Color32 = Color32::from_rgb(0xa9, 0xb1, 0xd6);
-/// Text of the selected tab, a step brighter than `TEXT`.
-pub const BRIGHT: Color32 = Color32::from_rgb(0xe6, 0xea, 0xff);
 pub const ACCENT: Color32 = Color32::from_rgb(0x7a, 0xa2, 0xf7);
 pub const GREEN: Color32 = Color32::from_rgb(0x9e, 0xce, 0x6a);
 pub const RED: Color32 = Color32::from_rgb(0xf7, 0x76, 0x8e);
@@ -35,10 +34,25 @@ const FALLBACKS: &[(&str, &str)] = &[
 /// macOS system face (SF Pro) for tab and workspace labels, as in cmux.
 const UI_FONT: &str = "/System/Library/Fonts/SFNS.ttf";
 
+/// SFNS.ttf is variable and defaults to the Display cut (`opsz` 28), whose
+/// tight spacing is meant for headlines. CoreText switches to the Text cut
+/// below 20pt; pin it here since every label is smaller than that.
+const UI_OPSZ: f32 = 17.0;
+
 /// Font for tab and workspace labels: SF Pro, falling back to the
 /// default proportional font when it isn't installed.
 pub fn ui_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui".into()))
+}
+
+/// Semibold `ui_font`, for status lines, badges and section headers.
+pub fn ui_font_semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("ui-semibold".into()))
+}
+
+/// Bold `ui_font`, for workspace names and dialog headings.
+pub fn ui_font_bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("ui-bold".into()))
 }
 
 pub fn install(ctx: &egui::Context) {
@@ -55,12 +69,17 @@ pub fn install(ctx: &egui::Context) {
             }
         }
     }
-    let mut ui = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    if let Ok(bytes) = std::fs::read(UI_FONT) {
-        fonts.font_data.insert("sf-pro".into(), FontData::from_owned(bytes).into());
-        ui.insert(0, "sf-pro".into());
+    let proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let bytes = std::fs::read(UI_FONT).ok();
+    for (family, weight) in [("ui", 400.0), ("ui-semibold", 600.0), ("ui-bold", 700.0)] {
+        let mut list = proportional.clone();
+        if let Some(bytes) = &bytes {
+            let tweak = FontTweak { coords: VariationCoords::new([(b"opsz", UI_OPSZ), (b"wght", weight)]), ..Default::default() };
+            fonts.font_data.insert(family.into(), FontData::from_owned(bytes.clone()).tweak(tweak).into());
+            list.insert(0, family.into());
+        }
+        fonts.families.insert(FontFamily::Name(family.into()), list);
     }
-    fonts.families.insert(FontFamily::Name("ui".into()), ui);
     ctx.set_fonts(fonts);
 
     let mut v = Visuals::dark();
@@ -76,5 +95,6 @@ pub fn install(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
         s.interaction.selectable_labels = false;
+        s.text_styles.insert(egui::TextStyle::Heading, ui_font_bold(18.0));
     });
 }

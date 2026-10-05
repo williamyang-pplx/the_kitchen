@@ -987,7 +987,7 @@ impl Viewer {
                 (_, _, true) => ("DIFF", theme::GREEN),
                 _ => ("FILE", theme::CYAN),
             };
-            ui.label(RichText::new(mode).size(10.5).strong().color(theme::BG).background_color(color));
+            ui.label(RichText::new(mode).font(theme::ui_font_semibold(10.5)).color(theme::BG).background_color(color));
             if self.diff && !self.outline && !self.browsing {
                 let (a, d) = self.doc.changed_count();
                 ui.label(RichText::new(format!("+{a} −{d}")).size(11.0).color(theme::DIM));
@@ -1292,7 +1292,7 @@ impl Viewer {
         egui::ScrollArea::vertical().id_salt(("changes", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("  CHANGED FILES ({})", self.changed.len())).size(10.5).strong().color(theme::DIM));
+                ui.label(RichText::new(format!("  CHANGED FILES ({})", self.changed.len())).font(theme::ui_font_semibold(10.5)).color(theme::DIM));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
                     all = ui.add(egui::Button::new(RichText::new("a: all files").size(10.0).color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary);
@@ -1357,7 +1357,7 @@ impl Viewer {
         egui::ScrollArea::vertical().id_salt(("files", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             if !self.changed.is_empty() {
-                ui.label(RichText::new(format!("  CHANGED FILES ({}) · a: tree", self.changed.len())).size(10.5).strong().color(theme::DIM));
+                ui.label(RichText::new(format!("  CHANGED FILES ({}) · a: tree", self.changed.len())).font(theme::ui_font_semibold(10.5)).color(theme::DIM));
             }
             for (i, c) in self.changed.iter().enumerate() {
                 let open = self.current.as_deref() == Some(c.path.as_str()) && !self.browsing;
@@ -1386,7 +1386,7 @@ impl Viewer {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(8.0);
-                let crumb = |ui: &mut Ui, text: &str| ui.add(egui::Button::new(RichText::new(text).size(10.5).strong().color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary);
+                let crumb = |ui: &mut Ui, text: &str| ui.add(egui::Button::new(RichText::new(text).font(theme::ui_font_semibold(10.5)).color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary);
                 if crumb(ui, "ROOT") {
                     browse = Some(String::new());
                 }
@@ -1634,6 +1634,7 @@ mod tests {
         let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
         run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir aster && echo a > aster/a.rs && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
         let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "edit".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
@@ -1708,6 +1709,7 @@ mod tests {
         let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
         run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p aster/a aster/b && echo 1 > aster/a/x.py && echo 2 > aster/b/y.py && echo 3 > aster/top.py && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
         let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
@@ -1771,6 +1773,7 @@ mod tests {
         run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p src/deep/er && printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n' > src/a.rs && echo gone > old.txt && echo z > z.md && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
         run("printf '1\\nX\\n3\\n4\\n5\\n6\\nY\\n8\\n' > src/a.rs && echo new > src/deep/er/b.rs && git rm -q old.txt && git add . && git commit -qm change");
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
         let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
@@ -1863,6 +1866,7 @@ end)"#,
         run("git init -q -b main && git config user.email t@t && git config user.name t && printf 'a\\nb\\nc\\n' > a.py && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
         run("printf 'a\\nB\\nc\\n' > a.py && git commit -qam change");
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
         let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
@@ -1922,6 +1926,7 @@ end)"#,
         let host = std::env::var("KT_VIEWER_HOST").unwrap_or_else(|_| "local".into());
         let wt = std::env::var("KT_VIEWER_WT").expect("KT_VIEWER_WT");
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host, repo_path: wt.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
         let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: wt, branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
