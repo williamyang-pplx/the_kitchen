@@ -35,8 +35,6 @@ use highlight::Spans;
 use picker::{Picker, PickerResult};
 use vim::{Vim, VimAction};
 
-/// Most definition candidates read per jump (bounds ssh round trips).
-const MAX_DEF_FILES: usize = 20;
 /// Most symbols summarized per model call.
 const MAX_SUMMARY_SYMBOLS: usize = 80;
 /// Tracked-file lists kept by [`tracked_files`] (agi: ~14 MB each).
@@ -84,7 +82,8 @@ enum Msg {
     FilesFailed(String),
     File { path: String, result: Result<FileData, String> },
     Base { path: String, data: BaseData },
-    Defs { name: String, hits: Vec<(String, Symbol)> },
+    /// The text search's answer to nav query `token` (gd and gr).
+    Grep { token: u64, locs: Vec<crate::plugins::Location> },
     Summaries { path: String, map: HashMap<String, String>, error: Option<String> },
     /// Result of a freshness check of `path` (`None`: could not stat).
     Stat { path: String, meta: Option<String> },
@@ -173,7 +172,6 @@ pub struct Viewer {
     summary_pending: HashSet<String>,
     show_files: bool,
     status: Option<(String, bool)>,
-    pending_def: Option<(String, Loc, Vec<(String, Symbol)>)>,
     /// Paths being re-read because they changed on disk.
     reloading: HashSet<String>,
     stat_at: std::time::Instant,
@@ -246,7 +244,6 @@ impl Viewer {
             summary_pending: HashSet::new(),
             show_files: true,
             status: None,
-            pending_def: None,
             reloading: HashSet::new(),
             stat_at: std::time::Instant::now(),
             live: tab.kind() == kitchen_proto::TabKind::Edit,
@@ -443,7 +440,7 @@ impl Viewer {
                     self.bases.insert(path, data);
                     self.doc_key = None;
                 }
-                Msg::Defs { name, hits } => self.finish_defs(&name, hits),
+                Msg::Grep { token, locs } => self.finish_grep(token, locs),
                 Msg::Nav { token, answer } => self.finish_nav(token, answer),
                 Msg::Summaries { path, map, error } => {
                     self.summary_pending.remove(&path);
@@ -581,59 +578,6 @@ impl Viewer {
         self.outline = false;
         self.open(&loc.path.clone(), None, false);
         self.pending_goto = Some((loc.line, loc.col));
-    }
-
-    fn grep_definition(&mut self, name: String) {
-        let Some(here) = self.here() else { return };
-        let local: Vec<(String, Symbol)> = self
-            .files
-            .get(&here.path)
-            .map(|f| f.symbols.iter().filter(|s| s.name == name).map(|s| (here.path.clone(), s.clone())).collect())
-            .unwrap_or_default();
-        // A unique definition in this file (that we're not already on) wins.
-        if local.len() == 1 && local[0].1.line != here.line {
-            let s = &local[0].1;
-            let loc = Loc { path: here.path.clone(), line: s.line, col: s.col };
-            self.record_and_go(loc);
-            return;
-        }
-        self.status = Some((format!("searching for definition of {name}…"), false));
-        self.pending_def = Some((name.clone(), here.clone(), local));
-        let (host, wt, tx, ctx, from) = (self.host.clone(), self.worktree.clone(), self.tx.clone(), self.engine.ctx.clone(), here.path);
-        std::thread::spawn(move || {
-            let hits = search_definitions(&host, &wt, &name, &from);
-            let _ = tx.send(Msg::Defs { name, hits });
-            ctx.request_repaint();
-        });
-    }
-
-    fn finish_defs(&mut self, name: &str, hits: Vec<(String, Symbol)>) {
-        let Some((pending, here, mut all)) = self.pending_def.take() else { return };
-        if pending != name {
-            return;
-        }
-        for h in hits {
-            if !all.iter().any(|(p, s)| *p == h.0 && s.line == h.1.line) {
-                all.push(h);
-            }
-        }
-        // Drop the definition we're standing on.
-        all.retain(|(p, s)| !(p == &here.path && s.line == here.line));
-        match all.len() {
-            0 => self.status = Some((format!("no definition found for {name}"), true)),
-            1 => {
-                self.status = None;
-                let (p, s) = &all[0];
-                let loc = Loc { path: p.clone(), line: s.line, col: s.col };
-                self.record_and_go(loc);
-            }
-            _ => {
-                self.status = None;
-                let locs: Vec<Loc> = all.iter().map(|(p, s)| Loc { path: p.clone(), line: s.line, col: s.col }).collect();
-                let items = all.iter().map(|(p, s)| (format!("{p}:{}", s.line), format!("{} {}", s.kind, s.signature))).collect();
-                self.picker = Some((PickerKind::Defs(locs), Picker::new(format!("definitions of {name}"), items)));
-            }
-        }
     }
 
     fn record_and_go(&mut self, loc: Loc) {
@@ -1084,6 +1028,11 @@ impl Viewer {
         }
         let mut code_ui = body_ui.new_child(egui::UiBuilder::new().max_rect(code_rect));
         let picked = self.picker.as_mut().map(|(_, picker)| picker.ui(&mut code_ui, cx.focused));
+        if matches!(picked, Some(PickerResult::Cancelled | PickerResult::Chosen(_))) && self.provisional_picker() {
+            // The user acted on the text matches: a late provider answer is dropped.
+            self.pending_nav = None;
+            self.status = None;
+        }
         match picked {
             None | Some(PickerResult::Open) => {}
             Some(PickerResult::Cancelled) => self.picker = None,
@@ -1651,61 +1600,9 @@ fn kind_color(kind: &str) -> egui::Color32 {
     }
 }
 
-/// Repo-wide definition search: `git grep` for lines that mention `name`
-/// next to a definition keyword, then parse just those files. Bounded, one
-/// grep plus at most [`MAX_DEF_FILES`] reads — cheap over ssh too.
-fn search_definitions(host: &Host, worktree: &str, name: &str, from: &str) -> Vec<(String, Symbol)> {
-    let Ok(out) = host.run(&["git", "-C", worktree, "grep", "-n", "-I", "-w", "--no-color", "-e", name], None) else {
-        return Vec::new();
-    };
-    let def_re = regex::Regex::new(&format!(
-        r"\b(def|class|fn|func|function|struct|enum|trait|interface|type|const|let|var|impl|mod|module)\b.*\b{}\b",
-        regex::escape(name)
-    ))
-    .expect("valid regex");
-    let mut files: Vec<String> = Vec::new();
-    for line in out.stdout.lines() {
-        let mut parts = line.splitn(3, ':');
-        let (Some(path), Some(_), Some(text)) = (parts.next(), parts.next(), parts.next()) else { continue };
-        if def_re.is_match(text) && !files.iter().any(|f| f == path) {
-            files.push(path.to_string());
-        }
-    }
-    let dir = |p: &str| p.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
-    let from_dir = dir(from);
-    files.sort_by_key(|p| (p != from, dir(p) != from_dir, p.clone()));
-    let mut hits = Vec::new();
-    for path in files.into_iter().take(MAX_DEF_FILES) {
-        let Ok(text) = host.read_file(&format!("{worktree}/{path}")) else { continue };
-        for s in kitchen_symbols::extract(&path, &text) {
-            if s.name == name {
-                hits.push((path.clone(), s));
-            }
-        }
-    }
-    hits
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn repo_wide_definition_search() {
-        let tmp = std::env::temp_dir().join(format!("kt-defs-{}", kitchen_core::util::new_id()));
-        std::fs::create_dir_all(tmp.join("pkg")).unwrap();
-        std::fs::write(tmp.join("pkg/a.py"), "from b import helper\nhelper()\n").unwrap();
-        std::fs::write(tmp.join("pkg/b.py"), "def helper():\n    return 1\n").unwrap();
-        std::fs::write(tmp.join("c.rs"), "fn helper() {}\n").unwrap();
-        let d = tmp.display().to_string();
-        let run = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&d).args(args).status().unwrap().success());
-        run(&["init", "-q"]);
-        run(&["add", "."]);
-        let hits = search_definitions(&Host::Local, &d, "helper", "pkg/a.py");
-        let found: Vec<(String, usize)> = hits.iter().map(|(p, s)| (p.clone(), s.line)).collect();
-        assert_eq!(found, vec![("pkg/b.py".to_string(), 1), ("c.rs".to_string(), 1)]);
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
 
     fn paths(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

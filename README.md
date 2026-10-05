@@ -68,7 +68,7 @@ Every app shortcut is ⌘+key, and acts on the focused pane: tab keys (⌘E ⌘I
 ⌘Enter) only in a focused side panel; the rest are global. Terminals get all other keys; the viewer uses vim
 keys (`gd` definition, `gr` references, `Ctrl-o` back, `]d` next diagnostic, …).
 `gd`/`gr` ask a plugin's language server when there is one (Python: ty) and
-fall back to text search.
+fall back to text search; a slow one (over 0.4s) shows the text matches until it answers.
 
 | keys | action |
 |---|---|

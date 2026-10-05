@@ -119,10 +119,15 @@ local function request(c, method, params, cb)
   local id = c.next_id
   c.pending[id] = cb
   local msg = { id = id, method = method, params = params }
-  if c.ready or method == "initialize" then
+  local sent = c.ready or method == "initialize"
+  if sent then
     send(c, msg)
   else
     table.insert(c.queue, msg)
+  end
+  -- Log stamps are in ms: with "-> N result(s)" they time the server.
+  if method == "textDocument/definition" or method == "textDocument/references" then
+    kitchen.log(string.format("%s #%d %s", method:gsub("^textDocument/", ""), id, sent and "sent" or "queued until the server is ready"))
   end
 end
 
@@ -288,6 +293,7 @@ local function start(s, host, root, realwt)
     for _, m in ipairs(queued) do
       send(c, m)
     end
+    kitchen.log(string.format("%s: ready (%s), %d queued message(s) sent", s.name, c.root, #queued))
   end)
   return c
 end
@@ -324,6 +330,7 @@ echo "$d"; (cd "$wt" 2>/dev/null && pwd -P) || echo "$wt"]]
       root, realwt = file.worktree, file.worktree
     end
     s.roots[key] = { root = root, realwt = realwt }
+    kitchen.log(string.format("%s: project root of %s is %s", s.name, dir, root))
     local waiting = s.waiting[key]
     s.waiting[key] = nil
     for _, f in ipairs(waiting) do

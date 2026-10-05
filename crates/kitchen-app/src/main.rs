@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 fn main() -> eframe::Result {
     kitchen_core::host::augment_local_path();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp_millis().init();
     let db_path = kitchen_proto::state_dir().join("kitchen.db");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
