@@ -495,7 +495,7 @@ impl KitchenApp {
                 let x = rect.left() + 14.0;
                 let p = ui.painter();
                 let host_color = if ws.host().is_local() { theme::GREEN } else { theme::PURPLE };
-                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font(15.0), if is_sel { theme::BRIGHT } else { theme::TEXT });
+                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_semibold(15.0), if is_sel { theme::BRIGHT } else { theme::TEXT });
                 let unread = ws.tabs.iter().any(|t| t.unread);
                 if unread {
                     p.circle_filled(egui::pos2(rect.right() - 16.0, rect.top() + 15.0), 4.0, theme::YELLOW);

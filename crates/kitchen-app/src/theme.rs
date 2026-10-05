@@ -1,6 +1,7 @@
 //! Fonts and colors.
 
-use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Visuals};
+use egui::epaint::text::VariationCoords;
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Visuals};
 
 pub const BG: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x26);
 pub const PANEL: Color32 = Color32::from_rgb(0x16, 0x16, 0x1e);
@@ -35,10 +36,20 @@ const FALLBACKS: &[(&str, &str)] = &[
 /// macOS system face (SF Pro) for tab and workspace labels, as in cmux.
 const UI_FONT: &str = "/System/Library/Fonts/SFNS.ttf";
 
+/// SFNS.ttf is variable and defaults to the Display cut (`opsz` 28), whose
+/// tight spacing is meant for headlines. CoreText switches to the Text cut
+/// below 20pt; pin it here since every label is smaller than that.
+const UI_OPSZ: f32 = 17.0;
+
 /// Font for tab and workspace labels: SF Pro, falling back to the
 /// default proportional font when it isn't installed.
 pub fn ui_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui".into()))
+}
+
+/// Semibold `ui_font`, for workspace names.
+pub fn ui_font_semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("ui-semibold".into()))
 }
 
 pub fn install(ctx: &egui::Context) {
@@ -55,12 +66,17 @@ pub fn install(ctx: &egui::Context) {
             }
         }
     }
-    let mut ui = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    if let Ok(bytes) = std::fs::read(UI_FONT) {
-        fonts.font_data.insert("sf-pro".into(), FontData::from_owned(bytes).into());
-        ui.insert(0, "sf-pro".into());
+    let proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let bytes = std::fs::read(UI_FONT).ok();
+    for (family, weight) in [("ui", 400.0), ("ui-semibold", 600.0)] {
+        let mut list = proportional.clone();
+        if let Some(bytes) = &bytes {
+            let tweak = FontTweak { coords: VariationCoords::new([(b"opsz", UI_OPSZ), (b"wght", weight)]), ..Default::default() };
+            fonts.font_data.insert(family.into(), FontData::from_owned(bytes.clone()).tweak(tweak).into());
+            list.insert(0, family.into());
+        }
+        fonts.families.insert(FontFamily::Name(family.into()), list);
     }
-    fonts.families.insert(FontFamily::Name("ui".into()), ui);
     ctx.set_fonts(fonts);
 
     let mut v = Visuals::dark();
