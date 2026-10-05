@@ -423,6 +423,20 @@ true"#
         Ok(text.split('\0').filter(|p| !p.is_empty()).map(String::from).collect())
     }
 
+    /// Files of worktree `dir` (tracked, and untracked but not ignored) in a
+    /// folder of `dir` whose path ends with `suffix` on whole components
+    /// (`a.md` matches `docs/a.md`, not `docs/xa.md` or the root's `a.md`),
+    /// relative to `dir`. Matched in the index, so tracked folders are not
+    /// walked; the untracked scan costs ~0.5 s on agi.
+    pub fn find_by_suffix(&self, dir: &str, suffix: &str) -> Result<Vec<String>> {
+        let pattern = format!("*/{suffix}");
+        let out = self.git_in(dir, &["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", &pattern])?;
+        let mut files: Vec<String> = out.split('\0').filter(|p| !p.is_empty()).map(String::from).collect();
+        // An unmerged path is listed once per stage.
+        files.dedup();
+        Ok(files)
+    }
+
     /// File content at `rev` (`None` when the path does not exist there).
     pub fn show(&self, dir: &str, rev: &str, path: &str) -> Result<Option<String>> {
         let spec = format!("{rev}:{path}");
@@ -682,6 +696,15 @@ mod tests {
         let l = repo.listing(&dir, "origin/main", false).unwrap();
         assert_eq!(l.changed.len(), 1, "untracked files skipped: {:?}", l.changed);
         assert_eq!(repo.tracked_files(&dir).unwrap(), vec!["aster/src/a.rs", "aster/ünï cødé.md", "top.md"]);
+        for (suffix, want) in [
+            ("a.rs", vec!["aster/src/a.rs"]),
+            ("src/a.rs", vec!["aster/src/a.rs"]),
+            ("rc/a.rs", vec![]),
+            ("sp ace.rs", vec!["aster/sp ace.rs"]),
+            ("top.md", vec![]),
+        ] {
+            assert_eq!(repo.find_by_suffix(&dir, suffix).unwrap(), want, "suffix={suffix:?}");
+        }
     }
 
     #[test]

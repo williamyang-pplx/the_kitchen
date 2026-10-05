@@ -857,10 +857,19 @@ impl Engine {
                     engine.push_ui(UiCommand::OpenViewer { tab_id, path: Some(format!("{path}/")), line: None, diff: None });
                     return Ok(());
                 }
-                if !host.exists(path) {
+                // A relative path not under the worktree root: the worktree's
+                // file whose path ends with it, nearest the root.
+                let path = if host.exists(path) {
+                    path.to_string()
+                } else if is_searchable(&f.path) {
+                    let wt = tab.row.worktree.trim_end_matches('/');
+                    let matches = Repo::new(&host, wt).find_by_suffix(wt, f.path.trim_start_matches("./"))?;
+                    let m = closest(&matches).with_context(|| format!("no such file {}", f.path))?;
+                    format!("{wt}/{m}")
+                } else {
                     bail!("no such file {path}");
-                }
-                engine.push_ui(UiCommand::OpenViewer { tab_id, path: Some(path.to_string()), line: f.line, diff: None });
+                };
+                engine.push_ui(UiCommand::OpenViewer { tab_id, path: Some(path), line: f.line, diff: None });
                 Ok(())
             }),
             // Opened on this Mac, devbox tabs included.
@@ -1139,6 +1148,17 @@ fn file_link_path(host: &Host, worktree: &str, path: &str) -> Result<String> {
     Ok(format!("{worktree}/{}", path.trim_start_matches("./")))
 }
 
+/// A printed path worth searching the worktree for: relative, not `~/` or
+/// `../` (those name one place), not a folder.
+fn is_searchable(path: &str) -> bool {
+    !path.starts_with(['/', '~']) && !path.starts_with("../") && !path.ends_with('/')
+}
+
+/// The match nearest the worktree root: fewest components, then by name.
+fn closest(matches: &[String]) -> Option<&String> {
+    matches.iter().min_by_key(|m| (m.matches('/').count(), m.as_str()))
+}
+
 fn agent_settings_json(plans: bool) -> String {
     let hook = |title: &str| {
         serde_json::json!([{ "hooks": [{ "type": "command",
@@ -1208,6 +1228,19 @@ mod tests {
             ("~/x.lua", format!("{home}/x.lua")),
         ] {
             assert_eq!(file_link_path(&Host::Local, wt, path).unwrap(), want, "path={path:?}");
+        }
+    }
+
+    #[test]
+    fn link_search() {
+        let paths = |ps: &[&str]| ps.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(closest(&paths(&["a/b/x.md", "z/x.md", "c/x.md"])).unwrap(), "c/x.md");
+        assert_eq!(closest(&[]), None);
+        for p in ["x.md", "./a/x.md", "a/x.md"] {
+            assert!(is_searchable(p), "{p:?}");
+        }
+        for p in ["/a/x", "~/x", "../x", "dir/"] {
+            assert!(!is_searchable(p), "{p:?}");
         }
     }
 

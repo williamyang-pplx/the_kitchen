@@ -79,7 +79,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘H / ⌘L | previous / next tab; in a focused viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
 | ⌘E | new edit (read/write) tab — own worktree |
 | ⌘I | new read-only tab: paste a PR link, or empty for latest main |
-| ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`), or a URL in the browser; plugins add more with `kitchen.link` |
+| ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |
 | ⌘P | fuzzy file picker (in a focused viewer) |
