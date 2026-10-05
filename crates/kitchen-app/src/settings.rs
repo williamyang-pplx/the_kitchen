@@ -9,7 +9,8 @@ pub struct Settings {
     pub branch_prefix: String,
     /// Agent started in a new edit tab (the planning prompt is appended).
     pub edit_agent_command: String,
-    /// Agent started in a new read-only tab. Plan mode + no edit tools.
+    /// Agent started in a new read-only tab. Skips permission prompts (so it can
+    /// write scratch scripts to /tmp through Bash) but has no edit tools.
     pub readonly_agent_command: String,
     pub autostart_readonly_agent: bool,
     /// Local dotfiles checkout; skills are symlinked from here.
@@ -34,7 +35,7 @@ impl Default for Settings {
         Self {
             branch_prefix: "william/".into(),
             edit_agent_command: "claude".into(),
-            readonly_agent_command: "claude --permission-mode plan --disallowedTools Edit,Write,NotebookEdit".into(),
+            readonly_agent_command: "claude --dangerously-skip-permissions --disallowedTools Edit,Write,NotebookEdit".into(),
             autostart_readonly_agent: true,
             dotfiles_local: format!("{home}/Documents/dotfiles"),
             dotfiles_remote_url: "https://github.com/williamyang-pplx/dotfiles".into(),
