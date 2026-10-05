@@ -474,13 +474,19 @@ impl Engine {
     /// Bring the workspace's spare worktrees to `origin/<default>` in the
     /// background (create missing ones, fast-forward stale ones). Called after
     /// every fetch of the default branch and whenever a spare was taken over.
-    /// One refresh per repo at a time; a request during one is dropped.
+    /// One refresh per repo at a time; a request during one makes it run
+    /// once more when it is done (a spare may have been taken meanwhile).
     pub fn refill_spare(self: &Arc<Self>, ws_id: &str) {
         let Some(ws) = self.workspace(ws_id) else { return };
         let Some(base) = ws.row.default_branch.clone() else { return };
         let key = format!("spares:{}:{}", ws.row.host, ws.row.repo_path);
-        if !self.opening.lock().unwrap().insert(key.clone()) {
-            return;
+        let again = format!("{key}:again");
+        {
+            let mut opening = self.opening.lock().unwrap();
+            if !opening.insert(key.clone()) {
+                opening.insert(again);
+                return;
+            }
         }
         let me = self.clone();
         std::thread::Builder::new()
@@ -488,19 +494,29 @@ impl Engine {
             .spawn(move || {
                 let _guard = OpeningGuard { engine: &me, path: key };
                 let host = ws.host();
-                if let Err(e) = Repo::new(&host, &ws.row.repo_path).ensure_spare_worktree(&base) {
-                    log::warn!("{}: spare worktrees: {e:#}", ws.row.name);
+                loop {
+                    if let Err(e) = Repo::new(&host, &ws.row.repo_path).ensure_spare_worktree(&base) {
+                        log::warn!("{}: spare worktrees: {e:#}", ws.row.name);
+                    }
+                    if !me.opening.lock().unwrap().remove(&again) {
+                        break;
+                    }
                 }
             })
             .expect("spawn thread");
     }
 
     /// Hold the workspace's shared read-only worktree while it is synced (a
-    /// second sync at the same time would fight over its index and modes).
+    /// second sync at the same time would fight over its index and modes);
+    /// waits for one in progress, which usually leaves nothing to do.
     pub fn hold_readonly(&self, ws: &Workspace) -> Result<impl Drop + '_> {
         let path = Repo::new(&ws.host(), &ws.row.repo_path).readonly_path();
-        if !self.opening.lock().unwrap().insert(path.clone()) {
-            bail!("the read-only worktree is being synced; try again in a moment");
+        let start = std::time::Instant::now();
+        while !self.opening.lock().unwrap().insert(path.clone()) {
+            if start.elapsed() > std::time::Duration::from_secs(300) {
+                bail!("the read-only worktree has been syncing for 5 minutes; try again later");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         Ok(OpeningGuard { engine: self, path })
     }
@@ -690,8 +706,9 @@ impl Engine {
                         if slug.is_empty() {
                             slug = format!("tab-{tab_id}");
                         }
-                        let wt = repo.create_edit_worktree(&base, &settings.branch_prefix, &slug)?;
+                        let wt = repo.create_edit_worktree(&base, &settings.branch_prefix, &slug);
                         self.refill_spare(ws_id);
+                        let wt = wt?;
                         (wt, first)
                     };
                     (wt.path.clone(), wt.branch.clone(), title)
@@ -703,10 +720,11 @@ impl Engine {
                     };
                     // (rev worktrees are held by `_guard` above)
                     let _shared = if rev_path.is_none() { Some(self.hold_readonly(&ws)?) } else { None };
-                    let (wt, _) = repo.sync_readonly_worktree_fetching(&path, &rev, &fetch)?;
+                    let synced = repo.sync_readonly_worktree_fetching(&path, &rev, &fetch);
                     // The fetch may have moved origin/<default>, and a new rev
-                    // worktree may have taken over a spare.
+                    // worktree may have taken over a spare (even if it failed after).
                     self.refill_spare(ws_id);
+                    let (wt, _) = synced?;
                     (wt.path, None, opts.title.clone().unwrap_or_else(|| format!("read-only {base}")))
                 }
             };
