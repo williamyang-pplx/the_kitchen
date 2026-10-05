@@ -130,8 +130,8 @@ impl Viewer {
         });
     }
 
-    /// Edit tabs: every few seconds fingerprint the worktree (HEAD + status,
-    /// one cheap round trip); a change re-reads the file list quietly.
+    /// Edit tabs: every few seconds re-list the changes quietly (one small
+    /// round trip; the file list is only re-sent when they or HEAD moved).
     pub(super) fn check_changes(&mut self) {
         if !self.live || self.changes_pending || self.changes_at.elapsed() < STAT_EVERY {
             if self.live && !self.changes_pending {
@@ -140,14 +140,7 @@ impl Viewer {
             return;
         }
         self.changes_at = Instant::now();
-        self.changes_pending = true;
-        let (host, wt, tx, ctx) = (self.host.clone(), self.worktree.clone(), self.tx.clone(), self.engine.ctx.clone());
-        std::thread::spawn(move || {
-            let script = format!("cd {} && {{ git rev-parse HEAD; git status --porcelain -z; }} 2>&1 | cksum", shell_quote(&wt));
-            let f = host.sh_ok(&script, None).map(|s| s.trim().to_string()).unwrap_or_default();
-            let _ = tx.send(Msg::Changes(f));
-            ctx.request_repaint();
-        });
+        self.load_file_list(true);
     }
 
     /// Rebuild the overlay when the file's decorations or text changed.

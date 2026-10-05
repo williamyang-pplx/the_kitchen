@@ -37,6 +37,17 @@ fn plugin_files(sub: &str, ext: &str) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Build the grammars and theme on a thread, so the first file opened
+/// doesn't wait for them. Call after [`set_extra_syntax_dirs`]: the set is
+/// built once, with whatever folders are known then.
+pub fn warm() {
+    std::thread::spawn(|| {
+        let start = std::time::Instant::now();
+        let _ = (syntaxes(), theme());
+        log::debug!(target: "kitchen::viewer", "{:.0}ms highlighter ready", start.elapsed().as_secs_f64() * 1000.0);
+    });
+}
+
 fn syntaxes() -> &'static SyntaxSet {
     static S: OnceLock<SyntaxSet> = OnceLock::new();
     S.get_or_init(|| {
@@ -117,9 +128,11 @@ pub fn highlight(path: &str, text: &str) -> Option<Spans> {
             _ => None,
         })
         .or_else(|| ss.find_syntax_by_first_line(first))?;
-    if text.lines().count() > MAX_LINES {
+    let lines = text.lines().count();
+    if lines > MAX_LINES {
         return None;
     }
+    let start = std::time::Instant::now();
     let mut h = HighlightLines::new(syntax, theme());
     let mut out = Vec::new();
     for line in text.lines() {
@@ -137,6 +150,7 @@ pub fn highlight(path: &str, text: &str) -> Option<Spans> {
         }
         out.push(spans);
     }
+    log::debug!(target: "kitchen::viewer", "{:.0}ms highlight {path} ({lines} lines)", start.elapsed().as_secs_f64() * 1000.0);
     Some(out)
 }
 
