@@ -93,6 +93,19 @@ impl Host {
         out.into_result(&format!("[{}] sh -c {script}", self.label()))
     }
 
+    /// [`Host::sh_ok`] with stdout kept as raw bytes (e.g. a gzip stream).
+    pub fn sh_bytes_ok(&self, script: &str, cwd: Option<&str>) -> Result<Vec<u8>> {
+        let argv = ["sh", "-c", script];
+        let mut cmd = self.command(&argv, cwd);
+        let start = std::time::Instant::now();
+        let (status, stdout, stderr) = run_command_raw(&mut cmd, None).with_context(|| format!("[{}] sh -c {script}", self.label()))?;
+        log::debug!(target: "kitchen::exec", "{:>6.0}ms [{}] {} ({} bytes)", start.elapsed().as_secs_f64() * 1000.0, self.label(), script.chars().take(160).collect::<String>(), stdout.len());
+        if status != 0 {
+            bail!("[{}] sh -c {script} failed (exit {status}): {}", self.label(), String::from_utf8_lossy(&stderr).trim());
+        }
+        Ok(stdout)
+    }
+
     pub fn read_file(&self, path: &str) -> Result<String> {
         match self {
             Host::Local => std::fs::read_to_string(path).with_context(|| format!("read {path}")),
@@ -186,6 +199,16 @@ impl Output {
 }
 
 fn run_command(cmd: &mut Command, stdin: Option<&[u8]>) -> Result<Output> {
+    let (status, stdout, stderr) = run_command_raw(cmd, stdin)?;
+    Ok(Output {
+        status,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+/// Exit status, stdout and stderr of `cmd`, as bytes.
+fn run_command_raw(cmd: &mut Command, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>, Vec<u8>)> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     let mut child = cmd.spawn()?;
@@ -198,11 +221,7 @@ fn run_command(cmd: &mut Command, stdin: Option<&[u8]>) -> Result<Output> {
         });
     }
     let out = child.wait_with_output()?;
-    Ok(Output {
-        status: out.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    })
+    Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr))
 }
 
 pub fn ssh_control_dir() -> PathBuf {
@@ -288,6 +307,13 @@ mod tests {
         assert_eq!(out.stdout.trim(), "hi");
         assert_eq!(out.stderr.trim(), "err");
         assert!(Host::Local.run_ok(&["false"], None).is_err());
+    }
+
+    #[test]
+    fn local_bytes() {
+        let out = Host::Local.sh_bytes_ok("printf 'a\\377b'", None).unwrap();
+        assert_eq!(out, b"a\xffb", "non-UTF-8 bytes survive");
+        assert!(Host::Local.sh_bytes_ok("echo no >&2; exit 4", None).unwrap_err().to_string().contains("exit 4"));
     }
 
     #[test]

@@ -463,18 +463,62 @@ impl Engine {
             crate::relay::ensure_relay(self, &alias);
         }
         self.refill_spare(ws_id);
+        let host = ws.host();
+        match Repo::new(&host, &ws.row.repo_path).tune() {
+            Ok(done) => done.iter().for_each(|d| log::info!("{}: {d}", ws.row.name)),
+            Err(e) => log::warn!("{}: repo tuning: {e:#}", ws.row.name),
+        }
         Ok(())
     }
 
-    /// Re-create the workspace's spare worktree in the background (it is
-    /// consumed by every new-branch edit tab).
+    /// Bring the workspace's spare worktrees to `origin/<default>` in the
+    /// background (create missing ones, fast-forward stale ones). Called after
+    /// every fetch of the default branch and whenever a spare was taken over.
+    /// One refresh per repo at a time; a request during one makes it run
+    /// once more when it is done (a spare may have been taken meanwhile).
     pub fn refill_spare(self: &Arc<Self>, ws_id: &str) {
         let Some(ws) = self.workspace(ws_id) else { return };
         let Some(base) = ws.row.default_branch.clone() else { return };
-        self.spawn("spare worktree", move |_| {
-            let host = ws.host();
-            Repo::new(&host, &ws.row.repo_path).ensure_spare_worktree(&base)
-        });
+        let key = format!("spares:{}:{}", ws.row.host, ws.row.repo_path);
+        let again = format!("{key}:again");
+        {
+            let mut opening = self.opening.lock().unwrap();
+            if !opening.insert(key.clone()) {
+                opening.insert(again);
+                return;
+            }
+        }
+        let me = self.clone();
+        std::thread::Builder::new()
+            .name("spare worktrees".into())
+            .spawn(move || {
+                let _guard = OpeningGuard { engine: &me, path: key };
+                let host = ws.host();
+                loop {
+                    if let Err(e) = Repo::new(&host, &ws.row.repo_path).ensure_spare_worktree(&base) {
+                        log::warn!("{}: spare worktrees: {e:#}", ws.row.name);
+                    }
+                    if !me.opening.lock().unwrap().remove(&again) {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn thread");
+    }
+
+    /// Hold the workspace's shared read-only worktree while it is synced (a
+    /// second sync at the same time would fight over its index and modes);
+    /// waits for one in progress, which usually leaves nothing to do.
+    pub fn hold_readonly(&self, ws: &Workspace) -> Result<impl Drop + '_> {
+        let path = Repo::new(&ws.host(), &ws.row.repo_path).readonly_path();
+        let start = std::time::Instant::now();
+        while !self.opening.lock().unwrap().insert(path.clone()) {
+            if start.elapsed() > std::time::Duration::from_secs(300) {
+                bail!("the read-only worktree has been syncing for 5 minutes; try again later");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(OpeningGuard { engine: self, path })
     }
 
     fn set_pending(&self, ws_id: &str, tab: Option<PendingTab>) {
@@ -662,8 +706,9 @@ impl Engine {
                         if slug.is_empty() {
                             slug = format!("tab-{tab_id}");
                         }
-                        let wt = repo.create_edit_worktree(&base, &settings.branch_prefix, &slug)?;
+                        let wt = repo.create_edit_worktree(&base, &settings.branch_prefix, &slug);
                         self.refill_spare(ws_id);
+                        let wt = wt?;
                         (wt, first)
                     };
                     (wt.path.clone(), wt.branch.clone(), title)
@@ -673,7 +718,13 @@ impl Engine {
                         (Some(p), Some(rev)) => (p.clone(), rev.clone(), opts.fetch.clone()),
                         _ => (repo.readonly_path(), format!("origin/{base}"), vec![branch_refspec(&base)]),
                     };
-                    let (wt, _) = repo.sync_readonly_worktree_fetching(&path, &rev, &fetch)?;
+                    // (rev worktrees are held by `_guard` above)
+                    let _shared = if rev_path.is_none() { Some(self.hold_readonly(&ws)?) } else { None };
+                    let synced = repo.sync_readonly_worktree_fetching(&path, &rev, &fetch);
+                    // The fetch may have moved origin/<default>, and a new rev
+                    // worktree may have taken over a spare (even if it failed after).
+                    self.refill_spare(ws_id);
+                    let (wt, _) = synced?;
                     (wt.path, None, opts.title.clone().unwrap_or_else(|| format!("read-only {base}")))
                 }
             };
@@ -752,9 +803,10 @@ impl Engine {
 
     /// Re-open of a rev tab: move its worktree to the (re-fetched) rev, keep
     /// the session, and refresh the viewer if anything changed.
-    fn resync_rev_tab(&self, ws: &Workspace, tab: &Tab, opts: &NewTab) -> Result<TabRow> {
+    fn resync_rev_tab(self: &Arc<Self>, ws: &Workspace, tab: &Tab, opts: &NewTab) -> Result<TabRow> {
         let rev = opts.rev.as_deref().unwrap_or_default();
         let (wt, moved) = Repo::new(&ws.host(), &ws.row.repo_path).sync_readonly_worktree_fetching(&tab.row.worktree, rev, &opts.fetch)?;
+        self.refill_spare(&ws.row.id);
         let mut row = tab.row.clone();
         let base_changed = opts.diff_base.is_some() && opts.diff_base != row.diff_base;
         if base_changed {

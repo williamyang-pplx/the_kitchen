@@ -22,8 +22,12 @@ for agent-driven PR work across local repos and Perplexity devboxes.
     `origin/<default>` (or an existing branch). With a task, the agent starts with
     `/low-level-plan` and writes `.kitchen/plan.md`.
   - *read-only* tab: shared detached worktree `<repo>-kitchen-readonly`, re-synced to
-    `origin/<default>` (after `git fetch`) whenever a read-only tab opens; files are
-    chmod a-w; agent runs in plan mode without edit tools.
+    `origin/<default>` (after `git fetch`) whenever a read-only tab opens; directories
+    are chmod a-w (files are not: chmod bumps ctime and git would re-hash the tree);
+    agent runs in plan mode without edit tools.
+  - *spares*: two detached worktrees `<repo>-kitchen-spare[-2]` kept at
+    `origin/<default>` (refreshed after every fetch of it). A new edit tab or PR
+    worktree takes one over instead of checking out the whole repo.
 - `.kitchen/` inside each worktree is git-excluded and holds kitchen files.
 
 ## Threads

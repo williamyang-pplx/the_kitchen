@@ -13,6 +13,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 blake3 = "1"
 rand = "0.9"
 log = "0.4"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -48,6 +48,7 @@ fn main() -> eframe::Result {
             let home = std::env::var("HOME").unwrap_or_default();
             dirs.extend(engine.settings().plugin_dirs.iter().map(|d| std::path::PathBuf::from(d.replacen('~', &home, 1))));
             engine.set_plugins(plugins::PluginHost::start(&engine, dirs));
+            viewer::highlight::warm(); // after the plugins added their grammars
             startup(&engine);
             Ok(Box::new(app::KitchenApp::new(engine)))
         }),

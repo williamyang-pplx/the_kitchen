@@ -17,11 +17,11 @@ mod plugin_glue;
 pub mod vim;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use egui::{RichText, Ui};
-use kitchen_core::git::{ChangedFile, Repo};
+use kitchen_core::git::{ChangedFile, Listing, Repo};
 use kitchen_core::host::Host;
 use kitchen_core::summaries;
 use kitchen_symbols::Symbol;
@@ -39,6 +39,8 @@ use vim::{Vim, VimAction};
 const MAX_DEF_FILES: usize = 20;
 /// Most symbols summarized per model call.
 const MAX_SUMMARY_SYMBOLS: usize = 80;
+/// Tracked-file lists kept by [`tracked_files`] (agi: ~14 MB each).
+const TREES_KEPT: usize = 4;
 
 struct FileData {
     text: String,
@@ -75,10 +77,10 @@ struct Entry {
 }
 
 enum Msg {
-    /// A file listing; `quiet` = a background refresh (keep the view as is).
-    Files { changed: Vec<ChangedFile>, all: Vec<String>, base: String, quiet: bool },
-    /// Fingerprint of the worktree's HEAD + status (edit tabs).
-    Changes(String),
+    /// HEAD and the changes; `quiet` = a background refresh (keep the view as is).
+    Files { listing: Listing, quiet: bool },
+    /// Every file of the worktree at index checksum `index` (or why it couldn't be listed).
+    Tree { index: String, result: Result<Arc<Vec<String>>, String> },
     FilesFailed(String),
     File { path: String, result: Result<FileData, String> },
     Base { path: String, data: BaseData },
@@ -116,10 +118,15 @@ pub struct Viewer {
     rx: Receiver<Msg>,
 
     changed: Vec<ChangedFile>,
-    all: Vec<String>,
+    /// Every file (tracked, minus deleted, plus changed), sorted.
+    all: Arc<Vec<String>>,
+    /// State of `all` (the changes arrive first and are enough for a diff).
     files_state: Option<Result<(), String>>,
     /// Merge base of HEAD and origin/<default>, for diffs.
     merge_base: Option<String>,
+    /// Index checksum of the last listing, and the one `all` was listed at.
+    index: Option<String>,
+    all_index: Option<String>,
 
     current: Option<String>,
     /// Folder shown in the file list, and in the main area while browsing.
@@ -171,10 +178,9 @@ pub struct Viewer {
     reloading: HashSet<String>,
     stat_at: std::time::Instant,
     stat_pending: bool,
-    /// Edit tab: the agent changes the worktree, so the file list is re-read
-    /// when its HEAD/status fingerprint moves.
+    /// Edit tab: the agent changes the worktree, so the changes are re-listed
+    /// every few seconds (and untracked files count).
     live: bool,
-    changes: Option<String>,
     changes_at: std::time::Instant,
     changes_pending: bool,
     overlay: Option<plugin_glue::OverlayCache>,
@@ -204,9 +210,11 @@ impl Viewer {
             tx,
             rx,
             changed: Vec::new(),
-            all: Vec::new(),
+            all: Arc::default(),
             files_state: None,
             merge_base: None,
+            index: None,
+            all_index: None,
             current: None,
             dir: String::new(),
             browsing: true,
@@ -242,7 +250,6 @@ impl Viewer {
             reloading: HashSet::new(),
             stat_at: std::time::Instant::now(),
             live: tab.kind() == kitchen_proto::TabKind::Edit,
-            changes: None,
             changes_at: std::time::Instant::now(),
             changes_pending: false,
             stat_pending: false,
@@ -261,17 +268,39 @@ impl Viewer {
 
     // ------------------------------------------------------------ loading
 
+    /// List HEAD and the changes, then (unless a quiet re-list found nothing
+    /// new) every file. The changes come first: a diff doesn't wait for a big
+    /// repo's file list.
     fn load_file_list(&mut self, quiet: bool) {
         if !quiet {
             self.files_state = None;
         }
-        let (host, wt, base_ref, tx, ctx) = (self.host.clone(), self.worktree.clone(), self.base_ref.clone(), self.tx.clone(), self.engine.ctx.clone());
+        // Cleared when the listing lands; no re-list starts meanwhile.
+        self.changes_pending = true;
+        // A quiet re-list that finds the same index and changes sends no file
+        // list, unless the last one failed (then it is what recovers).
+        let known = (quiet && matches!(self.files_state, Some(Ok(())))).then(|| (self.all_index.clone(), self.changed.clone()));
+        let (host, wt, base_ref, untracked, tx, ctx) =
+            (self.host.clone(), self.worktree.clone(), self.base_ref.clone(), self.live, self.tx.clone(), self.engine.ctx.clone());
         std::thread::spawn(move || {
-            let result = Repo::new(&host, &wt).listing(&wt, &base_ref).map(|mut l| {
-                changes_tree::sort(&mut l.changed);
-                Msg::Files { changed: l.changed, all: l.all, base: l.base, quiet }
-            });
-            let _ = tx.send(result.unwrap_or_else(|e| Msg::FilesFailed(format!("{e:#}"))));
+            let mut listing = match Repo::new(&host, &wt).listing(&wt, &base_ref, untracked) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(Msg::FilesFailed(format!("{e:#}")));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            changes_tree::sort(&mut listing.changed);
+            let same = known.is_some_and(|(index, changed)| index.as_deref() == Some(listing.index.as_str()) && changed == listing.changed);
+            let (index, changed) = (listing.index.clone(), listing.changed.clone());
+            let _ = tx.send(Msg::Files { listing, quiet });
+            ctx.request_repaint();
+            if same {
+                return;
+            }
+            let result = tracked_files(&host, &wt, &index).map(|t| merge_all(&t, &changed)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Tree { index, result });
             ctx.request_repaint();
         });
     }
@@ -332,51 +361,64 @@ impl Viewer {
     fn poll(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Files { changed, all, base, quiet: true } => {
-                    let base_moved = self.merge_base.as_deref() != Some(base.as_str());
-                    if !base_moved && changed == self.changed && all == self.all {
+                Msg::Files { listing, quiet: true } => {
+                    self.changes_pending = false;
+                    self.index = Some(listing.index);
+                    let base_moved = self.merge_base.as_deref() != Some(listing.base.as_str());
+                    if !base_moved && listing.changed == self.changed {
                         continue;
                     }
                     if base_moved {
                         self.bases.clear();
-                        self.merge_base = Some(base);
+                        self.merge_base = Some(listing.base);
+                        if !self.browsing {
+                            self.doc_key = None;
+                        }
                     }
-                    if self.browsing {
-                        // Rebuild the folder view, cursor on the same entry.
-                        self.select_entry = self.entries.get(self.vim.line).map(|e| e.path.clone());
-                        self.doc_key = None;
-                    } else if base_moved {
-                        self.doc_key = None;
-                    }
-                    self.changed = changed;
-                    self.all = all;
+                    self.changed = listing.changed;
                     // A deleted file may be back.
                     self.files.retain(|_, f| f.meta != DELETED);
                 }
-                Msg::Changes(f) => {
+                Msg::Files { listing, .. } => {
                     self.changes_pending = false;
-                    // The first fingerprint may already include changes made
-                    // after the initial listing, so it re-lists too.
-                    if self.changes.as_ref() != Some(&f) {
-                        self.load_file_list(true);
-                    }
-                    self.changes = Some(f);
-                }
-                Msg::Files { changed, all, base, .. } => {
-                    self.changed = changed;
-                    self.all = all;
-                    self.merge_base = Some(base);
-                    self.files_state = Some(Ok(()));
+                    self.changed = listing.changed;
+                    self.merge_base = Some(listing.base);
+                    self.index = Some(listing.index);
                     self.doc_key = None;
+                    // A diff needs only the changes; an empty list waits for the files.
+                    if !self.changed.is_empty() && !std::mem::replace(&mut self.routed, true) && self.current.is_none() {
+                        self.route();
+                    }
+                    self.refresh_picker_items();
+                }
+                Msg::Tree { index, result } => {
+                    if self.index.as_deref() != Some(index.as_str()) {
+                        continue; // an older listing's
+                    }
+                    match result {
+                        Ok(all) => {
+                            if self.browsing && self.files_state.is_some() && *all != *self.all {
+                                // Rebuild the folder view, cursor on the same entry.
+                                self.select_entry = self.entries.get(self.vim.line).map(|e| e.path.clone());
+                            }
+                            self.all = all;
+                            self.all_index = Some(index);
+                            self.files_state = Some(Ok(()));
+                        }
+                        Err(e) => self.files_state = Some(Err(e)),
+                    }
+                    if self.browsing {
+                        self.doc_key = None;
+                    }
                     if !std::mem::replace(&mut self.routed, true) && self.current.is_none() {
                         self.route();
                     }
-                    if let Some((PickerKind::Files, picker)) = &mut self.picker {
-                        let (items, bonus) = file_items(&self.changed, &self.all, &self.dir);
-                        picker.set_items(items, bonus);
-                    }
+                    self.refresh_picker_items();
                 }
-                Msg::FilesFailed(e) => self.files_state = Some(Err(e)),
+                Msg::FilesFailed(e) => {
+                    self.changes_pending = false;
+                    self.files_state = Some(Err(e));
+                }
                 Msg::File { path, result } => {
                     self.loading.remove(&path);
                     match result {
@@ -775,7 +817,10 @@ impl Viewer {
             d
         } else if self.diff && has_base {
             let base = &self.bases[&path];
-            Doc::diff(base.text.as_deref().unwrap_or(""), &file.text, base.spans.as_deref(), file.spans.as_deref())
+            let start = std::time::Instant::now();
+            let doc = Doc::diff(base.text.as_deref().unwrap_or(""), &file.text, base.spans.as_deref(), file.spans.as_deref());
+            log::debug!(target: "kitchen::viewer", "{:.0}ms diff {path} ({} rows)", start.elapsed().as_secs_f64() * 1000.0, doc.lines.len());
+            doc
         } else {
             Doc::plain(&file.text, file.spans.as_deref())
         };
@@ -948,6 +993,15 @@ impl Viewer {
                     None => self.open_file_picker(),
                 }
             }
+        }
+    }
+
+    /// An open file picker follows the file list.
+    fn refresh_picker_items(&mut self) {
+        if let Some((PickerKind::Files, picker)) = &mut self.picker {
+            let (items, bonus) = file_items(&self.changed, &self.all, &self.dir);
+            picker.set_items(items, bonus);
+            picker.loading = self.files_state.is_none();
         }
     }
 
@@ -1465,6 +1519,47 @@ fn parent_dir(path: &str) -> &str {
 }
 
 /// Rows of folder `dir`: `../`, subfolders, then files (both sorted).
+/// Tracked files of `worktree` while its index checksum is `index`, shared
+/// by every viewer on it (the read-only tabs of a repo share one worktree).
+fn tracked_files(host: &Host, worktree: &str, index: &str) -> anyhow::Result<Arc<Vec<String>>> {
+    type Trees = Mutex<Vec<((Host, String, String), Arc<Vec<String>>)>>;
+    static TREES: OnceLock<Trees> = OnceLock::new();
+    let trees = TREES.get_or_init(Default::default);
+    let key = (host.clone(), worktree.to_string(), index.to_string());
+    if let Some((_, t)) = trees.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+        return Ok(t.clone());
+    }
+    let files = Arc::new(Repo::new(host, worktree).tracked_files(worktree)?);
+    let mut t = trees.lock().unwrap_or_else(|e| e.into_inner());
+    t.retain(|(k, _)| *k != key);
+    t.push((key, files.clone()));
+    let n = t.len();
+    if n > TREES_KEPT {
+        t.drain(..n - TREES_KEPT);
+    }
+    Ok(files)
+}
+
+/// `tracked` without deleted (and renamed-away) paths, plus every other
+/// changed path (new, untracked), sorted. `tracked` itself when that changes
+/// nothing (read-only tabs), so viewers share one list.
+fn merge_all(tracked: &Arc<Vec<String>>, changed: &[ChangedFile]) -> Arc<Vec<String>> {
+    fn gone(c: &ChangedFile) -> impl Iterator<Item = &str> {
+        c.old_path.as_deref().into_iter().chain((c.status == 'D').then_some(c.path.as_str()))
+    }
+    let has = |p: &str| tracked.binary_search_by(|t| t.as_str().cmp(p)).is_ok();
+    let differs = changed.iter().any(|c| gone(c).any(|p| has(p)) || (c.status != 'D' && !has(&c.path)));
+    if !differs {
+        return tracked.clone();
+    }
+    let removed: HashSet<&str> = changed.iter().flat_map(gone).collect();
+    let mut all: Vec<String> = tracked.iter().filter(|p| !removed.contains(p.as_str())).cloned().collect();
+    all.extend(changed.iter().filter(|c| c.status != 'D').map(|c| c.path.clone()));
+    all.sort();
+    all.dedup();
+    Arc::new(all)
+}
+
 fn dir_entries(all: &[String], dir: &str) -> Vec<Entry> {
     let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
     let mut dirs: Vec<&str> = Vec::new();
@@ -1614,6 +1709,85 @@ mod tests {
 
     fn paths(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn cf(path: &str, status: char, old: Option<&str>) -> ChangedFile {
+        ChangedFile { path: path.into(), old_path: old.map(String::from), status, added: 0, removed: 0 }
+    }
+
+    #[test]
+    fn merge_all_tracks_changes() {
+        let tracked = Arc::new(paths(&["a.rs", "b/c.rs", "old.rs"]));
+        // Modified files only: the same list, shared.
+        assert!(Arc::ptr_eq(&merge_all(&tracked, &[cf("a.rs", 'M', None)]), &tracked));
+        assert!(Arc::ptr_eq(&merge_all(&tracked, &[]), &tracked));
+        let all = merge_all(&tracked, &[cf("a.rs", 'D', None), cf("b/new.rs", 'A', None), cf("z.rs", 'R', Some("old.rs"))]);
+        assert_eq!(*all, paths(&["b/c.rs", "b/new.rs", "z.rs"]));
+        // A deleted file that the index already dropped changes nothing.
+        assert!(Arc::ptr_eq(&merge_all(&tracked, &[cf("gone.rs", 'D', None)]), &tracked));
+    }
+
+    /// An edit tab lists once on open, re-lists only the changes while the
+    /// worktree is unchanged, and folds new files into the file list.
+    #[test]
+    fn live_changes_single_listing() {
+        let tmp = std::env::temp_dir().join(format!("kt-live-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let d = tmp.display().to_string();
+        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
+        run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir aster && echo a > aster/a.rs && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
+        let ctx = egui::Context::default();
+        let db = kitchen_core::db::Db::open_in_memory().unwrap();
+        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "edit".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_tab(&tab).unwrap();
+        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let w = engine.workspaces()[0].clone();
+        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
+        let frame = |v: &mut Viewer| {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
+                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
+                v.ui(ui, &mut cx);
+            });
+            out.textures_delta.clear();
+        };
+        let settle = |v: &mut Viewer| {
+            for _ in 0..200 {
+                frame(v);
+                if v.files_state.is_some() && !v.changes_pending {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            frame(v);
+        };
+        settle(&mut v);
+        assert!(v.browsing && v.dir == "aster", "no changes: opens on the default folder");
+        assert!(!v.changes_pending && v.index.is_some());
+        let first = v.all.clone();
+        // Nothing changed: the quiet re-list keeps the very same file list.
+        v.changes_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        frame(&mut v);
+        assert!(v.changes_pending, "a quiet re-list started");
+        settle(&mut v);
+        assert!(Arc::ptr_eq(&first, &v.all), "unchanged worktree: no new file list");
+        // An agent adds a file: it shows up as changed and in the folder.
+        run("echo b > aster/b.rs");
+        v.changes_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        frame(&mut v);
+        settle(&mut v);
+        for _ in 0..100 {
+            if v.all.iter().any(|p| p == "aster/b.rs") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            frame(&mut v);
+        }
+        assert!(v.changed.iter().any(|c| c.path == "aster/b.rs" && c.status == 'A'));
+        assert_eq!(*v.all, paths(&["aster/a.rs", "aster/b.rs"]));
+        assert!(v.entries.iter().any(|e| e.path == "aster/b.rs"), "folder view rebuilt");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

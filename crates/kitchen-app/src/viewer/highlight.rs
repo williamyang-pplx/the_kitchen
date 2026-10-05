@@ -65,6 +65,17 @@ pub fn set_extra_syntax_dirs(dirs: Vec<std::path::PathBuf>) {
     let _ = EXTRA_SYNTAX_DIRS.set(dirs);
 }
 
+/// Build the syntect grammars and theme on a thread, so the first file
+/// opened doesn't wait for them. Call after [`set_extra_syntax_dirs`]: the
+/// set is built once, with whatever folders are known then.
+pub fn warm() {
+    std::thread::spawn(|| {
+        let start = std::time::Instant::now();
+        let _ = (syntaxes(), theme());
+        log::debug!(target: "kitchen::viewer", "{:.0}ms highlighter ready", start.elapsed().as_secs_f64() * 1000.0);
+    });
+}
+
 fn syntaxes() -> &'static SyntaxSet {
     static S: OnceLock<SyntaxSet> = OnceLock::new();
     S.get_or_init(|| {
@@ -187,10 +198,13 @@ fn tree_sitter_highlight(config: &HighlightConfiguration, text: &str) -> Option<
 /// Highlight `text` as the language of `path` (by file name, extension,
 /// then first line).
 pub fn highlight(path: &str, text: &str) -> Option<Spans> {
-    if text.lines().count() > MAX_LINES {
+    let lines = text.lines().count();
+    if lines > MAX_LINES {
         return None;
     }
+    let start = std::time::Instant::now();
     if let Some(spans) = tree_sitter_config(path).and_then(|c| tree_sitter_highlight(c, text)) {
+        log::debug!(target: "kitchen::viewer", "{:.0}ms highlight {path} ({lines} lines, tree-sitter)", start.elapsed().as_secs_f64() * 1000.0);
         return Some(spans);
     }
     let ss = syntaxes();
@@ -218,6 +232,7 @@ pub fn highlight(path: &str, text: &str) -> Option<Spans> {
         }
         out.push(spans);
     }
+    log::debug!(target: "kitchen::viewer", "{:.0}ms highlight {path} ({lines} lines)", start.elapsed().as_secs_f64() * 1000.0);
     Some(out)
 }
 
