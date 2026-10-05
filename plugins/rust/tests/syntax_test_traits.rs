@@ -154,7 +154,7 @@ pub trait RKey = redb::Key + 'static + for<'a> From<<Self as redb::Value>::SelfT
 //        ^^^^ entity.name.trait.rust
 //             ^ keyword.operator.assignment.rust
 //               ^^^^^^^^^ meta.path.rust
-//               ^^^^ variable.other.rust
+//               ^^^^ variable.namespace.rust
 //                   ^^ meta.path.rust punctuation.accessor.rust
 //                     ^^^ storage.type.rust
 //                         ^ keyword.operator.arithmetic.union.rust
@@ -173,7 +173,7 @@ pub trait RKey = redb::Key + 'static + for<'a> From<<Self as redb::Value>::SelfT
 //                                                   ^^^^ storage.type.rust
 //                                                        ^^ keyword.operator.rust
 //                                                           ^^^^^^^^^^^ meta.path.rust
-//                                                           ^^^^ variable.other.rust
+//                                                           ^^^^ variable.namespace.rust
 //                                                               ^^ meta.path.rust punctuation.accessor.rust
 //                                                                 ^^^^^ storage.type.rust
 //                                                                      ^ punctuation.definition.generic.end.rust
@@ -208,7 +208,7 @@ pub trait RKeyBorrowed = RKey + for<'a> Borrow<<Self as redb::Value>::SelfType<'
 //                                              ^^^^ storage.type.rust
 //                                                   ^^ keyword.operator.rust
 //                                                      ^^^^^^^^^^^ meta.path.rust
-//                                                      ^^^^ variable.other.rust
+//                                                      ^^^^ variable.namespace.rust
 //                                                          ^^ meta.path.rust punctuation.accessor.rust
 //                                                            ^^^^^ storage.type.rust
 //                                                                 ^ punctuation.definition.generic.end.rust
@@ -221,3 +221,5 @@ pub trait RKeyBorrowed = RKey + for<'a> Borrow<<Self as redb::Value>::SelfType<'
 //                                                                               ^ punctuation.definition.generic.end.rust
 //                                                                                ^ punctuation.definition.generic.end.rust
 //                                                                                 ^ punctuation.terminator.rust
+
+// kitchen: module path segments assert variable.namespace (upstream: variable.other) on lines 157, 176, 211.

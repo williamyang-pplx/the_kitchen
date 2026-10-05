@@ -1,0 +1,338 @@
+# SYNTAX TEST "Packages/YAML/YAML.sublime-syntax"
+%YAML 1.2
+# <- punctuation.definition.directive.begin.yaml
+#^^^^ keyword.other.directive.yaml
+#     ^^^ constant.numeric
+---
+# <- punctuation.section.document.begin.yaml
+#^^ punctuation.section.document.begin.yaml
+
+# Keys
+key: value
+# <- entity.name.tag.yaml
+#^^ entity.name.tag.yaml
+#  ^ punctuation.separator.key-value.mapping.yaml
+#    ^^^^^ string.unquoted.plain.out.yaml - entity.name.tag
+#    ^^^^^ - invalid
+parent:
+  child: 1
+# ^^^^^ entity.name.tag.yaml
+#        ^ constant.numeric.integer.yaml
+  nested:
+    deep.key/with-chars: x
+#   ^^^^^^^^^^^^^^^^^^^ entity.name.tag.yaml
+#                        ^ string.unquoted - entity.name.tag
+  key with spaces: v
+# ^^^^^^^^^^^^^^^ entity.name.tag.yaml
+
+# Quoted keys
+"double key": 1
+# <- entity.name.tag.yaml punctuation.definition.string.begin.yaml
+#^^^^^^^^^^ string.quoted.double.yaml entity.name.tag.yaml
+#          ^ punctuation.definition.string.end.yaml
+#           ^ punctuation.separator.key-value.mapping.yaml
+'single key': "value"
+# <- string.quoted.single.yaml entity.name.tag.yaml
+#^^^^^^^^^^^ entity.name.tag.yaml
+#             ^^^^^^^ string.quoted.double.yaml - entity.name.tag
+"not a key"
+# <- string.quoted.double.yaml - entity.name.tag
+"with: colon": 'it''s'
+#^^^^^^^^^^^ entity.name.tag.yaml
+#              ^^^^^^^ string.quoted.single.yaml - entity.name.tag
+#                 ^^ constant.character.escape.single-quoted.yaml
+escaped: "a\tb"
+#          ^^ constant.character.escape.double-quoted.yaml
+
+# Keys are keys, whatever they look like
+200: OK
+# <- entity.name.tag.yaml - constant.numeric
+true: yes
+# <- entity.name.tag.yaml - constant.language
+on:
+# <- entity.name.tag.yaml - constant.language
+
+# Booleans (YAML 1.2): only true/false
+a: true
+#  ^^^^ constant.language.boolean.yaml
+b: False
+#  ^^^^^ constant.language.boolean.yaml
+c: yes
+#  ^^^ string.unquoted.plain.out.yaml - constant.language
+d: no
+#  ^^ string.unquoted - constant.language
+e: on
+#  ^^ string.unquoted - constant.language
+f: off
+#  ^^^ string.unquoted - constant.language
+g: y
+#  ^ string.unquoted - constant.language
+h: truthy
+#  ^^^^^^ string.unquoted - constant.language
+
+# Null
+n1: null
+#   ^^^^ constant.language.null.yaml
+n2: ~
+#   ^ constant.language.null.yaml
+n3: nullable
+#   ^^^^^^^^ string.unquoted - constant.language
+
+# Numbers
+i1: 42
+#   ^^ constant.numeric.integer.yaml
+i2: -17
+#   ^^^ constant.numeric.integer.yaml
+i3: 0x1F
+#   ^^^^ constant.numeric.integer.yaml
+i4: 0o17
+#   ^^^^ constant.numeric.integer.yaml
+f1: 3.14
+#   ^^^^ constant.numeric.float.yaml
+f2: 1.5e10
+#   ^^^^^^ constant.numeric.float.yaml
+f3: .inf
+#   ^^^^ constant.numeric.float.yaml
+f4: .NaN
+#   ^^^^ constant.numeric.float.yaml
+v1: 1.2.3
+#   ^^^^^ - constant.numeric.integer
+time: 12:30
+#     ^^^^^ string.unquoted - constant.numeric
+date: 2024-01-15
+#     ^^^^^^^^^^ constant.other.timestamp.yaml
+s1: 42 apples
+#   ^^^^^^^^^ string.unquoted - constant.numeric
+
+# Comments
+# <- comment.line.number-sign.yaml punctuation.definition.comment
+#^^^^^^^^^ comment.line.number-sign.yaml
+k: value # trailing comment
+#  ^^^^^ string.unquoted - comment
+#        ^ comment.line.number-sign.yaml punctuation.definition.comment
+#          ^^^^^^^^ comment.line.number-sign.yaml
+k2: "quoted" # comment
+#            ^^^^^^^^^ comment.line.number-sign.yaml
+k3: 1 # comment
+#   ^ constant.numeric.integer.yaml
+#     ^^^^^^^^^ comment.line.number-sign.yaml
+k4: a#b
+#   ^^^ string.unquoted - comment
+url: http://example.com/#anchor
+#    ^^^^^^^^^^^^^^^^^^^^^^^^^^ string.unquoted - comment
+
+# Anchors, aliases, merge keys
+base: &defaults
+#     ^ punctuation.definition.anchor.yaml
+#      ^^^^^^^^ entity.name.label.anchor.yaml
+  adapter: postgres
+# ^^^^^^^ entity.name.tag.yaml
+dev:
+  <<: *defaults
+# ^^ constant.language.merge.yaml
+#   ^ punctuation.separator.key-value.mapping.yaml
+#     ^ punctuation.definition.alias.yaml
+#      ^^^^^^^^ variable.other.label.alias.yaml
+  database: dev_db
+# ^^^^^^^^ entity.name.tag.yaml
+list:
+  - &item_one one
+#   ^ punctuation.definition.anchor.yaml
+#    ^^^^^^^^ entity.name.label.anchor.yaml
+#             ^^^ string.unquoted
+  - *item_one
+#   ^ punctuation.definition.alias.yaml
+#    ^^^^^^^^ variable.other.label.alias.yaml
+
+# Tags
+tagged: !!str 123
+#       ^^^^^ storage.type.tag-handle.yaml
+custom: !Ref MyBucket
+#       ^^^^ storage.type.tag-handle.yaml
+#            ^^^^^^^^ string.unquoted
+set: !!set
+#    ^^^^^ storage.type.tag-handle.yaml
+  ? a
+# ^ punctuation.definition.key-value.begin.yaml
+
+# Block scalars
+literal: |
+  #      ^ keyword.control.flow.block-scalar.literal.yaml
+  line one
+  # ^^^^^^ string.unquoted.block.yaml
+  key: not a key
+  # <- string.unquoted.block.yaml - entity.name.tag - comment
+    indented more
+
+  after blank line
+  # <- string.unquoted.block.yaml
+folded: >-
+  #     ^ keyword.control.flow.block-scalar.folded.yaml
+  #      ^ storage.modifier.chomping-indicator.yaml
+  folded text
+  # ^^^^^^^^^ string.unquoted.block.yaml
+keep: |+2 # comment
+    # ^ keyword.control.flow.block-scalar.literal.yaml
+    #  ^ storage.modifier.chomping-indicator.yaml
+    #   ^ constant.numeric.indentation-indicator.yaml
+    #     ^^^^^^^^^ comment.line.number-sign.yaml
+    text
+after: block
+# <- entity.name.tag.yaml - string.unquoted.block
+#      ^^^^^ string.unquoted.plain.out.yaml
+
+# Flow collections
+seq: [a, 1, true, "q", *ref]
+#    ^ punctuation.definition.sequence.begin.yaml
+#    ^^^^^^^^^^^^^^^^^^^^^^^ meta.flow-sequence.yaml
+#     ^ string.unquoted.plain.in.yaml
+#      ^ punctuation.separator.sequence.yaml
+#        ^ constant.numeric.integer.yaml
+#           ^^^^ constant.language.boolean.yaml
+#                 ^^^ string.quoted.double.yaml
+#                       ^^^ variable.other.label.alias.yaml
+#                          ^ punctuation.definition.sequence.end.yaml
+map: {name: x, "q k": 2, 'n': null, on: yes}
+#    ^ punctuation.definition.mapping.begin.yaml
+#     ^^^^ entity.name.tag.yaml
+#         ^ punctuation.separator.key-value.mapping.yaml
+#           ^ string.unquoted.plain.in.yaml - entity.name.tag
+#            ^ punctuation.separator.mapping.yaml
+#              ^^^^^ string.quoted.double.yaml entity.name.tag.yaml
+#                     ^ constant.numeric.integer.yaml
+#                        ^^^ string.quoted.single.yaml entity.name.tag.yaml
+#                             ^^^^ constant.language.null.yaml
+#                                   ^^ entity.name.tag.yaml
+#                                       ^^^ string.unquoted - constant.language
+#                                          ^ punctuation.definition.mapping.end.yaml
+json: {"a":1}
+#      ^^^ entity.name.tag.yaml
+nested: [{a: 1}, [b, c]]
+#         ^ entity.name.tag.yaml
+#                 ^ string.unquoted.plain.in.yaml
+...
+# <- punctuation.section.document.end.yaml
+--- # second document
+# <- punctuation.section.document.begin.yaml
+#   ^^^^^^^^^^^^^^^^^ comment.line.number-sign.yaml
+- top
+# <- punctuation.definition.block.sequence.item.yaml
+# ^^^ string.unquoted.plain.out.yaml
+- -1
+# ^^ constant.numeric.integer.yaml
+- key: v
+# ^^^ entity.name.tag.yaml
+---
+not---: a
+# <- entity.name.tag.yaml - punctuation.section.document
+--- !!map
+#   ^^^^^ storage.type.tag-handle.yaml
+
+# GitHub Actions workflow
+---
+name: CI
+# <- entity.name.tag.yaml
+#     ^^ string.unquoted.plain.out.yaml
+on:
+# <- entity.name.tag.yaml
+  push:
+# ^^^^ entity.name.tag.yaml
+    branches: [main, 'release/**']
+#   ^^^^^^^^ entity.name.tag.yaml
+#              ^^^^ string.unquoted.plain.in.yaml
+#                    ^^^^^^^^^^^^ string.quoted.single.yaml
+  pull_request:
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+#   ^^^^^^^ entity.name.tag.yaml
+#            ^^^^^^^^^^^^^^^^ string.unquoted.plain.out.yaml - meta.flow-mapping
+    strategy:
+      fail-fast: false
+#                ^^^^^ constant.language.boolean.yaml
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+#       ^^ entity.name.tag.yaml
+#            ^^^^^^^^^^^^^ string.unquoted.plain.in.yaml
+    steps:
+      - uses: actions/checkout@v4
+#       ^^^^ entity.name.tag.yaml
+#             ^^^^^^^^^^^^^^^^^^^ string.unquoted.plain.out.yaml
+      - name: Run tests
+        if: github.event_name == 'push'
+#       ^^ entity.name.tag.yaml
+        run: |
+          cargo test --all # not a comment
+          # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ string.unquoted.block.yaml - comment
+          echo "done"
+        env:
+#       ^^^ entity.name.tag.yaml - string.unquoted.block
+          RUST_LOG: debug
+#         ^^^^^^^^ entity.name.tag.yaml
+
+# Kubernetes manifest
+---
+apiVersion: apps/v1
+# <- entity.name.tag.yaml
+#           ^^^^^^^ string.unquoted.plain.out.yaml
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+#   ^^^^^^^^^^^^^^^^^^^^^^ entity.name.tag.yaml
+  annotations:
+    "example.com/owner": team-a
+#   ^^^^^^^^^^^^^^^^^^^ entity.name.tag.yaml
+spec:
+  replicas: 3
+#           ^ constant.numeric.integer.yaml
+  template:
+    spec:
+      containers:
+        - name: web
+#         ^^^^ entity.name.tag.yaml
+          image: "nginx:1.25"
+#                ^^^^^^^^^^^^ string.quoted.double.yaml - entity.name.tag
+          ports:
+            - containerPort: 80
+#             ^^^^^^^^^^^^^ entity.name.tag.yaml
+#                            ^^ constant.numeric.integer.yaml
+          resources:
+            limits: {cpu: 500m, memory: 128Mi}
+#                    ^^^ entity.name.tag.yaml
+#                         ^^^^ string.unquoted.plain.in.yaml
+          command: ["sh", "-c"]
+#                   ^^^^ string.quoted.double.yaml
+
+# docker-compose
+---
+version: "3.9"
+#        ^^^^^ string.quoted.double.yaml
+services:
+  db: &db
+#     ^ punctuation.definition.anchor.yaml
+#      ^^ entity.name.label.anchor.yaml
+    image: postgres:16
+#          ^^^^^^^^^^^ string.unquoted.plain.out.yaml - entity.name.tag
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: example
+#     ^^^^^^^^^^^^^^^^^ entity.name.tag.yaml
+      - DEBUG=1
+#       ^^^^^^^ string.unquoted.plain.out.yaml
+    ports:
+      - "5432:5432"
+#       ^^^^^^^^^^^ string.quoted.double.yaml
+      - 8080:80
+#       ^^^^^^^ string.unquoted - constant.numeric
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 10s
+#               ^^^ string.unquoted - constant.numeric
+  replica:
+    <<: *db
+#   ^^ constant.language.merge.yaml
+#        ^^ variable.other.label.alias.yaml
+    depends_on:
+      - db

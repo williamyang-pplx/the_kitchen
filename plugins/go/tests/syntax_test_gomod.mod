@@ -1,4 +1,7 @@
-// SYNTAX TEST "Gomod.sublime-syntax"
+// SYNTAX TEST "Packages/Gomod/Gomod.sublime-syntax"
+// Vendored from mitranim/sublime-gomod @ e0200f024a394d6e7d6b7b37a070bb8ef324b19b.
+// kitchen: fixed stale scopes (comment.gomod -> comment.line.gomod) and the
+// copy-pasted column offsets in the `tool` section.
 
     // comment
 //  ^^^^^^^^^^ comment.line.gomod
@@ -44,13 +47,13 @@
     exclude ident//comment
 //  ^^^^^^^ keyword.gomod
 //          ^^^^^ variable.gomod
-//               ^^^^^^^^^^ comment.gomod
+//               ^^^^^^^^^^ comment.line.gomod
 
     exclude ident version//comment
 //  ^^^^^^^ keyword.gomod
 //          ^^^^^ variable.gomod
 //                ^^^^^^^ string.version.gomod
-//                       ^^^^^^^^^^ comment.gomod
+//                       ^^^^^^^^^^ comment.line.gomod
 
     exclude(ident version)//comment
 //  ^^^^^^^ keyword.gomod
@@ -58,12 +61,12 @@
 //          ^^^^^ variable.gomod
 //                ^^^^^^^ string.version.gomod
 //                       ^ punctuation.section.parens.end.gomod
-//                        ^^^^^^^^^^ comment.gomod
+//                        ^^^^^^^^^^ comment.line.gomod
 
     exclude (//comment
 //  ^^^^^^^ keyword.gomod
 //          ^ punctuation.section.parens.begin.gomod
-//           ^^^^^^^^^^ comment.gomod
+//           ^^^^^^^^^^ comment.line.gomod
         ident
 //      ^^^^^ variable.gomod
         ident version
@@ -71,25 +74,25 @@
 //            ^^^^^^^ string.version.gomod
         ident//comment
 //      ^^^^^ variable.gomod
-//           ^^^^^^^^^^ comment.gomod
+//           ^^^^^^^^^^ comment.line.gomod
         ident version//comment
 //      ^^^^^ variable.gomod
 //            ^^^^^^^ string.version.gomod
-//                   ^^^^^^^^^^ comment.gomod
+//                   ^^^^^^^^^^ comment.line.gomod
     )//comment
 //  ^ punctuation.section.parens.end.gomod
-//   ^^^^^^^^^^ comment.gomod
+//   ^^^^^^^^^^ comment.line.gomod
 
     module ident//comment
 //  ^^^^^^ keyword.gomod
 //         ^^^^^ variable.gomod
-//              ^^^^^^^^^^ comment.gomod
+//              ^^^^^^^^^^ comment.line.gomod
 
     module ident version//comment
 //  ^^^^^^ keyword.gomod
 //         ^^^^^ variable.gomod
 //               ^^^^^^^ string.version.gomod
-//                      ^^^^^^^^^^ comment.gomod
+//                      ^^^^^^^^^^ comment.line.gomod
 
     module(ident version)//comment
 //  ^^^^^^ keyword.gomod
@@ -97,12 +100,12 @@
 //         ^^^^^ variable.gomod
 //               ^^^^^^^ string.version.gomod
 //                      ^ punctuation.section.parens.end.gomod
-//                       ^^^^^^^^^^ comment.gomod
+//                       ^^^^^^^^^^ comment.line.gomod
 
     module (//comment
 //  ^^^^^^ keyword.gomod
 //         ^ punctuation.section.parens.begin.gomod
-//          ^^^^^^^^^^ comment.gomod
+//          ^^^^^^^^^^ comment.line.gomod
        ident
 //     ^^^^^ variable.gomod
        ident version
@@ -110,21 +113,21 @@
 //           ^^^^^^^ string.version.gomod
        ident//comment
 //     ^^^^^ variable.gomod
-//          ^^^^^^^^^^ comment.gomod
+//          ^^^^^^^^^^ comment.line.gomod
        ident version//comment
 //     ^^^^^ variable.gomod
 //           ^^^^^^^ string.version.gomod
-//                  ^^^^^^^^^^ comment.gomod
+//                  ^^^^^^^^^^ comment.line.gomod
     )//comment
 //  ^ punctuation.section.parens.end.gomod
-//   ^^^^^^^^^^ comment.gomod
+//   ^^^^^^^^^^ comment.line.gomod
 
     replace ident => ident//comment
 //  ^^^^^^^ keyword.gomod
 //          ^^^^^ variable.gomod
 //                ^^ keyword.operator.gomod
 //                   ^^^^^ variable.gomod
-//                        ^^^^^^^^^^ comment.gomod
+//                        ^^^^^^^^^^ comment.line.gomod
 
     replace ident version => ident//comment
 //  ^^^^^^^ keyword.gomod
@@ -132,7 +135,7 @@
 //                ^^^^^^^ string.version.gomod
 //                        ^^ keyword.operator.gomod
 //                           ^^^^^ variable.gomod
-//                                ^^^^^^^^^^ comment.gomod
+//                                ^^^^^^^^^^ comment.line.gomod
 
     replace ident => ident version//comment
 //  ^^^^^^^ keyword.gomod
@@ -140,7 +143,7 @@
 //                ^^ keyword.operator.gomod
 //                   ^^^^^ variable.gomod
 //                         ^^^^^^^ string.version.gomod
-//                                ^^^^^^^^^^ comment.gomod
+//                                ^^^^^^^^^^ comment.line.gomod
 
     replace ident version => ident version//comment
 //  ^^^^^^^ keyword.gomod
@@ -149,7 +152,7 @@
 //                        ^^ keyword.operator.gomod
 //                           ^^^^^ variable.gomod
 //                                 ^^^^^^^ string.version.gomod
-//                                        ^^^^^^^^^^ comment.gomod
+//                                        ^^^^^^^^^^ comment.line.gomod
 
     replace ident=>ident version=>version => ident=>ident version=>version//comment
 //  ^^^^^^^ keyword.gomod
@@ -158,7 +161,7 @@
 //                                        ^^ keyword.operator.gomod
 //                                           ^^^^^^^^^^^^ variable.gomod
 //                                                        ^^^^^^^^^^^^^^^^ string.version.gomod
-//                                                                        ^^^^^^^^^^ comment.gomod
+//                                                                        ^^^^^^^^^^ comment.line.gomod
 
     replace (ident version => ident version)//comment
 //  ^^^^^^^ keyword.gomod
@@ -169,50 +172,50 @@
 //                            ^^^^^ variable.gomod
 //                                  ^^^^^^^ string.version.gomod
 //                                         ^ punctuation.section.parens.end.gomod
-//                                          ^^^^^^^^^^ comment.gomod
+//                                          ^^^^^^^^^^ comment.line.gomod
 
     replace (//comment
 //  ^^^^^^^ keyword.gomod
 //          ^ punctuation.section.parens.begin.gomod
-//           ^^^^^^^^^^ comment.gomod
+//           ^^^^^^^^^^ comment.line.gomod
         ident => ident//comment
 //      ^^^^^ variable.gomod
 //            ^^ keyword.operator.gomod
 //               ^^^^^ variable.gomod
-//                    ^^^^^^^^^^ comment.gomod
+//                    ^^^^^^^^^^ comment.line.gomod
         ident => ident version//comment
 //      ^^^^^ variable.gomod
 //            ^^ keyword.operator.gomod
 //               ^^^^^ variable.gomod
 //                     ^^^^^^^ string.version.gomod
-//                            ^^^^^^^^^^ comment.gomod
+//                            ^^^^^^^^^^ comment.line.gomod
         ident version => ident//comment
 //      ^^^^^ variable.gomod
 //            ^^^^^^^ string.version.gomod
 //                    ^^ keyword.operator.gomod
 //                       ^^^^^ variable.gomod
-//                            ^^^^^^^^^^ comment.gomod
+//                            ^^^^^^^^^^ comment.line.gomod
         ident version => ident version//comment
 //      ^^^^^ variable.gomod
 //            ^^^^^^^ string.version.gomod
 //                    ^^ keyword.operator.gomod
 //                       ^^^^^ variable.gomod
 //                             ^^^^^^^ string.version.gomod
-//                                    ^^^^^^^^^^ comment.gomod
+//                                    ^^^^^^^^^^ comment.line.gomod
     )//comment
 //  ^ punctuation.section.parens.end.gomod
-//   ^^^^^^^^^^ comment.gomod
+//   ^^^^^^^^^^ comment.line.gomod
 
     require ident//comment
 //  ^^^^^^^ keyword.gomod
 //          ^^^^^ variable.gomod
-//               ^^^^^^^^^^ comment.gomod
+//               ^^^^^^^^^^ comment.line.gomod
 
     require ident version//comment
 //  ^^^^^^^ keyword.gomod
 //          ^^^^^ variable.gomod
 //                ^^^^^^^ string.version.gomod
-//                       ^^^^^^^^^^ comment.gomod
+//                       ^^^^^^^^^^ comment.line.gomod
 
     require(ident version)//comment
 //  ^^^^^^^ keyword.gomod
@@ -220,12 +223,12 @@
 //          ^^^^^ variable.gomod
 //                ^^^^^^^ string.version.gomod
 //                       ^ punctuation.section.parens.end.gomod
-//                        ^^^^^^^^^^ comment.gomod
+//                        ^^^^^^^^^^ comment.line.gomod
 
     require (//comment
 //  ^^^^^^^ keyword.gomod
 //          ^ punctuation.section.parens.begin.gomod
-//           ^^^^^^^^^^ comment.gomod
+//           ^^^^^^^^^^ comment.line.gomod
         ident
 //      ^^^^^ variable.gomod
         ident version
@@ -233,38 +236,38 @@
 //            ^^^^^^^ string.version.gomod
         ident//comment
 //      ^^^^^ variable.gomod
-//           ^^^^^^^^^^ comment.gomod
+//           ^^^^^^^^^^ comment.line.gomod
         ident version//comment
 //      ^^^^^ variable.gomod
 //            ^^^^^^^ string.version.gomod
-//                   ^^^^^^^^^^ comment.gomod
+//                   ^^^^^^^^^^ comment.line.gomod
     )//comment
 //  ^ punctuation.section.parens.end.gomod
-//   ^^^^^^^^^^ comment.gomod
+//   ^^^^^^^^^^ comment.line.gomod
 
     tool ident//comment
-//  ^^^^^^^ keyword.gomod
-//          ^^^^^ variable.gomod
-//               ^^^^^^^^^^ comment.gomod
+//  ^^^^ keyword.gomod
+//       ^^^^^ variable.gomod
+//            ^^^^^^^^^^ comment.line.gomod
 
     tool ident version//comment
-//  ^^^^^^^ keyword.gomod
-//          ^^^^^ variable.gomod
-//                ^^^^^^^ string.version.gomod
-//                       ^^^^^^^^^^ comment.gomod
+//  ^^^^ keyword.gomod
+//       ^^^^^ variable.gomod
+//             ^^^^^^^ string.version.gomod
+//                    ^^^^^^^^^^ comment.line.gomod
 
     tool(ident version)//comment
-//  ^^^^^^^ keyword.gomod
-//         ^ punctuation.section.parens.begin.gomod
-//          ^^^^^ variable.gomod
-//                ^^^^^^^ string.version.gomod
-//                       ^ punctuation.section.parens.end.gomod
-//                        ^^^^^^^^^^ comment.gomod
+//  ^^^^ keyword.gomod
+//      ^ punctuation.section.parens.begin.gomod
+//       ^^^^^ variable.gomod
+//             ^^^^^^^ string.version.gomod
+//                    ^ punctuation.section.parens.end.gomod
+//                     ^^^^^^^^^^ comment.line.gomod
 
     tool (//comment
-//  ^^^^^^^ keyword.gomod
-//          ^ punctuation.section.parens.begin.gomod
-//           ^^^^^^^^^^ comment.gomod
+//  ^^^^ keyword.gomod
+//       ^ punctuation.section.parens.begin.gomod
+//        ^^^^^^^^^^ comment.line.gomod
         ident
 //      ^^^^^ variable.gomod
         ident version
@@ -272,11 +275,11 @@
 //            ^^^^^^^ string.version.gomod
         ident//comment
 //      ^^^^^ variable.gomod
-//           ^^^^^^^^^^ comment.gomod
+//           ^^^^^^^^^^ comment.line.gomod
         ident version//comment
 //      ^^^^^ variable.gomod
 //            ^^^^^^^ string.version.gomod
-//                   ^^^^^^^^^^ comment.gomod
+//                   ^^^^^^^^^^ comment.line.gomod
     )//comment
 //  ^ punctuation.section.parens.end.gomod
-//   ^^^^^^^^^^ comment.gomod
+//   ^^^^^^^^^^ comment.line.gomod

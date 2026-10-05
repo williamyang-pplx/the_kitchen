@@ -530,7 +530,7 @@ fn impl_trait_with_plus() -> impl Iterator<Item = hir::GenericParam<'hir>> + Cap
 //                                        ^^^^^^^^^^^^^^^^^^^^^^^^^ meta.generic - meta.generic meta.generic
 //                                         ^^^^ storage.type.rust
 //                                              ^ keyword.operator
-//                                                ^^^ variable.other.rust
+//                                                ^^^ variable.namespace.rust
 //                                                   ^^ punctuation.accessor.rust
 //                                                     ^^^^^^^^^^^^ storage.type.rust
 //                                                                 ^^^^^^ meta.generic meta.generic
@@ -554,3 +554,5 @@ fn impl_trait() -> impl Type use < {}
 //                               ^^ meta.generic.rust
 //                               ^ punctuation.definition.generic.begin.rust
 //                                 ^^ meta.block.rust
+
+// kitchen: module path segment on line 535 asserts variable.namespace (upstream: variable.other).

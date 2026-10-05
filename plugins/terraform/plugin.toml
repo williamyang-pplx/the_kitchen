@@ -1,0 +1,4 @@
+name = "terraform"
+version = "0.1.0"
+description = "Terraform / HCL / OpenTofu syntax highlighting (.tf, .tfvars, .hcl, .tofu)"
+api = 1

@@ -1,5 +1,9 @@
 %YAML 1.2
 ---
+# Vendored from sublimehq/Packages, Go/Go.sublime-syntax at commit
+# cbac1700c8ebc4bfbe9aec971c39093258f6183a
+# https://github.com/sublimehq/Packages/blob/cbac1700c8ebc4bfbe9aec971c39093258f6183a/Go/Go.sublime-syntax
+# License: see ../LICENSE-sublimehq-packages. Local changes are marked "kitchen:".
 # http://www.sublimetext.com/docs/3/syntax.html
 
 # The structure and lexicon of this syntax reflects the Go spec:
@@ -259,32 +263,13 @@ contexts:
         3: keyword.operator.assignment.go
       push: match-comment-magic-language-injection-language-id
 
+  # kitchen: the embedded-language syntaxes (CSS (Go), HTML (Go), ...) are not
+  # vendored, so the language name is scoped but no injection happens.
   match-comment-magic-language-injection-language-id:
     - meta_scope: comment.line.double-slash.go
-    - match: (?i)css\b
+    - match: (?i)(?:css|html|js|json|regexp|sql|t-?sql|xml)\b
       scope: meta.annotation.parameters.go constant.other.language-name.go
-      set: scope:source.go.embedded-backtick-string.css#match-comment-magic-language-injection-inner
-    - match: (?i)html\b
-      scope: meta.annotation.parameters.go constant.other.language-name.go
-      set: scope:source.go.embedded-backtick-string.html#match-comment-magic-language-injection-inner
-    - match: (?i)js\b
-      scope: meta.annotation.parameters.go constant.other.language-name.go
-      set: scope:source.go.embedded-backtick-string.js#match-comment-magic-language-injection-inner
-    - match: (?i)json\b
-      scope: meta.annotation.parameters.go constant.other.language-name.go
-      set: scope:source.go.embedded-backtick-string.json#match-comment-magic-language-injection-inner
-    - match: (?i)regexp\b
-      scope: meta.annotation.parameters.go constant.other.language-name.go
-      set: scope:source.go.embedded-backtick-string.regexp#match-comment-magic-language-injection-inner
-    - match: (?i)sql\b
-      scope: meta.annotation.parameters.go constant.other.language-name.go
-      set: scope:source.go.embedded-backtick-string.sql#match-comment-magic-language-injection-inner
-    - match: (?i)t-?sql\b
-      scope: meta.annotation.parameters.go constant.other.language-name.go
-      set: scope:source.go.embedded-backtick-string.tsql#match-comment-magic-language-injection-inner
-    - match: (?i)xml\b
-      scope: meta.annotation.parameters.go constant.other.language-name.go
-      set: scope:source.go.embedded-backtick-string.xml#match-comment-magic-language-injection-inner
+      set: pop-comment-line-normal
     - match: ''
       set: pop-comment-line-normal
 
@@ -343,11 +328,20 @@ contexts:
   # Nominally, this should include `match-call-or-type-conversion`; instead,
   # it's specified in `match-parens` to ensure proper ordering.
   match-tokens:
+    - include: match-label-definition
     - include: match-keywords
     - include: match-identifiers
     - include: match-literals
     - include: match-operators
     - include: match-punctuation
+
+  # kitchen: labeled statement, only when `Label:` stands alone on its line
+  # (otherwise it's ambiguous with composite-literal keys and case clauses).
+  match-label-definition:
+    - match: ^[ \t]*(?!{{keyword}}|{{ident_anon}}\b)({{ident}})(:)(?=[ \t]*(?://.*)?$)
+      captures:
+        1: entity.name.label.go
+        2: punctuation.separator.go
 
   # https://golang.org/ref/spec#Keywords
   match-keywords:
@@ -383,6 +377,13 @@ contexts:
     - include: match-call-or-type-conversion
     - include: match-short-variable-declarations
     - include: match-identifier-anon
+    # kitchen: composite literal of an instantiated generic type with 2+ type
+    # arguments, e.g. `Pair[string, int]{}`. Without this, the brackets fall
+    # into the type-parameter-list heuristic. The comma requirement keeps
+    # `if xs[i] {` (index + block) out.
+    - match: '{{ident}}(?=\[(?:[^\[\]()]|{{type_argument_list}})*,(?:[^\[\]()]|{{type_argument_list}})*\]{{noise}}\{)'
+      scope: variable.other.go
+      push: pop-type-argument-list
     - match: '{{ident}}'
       scope: variable.other.go
 
@@ -568,19 +569,13 @@ contexts:
     - match: \]
       scope: invalid.illegal.go
 
+  # kitchen: syntect has no branch_point/fail; a lookahead picks the
+  # type-parameter-list branch instead (upstream used branch + fail).
   pop-brackets-inner:
-    - match: ''
-      pop: 1
-      branch_point: point-brackets-inner
-      branch:
-        - pop-brackets-inner-type-parameter-list
-        - pop-brackets-inner-any
-
-  pop-brackets-inner-type-parameter-list:
     - match: (?={{ident}}{{noise}}(?:,|{{type_begin}}))
       set: pop-type-parameter-list-inner
     - match: (?=\S)
-      fail: point-brackets-inner
+      set: pop-brackets-inner-any
 
   pop-brackets-inner-any:
     - include: pop-on-bracket-end
@@ -978,6 +973,7 @@ contexts:
   match-keyword-break:
     - match: \bbreak\b
       scope: keyword.control.flow.break.go
+      push: pop-label-reference
 
   match-keyword-case:
     - match: \bcase\b
@@ -1044,6 +1040,7 @@ contexts:
   match-keyword-continue:
     - match: \bcontinue\b
       scope: keyword.control.flow.continue.go
+      push: pop-label-reference
 
   match-keyword-default:
     - match: \b(default)\b(:)?
@@ -1091,6 +1088,7 @@ contexts:
   match-keyword-goto:
     - match: \bgoto\b
       scope: keyword.control.flow.goto.go
+      push: pop-label-reference
 
   match-keyword-if:
     - match: \bif\b
@@ -1400,6 +1398,15 @@ contexts:
     - include: pop-now
 
   pop-now:
+    - match: ''
+      pop: 1
+
+  # kitchen: label after break/continue/goto (same line only).
+  pop-label-reference:
+    - match: '[ \t]*({{ident}})\b(?!{{noise}}[.(\[:=,])'
+      captures:
+        1: variable.label.go
+      pop: 1
     - match: ''
       pop: 1
 

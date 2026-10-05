@@ -84,8 +84,9 @@ let (x, y, z) = w;
 //         ^ variable.other.rust
 //              ^ variable.other.rust
 
+// kitchen: Some/None/Ok/Err are support.constant here (upstream: support.type)
 let Some(x) = test();
-//  ^^^^ support.type
+//  ^^^^ support.constant
 
 let BasicStruct(x) = test();
 //  ^^^^^^^^^^^ storage.type

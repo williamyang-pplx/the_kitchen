@@ -1,0 +1,4 @@
+name = "tokyonight"
+version = "0.1.0"
+description = "Tokyo Night (night) syntax-highlighting theme, adapted from folke/tokyonight.nvim"
+api = 1

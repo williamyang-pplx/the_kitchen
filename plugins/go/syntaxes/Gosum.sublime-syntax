@@ -1,5 +1,9 @@
 %YAML 1.2
 ---
+# Vendored from mitranim/sublime-gomod, Gosum.sublime-syntax at commit
+# e0200f024a394d6e7d6b7b37a070bb8ef324b19b
+# https://github.com/mitranim/sublime-gomod/blob/e0200f024a394d6e7d6b7b37a070bb8ef324b19b/Gosum.sublime-syntax
+# License: WTFPL, see ../LICENSE-sublime-gomod.
 # http://www.sublimetext.com/docs/3/syntax.html
 
 # https://github.com/golang/go/tree/master/src/cmd/go/internal/modfetch

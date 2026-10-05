@@ -1,4 +1,10 @@
 %YAML 1.2
+# Vendored from sharkdp/bat assets/syntaxes/02_Extra/TypeScript.sublime-syntax
+#   bat commit 4608fc959aa8abf80d32198836511a570b7ae9ea
+# which bat converted from Microsoft/TypeScript-Sublime-Plugin (Apache-2.0, see ../LICENSE)
+#   upstream commit ba45efd058df5111837e30fb9598cfc8cbd51095
+# Local additions are marked `# kitchen:` (satisfies, accessor, using/await using,
+# const/in/out type parameters, ??= ||= &&=, non-null `!`, unique symbol).
 ---
 # http://www.sublimetext.com/docs/3/syntax.html
 name: TypeScript
@@ -268,6 +274,9 @@ contexts:
           pop: true
         - include: comment
         - include: decorator
+        # kitchen: TS 4.9 `accessor` fields (missing upstream).
+        - match: '(?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))accessor(?=\s+[#_$[:alpha:]\[])'
+          scope: storage.modifier.ts
         - match: (?<=:)\s*
           push:
             - match: '(?=\s|[;),}\]:\-\+]|;|^\s*$|(?:^\s*(?:abstract|async|class|const|declare|enum|export|function|import|interface|let|module|namespace|return|type|var)\b))'
@@ -922,11 +931,22 @@ contexts:
       captures:
         1: keyword.control.as.ts
       push:
-        - match: '(?=^|[;),}\]:?\-\+\>]|\|\||\&\&|\!\=\=|$|((?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))(as)\s+)|(\s+\<))'
+        - match: '(?=^|[;),}\]:?\-\+\>]|\|\||\&\&|\!\=\=|$|((?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))(as|satisfies)\s+)|(\s+\<))'
+          pop: true
+        - include: type
+    # kitchen: TS 4.9 `satisfies` operator (missing upstream).
+    - match: '(?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))(satisfies)\s+'
+      captures:
+        1: keyword.control.satisfies.ts
+      push:
+        - match: '(?=^|[;),}\]:?\-\+\>]|\|\||\&\&|\!\=\=|$|((?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))(as|satisfies)\s+)|(\s+\<))'
           pop: true
         - include: type
     - match: \.\.\.
       scope: keyword.operator.spread.ts
+    # kitchen: ES2021 logical assignment operators (missing upstream).
+    - match: \?\?=|\|\|=|&&=
+      scope: keyword.operator.assignment.compound.ts
     - match: \*=|(?<!\()/=|%=|\+=|\-=
       scope: keyword.operator.assignment.compound.ts
     - match: \&=|\^=|<<=|>>=|>>>=|\|=
@@ -942,6 +962,9 @@ contexts:
         1: keyword.operator.logical.ts
         2: keyword.operator.assignment.compound.ts
         3: keyword.operator.arithmetic.ts
+    # kitchen: non-null assertion `x!` / `f()!` (scope matches upstream's call-site `!`).
+    - match: '(?<=[_$[:alnum:]\)\]])\!(?!=)'
+      scope: keyword.operator.definiteassignment.ts
     - match: \!|&&|\|\||\?\?
       scope: keyword.operator.logical.ts
     - match: \&|~|\^|\|
@@ -2360,6 +2383,11 @@ contexts:
         - match: (?=^)
           pop: true
   statements:
+    # kitchen: TS 5.2 `using` / `await using` declarations (missing upstream).
+    - match: '(?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))(?:(await)\s+)?(using)(?=\s+(?!in\b|of\b)[_$[:alpha:]][_$[:alnum:]]*\s*[=:])'
+      captures:
+        1: keyword.control.flow.ts
+        2: storage.type.ts
     - include: declaration
     - include: control-statement
     - include: after-operator-block-as-object-literal
@@ -3027,6 +3055,9 @@ contexts:
         - include: type
   type-operators:
     - include: typeof-operator
+    # kitchen: `unique symbol` (missing upstream).
+    - match: '(?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))unique(?=\s+symbol\b)'
+      scope: keyword.operator.expression.unique.ts
     - match: '([&|])(?=\s*\{)'
       captures:
         0: keyword.operator.type.ts
@@ -3059,6 +3090,9 @@ contexts:
             1: punctuation.definition.typeparameters.end.ts
           pop: true
         - include: comment
+        # kitchen: TS 4.7 variance (`in`/`out`) and TS 5.0 `const` type parameters (missing upstream).
+        - match: '(?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))(const|in|out)(?=\s+[_$[:alpha:]])'
+          scope: storage.modifier.ts
         - match: '(?<![_$[:alnum:]])(?:(?<=\.\.\.)|(?<!\.))(extends)(?![_$[:alnum:]])(?:(?=\.\.\.)|(?!\.))'
           scope: storage.modifier.ts
         - include: type

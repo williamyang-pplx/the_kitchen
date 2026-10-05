@@ -1,5 +1,22 @@
 %YAML 1.2
 #
+# Vendored for the_kitchen from https://github.com/SublimeText/Terraform
+# at commit 6a31694f28ecca8a478fd9420a74955aa87e8c6c (MIT, see ../LICENSE).
+#
+# Local changes (all marked "the_kitchen:" below), kept minimal:
+#   - file_extensions: added tfvars, hcl (also covers .tftest.hcl), tofu.
+#     The upstream HCL / Terraform-vars / JSON (Terraform) grammars use
+#     `extends`, which syntect does not support, so they are not vendored.
+#   - object-body: replaced the include of "JSON (Terraform)#object-body"
+#     with a small local rule for JSON-style `"key": value` members.
+#   - body: the opening `{` of a block no longer carries meta.block.head
+#     (syntect applies the old meta_content_scope to a `set` match).
+#   - nested blocks (inside a block body, e.g. ingress / lifecycle / dynamic /
+#     content) get `entity.name.type` on top of keyword.declaration, so they
+#     color apart from top-level block keywords (as in nvim-treesitter's hcl).
+#   - type constraints: set/tuple/object(...), and list/map(...) when the
+#     argument is a type, are storage.type; `optional` is a builtin function.
+#
 # This syntax definition is based on the Terraform guide:
 # https://www.terraform.io/docs/language/index.html
 #
@@ -25,6 +42,10 @@ version: 2
 file_extensions:
   - tf
   - nomad
+  # the_kitchen: tfvars / hcl / tofu (no separate HCL grammar under syntect).
+  - tfvars
+  - hcl
+  - tofu
 
 variables:
   # Identifiers: ID_Start (ID_Continue | '-')*;
@@ -100,6 +121,9 @@ variables:
   # https://www.terraform.io/docs/language/expressions/type-constraints.html#dynamic-types-the-quot-any-quot-constraint
   terraform_type_keywords: (?:any|string|number|bool)
 
+  # the_kitchen: type constructors in type constraints.
+  terraform_type_constructors: (?:list|map|set|tuple|object)
+
   # Built-In Functions
   #
   # https://developer.hashicorp.com/terraform/language/functions
@@ -135,6 +159,8 @@ variables:
     # type conversion
     | can | issensitive | nonsensitive | sensitive | tobool | tolist | tomap
     | tonumber | toset | tostring | try | type
+    # the_kitchen: type-constraint modifier
+    | optional
     # terraform-specific
     | provider::terraform::(?:encode_tfvars | decode_tfvars | encode_expr)
     # deprecated/old
@@ -188,6 +214,7 @@ contexts:
     - include: brackets
     - include: objects
     - include: attribute-access
+    - include: type-constructors
     - include: functions
     - include: parens
     - include: identifiers
@@ -229,6 +256,15 @@ contexts:
     - match: \b{{named_values}}\b
       comment: Special variables available only to Terraform.
       scope: variable.language.terraform
+
+  # the_kitchen: `set(string)`, `object({...})`, `list(number)`. `list(` and
+  # `map(` are also (removed) functions, so they count as types only when
+  # the argument starts with a type.
+  type-constructors:
+    - match: \b(?:set|tuple|object)(?=\()
+      scope: storage.type.terraform
+    - match: \b(?:list|map)(?=\(\s*{{terraform_type_keywords}}\b|\(\s*{{terraform_type_constructors}}\()
+      scope: storage.type.terraform
 
   type-keywords:
     - match: \b{{terraform_type_keywords}}\b
@@ -560,7 +596,20 @@ contexts:
         - object-value
         - assignment-operator
         - object-computed-key
-    - include: Packages/Terraform/JSON (Terraform).sublime-syntax#object-body
+    # the_kitchen: JSON-style `"key": value` members (upstream includes
+    # "JSON (Terraform).sublime-syntax", which needs `extends`).
+    - match: (?=\"(?:[^"\\]|\\.)*\"\s*:)
+      push:
+        - object-value
+        - key-value-separator
+        - object-literal-key
+    - include: comma
+
+  key-value-separator:
+    - match: ':'
+      scope: punctuation.separator.key-value.terraform
+      pop: 1
+    - include: else-pop
 
   object-computed-key:
     - meta_scope: meta.mapping.key.terraform meta.parens.terraform
@@ -859,17 +908,40 @@ contexts:
 
   body:
     - meta_content_scope: meta.block.head.terraform
+    # the_kitchen: lookahead + set so `{` is scoped by body-body only.
+    - match: (?=\{)
+      set:
+        - body-body
+        - body-begin
+    - include: else-pop
+
+  body-begin:
     - match: \{
       scope: punctuation.section.block.begin.terraform
-      set: body-body
-    - include: else-pop
+      pop: 1
 
   body-body:
     - meta_scope: meta.block.body.terraform
     - match: \}
       scope: punctuation.section.block.end.terraform
       pop: 1
+    # the_kitchen: blocks nested in a block body are types, not keywords.
+    - include: attribute-definition
+    - include: nested-blocks
     - include: main
+
+  nested-blocks:
+    - match: (?=\b({{identifier}})(\s+{{label}})*\s*\{)
+      push:
+        - body
+        - generic-block-labels
+        - nested-block-declaration
+
+  nested-block-declaration:
+    - match: '{{identifier}}'
+      scope: keyword.declaration.terraform entity.name.type.terraform
+      pop: 1
+    - include: else-pop
 
   else-pop:
     - match: (?=\S)

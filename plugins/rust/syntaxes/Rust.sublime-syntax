@@ -1,5 +1,10 @@
 %YAML 1.2
 ---
+# Rust grammar for the kitchen viewer.
+# Source: https://github.com/sublimehq/Packages/blob/7f74b54967118d74d7e2d439b19c526c025ea6b5/Rust/Rust.sublime-syntax
+# Pinned commit: sublimehq/Packages@7f74b54967118d74d7e2d439b19c526c025ea6b5 (2026-02-11)
+# License: see ../LICENSE (sublimehq/Packages, Rust package MIT terms).
+# Local changes are marked with "kitchen:".
 # http://www.sublimetext.com/docs/3/syntax.html
 name: Rust
 scope: source.rust
@@ -30,8 +35,10 @@ variables:
   # https://doc.rust-lang.org/std/prelude/index.html
   prelude_types: |-
     (?x:
+      # kitchen: upstream has a leading empty alternative (`|Box`); under
+      # syntect's backtracking regex it matches zero-width and wins.
       # std::boxed
-      |Box
+      Box
       # std::option
       |Option|Result
       # std::string
@@ -84,8 +91,8 @@ variables:
     )
   std_traits: |-
     (?x:
-      # std::ops
-      |(?:Add|BitAnd|BitOr|BitXor|Div|Mul|Rem|Shl|Shr|Sub)(?:Assign)?
+      # std::ops (kitchen: leading `|` dropped, see prelude_types)
+      (?:Add|BitAnd|BitOr|BitXor|Div|Mul|Rem|Shl|Shr|Sub)(?:Assign)?
       |Deref|DerefMut|Index|IndexMut
       |Neg|Not|RangeBounds
       |ControlFlow
@@ -125,19 +132,27 @@ contexts:
 
   frontmatter:
     - meta_include_prototype: false
+    # kitchen: upstream embeds scope:source.toml (with `pop: 1` on the same
+    # rule). syntect has no TOML grammar and treats pop+embed as a bare pop,
+    # so the frontmatter is scoped as an opaque TOML block instead.
     - match: \s*(---)\s*$\n?
       captures:
         0: meta.frontmatter.rust
         1: punctuation.section.frontmatter.begin.rust
-      embed: scope:source.toml
-      embed_scope: meta.frontmatter.rust source.toml.embedded.rust
-      escape: ^\s*(---)\s*$\n?
-      escape_captures:
+      set: frontmatter-body
+    - match: ^|(?=\S)  # Note: Ensure to highlight shebang if Rust is embedded.
+      pop: 1
+
+  frontmatter-body:
+    - meta_include_prototype: false
+    - meta_content_scope: meta.frontmatter.rust source.toml.embedded.rust
+    - match: ^\s*(---)\s*$\n?
+      captures:
         0: meta.frontmatter.rust
         1: punctuation.section.frontmatter.end.rust
       pop: 1
-    - match: ^|(?=\S)  # Note: Ensure to highlight shebang if Rust is embedded.
-      pop: 1
+    - match: '#.*$'
+      scope: comment.line.number-sign.toml
 
   statements:
     # This isn't really just "statements", it also includes all types,
@@ -685,6 +700,7 @@ contexts:
       scope: punctuation.accessor.rust
       set: [type-path-second, path-after-accessor]
     - include: type-names
+    - include: namespace-identifier-names
     - include: generic-identifier-names
     - include: else-pop
 
@@ -694,6 +710,7 @@ contexts:
       scope: punctuation.accessor.rust
       push: path-after-accessor
     - include: in-path-type-names
+    - include: namespace-identifier-names
     - include: immediately-pop
 
   type-names:
@@ -720,8 +737,10 @@ contexts:
       scope: support.type.rust
     - match: \b{{prelude_traits}}\b
       scope: support.type.rust
+    # kitchen: upstream scopes these support.type; nvim-treesitter treats
+    # them as @constant.builtin, so give them a constant scope instead.
     - match: \b{{prelude_enums}}\b
-      scope: support.type.rust
+      scope: support.constant.rust
     - match: \b{{std_types}}\b
       scope: support.type.rust
     - match: \b{{std_traits}}\b
@@ -1767,6 +1786,7 @@ contexts:
         1: punctuation.accessor.rust
       set: [static-identifier-path-second, path-after-accessor]
     - include: type-names
+    - include: namespace-identifier-names
     - include: identifier-names
     - include: immediately-pop
 
@@ -1778,6 +1798,7 @@ contexts:
       scope: punctuation.accessor.rust
       push: path-after-accessor
     - include: in-path-type-names
+    - include: namespace-identifier-names
     - include: in-path-identifier-names
     - match: (?=<)
       push: generic-angles
@@ -1851,6 +1872,15 @@ contexts:
   function-identifiers:
     - match: '{{identifier}}(?=\s*\()'
       scope: variable.function.rust
+    # kitchen: turbofish calls, `iter.collect::<Vec<_>>()`, `parse::<u8>(s)`.
+    - match: '{{identifier}}(?=\s*::\s*<)'
+      scope: variable.function.rust
+
+  # kitchen: module segments of a path (`std::io::stdin`), like
+  # nvim-treesitter's @module. Types, keywords and turbofish are excluded.
+  namespace-identifier-names:
+    - match: '(?!(?:crate|self|super|Self)\b){{identifier}}(?=\s*::(?!\s*<))'
+      scope: variable.namespace.rust
 
   generic-identifier-names:
     - match: '{{identifier}}'

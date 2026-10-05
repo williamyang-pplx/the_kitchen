@@ -34,12 +34,34 @@
 #   (i.e. highlights even if less indentation used than required).
 # - Properties are sometimes incorrectly highlighted
 #   for nested block collections (`- !!seq -`).
+#
+# Kitchen fork of sublimehq/Packages@fa6b8629c95041bf262d4c1dab95c456a0530122
+# (YAML/YAML.sublime-syntax). Changes:
+# - YAML 1.2 core schema: only true/false are booleans (yes/no/on/off/y/n
+#   are plain strings), no sexagesimal numbers, 0o octal, optional exponent sign
+# - block and flow mapping keys are always entity.name.tag (also numeric,
+#   boolean and quoted keys); `<<` merge keys are constant.language.merge
+# - anchor names are entity.name.label, `&`/`*` and `---`/`...` are punctuation
+# - extra YAML file names (.clang-format, .yamllint, ...)
 ---
 name: YAML
 file_extensions:
   - yaml
   - yml
   - sublime-syntax
+  - sublime-color-scheme.yaml
+  - cff
+  - .clang-format
+  - _clang-format
+  - .clang-tidy
+  - .clangd
+  - .yamllint
+  - .gemrc
+  - .condarc
+  - .golangci.yml
+  - pubspec.lock
+  - glide.lock
+  - pnpm-lock.yaml
 first_line_match: ^%YAML( ?1.\d+)? # Technically the number is required, but we'll be a bit loose here
 scope: source.yaml
 
@@ -113,22 +135,19 @@ variables:
   _type_null: (?:null|Null|NULL|~) # http://yaml.org/type/null.html
   _type_bool: |- # http://yaml.org/type/bool.html
     (?x:
-       y|Y|yes|Yes|YES|n|N|no|No|NO
-      |true|True|TRUE|false|False|FALSE
-      |on|On|ON|off|Off|OFF
+        true|True|TRUE|false|False|FALSE
     )
   _type_int: |- # http://yaml.org/type/int.html
     (?x:
         [-+]? 0b [0-1_]+ # (base 2)
-      | [-+]? 0  [0-7_]+ # (base 8)
+      | [-+]? 0o? [0-7_]+ # (base 8)
       | [-+]? (?: 0|[1-9][0-9_]*) # (base 10)
       | [-+]? 0x [0-9a-fA-F_]+ # (base 16)
-      | [-+]? [1-9] [0-9_]* (?: :[0-5]?[0-9])+ # (base 60)
     )
   _type_float: |- # http://yaml.org/type/float.html
     (?x:
-        [-+]? (?: [0-9] [0-9_]*)? \. [0-9.]* (?: [eE] [-+] [0-9]+)? # (base 10)
-      | [-+]? [0-9] [0-9_]* (?: :[0-5]?[0-9])+ \. [0-9_]* # (base 60)
+        [-+]? (?: [0-9] [0-9_]*)? \. [0-9_]* (?: [eE] [-+]? [0-9]+)? # (base 10)
+      | [-+]? [0-9] [0-9_]* [eE] [-+]? [0-9]+ # (base 10, exponent only)
       | [-+]? \. (?: inf|Inf|INF) # (infinity)
       |       \. (?: nan|NaN|NAN) # (not a number)
     )
@@ -170,10 +189,10 @@ contexts:
 
   main:
     - include: directive
-    - match: ^---
-      scope: entity.other.document.begin.yaml
-    - match: ^\.{3}
-      scope: entity.other.document.end.yaml
+    - match: ^---(?=\s|$)
+      scope: punctuation.section.document.begin.yaml
+    - match: ^\.{3}(?=\s|$)
+      scope: punctuation.section.document.end.yaml
     - include: node
     # Use this for debugging. It should not match anything.
     # - match: \S
@@ -270,8 +289,8 @@ contexts:
       # http://yaml.org/spec/1.2/spec.html#&%20anchor//
       - match: (&)({{ns_anchor_name}})(\S+)?
         captures:
-          1: keyword.control.property.anchor.yaml punctuation.definition.anchor.yaml
-          2: entity.name.other.anchor.yaml
+          1: punctuation.definition.anchor.yaml
+          2: entity.name.label.anchor.yaml
           3: invalid.illegal.character.anchor.yaml
         pop: true
       # !Tag Handle
@@ -287,8 +306,8 @@ contexts:
     # http://yaml.org/spec/1.2/spec.html#alias//
     - match: (\*)({{ns_anchor_name}})([^\s\]},]\S*)?
       captures:
-        1: keyword.control.flow.alias.yaml punctuation.definition.alias.yaml
-        2: variable.other.alias.yaml
+        1: punctuation.definition.alias.yaml
+        2: variable.other.label.alias.yaml
         3: invalid.illegal.character.anchor.yaml
 
   flow-scalar-double-quoted:
@@ -413,6 +432,7 @@ contexts:
         - match: :(?=\s|$|{{c_flow_indicator}})
           scope: punctuation.separator.key-value.mapping.yaml
           set: flow-pair-value
+    - include: flow-quoted-key
     # Attempt to match plain-in scalars and highlight as "entity.name.tag",
     # if followed by a colon
     - match: |
@@ -432,7 +452,7 @@ contexts:
         # TODO Use a merge type here and add "pop: true" and "scope: entity.name.tag.yaml";
         # https://github.com/SublimeTextIssues/Core/issues/966
         - meta_scope: meta.flow-pair.key.yaml
-        - include: flow-scalar-plain-in-implicit-type
+        - include: merge-key
         - match: '{{_flow_scalar_end_plain_in}}'
           pop: true
         - match: '{{ns_plain_first_plain_in}}'
@@ -455,12 +475,14 @@ contexts:
   block-scalar:
     # http://www.yaml.org/spec/1.2/spec.html#style/block/scalar
     # c-l+literal(n) | c-l+folded(n)
-    - match: (?:(\|)|(>))([1-9])?([-+])?  # c-b-block-header(m,t)
+    - match: (?:(\|)|(>))(?:([1-9])([-+])?|([-+])([1-9])?)?  # c-b-block-header(m,t), either order
       captures:
         1: keyword.control.flow.block-scalar.literal.yaml
         2: keyword.control.flow.block-scalar.folded.yaml
         3: constant.numeric.indentation-indicator.yaml
         4: storage.modifier.chomping-indicator.yaml
+        5: storage.modifier.chomping-indicator.yaml
+        6: constant.numeric.indentation-indicator.yaml
       push:
         - meta_include_prototype: false
         - match: ^([ ]+)(?! )  # match first non-empty line to determine indentation level
@@ -502,6 +524,7 @@ contexts:
           scope: invalid.illegal.expected-newline.yaml
           pop: true
         - include: block-node
+    - include: block-quoted-key
     # Attempt to match plain-out scalars and highlight as "entity.name.tag",
     # if followed by a colon
     - match: |
@@ -518,7 +541,7 @@ contexts:
           (\s|$)
         )
       push:
-        - include: flow-scalar-plain-out-implicit-type
+        - include: merge-key
         - match: '{{_flow_scalar_end_plain_out}}'
           pop: true
         - match: '{{ns_plain_first_plain_out}}'
@@ -529,6 +552,37 @@ contexts:
               pop: true
     - match: :(?=\s|$)
       scope: punctuation.separator.key-value.mapping.yaml
+
+  merge-key:
+    - match: '<<(?=\s*:)'
+      scope: constant.language.merge.yaml
+      pop: true
+
+  # Quoted scalars used as mapping keys: `"key": value`, `'key': value`.
+  block-quoted-key:
+    - match: '(")((?:[^"\\]|\\.)*)(")(?=[ \t]*:(?:\s|$))'
+      scope: string.quoted.double.yaml entity.name.tag.yaml
+      captures:
+        1: punctuation.definition.string.begin.yaml
+        3: punctuation.definition.string.end.yaml
+    - match: "(')((?:[^']|'')*)(')(?=[ \\t]*:(?:\\s|$))"
+      scope: string.quoted.single.yaml entity.name.tag.yaml
+      captures:
+        1: punctuation.definition.string.begin.yaml
+        3: punctuation.definition.string.end.yaml
+
+  flow-quoted-key:
+    # JSON-like keys may be followed directly by ':' in flow context
+    - match: '(")((?:[^"\\]|\\.)*)(")(?=[ \t]*:)'
+      scope: string.quoted.double.yaml entity.name.tag.yaml
+      captures:
+        1: punctuation.definition.string.begin.yaml
+        3: punctuation.definition.string.end.yaml
+    - match: "(')((?:[^']|'')*)(')(?=[ \\t]*:)"
+      scope: string.quoted.single.yaml entity.name.tag.yaml
+      captures:
+        1: punctuation.definition.string.begin.yaml
+        3: punctuation.definition.string.end.yaml
 
   comment:
     # http://www.yaml.org/spec/1.2/spec.html#comment//

@@ -1,5 +1,9 @@
 %YAML 1.2
 ---
+# Forked from sublimehq/Packages Python/Python.sublime-syntax at commit
+# fa6b8629c95041bf262d4c1dab95c456a0530122 (see ../LICENSE-syntax), with
+# additions for modern Python (match/case, type statements, PEP 695 generics,
+# walrus, attribute/constructor scopes). Lookaheads only: no branch_point.
 name: Python
 file_extensions:
   - py
@@ -87,7 +91,7 @@ contexts:
       scope: keyword.control.flow.return.python
     - match: \b(break|continue|pass)\b
       scope: keyword.control.flow.python
-    - match: ':'
+    - match: ':(?!=)'
       scope: punctuation.separator.annotation.variable.python
 
   imports:
@@ -101,7 +105,7 @@ contexts:
         - match: \.
           scope: invalid.illegal.unexpected-relative-import.python
         - include: import-alias
-        - include: qualified-name
+        - include: import-qualified-name
         - match: (?=\S)
           pop: true
     - match: \b(from)\b
@@ -150,6 +154,18 @@ contexts:
     - match: \S+
       scope: invalid.illegal.name.import.python
 
+  import-qualified-name:
+    - match: '(?={{path}})'
+      push:
+        - meta_scope: meta.qualified-name.python
+        - include: name
+        - match: '\s*(\.)\s*({{identifier}})'
+          captures:
+            1: punctuation.accessor.dot.python
+            2: meta.generic-name.python
+        - match: ''
+          pop: true
+
   import-alias:
     - match: \b(as)\b
       scope: keyword.control.import.as.python
@@ -177,6 +193,19 @@ contexts:
           pop: true
 
   block-statements:
+    # match/case soft keywords: only at statement start, when the line ends
+    # in a block colon, and not followed by something that makes them a name
+    # (`match = 3`, `match.group(1)`, `case: int`).
+    - match: '^\s*(match|case)\b(?!\s*(?:[=.,:)\]}]|[-+*/%@&|^<>!]=|->|$))(?=.*:\s*(?:#.*)?$)'
+      captures:
+        1: keyword.control.conditional.python
+      push: match-case-statement
+    # type X[T] = ...
+    - match: '^\s*(type)\s+({{identifier}})(?=\s*(?:\[.*\])?\s*=(?!=))'
+      captures:
+        1: storage.type.type.python
+        2: entity.name.type.python
+      push: type-alias-statement
     # async for ... in ...:
     - match: \b(async +)?(for)\b
       captures:
@@ -190,11 +219,11 @@ contexts:
           set:
             - meta_scope: meta.statement.for.python
             - include: line-continuation-or-pop
-            - match: ':'
+            - match: ':(?!=)'
               scope: punctuation.section.block.for.python
               pop: true
             - include: expressions
-        - match: ':'
+        - match: ':(?!=)'
           scope: invalid.illegal.missing-in.python
           pop: true
         - include: target-list
@@ -228,7 +257,7 @@ contexts:
       push:
         - meta_scope: meta.statement.if.python
         - include: line-continuation-or-pop
-        - match: ':'
+        - match: ':(?!=)'
           scope: punctuation.section.block.conditional.python
           pop: true
         - include: expressions
@@ -237,7 +266,7 @@ contexts:
       push:
         - meta_scope: meta.statement.while.python
         - include: line-continuation-or-pop
-        - match: ':'
+        - match: ':(?!=)'
           scope: punctuation.section.block.while.python
           pop: true
         - include: expressions
@@ -257,13 +286,59 @@ contexts:
         1: keyword.control.flow.finally.python
         2: punctuation.section.block.finally.python
 
+  match-case-statement:
+    - meta_scope: meta.statement.match.python
+    - include: line-continuation-or-pop
+    - match: ':(?!=)'
+      scope: punctuation.section.block.match.python
+      pop: true
+    - match: \b(as)\b
+      scope: keyword.control.flow.as.python
+    - match: \b(if)\b
+      scope: keyword.control.conditional.guard.python
+    - include: expressions-common
+    - include: qualified-name
+
+  type-alias-statement:
+    - meta_scope: meta.statement.type.python
+    - match: \[
+      scope: punctuation.definition.generic.begin.python
+      push: type-parameters
+    - match: '(?=\S)'
+      pop: true
+
+  type-parameters:
+    # PEP 695: [T, U: int, *Ts, **P, V = str]
+    - meta_scope: meta.generic.python
+    - match: \]
+      scope: punctuation.definition.generic.end.python
+      pop: true
+    - match: ','
+      scope: punctuation.separator.generic.python
+    - match: \*\*|\*
+      scope: keyword.operator.unpacking.python
+    - match: '{{identifier}}'
+      scope: variable.parameter.type.python
+    - match: ':'
+      scope: punctuation.separator.annotation.python
+      push: type-parameter-value
+    - match: '='
+      scope: keyword.operator.assignment.python
+      push: type-parameter-value
+    - include: comments
+
+  type-parameter-value:
+    - match: '(?=[,\]=])'
+      pop: true
+    - include: expressions
+
   with-body:
     - meta_scope: meta.statement.with.python
     - include: line-continuation-or-pop
     - match: \b(as)\b
       scope: keyword.control.flow.with.as.python
       set: with-as
-    - match: ':'
+    - match: ':(?!=)'
       scope: punctuation.section.block.with.python
       pop: true
     - match: ','
@@ -273,7 +348,7 @@ contexts:
   with-as:
     - meta_scope: meta.statement.with.python
     - include: line-continuation-or-pop
-    - match: ':'
+    - match: ':(?!=)'
       scope: punctuation.section.block.with.python
       pop: true
     - match: ','
@@ -332,7 +407,7 @@ contexts:
         - include: magic-function-names
         - include: magic-variable-names
         - include: illegal-names
-        - include: generic-names
+        - include: member-names
         - match: ''
           pop: true
 
@@ -357,7 +432,7 @@ contexts:
         - match: \]
           scope: meta.item-access.python punctuation.section.brackets.end.python
           pop: true
-        - match: ':'
+        - match: ':(?!=)'
           scope: punctuation.separator.slice.python
         - include: expressions
     # indirect function call following attribute access
@@ -370,7 +445,7 @@ contexts:
         - include: magic-function-names
         - include: magic-variable-names
         - include: illegal-names
-        - include: generic-names
+        - include: member-names
         - match: ''
           pop: true
     - match: ''
@@ -491,6 +566,8 @@ contexts:
       scope: keyword.operator.assignment.python
 
   operators:
+    - match: ':='
+      scope: keyword.operator.assignment.walrus.python
     - match: <>
       scope: invalid.deprecated.operator.python
     - match: <\=|>\=|\=\=|<|>|\!\=
@@ -534,6 +611,9 @@ contexts:
             - include: entity-name-class
             - match: ''
               pop: true
+        - match: \[
+          scope: punctuation.definition.generic.begin.python
+          push: type-parameters
         - match: \(
           scope: punctuation.section.inheritance.begin.python
           set:
@@ -584,6 +664,9 @@ contexts:
             - include: entity-name-function
             - match: ''
               pop: true
+        - match: \[
+          scope: punctuation.definition.generic.begin.python
+          push: type-parameters
         - match: '(?=\()'
           set:
             - match: \(
@@ -697,7 +780,7 @@ contexts:
             - meta_content_scope: meta.item-access.arguments.python
             - match: '(?=\])'
               pop: true
-            - match: ':'
+            - match: ':(?!=)'
               scope: punctuation.separator.slice.python
             - include: expressions
 
@@ -707,6 +790,9 @@ contexts:
 
   function-call-wrapper:
     - meta_scope: meta.function-call.python
+    # CapWords call: a class being instantiated
+    - match: '\b_*\p{Lu}{{identifier_continue}}*\b'
+      scope: meta.qualified-name.python support.class.python
     - match: '{{identifier}}'
       scope: meta.qualified-name.python variable.function.python
     - match: \)
@@ -800,7 +886,7 @@ contexts:
         - match: ','
           scope: punctuation.separator.dictionary-or-set.python
           push: allow-unpack-operators
-        - match: ':'
+        - match: ':(?!=)'
           scope: punctuation.separator.key-value.python
         - include: inline-for
         - include: expressions
@@ -861,7 +947,7 @@ contexts:
         - include: dotted-name-specials
         - match: '\b_*\p{Lu}+[\p{Lu}_]*\b'
           scope: variable.other.constant.python
-        - include: generic-names
+        - include: member-names
         - match: ''
           pop: true
 
@@ -898,7 +984,7 @@ contexts:
         1: punctuation.accessor.dot.python
       push:
         - include: dotted-name-specials
-        - include: generic-names
+        - include: member-names
         - match: ''
           pop: true
     - match: (\.)\s*(?={{identifier}})
@@ -937,6 +1023,10 @@ contexts:
   generic-names:
     - match: '{{identifier}}'
       scope: meta.generic-name.python
+
+  member-names:
+    - match: '{{identifier}}'
+      scope: variable.other.member.python
 
   illegal-names:
     - match: \b{{illegal_names}}\b
