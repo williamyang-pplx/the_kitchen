@@ -42,7 +42,7 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
 ## Build and run
 
 ```bash
-scripts/install.sh              # release build, ~/Applications/The Kitchen.app,
+scripts/install.sh              # release build, ~/Applications/The Kitchen.app (restarted),
                                 # ~/.local/bin/kitchenctl, Linux kitchenctl for devboxes
 scripts/install.sh --no-linux   # skip the devbox cross-build
 cargo run -p kitchen-app        # development

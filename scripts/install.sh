@@ -4,6 +4,7 @@
 #   * ~/Applications/The Kitchen.app (plain bundle; no Xcode needed), signed with
 #     "Kitchen Local Signing" if scripts/make-signing-cert.sh created it, else ad-hoc
 #   * ~/.local/bin/kitchenctl -> the bundle's kitchenctl
+#   * quits the running app and opens the new build (tmux sessions survive)
 #
 #   scripts/install.sh               # everything
 #   scripts/install.sh --no-linux    # skip the devbox cross-build
@@ -89,3 +90,16 @@ for p in ruff todo python github; do
 done
 
 echo "skill: link $root/skill/kitchen into your dotfiles skills/ so agents learn kitchenctl"
+
+if [ "$bundle" = 1 ]; then
+  # Quit the installed app (dev builds from `cargo run` are left alone), wait
+  # up to 10 s for it to exit, then open the new build.
+  exe="$macos/kitchen-app"
+  if pgrep -f "^$exe" >/dev/null; then
+    osascript -e 'tell application id "ai.perplexity.william.kitchen" to quit' >/dev/null 2>&1 || true
+    for _ in $(seq 50); do pgrep -f "^$exe" >/dev/null || break; sleep 0.2; done
+    pkill -f "^$exe" || true
+  fi
+  open "$app"
+  echo "restarted $app"
+fi
