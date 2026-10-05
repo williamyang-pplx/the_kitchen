@@ -39,10 +39,10 @@ pub struct LinkMatch {
 /// http(s) URLs; trailing sentence punctuation is cut by `trim_url`.
 static URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"'`]+"#).unwrap());
 
-/// Runs of path characters, plus an optional `:line[:col]` or `#Lline`.
-/// `is_path` decides which runs are paths.
+/// Runs of path characters (a folder may end in `/`), plus an optional
+/// `:line[:col]` or `#Lline`. `is_path` decides which runs are paths.
 static FILE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:~/|\.{1,2}/|/)?[\w.@+-]+(?:/[\w.@+-]+)*(?::(\d+)(?::\d+)?|#L(\d+))?").unwrap());
+    LazyLock::new(|| Regex::new(r"(?:~/|\.{1,2}/|/)?[\w.@+-]+(?:/[\w.@+-]+)*/?(?::(\d+)(?::\d+)?|#L(\d+))?").unwrap());
 
 /// The link covering byte `at` of `line`, if any.
 pub fn link_at(line: &str, at: usize, plugin_rules: &[LinkEntry]) -> Option<LinkMatch> {
@@ -152,6 +152,9 @@ mod tests {
             ("foo.py:42:7", 2, file("foo.py", Some(42))),
             ("Read(/home/dev/agi/a.rs)", 10, file("/home/dev/agi/a.rs", None)),
             ("~/x.lua", 0, file("~/x.lua", None)),
+            ("in pplx/python/apps/aster/services/inference/ now", 10, file("pplx/python/apps/aster/services/inference/", None)),
+            ("in pplx/python/apps/aster/services/inference/ now", 44, file("pplx/python/apps/aster/services/inference/", None)),
+            ("ls aster/services.", 5, file("aster/services", None)),
             ("./src/a.rs#L9", 3, file("./src/a.rs", Some(9))),
             ("(see foo.py).", 7, file("foo.py", None)),
             ("ends in foo.py.", 9, file("foo.py", None)),

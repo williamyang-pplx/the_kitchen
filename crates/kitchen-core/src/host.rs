@@ -140,6 +140,13 @@ impl Host {
         }
     }
 
+    pub fn is_dir(&self, path: &str) -> bool {
+        match self {
+            Host::Local => std::path::Path::new(path).is_dir(),
+            Host::Ssh(_) => self.run(&["test", "-d", path], None).map(|o| o.ok()).unwrap_or(false),
+        }
+    }
+
     pub fn home(&self) -> Result<String> {
         match self {
             Host::Local => Ok(std::env::var("HOME").context("HOME unset")?),

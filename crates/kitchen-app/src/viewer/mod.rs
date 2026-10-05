@@ -929,6 +929,13 @@ impl Viewer {
                     self.doc_key = None;
                 }
                 match path {
+                    // A folder (trailing `/`, the worktree itself included).
+                    Some(p) if p.ends_with('/') => {
+                        let wt = format!("{}/", self.worktree.trim_end_matches('/'));
+                        let dir = p.strip_prefix(&wt).unwrap_or(&p);
+                        self.routed = true;
+                        self.browse(dir, None);
+                    }
                     Some(p) => {
                         let p = p.strip_prefix(&format!("{}/", self.worktree)).map(String::from).unwrap_or(p);
                         self.outline = false;

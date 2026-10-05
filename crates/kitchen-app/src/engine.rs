@@ -799,10 +799,21 @@ impl Engine {
                 let (ws, tab) = engine.find_tab(&tab_id).context("the tab is gone")?;
                 let host = ws.host();
                 let path = file_link_path(&host, &tab.row.worktree, &f.path)?;
-                if !host.exists(&path) {
+                let path = path.trim_end_matches('/');
+                if host.is_dir(path) {
+                    // The folder view lists the worktree's files only.
+                    let wt = tab.row.worktree.trim_end_matches('/');
+                    if path != wt && !path.starts_with(&format!("{wt}/")) {
+                        bail!("{path} is a folder outside the worktree");
+                    }
+                    // A trailing `/` tells the viewer to browse the folder.
+                    engine.push_ui(UiCommand::OpenViewer { tab_id, path: Some(format!("{path}/")), line: None, diff: None });
+                    return Ok(());
+                }
+                if !host.exists(path) {
                     bail!("no such file {path}");
                 }
-                engine.push_ui(UiCommand::OpenViewer { tab_id, path: Some(path), line: f.line, diff: None });
+                engine.push_ui(UiCommand::OpenViewer { tab_id, path: Some(path.to_string()), line: f.line, diff: None });
                 Ok(())
             }),
             // Opened on this Mac, devbox tabs included.

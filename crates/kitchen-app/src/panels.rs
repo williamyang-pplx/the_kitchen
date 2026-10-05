@@ -31,7 +31,8 @@ pub enum PanelCmd {
     PrevFile,
     /// Palette: pick among the current file's plugin diagnostics.
     Diagnostics,
-    /// Open a file (from `kitchenctl viewer open`).
+    /// Open a file (from `kitchenctl viewer open`), or browse a folder if
+    /// `path` ends in `/`.
     Open { path: Option<String>, line: Option<usize>, diff: Option<bool> },
 }
 
