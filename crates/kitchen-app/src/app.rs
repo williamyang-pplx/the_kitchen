@@ -869,7 +869,7 @@ impl eframe::App for KitchenApp {
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();
-                centered_note(ui, &format!("{}\n\n⌘E  new edit tab (own worktree + branch, starts planning)\n⌘I  new read-only tab (latest {})\n{status}", ws.row.name, ws.row.default_branch.as_deref().unwrap_or("main")), theme::DIM)
+                centered_note(ui, &format!("{}\n\n⌘E  new edit tab (own worktree + branch)\n⌘I  new read-only tab (latest {})\n{status}", ws.row.name, ws.row.default_branch.as_deref().unwrap_or("main")), theme::DIM)
             }
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });

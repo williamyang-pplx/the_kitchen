@@ -57,9 +57,9 @@ pub struct NewReadonlyTab {
     first_frame: bool,
 }
 
+/// ⌘E: just a name, for the tab title and the worktree/branch slug.
 pub struct NewEditTab {
-    task: String,
-    target: String,
+    name: String,
     first_frame: bool,
 }
 
@@ -78,7 +78,7 @@ impl Dialog {
     }
 
     pub fn new_edit_tab() -> Dialog {
-        Dialog::NewEditTab(NewEditTab { task: String::new(), target: String::new(), first_frame: true })
+        Dialog::NewEditTab(NewEditTab { name: String::new(), first_frame: true })
     }
 
     pub fn new_readonly_tab() -> Dialog {
@@ -368,34 +368,20 @@ impl NewReadonlyTab {
 impl NewEditTab {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
         ui.heading("New edit tab");
-        ui.label(
-            RichText::new("Gets its own worktree + branch off the latest origin. With a task, the agent starts in the planning phase (/low-level-plan) and writes the plan for review (⌘⇧I).")
-                .color(theme::DIM)
-                .size(12.0),
-        );
+        ui.label(RichText::new("Gets its own worktree + branch off the latest origin, with Claude running in it.").color(theme::DIM).size(12.0));
         ui.add_space(8.0);
-        ui.label("Task / ticket (planning input)");
-        let task = ui.add(
-            egui::TextEdit::multiline(&mut self.task)
-                .hint_text("e.g. AI-9586: add retries to the judge client — or paste the high-level plan")
-                .desired_rows(5)
-                .desired_width(500.0),
-        );
+        let field = ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("tab / worktree name").desired_width(500.0));
         if self.first_frame {
-            task.request_focus();
+            field.request_focus();
             self.first_frame = false;
         }
-        ui.add_space(6.0);
-        ui.label("…or an existing branch (optional)");
-        ui.add(egui::TextEdit::singleline(&mut self.target).hint_text("william/my-branch").desired_width(500.0));
         ui.add_space(10.0);
-        // Outside `ui.input`: `has_focus` re-locks the egui context, which deadlocks inside it.
-        let task_focused = task.has_focus();
-        let submit = ui.input(|i| i.key_pressed(Key::Enter) && (i.modifiers.command || !task_focused));
+        let submit = ui.input(|i| i.key_pressed(Key::Enter));
         let mut out = DialogOutcome::Open;
         ui.horizontal(|ui| {
-            if ui.button("Create  ⌘⏎").clicked() || submit {
-                let opts = self.to_new_tab();
+            if ui.button("Create  ⏎").clicked() || submit {
+                let title = Some(self.name.trim().to_string()).filter(|t| !t.is_empty());
+                let opts = NewTab { kind: Some("edit".into()), title, ..Default::default() };
                 if let Some(ws) = engine.selected_workspace() {
                     let id = ws.row.id.clone();
                     engine.spawn("new edit tab", move |e| e.create_tab(&id, opts).map(|_| ()));
@@ -407,12 +393,6 @@ impl NewEditTab {
             }
         });
         out
-    }
-
-    fn to_new_tab(&self) -> NewTab {
-        let branch = Some(self.target.trim().to_string()).filter(|b| !b.is_empty());
-        let task = Some(self.task.trim().to_string()).filter(|t| !t.is_empty());
-        NewTab { kind: Some("edit".into()), task, branch, ..Default::default() }
     }
 }
 
@@ -428,8 +408,8 @@ mod tests {
         assert!(h[0].devbox && h[1].devbox && !h[2].devbox);
     }
 
-    /// Plain Enter in the task field once re-locked the egui context inside
-    /// `ui.input` and hung the app; it must just stay open (newline).
+    /// Enter in the ⌘E dialog once re-locked the egui context inside
+    /// `ui.input` and hung the app; now it just submits.
     #[test]
     fn edit_tab_enter_does_not_deadlock() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -446,9 +426,9 @@ mod tests {
             step(vec![]);
             step(vec![]);
             let enter = egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
-            tx.send(matches!(step(vec![enter]), DialogOutcome::Open)).unwrap();
+            tx.send(matches!(step(vec![enter]), DialogOutcome::Done)).unwrap();
         });
-        let open = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("Enter in the edit tab dialog deadlocked");
-        assert!(open, "plain Enter in the task field should not submit");
+        let done = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("Enter in the edit tab dialog deadlocked");
+        assert!(done, "Enter in the name field should submit");
     }
 }
