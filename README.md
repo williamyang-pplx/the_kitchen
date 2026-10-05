@@ -10,7 +10,8 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   right-click → Pin to top keeps one above the rest.
 - **Edit tabs**: one PR each, in a fresh worktree + branch cut from the latest
   `origin/<default>`. Given a task, the agent starts with `/low-level-plan` and
-  writes a plan you comment on inline (⌘⇧I).
+  writes a plan you comment on inline (⌘⇧I). Drag tabs in the tab strip to
+  reorder them.
 - **Read-only tabs**: code review and understanding, on a shared read-only
   worktree kept at the latest `origin/<default>`. ⌘I asks for a PR link
   (`https://github.com/<org>/<repo>/pull/<n>`, any suffix): the `github`
