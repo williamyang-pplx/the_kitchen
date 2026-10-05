@@ -114,6 +114,36 @@ fn spares_fresh(host: &Host, repo: &Repo, base: &str) -> bool {
     })
 }
 
+fn edit_tab(engine: &Arc<Engine>, clean: &mut Cleanup, ws_id: &str, name: &str) -> anyhow::Result<kitchen_core::db::TabRow> {
+    let row = engine.create_tab(ws_id, NewTab { kind: Some("edit".into()), title: Some(name.into()), no_agent: true, focus: Some(false), ..Default::default() })?;
+    clean.tabs.push(row.id.clone());
+    clean.worktrees.push(row.worktree.clone());
+    clean.branches.extend(row.branch.clone());
+    Ok(row)
+}
+
+/// One UI frame of `v`.
+fn frame(engine: &Arc<Engine>, v: &mut Viewer) {
+    let mut out = engine.ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))), ..Default::default() }, |ui| {
+        let mut cx = PanelCtx { engine, focused: true, clicked: false };
+        v.ui(ui, &mut cx);
+    });
+    out.textures_delta.clear();
+}
+
+/// Frame `v` until `f` holds (or `limit`); whether it did.
+fn frame_until(engine: &Arc<Engine>, v: &mut Viewer, limit: Duration, f: impl Fn(&Viewer) -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        frame(engine, v);
+        if f(v) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 fn wait_for(limit: Duration, mut f: impl FnMut() -> bool) -> Option<Duration> {
     let start = Instant::now();
     while start.elapsed() < limit {
@@ -374,34 +404,97 @@ fn e2e_fast_tabs() {
         r.check(listed2.zip(listed).is_some_and(|(b, a)| b < a) && Arc::ptr_eq(&v.all, &v2.all), format!("second viewer reuses the cached list ({listed2:?}s)"));
     }
 
-    // 9. Edit tab, live: an agent's new file shows up as changed and in the list.
+    // 9. Edit tab, live: an agent's new file shows up as changed and in the
+    //    list; a staged-then-dropped file doesn't linger (index-keyed cache);
+    //    one failed poll doesn't leave the viewer in an error state; a poll
+    //    costs about a listing.
     if let Some(row) = edits.first() {
         let ws = engine.workspace(&ws_id).unwrap();
         let tab = ws.tab(&row.id).unwrap().clone();
         let mut v = Viewer::new(&engine, &ws, &tab);
-        let ctx = engine.ctx.clone();
-        let frame = |v: &mut Viewer| {
-            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))), ..Default::default() }, |ui| {
-                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
-                v.ui(ui, &mut cx);
-            });
-            out.textures_delta.clear();
-        };
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(20) && v.files_state.is_none() {
-            frame(&mut v);
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        frame_until(&engine, &mut v, Duration::from_secs(20), |v| v.files_state.is_some());
         let first = v.all.clone();
-        sh(&host, &format!("echo e2e > {}/kt_e2e_new_file.txt", q(&row.worktree)));
+        let wt = q(&row.worktree);
+        sh(&host, &format!("echo e2e > {wt}/kt_e2e_new_file.txt"));
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(20) && !v.all.iter().any(|p| p == "kt_e2e_new_file.txt") {
-            frame(&mut v);
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        frame_until(&engine, &mut v, Duration::from_secs(20), |v| v.all.iter().any(|p| p == "kt_e2e_new_file.txt"));
         r.check(v.changed.iter().any(|c| c.path == "kt_e2e_new_file.txt"), format!("edit tab: new file listed as changed after {:.1}s", start.elapsed().as_secs_f64()));
         r.check(v.all.iter().any(|p| p == "kt_e2e_new_file.txt") && v.all.len() == first.len() + 1, "edit tab: new file merged into the file list");
+
+        sh(&host, &format!("echo g > {wt}/kt_e2e_ghost.txt && git -C {wt} add kt_e2e_ghost.txt"));
+        frame_until(&engine, &mut v, Duration::from_secs(20), |v| v.all.iter().any(|p| p == "kt_e2e_ghost.txt"));
+        // Re-list from scratch so the cache holds the index with the staged file.
+        v.command(crate::panels::PanelCmd::Reload, &engine);
+        frame_until(&engine, &mut v, Duration::from_secs(20), |v| matches!(v.files_state, Some(Ok(()))));
+        sh(&host, &format!("git -C {wt} rm -q --cached kt_e2e_ghost.txt && rm {wt}/kt_e2e_ghost.txt"));
+        let gone = frame_until(&engine, &mut v, Duration::from_secs(15), |v| !v.all.iter().any(|p| p == "kt_e2e_ghost.txt"));
+        r.check(gone, "edit tab: a staged file that was unstaged and deleted leaves the file list");
+        v.command(crate::panels::PanelCmd::Reload, &engine);
+        frame_until(&engine, &mut v, Duration::from_secs(20), |v| matches!(v.files_state, Some(Ok(()))));
+        r.check(!v.all.iter().any(|p| p == "kt_e2e_ghost.txt"), "edit tab: and stays gone after ⌘R reload");
+
+        // A transient failure (worktree briefly unreachable), then recovery.
+        sh(&host, &format!("mv {wt} {}", q(&format!("{}.kt-e2e-away", row.worktree))));
+        let failed = frame_until(&engine, &mut v, Duration::from_secs(15), |v| matches!(v.files_state, Some(Err(_))));
+        sh(&host, &format!("mv {} {wt}", q(&format!("{}.kt-e2e-away", row.worktree))));
+        let back = frame_until(&engine, &mut v, Duration::from_secs(15), |v| matches!(v.files_state, Some(Ok(()))));
+        r.check(!failed || back, format!("edit tab: viewer recovers after one failed poll (failed={failed}, recovered={back})"));
+
+        let start = Instant::now();
+        let l = repo.listing(&row.worktree, &format!("origin/{base}"), true);
+        r.check(l.is_ok(), "edit tab: listing works");
+        r.within(start.elapsed(), Duration::from_millis(1500), "edit tab: one 3 s poll (listing with untracked)");
     }
+
+    // 10. A takeover while a refresh runs still ends with every spare fresh
+    //     (the second tab's refill request arrives during the first's refresh).
+    let took = wait_for(Duration::from_secs(300), || spares_fresh(&host, &repo, &base));
+    r.check(took.is_some(), "spares fresh before back-to-back takeovers");
+    std::thread::sleep(Duration::from_secs(5));
+    let d = edit_tab(&engine, &mut clean, &ws_id, "kt e2e d");
+    let e = edit_tab(&engine, &mut clean, &ws_id, "kt e2e e");
+    r.check(d.is_ok() && e.is_ok(), "two edit tabs back to back");
+    let took = wait_for(Duration::from_secs(300), || spares_fresh(&host, &repo, &base));
+    r.check(took.is_some(), format!("both spares refilled after back-to-back takeovers ({:?})", took));
+
+    // 11. A concurrent fetch of the default branch (another tab, a plugin)
+    //     doesn't fail tab creation.
+    sh(&host, &format!("( for i in 1 2 3 4 5 6; do git -C {r} fetch -q --no-tags origin +refs/heads/{base}:refs/remotes/origin/{base}; done ) >/dev/null 2>&1 &", r = q(&env.repo)));
+    let f = edit_tab(&engine, &mut clean, &ws_id, "kt e2e f");
+    r.check(f.is_ok(), format!("edit tab during concurrent fetches ({:?})", f.as_ref().err().map(|e| format!("{e:#}"))));
+    std::thread::sleep(Duration::from_secs(1));
+    let ro2 = engine.create_tab(&ws_id, NewTab { kind: Some("readonly".into()), title: Some("kt e2e ro2".into()), focus: Some(false), ..Default::default() });
+    if let Ok(t) = &ro2 {
+        clean.tabs.push(t.id.clone());
+    }
+    r.check(ro2.is_ok(), format!("read-only tab during concurrent fetches ({:?})", ro2.as_ref().err().map(|e| format!("{e:#}"))));
+
+    // 12. Two read-only main tabs opened at once (double ⌘I).
+    let (e1, e2) = (engine.clone(), engine.clone());
+    let (w1, w2) = (ws_id.clone(), ws_id.clone());
+    let t1 = std::thread::spawn(move || e1.create_tab(&w1, NewTab { kind: Some("readonly".into()), title: Some("kt e2e ro3".into()), focus: Some(false), ..Default::default() }));
+    let t2 = std::thread::spawn(move || e2.create_tab(&w2, NewTab { kind: Some("readonly".into()), title: Some("kt e2e ro4".into()), focus: Some(false), ..Default::default() }));
+    let (a1, a2) = (t1.join().unwrap(), t2.join().unwrap());
+    for t in [&a1, &a2].into_iter().flatten() {
+        clean.tabs.push(t.id.clone());
+    }
+    r.check(a1.is_ok() && a2.is_ok(), format!("two read-only tabs at once both open ({:?} / {:?})", a1.as_ref().err().map(|e| format!("{e:#}")), a2.as_ref().err().map(|e| format!("{e:#}"))));
+
+    // 13. A spare whose folder vanished (still registered with git) is re-created.
+    let took = wait_for(Duration::from_secs(300), || spares_fresh(&host, &repo, &base));
+    r.check(took.is_some(), "spares fresh before deleting one");
+    std::thread::sleep(Duration::from_secs(5));
+    let spares = repo.spare_paths();
+    sh(&host, &format!("rm -rf {}", q(&spares[1])));
+    engine.refill_spare(&ws_id);
+    let took = wait_for(Duration::from_secs(300), || spares_fresh(&host, &repo, &base));
+    r.check(took.is_some(), "a deleted (still registered) spare is re-created");
+
+    // 14. The gzipped file list decodes to the same paths as git lists.
+    let raw = repo.tracked_files(&ro_path).unwrap_or_default();
+    let want = sh(&host, &format!("git -C {} ls-files | head -1; git -C {} ls-files | wc -l", q(&ro_path), q(&ro_path)));
+    let mut want = want.lines();
+    r.check(raw.first().map(String::as_str) == want.next() && Some(raw.len().to_string().as_str()) == want.next().map(str::trim), format!("tracked_files over ssh matches git ls-files ({} paths, first {:?})", raw.len(), raw.first()));
 
     drop(clean);
     let _ = std::fs::remove_dir_all(&plugin_dir);
