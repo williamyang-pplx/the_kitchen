@@ -256,11 +256,28 @@ end)
 `kitchen.json.encode/decode` (`kitchen.json.null` encodes as `null`),
 `require()` from the plugin's `lua/` folder.
 
-### Syntax grammars
+### Syntax grammars and themes
 
 Drop `.sublime-syntax` files in the plugin's `syntaxes/` folder; they're
 added to the viewer's highlighter at startup (restart the kitchen after
-changing them).
+changing them). A plugin grammar wins over a bundled one for the same
+extension, and `file_extensions` may hold a whole file name (`go.mod`),
+which is tried before the extension. Grammars run on syntect, which ignores
+`extends`, `branch_point`/`fail` and `pop: N`; a grammar that fails to
+compile is logged and skipped. A plugin can be grammars only: no `init.lua`.
+
+Put Sublime syntax tests in `tests/syntax_test_*` (first line
+`# SYNTAX TEST "Packages/X/Name.sublime-syntax"`, where `Name` is the
+grammar's file name; then `# ^^^ scope` / `# <- scope` assertions);
+`cargo test -p kitchen-app plugin_syntax_tests` runs every bundled
+plugin's tests (`KITCHEN_PLUGIN_TEST=<name>` runs one plugin's).
+
+A `themes/*.tmTheme` replaces the default color theme (the first one found
+in an enabled plugin); only foreground colors are used.
+
+Bundled language plugins: `tokyonight` (theme), `python`, `yaml`,
+`terraform` (`.tf`, `.tfvars`, `.hcl`), `go` (plus `go.mod`), `rust`,
+`typescript` (`.ts`, `.tsx`, `.mts`, `.cts`).
 
 ## Limits
 
