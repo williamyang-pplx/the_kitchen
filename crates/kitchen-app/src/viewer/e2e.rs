@@ -184,6 +184,12 @@ impl Drop for Cleanup {
             let _ = self.engine.close_tab(t);
         }
         let repo = Repo::new(h, &self.repo);
+        // Also any worktree of ours a failed create left behind.
+        for w in repo.worktrees().unwrap_or_default() {
+            if w.path.rsplit('/').next().is_some_and(|n| n.contains("-kt-e2e-")) && !self.worktrees.contains(&w.path) {
+                self.worktrees.push(w.path);
+            }
+        }
         for wt in &self.worktrees {
             if let Err(e) = repo.remove_worktree(wt, true) {
                 eprintln!("cleanup: {wt}: {e:#}");
