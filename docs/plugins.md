@@ -35,9 +35,11 @@ Run commands from **⌘⇧P** (command palette), their keys, or
 `~/.kitchen/logs/plugins/hello.log` (`kitchenctl plugin logs hello`).
 
 Examples in the repo's `plugins/`: `ruff` (Python lint), `python` (`gd`/`gr`
-via the ty language server), `todo` (highlights), `hello` (commands, keys,
-jobs). `install.sh` links `ruff`, `python` and `todo` into
-`~/.kitchen/plugins/`.
+via the ty language server), `github` (PR links in ⌘I, PR review comments),
+`todo` (highlights), `hello` (commands, keys, jobs), `prune-worktrees` (a timer
+from `kitchen.spawn`; removes edit and PR review worktrees of merged/closed
+PRs). `install.sh` links `ruff`, `python`, `todo`, `github` and
+`prune-worktrees` into `~/.kitchen/plugins/`.
 
 ## Configuration
 

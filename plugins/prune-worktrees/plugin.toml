@@ -1,0 +1,10 @@
+name = "prune-worktrees"
+version = "0.1.0"
+description = "Every so often, remove clean worktrees whose PR is merged or closed (no open tab, no unpushed commits)"
+api = 4
+
+[config]
+# Minutes between passes; the first pass runs about a minute after the kitchen starts.
+interval_minutes = 60
+# Where gh and kitchenctl live when the kitchen was started from Finder (minimal PATH).
+path = "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"

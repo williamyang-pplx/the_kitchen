@@ -876,12 +876,75 @@ mod tests {
         assert_eq!(file_level[11], "body=**L12**: `x = 1`\n\nhm");
     }
 
+    /// prune-worktrees: which worktrees are candidates, what gh's answer means
+    /// for them, and the guarded branch delete.
+    #[test]
+    fn prune_plugin_decides_what_to_remove() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        lua.load("kitchen = { on = function() end, command = function() end, config = {}, json = {} }").exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/prune-worktrees/init.lua");
+        let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
+        let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
+        let val = |j: serde_json::Value| lua.to_value(&j).unwrap();
+
+        let list = val(serde_json::json!([
+            { "path": "/r/air", "branch": "main", "head": "a", "role": "main" },
+            { "path": "/r/air-kitchen-readonly", "head": "b", "role": "readonly" },
+            { "path": "/r/air-kitchen-spare", "head": "c", "role": "spare" },
+            { "path": "/r/air-tabbed", "branch": "william/tabbed", "head": "d", "role": "edit", "tab": "t1" },
+            { "path": "/r/air-detached", "head": "e", "role": "edit" },
+            { "path": "/r/air-good", "branch": "william/good", "head": "f", "role": "edit" },
+            { "path": "/r/air-moved", "branch": "william/open-elsewhere", "head": "g", "role": "edit" },
+            { "path": "/r/air-kitchen-ro-pr-12", "head": "h", "role": "readonly" },
+            { "path": "/r/air-kitchen-ro-pr-13", "head": "i", "role": "readonly" },
+        ]));
+        // Tabs whose worktree path git spells differently: matched by branch / name.
+        let tabs = val(serde_json::json!([
+            { "worktree": "/private/r/air-other", "branch": "william/open-elsewhere" },
+            { "worktree": "/private/r/air-kitchen-ro-pr-13" },
+        ]));
+        let got = to_json(m.get::<mlua::Function>("candidates").unwrap().call((list, tabs)).unwrap());
+        assert_eq!(
+            got,
+            serde_json::json!([
+                { "kind": "edit", "path": "/r/air-good", "branch": "william/good", "head": "f" },
+                { "kind": "pr", "path": "/r/air-kitchen-ro-pr-12", "number": 12, "head": "h" },
+            ])
+        );
+
+        let verdict: mlua::Function = m.get("verdict").unwrap();
+        let edit = |head: &str| val(serde_json::json!({ "kind": "edit", "head": head, "branch": "b" }));
+        let pr = |n: u64, state: &str, oid: &str| serde_json::json!({ "number": n, "state": state, "headRefOid": oid });
+        let judge = |wt: mlua::Value, prs: serde_json::Value| to_json(verdict.call((wt, val(prs))).unwrap());
+        let v = judge(edit("abc"), serde_json::json!([]));
+        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("no PR")));
+        let v = judge(edit("abc"), serde_json::json!([pr(1, "MERGED", "abc"), pr(2, "OPEN", "abc")]));
+        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("PR #2 open")));
+        let v = judge(edit("def"), serde_json::json!([pr(3, "MERGED", "abc")]));
+        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("local commits not on PR #3")));
+        let v = judge(edit("abc"), serde_json::json!([pr(3, "CLOSED", "abc")]));
+        assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some(false)));
+        let v = judge(edit("abc"), serde_json::json!([pr(1, "CLOSED", "old"), pr(4, "MERGED", "abc")]));
+        assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool(), v["pr"]["number"].as_u64()), (Some("remove"), Some(true), Some(4)));
+        let review = || val(serde_json::json!({ "kind": "pr", "number": 12, "head": "zzz" }));
+        let v = judge(review(), serde_json::json!([{ "number": 12, "state": "MERGED" }]));
+        assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some(false)));
+        let v = judge(review(), serde_json::json!([{ "number": 12, "state": "OPEN" }]));
+        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("PR #12 open")));
+
+        let del: String = m.get::<mlua::Function>("delete_branch_sh").unwrap().call(("william/x'y", "abc")).unwrap();
+        assert_eq!(del, r#"[ "$(git rev-parse --verify -q 'refs/heads/william/x'\''y')" = 'abc' ] && git branch -D 'william/x'\''y'"#);
+    }
+
     #[test]
     fn bundled_plugins() {
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 5 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        // The prune-worktrees ticker starts too; with no workspaces it never prunes, and
+        // once the test binary exits its next echo fails and it ends.
+        wait(&|| host.list().len() == 6 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);

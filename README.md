@@ -34,7 +34,9 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   viewer diagnostics/highlights, `gd`/`gr` providers, and jobs or
   long-running processes (language servers) on the tab's devbox. Ships with
   `ruff` (Python lint), `python` (`gd` / `gr` from the ty language server),
-  `github` (PR links in ⌘I, PR review comments) and `todo`. ⌘⇧P is the command palette.
+  `github` (PR links in ⌘I, PR review comments), `todo` and `prune-worktrees`
+  (hourly, removes the worktrees of merged/closed PRs that no tab uses and
+  that hold nothing unpushed). ⌘⇧P is the command palette.
   See [docs/plugins.md](docs/plugins.md).
 - **`kitchenctl`**: the public CLI, so agents can do everything you do from
   the keyboard. See [docs/cli.md](docs/cli.md) or run `kitchenctl guide`.
