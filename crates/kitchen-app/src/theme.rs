@@ -1,6 +1,6 @@
 //! Fonts and colors.
 
-use egui::{Color32, FontData, FontDefinitions, FontFamily, Visuals};
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Visuals};
 
 pub const BG: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x26);
 pub const PANEL: Color32 = Color32::from_rgb(0x16, 0x16, 0x1e);
@@ -8,6 +8,11 @@ pub const SIDEBAR: Color32 = Color32::from_rgb(0x13, 0x13, 0x1a);
 pub const BORDER: Color32 = Color32::from_rgb(0x29, 0x2e, 0x42);
 pub const TEXT: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
 pub const DIM: Color32 = Color32::from_rgb(0x56, 0x5f, 0x89);
+/// Secondary text that still has to be read: ~8:1 against `PANEL`, where
+/// `DIM` is under 3:1.
+pub const MUTED: Color32 = Color32::from_rgb(0xa9, 0xb1, 0xd6);
+/// Text of the selected tab, a step brighter than `TEXT`.
+pub const BRIGHT: Color32 = Color32::from_rgb(0xe6, 0xea, 0xff);
 pub const ACCENT: Color32 = Color32::from_rgb(0x7a, 0xa2, 0xf7);
 pub const GREEN: Color32 = Color32::from_rgb(0x9e, 0xce, 0x6a);
 pub const RED: Color32 = Color32::from_rgb(0xf7, 0x76, 0x8e);
@@ -27,6 +32,15 @@ const FALLBACKS: &[(&str, &str)] = &[
     ("hiragino-gb", "/System/Library/Fonts/Hiragino Sans GB.ttc"),
 ];
 
+/// macOS system face (SF Pro) for tab and workspace labels, as in cmux.
+const UI_FONT: &str = "/System/Library/Fonts/SFNS.ttf";
+
+/// Font for tab and workspace labels: SF Pro, falling back to the
+/// default proportional font when it isn't installed.
+pub fn ui_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("ui".into()))
+}
+
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Menlo.ttc") {
@@ -41,6 +55,12 @@ pub fn install(ctx: &egui::Context) {
             }
         }
     }
+    let mut ui = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    if let Ok(bytes) = std::fs::read(UI_FONT) {
+        fonts.font_data.insert("sf-pro".into(), FontData::from_owned(bytes).into());
+        ui.insert(0, "sf-pro".into());
+    }
+    fonts.families.insert(FontFamily::Name("ui".into()), ui);
     ctx.set_fonts(fonts);
 
     let mut v = Visuals::dark();

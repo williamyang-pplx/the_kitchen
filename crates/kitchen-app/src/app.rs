@@ -458,7 +458,7 @@ impl KitchenApp {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(RichText::new("WORKSPACES").size(11.0).color(theme::DIM).strong());
+            ui.label(RichText::new("WORKSPACES").font(theme::ui_font(12.0)).color(theme::MUTED).strong());
         });
         ui.add_space(4.0);
         let pinned_count = workspaces.iter().filter(|w| w.row.pinned).count();
@@ -495,18 +495,18 @@ impl KitchenApp {
                 let x = rect.left() + 14.0;
                 let p = ui.painter();
                 let host_color = if ws.host().is_local() { theme::GREEN } else { theme::PURPLE };
-                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, egui::FontId::proportional(14.0), theme::TEXT);
+                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font(15.0), if is_sel { theme::BRIGHT } else { theme::TEXT });
                 let unread = ws.tabs.iter().any(|t| t.unread);
                 if unread {
                     p.circle_filled(egui::pos2(rect.right() - 16.0, rect.top() + 15.0), 4.0, theme::YELLOW);
                 }
                 let hint = if i < 9 { format!("{}", i + 1) } else { String::new() };
-                p.text(egui::pos2(rect.right() - 28.0, rect.top() + 9.0), egui::Align2::RIGHT_TOP, hint, egui::FontId::monospace(10.0), theme::DIM);
+                p.text(egui::pos2(rect.right() - 28.0, rect.top() + 9.0), egui::Align2::RIGHT_TOP, hint, egui::FontId::monospace(10.5), theme::MUTED);
                 if ws.row.pinned {
                     p.text(egui::pos2(rect.right() - 40.0, rect.top() + 8.0), egui::Align2::RIGHT_TOP, "📌", egui::FontId::proportional(11.0), theme::DIM);
                 }
                 let sub = format!("{} · {} · {} tab{}", ws.row.host, ws.repo_name(), ws.tabs.len(), if ws.tabs.len() == 1 { "" } else { "s" });
-                p.text(egui::pos2(x, rect.top() + 27.0), egui::Align2::LEFT_TOP, sub, egui::FontId::proportional(11.5), host_color);
+                p.text(egui::pos2(x, rect.top() + 27.0), egui::Align2::LEFT_TOP, sub, theme::ui_font(12.0), host_color);
                 let (status, color) = match (&ws.error, &ws.status) {
                     (Some(e), _) => (format!("⚠ {e}"), theme::RED),
                     (None, Some(s)) => (format!("⋯ {s}"), theme::YELLOW),
@@ -514,7 +514,7 @@ impl KitchenApp {
                 };
                 if !status.is_empty() {
                     let status: String = status.chars().take(40).collect();
-                    p.text(egui::pos2(x, rect.top() + 42.0), egui::Align2::LEFT_TOP, status, egui::FontId::proportional(10.5), color);
+                    p.text(egui::pos2(x, rect.top() + 42.0), egui::Align2::LEFT_TOP, status, theme::ui_font(11.0), color);
                 }
                 if resp.clicked_by(egui::PointerButton::Primary) {
                     self.engine.select_workspace(&ws.row.id);
@@ -579,7 +579,7 @@ impl KitchenApp {
     fn footer(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new("＋ Workspace  ⌘N").size(12.0)).frame(false)).clicked_by(egui::PointerButton::Primary) {
+            if ui.add(egui::Button::new(RichText::new("＋ Workspace  ⌘N").font(theme::ui_font(13.0))).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewWorkspace);
             }
         });
@@ -597,17 +597,17 @@ impl KitchenApp {
                 };
                 let title: String = tab.row.title.chars().take(28).collect();
                 let mut job = egui::text::LayoutJob::default();
-                let fmt = |c: Color32, size: f32| egui::TextFormat { font_id: egui::FontId::proportional(size), color: c, ..Default::default() };
-                job.append(&format!("{} ", i + 1), 0.0, fmt(theme::DIM, 11.0));
-                job.append(badge, 0.0, fmt(badge_color, 10.5));
-                job.append(&format!("  {title}"), 0.0, fmt(if is_sel { theme::TEXT } else { theme::DIM }, 12.5));
+                let fmt = |c: Color32, size: f32| egui::TextFormat { font_id: theme::ui_font(size), color: c, valign: Align::Center, ..Default::default() };
+                job.append(&format!("{} ", i + 1), 0.0, fmt(theme::MUTED, 12.5));
+                job.append(badge, 0.0, fmt(badge_color, 11.5));
+                job.append(&format!("  {title}"), 0.0, fmt(if is_sel { theme::BRIGHT } else { theme::MUTED }, 14.0));
                 if tab.unread {
-                    job.append("  ●", 0.0, fmt(theme::YELLOW, 11.0));
+                    job.append("  ●", 0.0, fmt(theme::YELLOW, 12.0));
                 }
                 let btn = egui::Button::new(job)
                     .fill(if is_sel { theme::SELECTED } else { Color32::TRANSPARENT })
                     .corner_radius(5.0)
-                    .min_size(egui::vec2(0.0, 24.0));
+                    .min_size(egui::vec2(0.0, 26.0));
                 let resp = ui.add(btn).on_hover_text(format!(
                     "{}\n{}",
                     tab.row.worktree,
@@ -623,15 +623,15 @@ impl KitchenApp {
             }
             for p in &ws.pending {
                 let color = if p.kind == TabKind::Edit { theme::GREEN } else { theme::CYAN };
-                let label = RichText::new(format!("⋯ {}", p.title.chars().take(28).collect::<String>())).size(12.5).color(color).italics();
-                ui.add(egui::Button::new(label).fill(if p.focus { theme::SELECTED } else { Color32::TRANSPARENT }).corner_radius(5.0).min_size(egui::vec2(0.0, 24.0)))
+                let label = RichText::new(format!("⋯ {}", p.title.chars().take(28).collect::<String>())).font(theme::ui_font(14.0)).color(color).italics();
+                ui.add(egui::Button::new(label).fill(if p.focus { theme::SELECTED } else { Color32::TRANSPARENT }).corner_radius(5.0).min_size(egui::vec2(0.0, 26.0)))
                     .on_hover_text("fetching origin and preparing the worktree…");
             }
             ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new("＋ edit ⌘E").size(11.5).color(theme::GREEN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
+            if ui.add(egui::Button::new(RichText::new("＋ edit ⌘E").font(theme::ui_font(12.5)).color(theme::GREEN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewEditTab);
             }
-            if ui.add(egui::Button::new(RichText::new("＋ read-only ⌘I").size(11.5).color(theme::CYAN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
+            if ui.add(egui::Button::new(RichText::new("＋ read-only ⌘I").font(theme::ui_font(12.5)).color(theme::CYAN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewReadonlyTab);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -641,7 +641,7 @@ impl KitchenApp {
                     (SideKind::Viewer, "Files ⌘.", Action::ToggleFiles),
                 ] {
                     let on = self.side == Some(kind);
-                    let text = RichText::new(label).size(11.5).color(if on { theme::ACCENT } else { theme::DIM });
+                    let text = RichText::new(label).font(theme::ui_font(12.5)).color(if on { theme::ACCENT } else { theme::MUTED });
                     if ui.add(egui::Button::new(text).frame(false)).clicked_by(egui::PointerButton::Primary) {
                         if on {
                             self.side = None;
@@ -840,7 +840,7 @@ impl eframe::App for KitchenApp {
             .show(ui, |ui| self.status_bar(ui));
         if let Some(ws) = &ws {
             egui::Panel::top("tabs")
-                .exact_size(34.0)
+                .exact_size(36.0)
                 .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(0, 4)))
                 .show(ui, |ui| self.tab_strip(ui, ws));
         }
@@ -963,6 +963,7 @@ mod tests {
         let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
         run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p .agents/skills aster/x && echo 1 > .agents/skills/a.md && echo 2 > aster/x/b.py && echo 3 > README.md && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
         let ctx = egui::Context::default();
+        theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
         let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
