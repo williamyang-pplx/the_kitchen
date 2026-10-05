@@ -29,6 +29,22 @@ fn main() -> ExitCode {
         }
     };
     match call {
+        Call::PluginLogs { name, lines } => {
+            let path = kitchen_proto::state_dir().join("logs").join("plugins").join(format!("{name}.log"));
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let all: Vec<&str> = text.lines().collect();
+                    for l in &all[all.len().saturating_sub(lines)..] {
+                        println!("{l}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("kitchenctl: {}: {e}", path.display());
+                    ExitCode::from(1)
+                }
+            }
+        }
         Call::Guide => {
             if cli.json {
                 println!("{}", json!({"topic": "kitchen", "format": "markdown", "content": GUIDE}));

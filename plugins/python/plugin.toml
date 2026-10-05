@@ -1,0 +1,13 @@
+name = "python"
+version = "0.1.0"
+description = "Python go-to-definition (gd) and references (gr) from a language server (ty by default), run where the code lives"
+api = 2
+filetypes = ["py", "pyi"]
+
+[config]
+# ty (default), basedpyright, pyright, pyrefly or jedi — or any command via `cmd`.
+server = "ty"
+# A custom server command (sh, run in the project root); overrides `server`.
+cmd = ""
+# Show the server's type errors as diagnostics (ruff already lints).
+diagnostics = false

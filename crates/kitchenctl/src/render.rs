@@ -20,12 +20,11 @@ fn tabs(out: &mut String, tabs: &Value, indent: &str) {
         let kind = if t["kind"] == "readonly" { "RO" } else { "RW" };
         let unread = if t["unread"].as_bool() == Some(true) { " ●" } else { "" };
         out.push_str(&format!(
-            "{indent}{mark} tab:{} [{kind}] {}{unread}  (id {}{}{})\n{indent}    {}\n",
+            "{indent}{mark} tab:{} [{kind}] {}{unread}  (id {}{})\n{indent}    {}\n",
             s(&t["index"]),
             s(&t["title"]),
             s(&t["id"]),
             opt(&t["branch"], ", branch "),
-            opt(&t["pr_number"], ", PR #"),
             s(&t["worktree"]),
         ));
     }
@@ -52,8 +51,8 @@ pub fn render(method: &str, v: &Value) -> String {
                     s(&tab["id"]),
                     s(&tab["worktree"]),
                     opt(&tab["branch"], "branch:    ") + if tab["branch"].is_null() { "" } else { "\n" },
-                    opt(&tab["pr_number"], "pr:        #") + if tab["pr_number"].is_null() { "" } else { "\n" },
                     opt(&tab["plan_file"], "plan:      ") + if tab["plan_file"].is_null() { "" } else { "\n" },
+                    opt(&tab["diff_base"], "diff base: ") + if tab["diff_base"].is_null() { "" } else { "\n" },
                 ));
             }
             out.push_str(&format!("focused:   workspace {} tab {}\n", s(&v["focused"]["workspace"]), s(&v["focused"]["tab"])));
@@ -114,67 +113,29 @@ pub fn render(method: &str, v: &Value) -> String {
                 out.push_str("no open plan comments\n");
             }
         }
+        "plugin.list" => {
+            for p in v.as_array().into_iter().flatten() {
+                let status = match s(&p["status"]["state"]).as_str() {
+                    "failed" => format!("FAILED: {}", s(&p["status"]["detail"])),
+                    other => other.to_string(),
+                };
+                out.push_str(&format!("{:<12} {:<8} {}  [{}]\n", s(&p["name"]), s(&p["version"]), s(&p["description"]), status));
+                let cmds: Vec<String> = p["commands"].as_array().into_iter().flatten().map(s).collect();
+                if !cmds.is_empty() {
+                    out.push_str(&format!("{:<12} commands: {}\n", "", cmds.join(", ")));
+                }
+                out.push_str(&format!("{:<12} {}\n", "", s(&p["dir"])));
+            }
+            if out.is_empty() {
+                out.push_str("no plugins (put them in ~/.kitchen/plugins/<name>/)\n");
+            }
+        }
         "worktree.list" => {
             for w in v.as_array().into_iter().flatten() {
                 let role = s(&w["role"]);
                 let dirty = if w["dirty"].as_bool() == Some(true) { " (dirty)" } else { "" };
                 let head = if w["branch"].is_null() { format!("detached {}", &s(&w["head"]).chars().take(10).collect::<String>()) } else { s(&w["branch"]) };
                 out.push_str(&format!("{:<9} {}{dirty}\n          {head}{}\n", role, s(&w["path"]), opt(&w["tab"], "  tab ")));
-            }
-        }
-        "pr.threads" => {
-            for t in v.as_array().into_iter().flatten() {
-                let state = if t["is_resolved"].as_bool() == Some(true) { "resolved" } else { "open" };
-                let line = t["line"].as_i64().or(t["original_line"].as_i64()).map(|l| format!(":{l}")).unwrap_or_default();
-                out.push_str(&format!("{} [{state}] {}{line}\n", s(&t["id"]), s(&t["path"])));
-                for c in t["comments"].as_array().into_iter().flatten() {
-                    out.push_str(&format!("    @{}: {}\n", s(&c["author"]), s(&c["body"]).replace('\n', "\n      ")));
-                }
-            }
-            if out.is_empty() {
-                out.push_str("no review threads\n");
-            }
-        }
-        "review.draft.list" => {
-            for d in v.as_array().into_iter().flatten() {
-                let line = if d["line"].is_null() { "file".to_string() } else { format!("{}:{}", s(&d["side"]), s(&d["line"])) };
-                out.push_str(&format!(
-                    "[{}] {} {}#{} {} {line}{}\n    {}\n",
-                    s(&d["id"]),
-                    s(&d["state"]),
-                    s(&d["github_slug"]),
-                    s(&d["pr_number"]),
-                    s(&d["path"]),
-                    opt(&d["severity"], " "),
-                    s(&d["body"]).replace('\n', "\n    ")
-                ));
-            }
-            if out.is_empty() {
-                out.push_str("no drafts\n");
-            }
-        }
-        "review.runs" => {
-            for r in v.as_array().into_iter().flatten() {
-                out.push_str(&format!(
-                    "run {} {} {}#{} by {} — {}\n",
-                    s(&r["id"]),
-                    s(&r["status"]),
-                    s(&r["github_slug"]),
-                    s(&r["pr_number"]),
-                    s(&r["author"]),
-                    s(&r["title"])
-                ));
-            }
-            if out.is_empty() {
-                out.push_str("no review runs\n");
-            }
-        }
-        "review.watch.list" => {
-            for l in v.as_array().into_iter().flatten() {
-                out.push_str(&format!("{}\n", s(l)));
-            }
-            if out.is_empty() {
-                out.push_str("watch list is empty\n");
             }
         }
         "notification.list" => {

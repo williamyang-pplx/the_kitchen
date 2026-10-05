@@ -1,4 +1,5 @@
-//! Modal dialogs: new workspace (⌘N), new edit tab (⌘E), close confirmations.
+//! Modal dialogs: new workspace (⌘N), new edit tab (⌘E), new read-only tab
+//! (⌘I), rename tab (⌘R) / workspace (⌘⇧R), close confirmations.
 //! Enter submits, Esc cancels, Tab moves between fields.
 
 use std::collections::HashMap;
@@ -20,8 +21,10 @@ pub enum DialogOutcome {
 pub enum Dialog {
     NewWorkspace(NewWorkspace),
     NewEditTab(NewEditTab),
+    NewReadonlyTab(NewReadonlyTab),
     ConfirmCloseTab { id: String, title: String },
     ConfirmCloseWorkspace { id: String, name: String },
+    Rename(Rename),
 }
 
 pub struct NewWorkspace {
@@ -38,6 +41,20 @@ pub struct NewWorkspace {
 pub struct HostChoice {
     pub alias: String,
     pub devbox: bool,
+}
+
+pub struct Rename {
+    /// Renaming a workspace rather than a tab.
+    workspace: bool,
+    id: String,
+    name: String,
+    first_frame: bool,
+}
+
+/// ⌘I: empty = latest main; anything else (a PR link) goes to the plugins.
+pub struct NewReadonlyTab {
+    text: String,
+    first_frame: bool,
 }
 
 pub struct NewEditTab {
@@ -64,12 +81,27 @@ impl Dialog {
         Dialog::NewEditTab(NewEditTab { task: String::new(), target: String::new(), first_frame: true })
     }
 
+    pub fn new_readonly_tab() -> Dialog {
+        // A link just copied from the browser is the likely input.
+        let clip = std::process::Command::new("pbpaste").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let text = clip.filter(|c| c.starts_with("https://") && !c.contains(char::is_whitespace)).unwrap_or_default();
+        Dialog::NewReadonlyTab(NewReadonlyTab { text, first_frame: true })
+    }
+
     pub fn confirm_close(tab: &Tab) -> Dialog {
         Dialog::ConfirmCloseTab { id: tab.row.id.clone(), title: tab.row.title.clone() }
     }
 
     pub fn confirm_close_workspace(ws: &Workspace) -> Dialog {
         Dialog::ConfirmCloseWorkspace { id: ws.row.id.clone(), name: ws.row.name.clone() }
+    }
+
+    pub fn rename_tab(tab: &Tab) -> Dialog {
+        Dialog::Rename(Rename { workspace: false, id: tab.row.id.clone(), name: tab.row.title.clone(), first_frame: true })
+    }
+
+    pub fn rename_workspace(ws: &Workspace) -> Dialog {
+        Dialog::Rename(Rename { workspace: true, id: ws.row.id.clone(), name: ws.row.name.clone(), first_frame: true })
     }
 
     pub fn show(&mut self, ctx: &egui::Context, engine: &Arc<Engine>) -> DialogOutcome {
@@ -83,6 +115,8 @@ impl Dialog {
             outcome = match self {
                 Dialog::NewWorkspace(d) => d.ui(ui, engine),
                 Dialog::NewEditTab(d) => d.ui(ui, engine),
+                Dialog::NewReadonlyTab(d) => d.ui(ui, engine),
+                Dialog::Rename(d) => d.ui(ui, engine),
                 Dialog::ConfirmCloseTab { id, title } => confirm(
                     ui,
                     &format!("Close tab “{title}”?"),
@@ -259,11 +293,83 @@ pub fn parse_ssh_config(text: &str) -> Vec<HostChoice> {
     out
 }
 
+impl Rename {
+    fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
+        ui.heading(if self.workspace { "Rename workspace" } else { "Rename tab" });
+        ui.add_space(8.0);
+        let field = ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(500.0));
+        if self.first_frame {
+            field.request_focus();
+            let mut state = egui::TextEdit::load_state(ui.ctx(), field.id).unwrap_or_default();
+            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.name.chars().count()));
+            state.cursor.set_char_range(Some(all));
+            state.store(ui.ctx(), field.id);
+            self.first_frame = false;
+        }
+        ui.add_space(10.0);
+        let name = self.name.trim().to_string();
+        let submit = ui.input(|i| i.key_pressed(Key::Enter)) && !name.is_empty();
+        let mut out = DialogOutcome::Open;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!name.is_empty(), egui::Button::new("Rename  ⏎")).clicked() || submit {
+                let (id, workspace) = (self.id.clone(), self.workspace);
+                engine.spawn("rename", move |e| if workspace { e.rename_workspace(&id, &name) } else { e.rename_tab(&id, &name) });
+                out = DialogOutcome::Done;
+            }
+            if ui.button("Cancel  esc").clicked() {
+                out = DialogOutcome::Closed;
+            }
+        });
+        out
+    }
+}
+
+impl NewReadonlyTab {
+    fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
+        ui.heading("New read-only tab");
+        ui.label(RichText::new("Paste a PR link to review it, or leave empty for the latest main.").color(theme::DIM).size(12.0));
+        ui.add_space(8.0);
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut self.text).hint_text("https://github.com/ppl-ai/air/pull/14211  (optional)").desired_width(500.0),
+        );
+        if self.first_frame {
+            field.request_focus();
+            let mut state = egui::TextEdit::load_state(ui.ctx(), field.id).unwrap_or_default();
+            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.text.chars().count()));
+            state.cursor.set_char_range(Some(all));
+            state.store(ui.ctx(), field.id);
+            self.first_frame = false;
+        }
+        ui.add_space(10.0);
+        let submit = ui.input(|i| i.key_pressed(Key::Enter));
+        let mut out = DialogOutcome::Open;
+        ui.horizontal(|ui| {
+            let label = if self.text.trim().is_empty() { "Open latest main  ⏎" } else { "Open  ⏎" };
+            if ui.button(label).clicked() || submit {
+                let text = self.text.trim().to_string();
+                if text.is_empty() {
+                    if let Some(ws) = engine.selected_workspace() {
+                        let id = ws.row.id.clone();
+                        engine.spawn("read-only tab", move |e| e.create_tab(&id, NewTab { kind: Some("readonly".into()), ..Default::default() }).map(|_| ()));
+                    }
+                } else {
+                    engine.spawn("open", move |e| e.open_text(&text));
+                }
+                out = DialogOutcome::Done;
+            }
+            if ui.button("Cancel  esc").clicked() {
+                out = DialogOutcome::Closed;
+            }
+        });
+        out
+    }
+}
+
 impl NewEditTab {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
         ui.heading("New edit tab");
         ui.label(
-            RichText::new("Gets its own worktree + branch off the latest origin. With a task, the agent starts in the planning phase (/low-level-plan) and writes the plan for review (⌘⇧R).")
+            RichText::new("Gets its own worktree + branch off the latest origin. With a task, the agent starts in the planning phase (/low-level-plan) and writes the plan for review (⌘⇧I).")
                 .color(theme::DIM)
                 .size(12.0),
         );
@@ -280,8 +386,8 @@ impl NewEditTab {
             self.first_frame = false;
         }
         ui.add_space(6.0);
-        ui.label("…or an existing PR number / branch (optional)");
-        ui.add(egui::TextEdit::singleline(&mut self.target).hint_text("1234, #1234, a PR URL, or william/my-branch").desired_width(500.0));
+        ui.label("…or an existing branch (optional)");
+        ui.add(egui::TextEdit::singleline(&mut self.target).hint_text("william/my-branch").desired_width(500.0));
         ui.add_space(10.0);
         let submit = ui.input(|i| i.key_pressed(Key::Enter) && (i.modifiers.command || !task.has_focus()));
         let mut out = DialogOutcome::Open;
@@ -302,42 +408,15 @@ impl NewEditTab {
     }
 
     fn to_new_tab(&self) -> NewTab {
-        let target = self.target.trim();
-        let (pr, branch) = parse_target(target);
+        let branch = Some(self.target.trim().to_string()).filter(|b| !b.is_empty());
         let task = Some(self.task.trim().to_string()).filter(|t| !t.is_empty());
-        NewTab { kind: Some("edit".into()), task, pr, branch, ..Default::default() }
+        NewTab { kind: Some("edit".into()), task, branch, ..Default::default() }
     }
-}
-
-/// `1234`, `#1234`, `.../pull/1234` -> PR; anything else non-empty -> branch.
-pub fn parse_target(target: &str) -> (Option<u64>, Option<String>) {
-    let t = target.trim();
-    if t.is_empty() {
-        return (None, None);
-    }
-    let num = t.trim_start_matches('#');
-    if let Ok(n) = num.parse::<u64>() {
-        return (Some(n), None);
-    }
-    if let Some(rest) = t.split("/pull/").nth(1) {
-        if let Ok(n) = rest.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").parse::<u64>() {
-            return (Some(n), None);
-        }
-    }
-    (None, Some(t.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn targets() {
-        assert_eq!(parse_target("#12"), (Some(12), None));
-        assert_eq!(parse_target("https://github.com/o/r/pull/99/files"), (Some(99), None));
-        assert_eq!(parse_target("william/x"), (None, Some("william/x".into())));
-        assert_eq!(parse_target(" "), (None, None));
-    }
 
     #[test]
     fn ssh_config() {

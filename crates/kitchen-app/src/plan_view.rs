@@ -1,4 +1,4 @@
-//! Plan reviewer (⌘⇧R): the tab's low-level plan as a vim-navigable
+//! Plan reviewer (⌘⇧I): the tab's low-level plan as a vim-navigable
 //! document with inline comments. ⌘M comments on the cursor line or visual
 //! selection, ⌘Enter submits it; ⌘Enter with no comment open sends every
 //! open comment to the tab's agent in one message. The file is re-read
@@ -212,7 +212,7 @@ impl PlanView {
                 self.reload_comments();
                 self.poll_file(true);
             }
-            PanelCmd::ToggleDiff | PanelCmd::ToggleOutline | PanelCmd::FilePicker | PanelCmd::Open { .. } => {
+            PanelCmd::ToggleDiff | PanelCmd::ToggleOutline | PanelCmd::FilePicker | PanelCmd::FocusList | PanelCmd::FocusCode | PanelCmd::ToggleFiles | PanelCmd::NextFile | PanelCmd::PrevFile | PanelCmd::Diagnostics | PanelCmd::Open { .. } => {
                 self.status = Some(("plan reviewer: ⌘M comment · ⌘Enter submit / send to agent".into(), false));
             }
         }
@@ -271,6 +271,8 @@ impl PlanView {
                 focused: cx.focused,
                 font_size: cx.engine.settings().font_size,
                 two_gutters: false,
+                relative: self.engine.settings().relative_line_numbers,
+                overlay: None,
                 id: egui::Id::new(("plan", &self.tab_id)),
             }
             .show(&mut body_ui);

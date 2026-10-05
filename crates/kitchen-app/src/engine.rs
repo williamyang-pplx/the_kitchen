@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow, bail};
 use kitchen_core::db::{Db, PlanComment, TabRow, WorkspaceRow};
-use kitchen_core::git::Repo;
+use kitchen_core::git::{Repo, branch_refspec};
 use kitchen_core::host::Host;
 use kitchen_core::tmux::{self, Tmux};
 use kitchen_core::util::{new_id, shell_quote, slugify};
-use kitchen_core::{gh, plan};
+use kitchen_core::plan;
 use kitchen_proto::{Caller, TabInfo, TabKind, WorkspaceInfo};
 
 use crate::settings::Settings;
@@ -68,6 +68,33 @@ impl Tab {
     pub fn kind(&self) -> TabKind {
         TabKind::parse(&self.row.kind).unwrap_or(TabKind::Edit)
     }
+
+    /// Rev the tab's changes are shown against.
+    pub fn diff_base(&self, ws: &Workspace) -> String {
+        diff_base_of(&ws.row, &self.row)
+    }
+}
+
+fn diff_base_of(ws: &WorkspaceRow, tab: &TabRow) -> String {
+    tab.diff_base.clone().unwrap_or_else(|| format!("origin/{}", ws.default_branch.as_deref().unwrap_or("main")))
+}
+
+/// Environment of a tab's shell (same for a new and a re-created session).
+fn tab_env(ws: &WorkspaceRow, tab: &TabRow, host: &Host) -> Vec<(String, String)> {
+    let mut env = vec![
+        (kitchen_proto::ENV_WORKSPACE.to_string(), ws.id.clone()),
+        (kitchen_proto::ENV_TAB.to_string(), tab.id.clone()),
+        (kitchen_proto::ENV_TAB_KIND.to_string(), tab.kind.clone()),
+        (kitchen_proto::ENV_DIFF_BASE.to_string(), diff_base_of(ws, tab)),
+    ];
+    env.extend(local_socket_env(host));
+    if tab.kind == TabKind::Readonly.as_str() {
+        env.push((kitchen_proto::ENV_READONLY.to_string(), "1".into()));
+    }
+    if let Some(p) = &tab.plan_file {
+        env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), p.clone()));
+    }
+    env
 }
 
 /// Requests for the UI thread (it owns terminals and viewer state).
@@ -75,10 +102,12 @@ impl Tab {
 pub enum UiCommand {
     OpenViewer { tab_id: String, path: Option<String>, line: Option<usize>, diff: Option<bool> },
     OpenPlan { tab_id: String },
-    OpenInbox,
     ReloadPlan { tab_id: String },
-    FocusTerminal,
+    /// Drop the tab's viewer (its worktree moved or its diff base changed).
+    ResetViewer { tab_id: String },
     Screenshot { path: String, reply: std::sync::mpsc::Sender<Result<(), String>> },
+    /// Feed input events to the window (`kitchenctl debug keys`).
+    Keys(Vec<egui::Event>),
 }
 
 #[derive(Debug, Clone)]
@@ -95,21 +124,41 @@ pub struct State {
     pub toasts: Vec<Toast>,
 }
 
-/// Options for a new tab (from Cmd+E/Cmd+R dialogs or `kitchenctl tab new`).
+/// Options for a new tab (from Cmd+E/Cmd+I or `kitchenctl tab new`).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct NewTab {
     pub kind: Option<String>,
     /// Ticket / task description. Edit tabs start planning on it.
     pub task: Option<String>,
-    pub pr: Option<u64>,
     pub branch: Option<String>,
+    /// Read-only tab at this rev (checked out in its own worktree, named
+    /// after `name`) instead of the latest default branch.
+    pub rev: Option<String>,
+    /// Refspecs fetched from origin first (same round trip as the checkout).
+    pub fetch: Vec<String>,
+    /// What the viewer diffs against (default `origin/<default>`).
+    pub diff_base: Option<String>,
+    /// Worktree name for `rev` tabs; a tab already on it is reused.
+    pub name: Option<String>,
     pub title: Option<String>,
     /// Command typed into the new shell instead of the default agent.
     pub command: Option<String>,
     /// Start no agent at all.
     pub no_agent: bool,
     pub focus: Option<bool>,
+}
+
+/// Releases a worktree from [`Engine::opening`] when a rev tab is done.
+struct OpeningGuard<'a> {
+    engine: &'a Engine,
+    path: String,
+}
+
+impl Drop for OpeningGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.opening.lock().unwrap().remove(&self.path);
+    }
 }
 
 pub struct Engine {
@@ -121,6 +170,9 @@ pub struct Engine {
     /// Tabs whose tmux session was just created: the first attach can skip
     /// the "does the session still exist?" round trip.
     fresh_sessions: Mutex<std::collections::HashSet<String>>,
+    /// Worktrees of rev tabs being opened (a second open waits its turn).
+    opening: Mutex<std::collections::HashSet<String>>,
+    plugins: std::sync::OnceLock<Arc<crate::plugins::PluginHost>>,
 }
 
 impl Engine {
@@ -146,7 +198,18 @@ impl Engine {
             ui_cmds: Mutex::new(Vec::new()),
             settings: Mutex::new(settings),
             fresh_sessions: Mutex::new(Default::default()),
+            opening: Mutex::new(Default::default()),
+            plugins: std::sync::OnceLock::new(),
         }))
+    }
+
+    pub fn set_plugins(&self, host: Arc<crate::plugins::PluginHost>) {
+        let _ = self.plugins.set(host);
+    }
+
+    /// The plugin host (absent only before startup finished, and in tests).
+    pub fn plugins(&self) -> Option<&Arc<crate::plugins::PluginHost>> {
+        self.plugins.get()
     }
 
     pub fn db(&self) -> MutexGuard<'_, Db> {
@@ -159,12 +222,6 @@ impl Engine {
 
     pub fn settings(&self) -> Settings {
         self.settings.lock().unwrap().clone()
-    }
-
-    pub fn set_settings(&self, s: Settings) -> Result<()> {
-        self.db().set_setting("settings", &serde_json::to_string(&s)?)?;
-        *self.settings.lock().unwrap() = s;
-        Ok(())
     }
 
     fn repaint(&self) {
@@ -319,6 +376,7 @@ impl Engine {
                 host: w.row.host.clone(),
                 repo_path: w.row.repo_path.clone(),
                 github_slug: w.row.github_slug.clone(),
+                default_branch: w.row.default_branch.clone(),
                 selected: st.selected.as_deref() == Some(&w.row.id),
                 tabs: tab_infos(w),
             })
@@ -357,6 +415,7 @@ impl Engine {
                 github_slug,
                 default_branch,
                 position: st.workspaces.iter().map(|w| w.row.position).max().unwrap_or(0) + 1,
+                pinned: false,
             }
         };
         self.db().insert_workspace(&row)?;
@@ -470,6 +529,43 @@ impl Engine {
         self.select_workspace(&next);
     }
 
+    /// Sidebar drag: move workspace `id` to insertion slot `to` (0..=len, in
+    /// the current order). Pinned and unpinned workspaces each stay in their
+    /// own group, so a drop past the boundary lands at the group's edge.
+    pub fn move_workspace(&self, id: &str, to: usize) -> Result<()> {
+        self.rearrange_workspace(id, |from, _| if to > from { to - 1 } else { to }, None)
+    }
+
+    /// Pin a workspace (it joins the bottom of the pinned group at the top of
+    /// the sidebar) or unpin it (it becomes the first unpinned workspace).
+    pub fn set_workspace_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        self.rearrange_workspace(id, |_, pinned_count| pinned_count, Some(pinned))
+    }
+
+    /// Remove `id`, optionally change its pin state, re-insert it at
+    /// `slot(from, pinned_count_without_it)` clamped to its group, then persist
+    /// every position.
+    fn rearrange_workspace(&self, id: &str, slot: impl FnOnce(usize, usize) -> usize, pinned: Option<bool>) -> Result<()> {
+        let order = {
+            let mut st = self.state();
+            let from = st.workspaces.iter().position(|w| w.row.id == id).context("no such workspace")?;
+            let mut ws = st.workspaces.remove(from);
+            if let Some(p) = pinned {
+                ws.row.pinned = p;
+            }
+            let pinned_count = st.workspaces.iter().filter(|w| w.row.pinned).count();
+            let to = slot(from, pinned_count);
+            let to = if ws.row.pinned { to.min(pinned_count) } else { to.clamp(pinned_count, st.workspaces.len()) };
+            st.workspaces.insert(to, ws);
+            for (i, w) in st.workspaces.iter_mut().enumerate() {
+                w.row.position = i as i64;
+            }
+            st.workspaces.iter().map(|w| (w.row.id.clone(), w.row.position, w.row.pinned)).collect::<Vec<_>>()
+        };
+        self.repaint();
+        self.db().reorder_workspaces(&order)
+    }
+
     pub fn rename_workspace(&self, id: &str, name: &str) -> Result<()> {
         let row = {
             let mut st = self.state();
@@ -512,13 +608,33 @@ impl Engine {
         };
         let host = ws.host();
         let repo = Repo::new(&host, &ws.row.repo_path);
+        let rev_path = opts.rev.as_ref().filter(|_| kind == TabKind::Readonly).map(|rev| {
+            let name = opts.name.clone().unwrap_or_else(|| rev.clone());
+            repo.sibling_path(&format!("kitchen-ro-{}", slugify(&name, 60)))
+        });
+        let _guard = match &rev_path {
+            Some(path) => {
+                if !self.opening.lock().unwrap().insert(path.clone()) {
+                    bail!("{} is already being opened", opts.title.as_deref().unwrap_or(path));
+                }
+                // Same sibling dir of this workspace's repo (stored paths are
+                // resolved, e.g. /private/tmp, so compare the name).
+                let dir_name = |p: &str| p.trim_end_matches('/').rsplit('/').next().map(str::to_string);
+                if let Some(tab) = ws.tabs.iter().find(|t| dir_name(&t.row.worktree) == dir_name(path)) {
+                    let r = self.resync_rev_tab(&ws, tab, &opts);
+                    self.opening.lock().unwrap().remove(path);
+                    return r;
+                }
+                Some(OpeningGuard { engine: self, path: path.clone() })
+            }
+            None => None,
+        };
         let settings = self.settings();
         let tab_id = new_id();
         let pending_title = opts
             .title
             .clone()
             .or_else(|| opts.task.as_deref().and_then(|t| t.lines().next()).map(String::from))
-            .or_else(|| opts.pr.map(|n| format!("#{n}")))
             .or_else(|| opts.branch.clone())
             .unwrap_or_else(|| if kind == TabKind::Edit { "new tab".into() } else { "read-only".into() });
         self.set_pending(ws_id, Some(PendingTab { id: tab_id.clone(), title: pending_title, kind, focus: opts.focus.unwrap_or(true) }));
@@ -530,19 +646,13 @@ impl Engine {
                 Some(b) => b.clone(),
                 None => repo.default_branch()?,
             };
-            if opts.pr.is_some() || opts.branch.as_deref().is_some_and(|b| !b.is_empty()) {
+            let existing_branch = opts.branch.as_deref().filter(|b| !b.is_empty() && kind == TabKind::Edit);
+            if existing_branch.is_some() {
                 repo.fetch().context("git fetch origin")?;
             }
-            let pr = match (opts.pr, &ws.row.github_slug) {
-                (Some(n), Some(slug)) => Some(gh::Gh::default().pr_view(slug, n)?),
-                (Some(_), None) => bail!("workspace has no GitHub remote; cannot open a PR"),
-                _ => None,
-            };
             let (worktree, branch, title) = match kind {
                 TabKind::Edit => {
-                    let (wt, title) = if let Some(pr) = &pr {
-                        (repo.add_worktree_existing_branch(&pr.head_ref, &repo.sibling_path(&format!("pr-{}", pr.number)))?, format!("#{} {}", pr.number, pr.title))
-                    } else if let Some(b) = opts.branch.as_deref().filter(|b| !b.is_empty()) {
+                    let (wt, title) = if let Some(b) = existing_branch {
                         let slug = slugify(b.rsplit('/').next().unwrap_or(b), 40);
                         (repo.add_worktree_existing_branch(b, &unique_path(&host, &repo.sibling_path(&slug)))?, b.to_string())
                     } else {
@@ -559,39 +669,36 @@ impl Engine {
                     (wt.path.clone(), wt.branch.clone(), title)
                 }
                 TabKind::Readonly => {
-                    if let Some(pr) = &pr {
-                        let path = repo.sibling_path(&format!("kitchen-review-{}", pr.number));
-                        let rev = format!("refs/remotes/origin/kitchen-pr/{}", pr.number);
-                        let spec = format!("pull/{}/head:{rev}", pr.number);
-                        host.run_ok(&["git", "-C", &ws.row.repo_path, "fetch", "--quiet", "--force", "origin", &spec], None)?;
-                        let wt = repo.sync_readonly_worktree(&path, &rev)?;
-                        (wt.path, Some(pr.head_ref.clone()), format!("review #{} {}", pr.number, pr.title))
-                    } else {
-                        let wt = repo.sync_readonly_worktree_fetching(&repo.readonly_path(), &format!("origin/{base}"), Some(&base))?;
-                        (wt.path, None, opts.title.clone().unwrap_or_else(|| format!("read-only {base}")))
-                    }
+                    let (path, rev, fetch) = match (&rev_path, &opts.rev) {
+                        (Some(p), Some(rev)) => (p.clone(), rev.clone(), opts.fetch.clone()),
+                        _ => (repo.readonly_path(), format!("origin/{base}"), vec![branch_refspec(&base)]),
+                    };
+                    let (wt, _) = repo.sync_readonly_worktree_fetching(&path, &rev, &fetch)?;
+                    (wt.path, None, opts.title.clone().unwrap_or_else(|| format!("read-only {base}")))
                 }
             };
             let title = opts.title.clone().unwrap_or(title);
-            if pr.is_some() || opts.branch.is_some() {
+            if existing_branch.is_some() {
                 // (new-branch worktrees were excluded by their creation script)
                 plan::ensure_excluded(&host, &worktree)?;
             }
             let plan_file = (kind == TabKind::Edit).then(|| plan::plan_file_for(&worktree));
 
             let session = tmux::session_name(ws_id, &tab_id);
-            let mut env = vec![
-                (kitchen_proto::ENV_WORKSPACE.to_string(), ws_id.to_string()),
-                (kitchen_proto::ENV_TAB.to_string(), tab_id.clone()),
-                (kitchen_proto::ENV_TAB_KIND.to_string(), kind.as_str().to_string()),
-            ];
-            env.extend(local_socket_env(&host));
-            if kind == TabKind::Readonly {
-                env.push((kitchen_proto::ENV_READONLY.to_string(), "1".into()));
-            }
-            if let Some(p) = &plan_file {
-                env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), p.clone()));
-            }
+            let row = TabRow {
+                id: tab_id.clone(),
+                workspace_id: ws_id.to_string(),
+                kind: kind.as_str().to_string(),
+                title,
+                worktree,
+                branch,
+                tmux_session: session,
+                plan_file,
+                position: ws.tabs.iter().map(|t| t.row.position).max().unwrap_or(0) + 1,
+                diff_base: opts.diff_base.clone().filter(|_| rev_path.is_some()),
+            };
+            let (worktree, plan_file) = (&row.worktree, &row.plan_file);
+            let env = tab_env(&ws.row, &row, &host);
             let mut setup = None;
             let command = if opts.no_agent {
                 None
@@ -600,7 +707,7 @@ impl Engine {
             } else {
                 match kind {
                     TabKind::Edit => {
-                        let (cmd, prompt_setup) = edit_agent_command(&worktree, &settings, opts.task.as_deref(), plan_file.as_deref())?;
+                        let (cmd, prompt_setup) = edit_agent_command(worktree, &settings, opts.task.as_deref(), plan_file.as_deref())?;
                         setup = prompt_setup;
                         Some(cmd)
                     }
@@ -609,21 +716,8 @@ impl Engine {
                     }),
                 }
             };
-            Tmux::new(&host).new_session_with_setup(&session, &worktree, &env, command.as_deref(), setup.as_deref())?;
+            Tmux::new(&host).new_session_with_setup(&row.tmux_session, worktree, &env, command.as_deref(), setup.as_deref())?;
             self.fresh_sessions.lock().unwrap().insert(tab_id.clone());
-
-            let row = TabRow {
-                id: tab_id.clone(),
-                workspace_id: ws_id.to_string(),
-                kind: kind.as_str().to_string(),
-                title,
-                worktree,
-                branch,
-                pr_number: pr.as_ref().map(|p| p.number as i64),
-                tmux_session: session,
-                plan_file,
-                position: ws.tabs.iter().map(|t| t.row.position).max().unwrap_or(0) + 1,
-            };
             self.db().insert_tab(&row)?;
             Ok(row)
         })();
@@ -642,6 +736,44 @@ impl Engine {
             self.select_tab(&row.id);
         }
         self.repaint();
+        Ok(row)
+    }
+
+    /// Text from ⌘I / `kitchenctl tab open` (a PR link, …): handed to the
+    /// plugins' `open` handlers, which open a tab with `kitchen.tab_open`.
+    pub fn open_text(&self, text: &str) -> Result<()> {
+        let ev = serde_json::json!({ "text": text.trim(), "workspaces": self.workspace_info() });
+        let handled = self.plugins().is_some_and(|p| p.open(ev));
+        if !handled {
+            bail!("no plugin opens {:?} (enable the github plugin for PR links)", text.trim());
+        }
+        Ok(())
+    }
+
+    /// Re-open of a rev tab: move its worktree to the (re-fetched) rev, keep
+    /// the session, and refresh the viewer if anything changed.
+    fn resync_rev_tab(&self, ws: &Workspace, tab: &Tab, opts: &NewTab) -> Result<TabRow> {
+        let rev = opts.rev.as_deref().unwrap_or_default();
+        let (wt, moved) = Repo::new(&ws.host(), &ws.row.repo_path).sync_readonly_worktree_fetching(&tab.row.worktree, rev, &opts.fetch)?;
+        let mut row = tab.row.clone();
+        let base_changed = opts.diff_base.is_some() && opts.diff_base != row.diff_base;
+        if base_changed {
+            row.diff_base = opts.diff_base.clone();
+            self.db().update_tab(&row)?;
+            let mut st = self.state();
+            if let Some(t) = st.workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()).find(|t| t.row.id == row.id) {
+                t.row = row.clone();
+            }
+        }
+        if moved || base_changed {
+            self.push_ui(UiCommand::ResetViewer { tab_id: row.id.clone() });
+        }
+        if moved {
+            self.toast(format!("{} updated to {}", row.title, &wt.head[..wt.head.len().min(10)]));
+        }
+        if opts.focus.unwrap_or(true) {
+            self.select_tab(&row.id);
+        }
         Ok(row)
     }
 
@@ -752,18 +884,7 @@ impl Engine {
         }
         let (ws, tab) = self.find_tab(tab_id).context("no such tab")?;
         let host = ws.host();
-        let mut env = vec![
-            (kitchen_proto::ENV_WORKSPACE.to_string(), ws.row.id.clone()),
-            (kitchen_proto::ENV_TAB.to_string(), tab.row.id.clone()),
-            (kitchen_proto::ENV_TAB_KIND.to_string(), tab.row.kind.clone()),
-        ];
-        env.extend(local_socket_env(&host));
-        if tab.kind() == TabKind::Readonly {
-            env.push((kitchen_proto::ENV_READONLY.to_string(), "1".into()));
-        }
-        if let Some(p) = &tab.row.plan_file {
-            env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), p.clone()));
-        }
+        let env = tab_env(&ws.row, &tab.row, &host);
         Tmux::new(&host).ensure_session(&tab.row.tmux_session, &tab.row.worktree, &env)
     }
 
@@ -886,10 +1007,10 @@ fn tab_infos(w: &Workspace) -> Vec<TabInfo> {
             title: t.row.title.clone(),
             worktree: t.row.worktree.clone(),
             branch: t.row.branch.clone(),
-            pr_number: t.row.pr_number.map(|n| n as u64),
             tmux_session: t.row.tmux_session.clone(),
             selected: sel.as_deref() == Some(&t.row.id),
             plan_file: t.row.plan_file.clone(),
+            diff_base: t.row.diff_base.clone(),
             unread: t.unread,
         })
         .collect()
@@ -913,4 +1034,57 @@ fn local_socket_env(host: &Host) -> Option<(String, String)> {
 
 fn applescript_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine_with(ids: &[&str]) -> Arc<Engine> {
+        let db = Db::open_in_memory().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            db.insert_workspace(&WorkspaceRow {
+                id: id.to_string(),
+                name: id.to_string(),
+                host: "local".into(),
+                repo_path: "/r".into(),
+                github_slug: None,
+                default_branch: None,
+                position: i as i64,
+                pinned: false,
+            })
+            .unwrap();
+        }
+        Engine::new(egui::Context::default(), db).unwrap()
+    }
+
+    fn order(e: &Engine) -> Vec<String> {
+        e.workspaces().into_iter().map(|w| w.row.id).collect()
+    }
+
+    #[test]
+    fn move_and_pin_workspaces() {
+        let e = engine_with(&["a", "b", "c", "d"]);
+        e.move_workspace("a", 3).unwrap();
+        assert_eq!(order(&e), ["b", "c", "a", "d"]);
+        e.move_workspace("d", 0).unwrap();
+        assert_eq!(order(&e), ["d", "b", "c", "a"]);
+
+        e.set_workspace_pinned("c", true).unwrap();
+        e.set_workspace_pinned("a", true).unwrap();
+        assert_eq!(order(&e), ["c", "a", "d", "b"]);
+        // An unpinned workspace can't be dragged above the pinned group,
+        // and a pinned one can't leave it.
+        e.move_workspace("b", 0).unwrap();
+        assert_eq!(order(&e), ["c", "a", "b", "d"]);
+        e.move_workspace("c", 4).unwrap();
+        assert_eq!(order(&e), ["a", "c", "b", "d"]);
+        e.set_workspace_pinned("a", false).unwrap();
+        assert_eq!(order(&e), ["c", "a", "b", "d"]);
+
+        // The order survives a restart.
+        let rows = e.db().workspaces().unwrap();
+        assert_eq!(rows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["c", "a", "b", "d"]);
+        assert_eq!(rows.iter().map(|w| w.pinned).collect::<Vec<_>>(), [true, false, false, false]);
+    }
 }

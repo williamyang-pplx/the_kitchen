@@ -1,10 +1,7 @@
 //! The socket API behind `kitchenctl`. Newline-delimited JSON
 //! ([`kitchen_proto::Request`] / [`kitchen_proto::Response`]).
 //!
-//! Every human keyboard action has an API method here, with one deliberate
-//! exception: publishing agent review drafts to GitHub. That only happens
-//! from a keypress in the review inbox (see `review.rs`), so no agent can
-//! make a comment public on its own.
+//! Every human keyboard action has an API method here.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -57,12 +54,25 @@ fn serve_conn(engine: &Arc<Engine>, stream: UnixStream) {
     }
 }
 
-/// Parse and answer one request line (also used by the devbox relay).
+/// Parse and answer one request line from the local socket.
 pub fn handle_line(engine: &Arc<Engine>, line: &str) -> Response {
+    handle_line_from(engine, line, false)
+}
+
+/// Parse and answer one request line. `remote`: it came through a devbox
+/// relay, so plugin methods are restricted (see [`plugin_dispatch`]).
+pub fn handle_line_from(engine: &Arc<Engine>, line: &str, remote: bool) -> Response {
     match serde_json::from_str::<Request>(line) {
         Ok(req) => {
             let id = req.id;
-            match dispatch(engine, &req.method, req.params, &req.caller) {
+            let result = if req.method.starts_with("plugin.") || req.method.starts_with("decor.") {
+                plugin_dispatch(engine, &req.method, req.params, &req.caller, remote)
+            } else if remote && req.method == "debug.keys" {
+                Err(anyhow!("debug.keys can't be called from a devbox"))
+            } else {
+                dispatch(engine, &req.method, req.params, &req.caller)
+            };
+            match result {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => Response::err(id, format!("{e:#}")),
             }
@@ -83,6 +93,93 @@ struct Target {
     tab: Option<String>,
 }
 
+/// `plugin.*` and `decor.*`. Socket pushes always land in `ext.<ns>` so they
+/// can't overwrite a plugin's own sets; devbox callers may not reload
+/// plugins and may only run commands marked `remote = true`.
+fn plugin_dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller, remote: bool) -> Result<Value> {
+    use crate::plugins::decor::{self, FileKey, Kind};
+    let host = engine.plugins().cloned().ok_or_else(|| anyhow!("plugins are not running"))?;
+    #[derive(Deserialize)]
+    struct DecorParams {
+        ns: String,
+        #[serde(default)]
+        host: Option<String>,
+        #[serde(default)]
+        worktree: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        items: Value,
+        #[serde(default)]
+        version: Option<String>,
+    }
+    // A file from params, defaulting host/worktree to the calling tab's.
+    let file = |d: &DecorParams| -> Result<Option<FileKey>> {
+        let Some(path) = d.path.clone() else { return Ok(None) };
+        let tab = caller.tab_id.as_deref().and_then(|t| engine.find_tab(t));
+        let host = d.host.clone().or_else(|| tab.as_ref().map(|(w, _)| w.host().label().to_string())).ok_or_else(|| anyhow!("host is required outside a kitchen tab"))?;
+        let worktree = d.worktree.clone().or_else(|| tab.as_ref().map(|(_, t)| t.row.worktree.clone())).ok_or_else(|| anyhow!("worktree is required outside a kitchen tab"))?;
+        let path = path.strip_prefix(&format!("{}/", worktree.trim_end_matches('/'))).map(String::from).unwrap_or(path);
+        Ok(Some(FileKey { host, worktree, path }))
+    };
+    let ext = |ns: &str| format!("ext.{}", ns.trim_start_matches("ext."));
+    match method {
+        "plugin.list" => Ok(serde_json::to_value(host.list())?),
+        "plugin.reload" => {
+            if remote {
+                bail!("plugin.reload is only allowed from this mac");
+            }
+            #[derive(Deserialize, Default)]
+            struct P {
+                #[serde(default)]
+                name: Option<String>,
+            }
+            let P { name } = p(params)?;
+            Ok(json!({ "reloaded": host.reload(name.as_deref())? }))
+        }
+        "plugin.run" => {
+            #[derive(Deserialize)]
+            struct P {
+                command: String,
+            }
+            let P { command } = p(params)?;
+            let tab = caller.tab_id.clone().or_else(|| engine.selected_workspace().and_then(|w| w.selected().map(|t| t.row.id.clone()))).unwrap_or_default();
+            host.invoke(&command, crate::plugins::command_context(engine, &tab, None), remote)?;
+            Ok(json!({ "started": command }))
+        }
+        "decor.set" => {
+            let d: DecorParams = p(params)?;
+            let key = file(&d)?.ok_or_else(|| anyhow!("path is required"))?;
+            let ns = ext(&d.ns);
+            let items = match d.items {
+                Value::Null => Value::Array(Vec::new()),
+                v => v,
+            };
+            match d.kind.as_deref().map(Kind::parse) {
+                None | Some(Some(Kind::Diagnostics)) => host.decor.set_diagnostics(&key, &ns, decor::parse_diagnostics(items).map_err(|e| anyhow!(e))?, d.version),
+                Some(Some(Kind::Highlights)) => host.decor.set_highlights(&key, &ns, decor::parse_highlights(items).map_err(|e| anyhow!(e))?, d.version),
+                Some(None) => bail!("kind is diagnostics or highlights"),
+            }
+            engine.ctx.request_repaint();
+            Ok(json!({ "ns": ns, "path": key.path }))
+        }
+        "decor.clear" => {
+            let d: DecorParams = p(params)?;
+            let key = file(&d)?;
+            let kind = match d.kind.as_deref() {
+                None => None,
+                Some(k) => Some(Kind::parse(k).ok_or_else(|| anyhow!("kind is diagnostics or highlights"))?),
+            };
+            host.decor.clear(key.as_ref(), &ext(&d.ns), kind);
+            engine.ctx.request_repaint();
+            Ok(json!({ "ns": ext(&d.ns) }))
+        }
+        _ => bail!("unknown method {method}"),
+    }
+}
+
 pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) -> Result<Value> {
     match method {
         // ------------------------------------------------------------ system
@@ -94,7 +191,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({
                 "caller": {
                     "workspace": ws.as_ref().map(|w| json!({"id": w.row.id, "name": w.row.name, "host": w.row.host, "repo_path": w.row.repo_path})),
-                    "tab": tab.as_ref().map(|t| json!({"id": t.row.id, "kind": t.row.kind, "title": t.row.title, "worktree": t.row.worktree, "branch": t.row.branch, "pr_number": t.row.pr_number, "plan_file": t.row.plan_file})),
+                    "tab": tab.as_ref().map(|t| json!({"id": t.row.id, "kind": t.row.kind, "title": t.row.title, "worktree": t.row.worktree, "branch": t.row.branch, "plan_file": t.row.plan_file, "diff_base": t.row.diff_base})),
                 },
                 "focused": {
                     "workspace": selected.as_ref().map(|w| w.row.id.clone()),
@@ -164,6 +261,15 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             let id = engine.resolve_workspace(t.workspace.as_deref(), caller)?;
             let info = engine.workspace_info().into_iter().find(|w| w.id == id).context("workspace vanished")?;
             Ok(serde_json::to_value(info.tabs)?)
+        }
+        "tab.open" => {
+            #[derive(Deserialize)]
+            struct P {
+                text: String,
+            }
+            let a: P = p(params)?;
+            engine.open_text(&a.text)?;
+            Ok(json!({"opening": a.text.trim()}))
         }
         "tab.create" => {
             #[derive(Deserialize)]
@@ -275,7 +381,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             let id = engine.resolve_tab(t.tab.as_deref(), t.workspace.as_deref(), caller)?;
             let (ws, tab) = engine.find_tab(&id).context("no such tab")?;
             engine.push_ui(UiCommand::ReloadPlan { tab_id: id.clone() });
-            engine.notify(Some(&ws.row.id), Some(&id), "plan ready", &format!("{} — review with ⌘⇧R", tab.row.title))?;
+            engine.notify(Some(&ws.row.id), Some(&id), "plan ready", &format!("{} — review with ⌘⇧I", tab.row.title))?;
             Ok(json!({"tab": id}))
         }
         "plan.comments" => {
@@ -344,10 +450,22 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({"path": a.path}))
         }
 
+        "debug.keys" => {
+            #[derive(Deserialize)]
+            struct P {
+                keys: String,
+            }
+            let a: P = p(params)?;
+            let events = crate::plugins::keys::parse_sequence(&a.keys).map_err(|e| anyhow!(e))?;
+            let n = events.len();
+            engine.push_ui(UiCommand::Keys(events));
+            engine.ctx.request_repaint();
+            Ok(json!({"events": n}))
+        }
+
         "worktree.list" | "worktree.sync_readonly" | "worktree.remove" => worktree(engine, method, params, caller),
 
-        _ => crate::review::dispatch(engine, method, params, caller)
-            .unwrap_or_else(|| Err(anyhow!("unknown method {method:?}; see `kitchenctl --help`"))),
+        _ => Err(anyhow!("unknown method {method:?}; see `kitchenctl --help`")),
     }
 }
 
@@ -381,7 +499,7 @@ fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) 
                     // git lists the main checkout first.
                     let role = if i == 0 {
                         "main"
-                    } else if w.path.ends_with(READONLY_SUFFIX) || w.path.contains("-kitchen-review-") {
+                    } else if w.path.ends_with(READONLY_SUFFIX) {
                         "readonly"
                     } else {
                         "edit"

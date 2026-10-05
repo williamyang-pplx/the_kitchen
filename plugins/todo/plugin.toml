@@ -1,0 +1,7 @@
+name = "todo"
+version = "0.1.0"
+description = "Highlight TODO / FIXME / XXX / HACK comments in every file"
+api = 1
+
+[config]
+words = ["TODO", "FIXME", "XXX", "HACK"]

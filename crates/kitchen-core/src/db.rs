@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     github_slug    TEXT,
     default_branch TEXT,
     position       INTEGER NOT NULL,
+    pinned         INTEGER NOT NULL DEFAULT 0,  -- pinned workspaces sort to the top of the sidebar
     created_at     INTEGER NOT NULL
 );
 
@@ -31,9 +32,9 @@ CREATE TABLE IF NOT EXISTS tabs (
     title        TEXT NOT NULL,
     worktree     TEXT NOT NULL,
     branch       TEXT,
-    pr_number    INTEGER,
     tmux_session TEXT NOT NULL UNIQUE,
     plan_file    TEXT,
+    diff_base    TEXT,
     position     INTEGER NOT NULL,
     created_at   INTEGER NOT NULL
 );
@@ -50,50 +51,6 @@ CREATE TABLE IF NOT EXISTS plan_comments (
     created_at  INTEGER NOT NULL,
     sent_at     INTEGER,
     resolved_at INTEGER
-);
-
--- One automatic review of someone else's PR at one head commit.
-CREATE TABLE IF NOT EXISTS review_runs (
-    id           INTEGER PRIMARY KEY,
-    github_slug  TEXT NOT NULL,
-    pr_number    INTEGER NOT NULL,
-    head_sha     TEXT NOT NULL,
-    author       TEXT,
-    title        TEXT,
-    url          TEXT,
-    workspace_id TEXT,
-    worktree     TEXT,
-    tmux_session TEXT,
-    status       TEXT NOT NULL,            -- queued | running | done | failed | superseded
-    error        TEXT,
-    started_at   INTEGER,
-    finished_at  INTEGER,
-    UNIQUE (github_slug, pr_number, head_sha)
-);
-
--- Agent-written review comments. They never reach GitHub until William
--- approves each one: state goes draft -> published (or rejected).
-CREATE TABLE IF NOT EXISTS drafts (
-    id                INTEGER PRIMARY KEY,
-    run_id            INTEGER REFERENCES review_runs(id) ON DELETE SET NULL,
-    github_slug       TEXT NOT NULL,
-    pr_number         INTEGER NOT NULL,
-    head_sha          TEXT,
-    path              TEXT NOT NULL,
-    line              INTEGER,             -- NULL = file-level comment
-    start_line        INTEGER,
-    side              TEXT NOT NULL DEFAULT 'RIGHT' CHECK (side IN ('LEFT', 'RIGHT')),
-    body              TEXT NOT NULL,
-    severity          TEXT,
-    state             TEXT NOT NULL DEFAULT 'draft' CHECK (state IN ('draft', 'published', 'rejected')),
-    github_comment_id INTEGER,
-    github_url        TEXT,
-    created_at        INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS watch_list (
-    login TEXT PRIMARY KEY
 );
 
 -- Model-written summaries of functions/classes, keyed by the symbol's
@@ -137,6 +94,8 @@ pub struct WorkspaceRow {
     pub github_slug: Option<String>,
     pub default_branch: Option<String>,
     pub position: i64,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -147,10 +106,12 @@ pub struct TabRow {
     pub title: String,
     pub worktree: String,
     pub branch: Option<String>,
-    pub pr_number: Option<i64>,
     pub tmux_session: String,
     pub plan_file: Option<String>,
     pub position: i64,
+    /// What the viewer diffs against (any rev); `None` = `origin/<default>`.
+    #[serde(default)]
+    pub diff_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -163,56 +124,6 @@ pub struct PlanComment {
     pub body: String,
     pub state: String,
     pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ReviewRun {
-    pub id: i64,
-    pub github_slug: String,
-    pub pr_number: i64,
-    pub head_sha: String,
-    pub author: Option<String>,
-    pub title: Option<String>,
-    pub url: Option<String>,
-    pub workspace_id: Option<String>,
-    pub worktree: Option<String>,
-    pub tmux_session: Option<String>,
-    pub status: String,
-    pub error: Option<String>,
-    pub started_at: Option<i64>,
-    pub finished_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Draft {
-    pub id: i64,
-    pub run_id: Option<i64>,
-    pub github_slug: String,
-    pub pr_number: i64,
-    pub head_sha: Option<String>,
-    pub path: String,
-    pub line: Option<i64>,
-    pub start_line: Option<i64>,
-    pub side: String,
-    pub body: String,
-    pub severity: Option<String>,
-    pub state: String,
-    pub github_comment_id: Option<i64>,
-    pub github_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct NewDraft {
-    pub run_id: Option<i64>,
-    pub github_slug: String,
-    pub pr_number: i64,
-    pub head_sha: Option<String>,
-    pub path: String,
-    pub line: Option<i64>,
-    pub start_line: Option<i64>,
-    pub side: Option<String>,
-    pub body: String,
-    pub severity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -235,6 +146,7 @@ fn workspace_from(r: &Row) -> rusqlite::Result<WorkspaceRow> {
         github_slug: r.get(4)?,
         default_branch: r.get(5)?,
         position: r.get(6)?,
+        pinned: r.get(7)?,
     })
 }
 
@@ -246,10 +158,10 @@ fn tab_from(r: &Row) -> rusqlite::Result<TabRow> {
         title: r.get(3)?,
         worktree: r.get(4)?,
         branch: r.get(5)?,
-        pr_number: r.get(6)?,
-        tmux_session: r.get(7)?,
-        plan_file: r.get(8)?,
-        position: r.get(9)?,
+        tmux_session: r.get(6)?,
+        plan_file: r.get(7)?,
+        position: r.get(8)?,
+        diff_base: r.get(9)?,
     })
 }
 
@@ -266,49 +178,24 @@ fn plan_comment_from(r: &Row) -> rusqlite::Result<PlanComment> {
     })
 }
 
-fn run_from(r: &Row) -> rusqlite::Result<ReviewRun> {
-    Ok(ReviewRun {
-        id: r.get(0)?,
-        github_slug: r.get(1)?,
-        pr_number: r.get(2)?,
-        head_sha: r.get(3)?,
-        author: r.get(4)?,
-        title: r.get(5)?,
-        url: r.get(6)?,
-        workspace_id: r.get(7)?,
-        worktree: r.get(8)?,
-        tmux_session: r.get(9)?,
-        status: r.get(10)?,
-        error: r.get(11)?,
-        started_at: r.get(12)?,
-        finished_at: r.get(13)?,
-    })
-}
-
-fn draft_from(r: &Row) -> rusqlite::Result<Draft> {
-    Ok(Draft {
-        id: r.get(0)?,
-        run_id: r.get(1)?,
-        github_slug: r.get(2)?,
-        pr_number: r.get(3)?,
-        head_sha: r.get(4)?,
-        path: r.get(5)?,
-        line: r.get(6)?,
-        start_line: r.get(7)?,
-        side: r.get(8)?,
-        body: r.get(9)?,
-        severity: r.get(10)?,
-        state: r.get(11)?,
-        github_comment_id: r.get(12)?,
-        github_url: r.get(13)?,
-    })
-}
-
-const WS_COLS: &str = "id, name, host, repo_path, github_slug, default_branch, position";
-const TAB_COLS: &str = "id, workspace_id, kind, title, worktree, branch, pr_number, tmux_session, plan_file, position";
+const WS_COLS: &str = "id, name, host, repo_path, github_slug, default_branch, position, pinned";
+const TAB_COLS: &str = "id, workspace_id, kind, title, worktree, branch, tmux_session, plan_file, position, diff_base";
 const PC_COLS: &str = "id, tab_id, line, end_line, quote, body, state, created_at";
-const RUN_COLS: &str = "id, github_slug, pr_number, head_sha, author, title, url, workspace_id, worktree, tmux_session, status, error, started_at, finished_at";
-const DRAFT_COLS: &str = "id, run_id, github_slug, pr_number, head_sha, path, line, start_line, side, body, severity, state, github_comment_id, github_url";
+
+/// Columns added after a table first shipped; `CREATE TABLE IF NOT EXISTS`
+/// leaves older databases without them.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_pinned: bool =
+        conn.query_row("SELECT COUNT(*) FROM pragma_table_info('workspaces') WHERE name = 'pinned'", [], |r| r.get(0))?;
+    if !has_pinned {
+        conn.execute_batch("ALTER TABLE workspaces ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let has_base: bool = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('tabs') WHERE name = 'diff_base'", [], |r| r.get(0))?;
+    if !has_base {
+        conn.execute_batch("ALTER TABLE tabs ADD COLUMN diff_base TEXT")?;
+    }
+    Ok(())
+}
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
@@ -324,31 +211,42 @@ impl Db {
 
     fn init(conn: Connection) -> Result<Db> {
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Db { conn })
     }
 
     // ------------------------------------------------------------ workspaces
 
     pub fn workspaces(&self) -> Result<Vec<WorkspaceRow>> {
-        let mut st = self.conn.prepare(&format!("SELECT {WS_COLS} FROM workspaces ORDER BY position, created_at"))?;
+        let mut st = self.conn.prepare(&format!("SELECT {WS_COLS} FROM workspaces ORDER BY pinned DESC, position, created_at"))?;
         Ok(st.query_map([], workspace_from)?.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn insert_workspace(&self, w: &WorkspaceRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO workspaces (id, name, host, repo_path, github_slug, default_branch, position, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![w.id, w.name, w.host, w.repo_path, w.github_slug, w.default_branch, w.position, now()],
+            "INSERT INTO workspaces (id, name, host, repo_path, github_slug, default_branch, position, pinned, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![w.id, w.name, w.host, w.repo_path, w.github_slug, w.default_branch, w.position, w.pinned, now()],
         )?;
         Ok(())
     }
 
     pub fn update_workspace(&self, w: &WorkspaceRow) -> Result<()> {
         self.conn.execute(
-            "UPDATE workspaces SET name = ?2, host = ?3, repo_path = ?4, github_slug = ?5, default_branch = ?6, position = ?7
-             WHERE id = ?1",
-            params![w.id, w.name, w.host, w.repo_path, w.github_slug, w.default_branch, w.position],
+            "UPDATE workspaces SET name = ?2, host = ?3, repo_path = ?4, github_slug = ?5, default_branch = ?6, position = ?7,
+             pinned = ?8 WHERE id = ?1",
+            params![w.id, w.name, w.host, w.repo_path, w.github_slug, w.default_branch, w.position, w.pinned],
         )?;
+        Ok(())
+    }
+
+    /// Persist a new sidebar order: each workspace's position and pin state, atomically.
+    pub fn reorder_workspaces(&self, order: &[(String, i64, bool)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, position, pinned) in order {
+            tx.execute("UPDATE workspaces SET position = ?2, pinned = ?3 WHERE id = ?1", params![id, position, pinned])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -371,7 +269,7 @@ impl Db {
 
     pub fn insert_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, pr_number, tmux_session, plan_file, position, created_at)
+            "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, plan_file, position, diff_base, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 t.id,
@@ -380,10 +278,10 @@ impl Db {
                 t.title,
                 t.worktree,
                 t.branch,
-                t.pr_number,
                 t.tmux_session,
                 t.plan_file,
                 t.position,
+                t.diff_base,
                 now()
             ],
         )?;
@@ -392,8 +290,8 @@ impl Db {
 
     pub fn update_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
-            "UPDATE tabs SET title = ?2, worktree = ?3, branch = ?4, pr_number = ?5, plan_file = ?6, position = ?7 WHERE id = ?1",
-            params![t.id, t.title, t.worktree, t.branch, t.pr_number, t.plan_file, t.position],
+            "UPDATE tabs SET title = ?2, worktree = ?3, branch = ?4, plan_file = ?5, position = ?6, diff_base = ?7 WHERE id = ?1",
+            params![t.id, t.title, t.worktree, t.branch, t.plan_file, t.position, t.diff_base],
         )?;
         Ok(())
     }
@@ -438,180 +336,6 @@ impl Db {
 
     pub fn delete_plan_comment(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM plan_comments WHERE id = ?1", [id])?;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------ review runs
-
-    /// Insert a run unless one already exists for this exact head commit.
-    /// Returns the new id, or `None` when the PR@sha was already reviewed.
-    pub fn insert_review_run(
-        &self,
-        slug: &str,
-        pr: i64,
-        head_sha: &str,
-        author: Option<&str>,
-        title: Option<&str>,
-        url: Option<&str>,
-    ) -> Result<Option<i64>> {
-        let n = self.conn.execute(
-            "INSERT OR IGNORE INTO review_runs (github_slug, pr_number, head_sha, author, title, url, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued')",
-            params![slug, pr, head_sha, author, title, url],
-        )?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let id = self.conn.last_insert_rowid();
-        // Older runs of the same PR are superseded by the new head.
-        self.conn.execute(
-            "UPDATE review_runs SET status = 'superseded'
-             WHERE github_slug = ?1 AND pr_number = ?2 AND id != ?3 AND status IN ('queued', 'running')",
-            params![slug, pr, id],
-        )?;
-        Ok(Some(id))
-    }
-
-    pub fn review_runs(&self, limit: i64) -> Result<Vec<ReviewRun>> {
-        let mut st = self.conn.prepare(&format!("SELECT {RUN_COLS} FROM review_runs ORDER BY id DESC LIMIT ?1"))?;
-        Ok(st.query_map([limit], run_from)?.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn review_run(&self, id: i64) -> Result<Option<ReviewRun>> {
-        Ok(self.conn.query_row(&format!("SELECT {RUN_COLS} FROM review_runs WHERE id = ?1"), [id], run_from).optional()?)
-    }
-
-    pub fn runs_with_status(&self, status: &str) -> Result<Vec<ReviewRun>> {
-        let mut st = self.conn.prepare(&format!("SELECT {RUN_COLS} FROM review_runs WHERE status = ?1 ORDER BY id"))?;
-        Ok(st.query_map([status], run_from)?.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// Re-queue a failed (or crash-orphaned queued) run of this exact head (manual retry).
-    pub fn requeue_failed_run(&self, slug: &str, pr: i64, head_sha: &str) -> Result<Option<i64>> {
-        let id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM review_runs WHERE github_slug = ?1 AND pr_number = ?2 AND head_sha = ?3 AND status IN ('failed', 'queued')",
-                params![slug, pr, head_sha],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = id {
-            self.conn.execute(
-                "UPDATE review_runs SET status = 'queued', error = NULL, started_at = NULL, finished_at = NULL WHERE id = ?1",
-                [id],
-            )?;
-        }
-        Ok(id)
-    }
-
-    pub fn start_review_run(&self, id: i64, workspace_id: &str, worktree: &str, session: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE review_runs SET status = 'running', workspace_id = ?2, worktree = ?3, tmux_session = ?4, started_at = ?5
-             WHERE id = ?1",
-            params![id, workspace_id, worktree, session, now()],
-        )?;
-        Ok(())
-    }
-
-    pub fn finish_review_run(&self, id: i64, status: &str, error: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE review_runs SET status = ?2, error = ?3, finished_at = ?4 WHERE id = ?1",
-            params![id, status, error, now()],
-        )?;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------ drafts
-
-    pub fn add_draft(&self, d: &NewDraft) -> Result<i64> {
-        let side = d.side.clone().unwrap_or_else(|| "RIGHT".into()).to_uppercase();
-        self.conn.execute(
-            "INSERT INTO drafts (run_id, github_slug, pr_number, head_sha, path, line, start_line, side, body, severity, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
-            params![
-                d.run_id,
-                d.github_slug,
-                d.pr_number,
-                d.head_sha,
-                d.path,
-                d.line,
-                d.start_line,
-                side,
-                d.body,
-                d.severity,
-                now()
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn drafts_for_pr(&self, slug: &str, pr: i64) -> Result<Vec<Draft>> {
-        let mut st = self.conn.prepare(&format!(
-            "SELECT {DRAFT_COLS} FROM drafts WHERE github_slug = ?1 AND pr_number = ?2 ORDER BY path, line, id"
-        ))?;
-        Ok(st.query_map(params![slug, pr], draft_from)?.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn drafts_with_state(&self, state: &str) -> Result<Vec<Draft>> {
-        let mut st = self
-            .conn
-            .prepare(&format!("SELECT {DRAFT_COLS} FROM drafts WHERE state = ?1 ORDER BY github_slug, pr_number, path, line, id"))?;
-        Ok(st.query_map([state], draft_from)?.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn drafts_for_run(&self, run_id: i64) -> Result<Vec<Draft>> {
-        let mut st = self.conn.prepare(&format!("SELECT {DRAFT_COLS} FROM drafts WHERE run_id = ?1 ORDER BY path, line, id"))?;
-        Ok(st.query_map([run_id], draft_from)?.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn count_drafts(&self, state: &str) -> Result<i64> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM drafts WHERE state = ?1", [state], |r| r.get(0))?)
-    }
-
-    pub fn draft(&self, id: i64) -> Result<Option<Draft>> {
-        Ok(self.conn.query_row(&format!("SELECT {DRAFT_COLS} FROM drafts WHERE id = ?1"), [id], draft_from).optional()?)
-    }
-
-    pub fn edit_draft(&self, id: i64, body: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE drafts SET body = ?2, updated_at = ?3 WHERE id = ?1 AND state = 'draft'",
-            params![id, body, now()],
-        )?;
-        Ok(())
-    }
-
-    pub fn reject_draft(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE drafts SET state = 'rejected', updated_at = ?2 WHERE id = ?1 AND state = 'draft'",
-            params![id, now()],
-        )?;
-        Ok(())
-    }
-
-    /// The only transition to `published`; called after GitHub accepted it.
-    pub fn mark_draft_published(&self, id: i64, comment_id: Option<i64>, url: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE drafts SET state = 'published', github_comment_id = ?2, github_url = ?3, updated_at = ?4 WHERE id = ?1",
-            params![id, comment_id, url, now()],
-        )?;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------ watch list
-
-    pub fn watch_list(&self) -> Result<Vec<String>> {
-        let mut st = self.conn.prepare("SELECT login FROM watch_list ORDER BY login")?;
-        Ok(st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
-    }
-
-    pub fn watch(&self, login: &str) -> Result<()> {
-        self.conn.execute("INSERT OR IGNORE INTO watch_list (login) VALUES (?1)", [login.trim_start_matches('@')])?;
-        Ok(())
-    }
-
-    pub fn unwatch(&self, login: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM watch_list WHERE login = ?1", [login.trim_start_matches('@')])?;
         Ok(())
     }
 
@@ -700,6 +424,7 @@ mod tests {
             github_slug: Some("o/r".into()),
             default_branch: Some("main".into()),
             position: pos,
+            pinned: false,
         }
     }
 
@@ -716,10 +441,10 @@ mod tests {
             title: "x".into(),
             worktree: "/r-x".into(),
             branch: Some("william/x".into()),
-            pr_number: None,
             tmux_session: "kt_a_t1".into(),
             plan_file: None,
             position: 1,
+            diff_base: Some("origin/main".into()),
         };
         db.insert_tab(&tab).unwrap();
         assert_eq!(db.tabs("a").unwrap(), vec![tab.clone()]);
@@ -728,50 +453,37 @@ mod tests {
     }
 
     #[test]
-    fn review_runs_dedup_and_supersede() {
+    fn pinned_workspaces_sort_first_and_reorder_persists() {
         let db = Db::open_in_memory().unwrap();
-        let r1 = db.insert_review_run("o/r", 5, "sha1", Some("bob"), None, None).unwrap();
-        assert!(r1.is_some());
-        assert!(db.insert_review_run("o/r", 5, "sha1", None, None, None).unwrap().is_none());
-        let r2 = db.insert_review_run("o/r", 5, "sha2", None, None, None).unwrap().unwrap();
-        assert_eq!(db.review_run(r1.unwrap()).unwrap().unwrap().status, "superseded");
-        assert_eq!(db.review_run(r2).unwrap().unwrap().status, "queued");
+        for (id, pos) in [("a", 0), ("b", 1), ("c", 2)] {
+            db.insert_workspace(&ws(id, pos)).unwrap();
+        }
+        let order = |db: &Db| db.workspaces().unwrap().into_iter().map(|w| w.id).collect::<Vec<_>>();
+        db.update_workspace(&WorkspaceRow { pinned: true, ..ws("c", 2) }).unwrap();
+        assert_eq!(order(&db), ["c", "a", "b"]);
+        db.reorder_workspaces(&[("b".into(), 0, false), ("a".into(), 1, false), ("c".into(), 2, false)]).unwrap();
+        assert_eq!(order(&db), ["b", "a", "c"]);
     }
 
     #[test]
-    fn requeue_only_failed_or_orphaned() {
-        let db = Db::open_in_memory().unwrap();
-        let id = db.insert_review_run("o/r", 1, "s", None, None, None).unwrap().unwrap();
-        db.start_review_run(id, "w", "/wt", "sess").unwrap();
-        assert_eq!(db.requeue_failed_run("o/r", 1, "s").unwrap(), None, "running runs are not retried");
-        db.finish_review_run(id, "failed", Some("boom")).unwrap();
-        assert_eq!(db.requeue_failed_run("o/r", 1, "s").unwrap(), Some(id));
-        let run = db.review_run(id).unwrap().unwrap();
-        assert_eq!((run.status.as_str(), run.error), ("queued", None));
-        db.add_draft(&NewDraft { run_id: Some(id), github_slug: "o/r".into(), pr_number: 1, path: "a".into(), body: "b".into(), ..Default::default() }).unwrap();
-        assert_eq!(db.drafts_for_run(id).unwrap().len(), 1);
-        assert_eq!(db.count_drafts("draft").unwrap(), 1);
-    }
-
-    #[test]
-    fn drafts_gate() {
-        let db = Db::open_in_memory().unwrap();
-        let id = db
-            .add_draft(&NewDraft {
-                github_slug: "o/r".into(),
-                pr_number: 5,
-                path: "a.rs".into(),
-                line: Some(3),
-                body: "nit".into(),
-                ..Default::default()
-            })
-            .unwrap();
-        db.edit_draft(id, "better nit").unwrap();
-        let d = db.draft(id).unwrap().unwrap();
-        assert_eq!((d.state.as_str(), d.body.as_str(), d.side.as_str()), ("draft", "better nit", "RIGHT"));
-        db.mark_draft_published(id, Some(99), Some("u")).unwrap();
-        db.edit_draft(id, "too late").unwrap();
-        assert_eq!(db.draft(id).unwrap().unwrap().body, "better nit", "published drafts are frozen");
+    fn migrate_adds_pinned_to_old_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, repo_path TEXT NOT NULL,
+             github_slug TEXT, default_branch TEXT, position INTEGER NOT NULL, created_at INTEGER NOT NULL);
+             INSERT INTO workspaces VALUES ('a', 'a', 'local', '/r', NULL, NULL, 0, 0);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tabs (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL,
+             worktree TEXT NOT NULL, branch TEXT, pr_number INTEGER, tmux_session TEXT NOT NULL UNIQUE, plan_file TEXT,
+             position INTEGER NOT NULL, created_at INTEGER NOT NULL);
+             INSERT INTO tabs VALUES ('t', 'a', 'readonly', 't', '/w', NULL, 12, 's', NULL, 1, 0);",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert!(!db.workspaces().unwrap()[0].pinned);
+        assert_eq!(db.tab("t").unwrap().unwrap().diff_base, None, "old tabs gain diff_base");
     }
 
     #[test]
@@ -785,10 +497,10 @@ mod tests {
             title: "t".into(),
             worktree: "/w".into(),
             branch: None,
-            pr_number: None,
             tmux_session: "s".into(),
             plan_file: None,
             position: 1,
+            diff_base: None,
         })
         .unwrap();
         let id = db.add_plan_comment("t", 4, None, "## F1", "rename this").unwrap();

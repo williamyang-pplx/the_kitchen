@@ -16,9 +16,56 @@ pub type Spans = Vec<Vec<(Range<usize>, Color32)>>;
 /// Files longer than this are shown unhighlighted.
 const MAX_LINES: usize = 20_000;
 
+/// Extra grammar folders (plugins' `syntaxes/`), set once at startup before
+/// the first file is highlighted.
+static EXTRA_SYNTAX_DIRS: OnceLock<Vec<std::path::PathBuf>> = OnceLock::new();
+
+pub fn set_extra_syntax_dirs(dirs: Vec<std::path::PathBuf>) {
+    let _ = EXTRA_SYNTAX_DIRS.set(dirs);
+}
+
 fn syntaxes() -> &'static SyntaxSet {
     static S: OnceLock<SyntaxSet> = OnceLock::new();
-    S.get_or_init(SyntaxSet::load_defaults_newlines)
+    S.get_or_init(|| {
+        let dirs = EXTRA_SYNTAX_DIRS.get().cloned().unwrap_or_default();
+        if dirs.is_empty() {
+            return SyntaxSet::load_defaults_newlines();
+        }
+        let mut b = SyntaxSet::load_defaults_newlines().into_builder();
+        for d in dirs {
+            if let Err(e) = b.add_from_folder(&d, true) {
+                log::warn!("plugin syntaxes in {}: {e}", d.display());
+            }
+        }
+        b.build()
+    })
+}
+
+/// Color for a highlight group: `#rrggbb`, or a TextMate scope
+/// (`keyword`, `comment`, `entity.name.function`, …) through the theme.
+pub fn group_color(group: &str) -> Option<Color32> {
+    if let Some(hex) = group.strip_prefix('#') {
+        let v = u32::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 6)?;
+        return Some(Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8));
+    }
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Option<Color32>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(c) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(group) {
+        return *c;
+    }
+    let color = match group {
+        "error" => Some(crate::theme::RED),
+        "warning" => Some(crate::theme::YELLOW),
+        "info" | "hint" => Some(crate::theme::CYAN),
+        "todo" => Some(crate::theme::YELLOW),
+        _ => syntect::parsing::Scope::new(group).ok().map(|scope| {
+            let h = syntect::highlighting::Highlighter::new(theme());
+            let style = h.style_for_stack(&[scope]);
+            Color32::from_rgb(style.foreground.r, style.foreground.g, style.foreground.b)
+        }),
+    };
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(group.to_string(), color);
+    color
 }
 
 fn theme() -> &'static Theme {

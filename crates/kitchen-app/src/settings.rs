@@ -17,12 +17,15 @@ pub struct Settings {
     pub dotfiles_remote_url: String,
     /// Where devboxes keep the dotfiles checkout.
     pub dotfiles_remote_dir: String,
-    /// Seconds between checks for PRs that request William's review.
-    pub review_poll_secs: u64,
-    pub review_poll_enabled: bool,
     /// Model used for outline summaries (`claude -p --model <this>`).
     pub summary_model: String,
     pub font_size: f32,
+    /// Folders the viewer opens at when a tab has no changes (first that exists).
+    pub viewer_default_dirs: Vec<String>,
+    /// Viewer / plan gutters count lines from the cursor (vim `relativenumber`).
+    pub relative_line_numbers: bool,
+    /// Plugin folders besides `~/.kitchen/plugins` (`~` is expanded).
+    pub plugin_dirs: Vec<String>,
 }
 
 impl Default for Settings {
@@ -36,10 +39,11 @@ impl Default for Settings {
             dotfiles_local: format!("{home}/Documents/dotfiles"),
             dotfiles_remote_url: "https://github.com/williamyang-pplx/dotfiles".into(),
             dotfiles_remote_dir: "~/.dotfiles".into(),
-            review_poll_secs: 180,
-            review_poll_enabled: true,
             summary_model: "haiku".into(),
             font_size: 13.0,
+            viewer_default_dirs: vec!["aster".into()],
+            relative_line_numbers: true,
+            plugin_dirs: Vec::new(),
         }
     }
 }

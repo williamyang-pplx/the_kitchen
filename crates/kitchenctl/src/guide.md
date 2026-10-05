@@ -23,8 +23,11 @@ Environment in every kitchen tab: `KITCHEN_WORKSPACE_ID`, `KITCHEN_TAB_ID`,
 - **Edit tab** — its own git worktree `<repo>-<slug>` on branch
   `william/<slug>`, cut from freshly fetched `origin/<default>`. One PR per tab.
 - **Read-only tab** — the shared read-only worktree `<repo>-kitchen-readonly`,
-  synced to the latest `origin/<default>`. Files are not writable. Use it for
+  synced to the latest `origin/<default>`, or (opened from a PR link) the PR
+  head in `<repo>-kitchen-ro-pr-<N>`. Files are not writable. Use it for
   code understanding and review only; never try to make it writable.
+- Every tab has `$KITCHEN_DIFF_BASE`: the tab's changes (an edit tab's work,
+  or a PR's diff) are `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`.
 - Handles: ids, 1-based indexes (`2`, `workspace:2`, `tab:3`), or names.
 
 ## Common tasks
@@ -32,8 +35,9 @@ Environment in every kitchen tab: `KITCHEN_WORKSPACE_ID`, `KITCHEN_TAB_ID`,
 ```bash
 kitchenctl workspace list
 kitchenctl tab new --edit --task "AI-123: add retries to the judge client"
-kitchenctl tab new --edit --pr 1234          # work on an existing PR
+kitchenctl tab new --edit --branch william/x  # continue an existing branch
 kitchenctl tab new --readonly                # latest main, read-only
+kitchenctl tab open https://github.com/ppl-ai/air/pull/14211   # review a PR
 kitchenctl tab send --tab 2 --enter "make test"
 kitchenctl tab read-screen --tab 2 --scrollback 200
 kitchenctl tab send-key --tab 2 C-c
@@ -57,35 +61,33 @@ Every PR starts with a plan. When you were started with a task:
    `kitchenctl plan ready` again.
 4. Do not implement until William approves the plan.
 
-## PR review comments on your PR
+## Plugins and viewer diagnostics
 
-```bash
-kitchenctl pr threads --unresolved           # William's and others' threads
-kitchenctl pr resolve <thread-id> --reply "Fixed in 3f2a1c: ..."
+Plugins are Lua in `~/.kitchen/plugins/<name>/` (`plugin.toml` + `init.lua`;
+full reference: `docs/plugins.md` in the kitchen repo). They reload when
+their files change.
+
+```
+kitchenctl plugin list                      # status + commands
+kitchenctl plugin run ruff.explain          # run a plugin command in the caller's tab
+kitchenctl plugin logs ruff                 # print()/errors of a plugin
+kitchenctl plugin reload [name]             # this mac only
 ```
 
-Resolve a thread as soon as you have addressed it (pushed the fix), so the
-kitchen and GitHub show it as done. Only reply publicly where the
-`address-pr-comments` skill allows it.
+Any program can push diagnostics into the viewer without writing a plugin
+(namespace becomes `ext.<ns>`; host/worktree default to the calling tab):
 
-## Reviewing other people's PRs (auto-review runs)
-
-When the kitchen starts you to review a PR, record each finding as a
-**draft** — drafts are private and are published only after William approves
-each one. Never post review comments to GitHub yourself (`gh pr review`,
-`gh api .../comments`): that bypasses his approval.
-
-```bash
-kitchenctl review draft --run 7 --path src/a.rs --line 42 --severity bug \
-  --body "This unwrap panics when the list is empty; use .first()?"
-kitchenctl review draft --run 7 --path src/a.rs --body "File-level note"
-kitchenctl review draft --run 7 --path src/a.rs --line 10 --side LEFT --body "..."   # deleted line
-kitchenctl review done --run 7               # or: --failed "reason"
-kitchenctl review drafts                     # what you have drafted
+```
+kitchenctl decor set app/main.py --ns mytool --items '[{"line":3,"col":5,"severity":"error","message":"boom"}]'
+kitchenctl decor clear app/main.py --ns mytool
 ```
 
-Lines are line numbers in the new file (`--side RIGHT`, the default) or in the
-old file for deleted code (`--side LEFT`). Use `--start-line` for ranges.
+Lines and columns are 1-based, columns in characters of the raw line,
+`end_col` exclusive.
+
+In the viewer, `gd` / `gr` (definition / references) come from a plugin's
+language server when one covers the file (the bundled `python` plugin runs ty
+in the project root on the file's host) and fall back to text search.
 
 ## Output and errors
 

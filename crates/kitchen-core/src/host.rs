@@ -44,8 +44,10 @@ impl Host {
         self.run_with_stdin(argv, cwd, None)
     }
 
-    pub fn run_with_stdin(&self, argv: &[&str], cwd: Option<&str>, stdin: Option<&[u8]>) -> Result<Output> {
-        let mut cmd = match self {
+    /// The process that runs `argv` in `cwd` on this host (ssh for devboxes),
+    /// for callers that need to manage the child themselves (timeouts).
+    pub fn command(&self, argv: &[&str], cwd: Option<&str>) -> Command {
+        match self {
             Host::Local => {
                 let mut c = Command::new(argv[0]);
                 c.args(&argv[1..]);
@@ -64,7 +66,11 @@ impl Host {
                 c.args(ssh_base_args()).arg(alias).arg("--").arg(script);
                 c
             }
-        };
+        }
+    }
+
+    pub fn run_with_stdin(&self, argv: &[&str], cwd: Option<&str>, stdin: Option<&[u8]>) -> Result<Output> {
+        let mut cmd = self.command(argv, cwd);
         let start = std::time::Instant::now();
         let out = run_command(&mut cmd, stdin).with_context(|| format!("[{}] {}", self.label(), shell_join(argv)));
         log::debug!(target: "kitchen::exec", "{:>6.0}ms [{}] {}", start.elapsed().as_secs_f64() * 1000.0, self.label(), shell_join(argv).chars().take(160).collect::<String>());

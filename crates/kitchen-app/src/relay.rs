@@ -119,7 +119,7 @@ fn run_once(engine: &Arc<Engine>, alias: &str) -> Result<()> {
         let stdin = stdin.clone();
         // Requests can block (tab creation fetches); answer each on its own thread.
         std::thread::spawn(move || {
-            let resp = api::handle_line(&engine, &frame.line);
+            let resp = api::handle_line_from(&engine, &frame.line, true);
             let Ok(resp_line) = serde_json::to_string(&resp) else { return };
             let Ok(mut out) = serde_json::to_string(&RelayFrame { rid: frame.rid, line: resp_line }) else { return };
             out.push('\n');

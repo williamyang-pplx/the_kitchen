@@ -1,0 +1,9 @@
+name = "ruff"
+version = "0.1.0"
+description = "Python diagnostics from ruff, run where the code lives (devbox or mac)"
+api = 1
+filetypes = ["py", "pyi"]
+
+[config]
+# Extra rule selection on top of the project's ruff config ("" = project config only).
+select = ""

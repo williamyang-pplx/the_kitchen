@@ -1,12 +1,18 @@
-//! The file viewer (one per tab): PR-relevant files first, plain / diff /
-//! outline modes, vim navigation, jump-to-definition with a jump list, and
-//! inline PR comments. All file access goes through the workspace's
-//! [`Host`] on background threads, so devbox workspaces work the same.
+//! The file viewer (one per tab). With changes (a PR tab, an edit tab the
+//! agent worked in) it opens on the first changed file's diff, next to a
+//! tree of just the changed files; without, on a folder view at a default
+//! folder such as `aster/`. Plain / diff / outline modes, vim
+//! navigation, and jump-to-definition with a jump list. All file access goes
+//! through the workspace's [`Host`] on background threads, so devbox
+//! workspaces work the same.
 
+mod changes_tree;
 pub mod code_view;
 pub mod doc;
 pub mod highlight;
+mod nav;
 pub mod picker;
+mod plugin_glue;
 pub mod vim;
 
 use std::collections::{HashMap, HashSet};
@@ -14,7 +20,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use egui::{RichText, Ui};
-use kitchen_core::gh::CommentAnchor;
 use kitchen_core::git::{ChangedFile, Repo};
 use kitchen_core::host::Host;
 use kitchen_core::summaries;
@@ -22,10 +27,9 @@ use kitchen_symbols::Symbol;
 
 use crate::engine::{Engine, Tab, Workspace};
 use crate::panels::{PanelCmd, PanelCtx};
-use crate::review;
 use crate::theme;
-use code_view::{Block, CodeView, Editor, ViewState};
-use doc::{Doc, DocLine, LineKind};
+use code_view::{CodeView, ViewState};
+use doc::{Doc, DocLine};
 use highlight::Spans;
 use picker::{Picker, PickerResult};
 use vim::{Vim, VimAction};
@@ -39,6 +43,10 @@ struct FileData {
     text: String,
     spans: Option<Spans>,
     symbols: Vec<Symbol>,
+    /// Content hash (plugins' decoration version).
+    version: String,
+    /// Size + mtime when read, to notice changes on disk.
+    meta: String,
 }
 
 struct BaseData {
@@ -55,19 +63,46 @@ struct Loc {
     col: usize,
 }
 
+/// One row of the folder view.
+#[derive(Clone, Debug, PartialEq)]
+struct Entry {
+    /// Shown text: `../`, `name/` or `name`.
+    label: String,
+    /// Worktree-relative path (a directory without trailing slash).
+    path: String,
+    is_dir: bool,
+}
+
 enum Msg {
-    Files { changed: Vec<ChangedFile>, all: Vec<String>, base: String },
+    /// A file listing; `quiet` = a background refresh (keep the view as is).
+    Files { changed: Vec<ChangedFile>, all: Vec<String>, base: String, quiet: bool },
+    /// Fingerprint of the worktree's HEAD + status (edit tabs).
+    Changes(String),
     FilesFailed(String),
     File { path: String, result: Result<FileData, String> },
     Base { path: String, data: BaseData },
     Defs { name: String, hits: Vec<(String, Symbol)> },
     Summaries { path: String, map: HashMap<String, String>, error: Option<String> },
-    Posted(Result<String, String>),
+    /// Result of a freshness check of `path` (`None`: could not stat).
+    Stat { path: String, meta: Option<String> },
+    /// A `gd`/`gr` answer (`None`: the provider couldn't tell).
+    Nav { token: u64, answer: Option<Vec<crate::plugins::Location>> },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HunkGoto {
+    First,
+    Last,
+}
+
+/// `FileData::meta` of a deleted file (shown as all removed lines).
+const DELETED: &str = "deleted";
 
 enum PickerKind {
     Files,
     Defs(Vec<Loc>),
+    /// Like `Defs`, with 1-based raw columns (from plugins / git grep).
+    RawLocs(Vec<Loc>),
 }
 
 pub struct Viewer {
@@ -86,6 +121,28 @@ pub struct Viewer {
     merge_base: Option<String>,
 
     current: Option<String>,
+    /// Folder shown in the file list, and in the main area while browsing.
+    dir: String,
+    /// The main area shows `dir` instead of the current file (`-` goes up).
+    browsing: bool,
+    /// Rows of the folder doc while browsing.
+    entries: Vec<Entry>,
+    /// Entry to put the cursor on once the folder doc is built.
+    select_entry: Option<String>,
+    /// The first file list decided where the viewer opens.
+    routed: bool,
+    /// Keyboard is in the file list (⌘H), not the code (⌘L).
+    list_focus: bool,
+    /// Keyboard cursor in the file list: changed files, then folder entries.
+    list_cursor: usize,
+    /// The list cursor moved: scroll it into view.
+    list_scroll: bool,
+    /// Pending `g` of `gg` in the file list.
+    list_g: bool,
+    /// The file list shows the repo's folders instead of the changed-files tree.
+    list_all: bool,
+    /// Where to put the cursor once the open file's diff is built.
+    hunk_goto: Option<HunkGoto>,
     diff: bool,
     outline: bool,
     files: HashMap<String, FileData>,
@@ -104,14 +161,29 @@ pub struct Viewer {
     fwd: Vec<Loc>,
 
     picker: Option<(PickerKind, Picker)>,
-    editor: Option<Editor>,
     summaries: HashMap<String, HashMap<String, String>>,
     summary_pending: HashSet<String>,
     show_files: bool,
     status: Option<(String, bool)>,
     pending_def: Option<(String, Loc, Vec<(String, Symbol)>)>,
-    /// ⌘Enter arrived; submit once the editor has seen this frame's input.
-    submit_pending: bool,
+    /// Paths being re-read because they changed on disk.
+    reloading: HashSet<String>,
+    stat_at: std::time::Instant,
+    stat_pending: bool,
+    /// Edit tab: the agent changes the worktree, so the file list is re-read
+    /// when its HEAD/status fingerprint moves.
+    live: bool,
+    changes: Option<String>,
+    changes_at: std::time::Instant,
+    changes_pending: bool,
+    overlay: Option<plugin_glue::OverlayCache>,
+    /// Keys typed after the `\` leader, and when it was pressed.
+    leader: Option<(String, std::time::Instant)>,
+    /// The `gd`/`gr` query in flight (answers for older ones are dropped).
+    pending_nav: Option<nav::PendingNav>,
+    nav_token: u64,
+    /// `pending_goto`'s column is a raw 1-based column, not a display one.
+    goto_raw: bool,
 }
 
 impl Viewer {
@@ -122,7 +194,7 @@ impl Viewer {
             tab_id: tab.row.id.clone(),
             host: ws.host(),
             worktree: tab.row.worktree.clone(),
-            base_ref: format!("origin/{}", ws.row.default_branch.as_deref().unwrap_or("main")),
+            base_ref: tab.diff_base(ws),
             tx,
             rx,
             changed: Vec::new(),
@@ -130,6 +202,17 @@ impl Viewer {
             files_state: None,
             merge_base: None,
             current: None,
+            dir: String::new(),
+            browsing: true,
+            entries: Vec::new(),
+            select_entry: None,
+            routed: false,
+            list_focus: false,
+            list_cursor: 0,
+            list_scroll: false,
+            list_g: false,
+            list_all: false,
+            hunk_goto: None,
             diff: false,
             outline: false,
             files: HashMap::new(),
@@ -145,47 +228,74 @@ impl Viewer {
             back: Vec::new(),
             fwd: Vec::new(),
             picker: None,
-            editor: None,
             summaries: HashMap::new(),
             summary_pending: HashSet::new(),
             show_files: true,
             status: None,
             pending_def: None,
-            submit_pending: false,
+            reloading: HashSet::new(),
+            stat_at: std::time::Instant::now(),
+            live: tab.kind() == kitchen_proto::TabKind::Edit,
+            changes: None,
+            changes_at: std::time::Instant::now(),
+            changes_pending: false,
+            stat_pending: false,
+            overlay: None,
+            leader: None,
+            pending_nav: None,
+            nav_token: 0,
+            goto_raw: false,
         };
-        v.load_file_list();
+        v.load_file_list(false);
         v
     }
 
     // ------------------------------------------------------------ loading
 
-    fn load_file_list(&mut self) {
-        self.files_state = None;
+    fn load_file_list(&mut self, quiet: bool) {
+        if !quiet {
+            self.files_state = None;
+        }
         let (host, wt, base_ref, tx, ctx) = (self.host.clone(), self.worktree.clone(), self.base_ref.clone(), self.tx.clone(), self.engine.ctx.clone());
         std::thread::spawn(move || {
-            let repo = Repo::new(&host, &wt);
-            let result = (|| -> anyhow::Result<Msg> {
-                let base = repo.merge_base(&wt, "HEAD", &base_ref).unwrap_or(base_ref);
-                let changed = repo.changed_files(&wt, &base)?;
-                let all = repo.ls_files(&wt)?;
-                Ok(Msg::Files { changed, all, base })
-            })();
+            let result = Repo::new(&host, &wt).listing(&wt, &base_ref).map(|mut l| {
+                changes_tree::sort(&mut l.changed);
+                Msg::Files { changed: l.changed, all: l.all, base: l.base, quiet }
+            });
             let _ = tx.send(result.unwrap_or_else(|e| Msg::FilesFailed(format!("{e:#}"))));
             ctx.request_repaint();
         });
+    }
+
+    /// `path` on the host: worktree-relative, or already absolute (outside the worktree).
+    fn abs_path(&self, path: &str) -> String {
+        if path.starts_with('/') { path.to_string() } else { format!("{}/{}", self.worktree, path) }
     }
 
     fn ensure_loaded(&mut self, path: &str) {
         if self.files.contains_key(path) || self.loading.contains(path) || self.load_errors.contains_key(path) {
             return;
         }
+        if self.changed.iter().any(|c| c.path == path && c.status == 'D') {
+            let data = FileData { text: String::new(), spans: None, symbols: Vec::new(), version: String::new(), meta: DELETED.into() };
+            self.files.insert(path.to_string(), data);
+            self.doc_key = None;
+            return;
+        }
+        self.read_file(path);
+    }
+
+    /// Read `path` in the background (the old contents stay shown meanwhile).
+    fn read_file(&mut self, path: &str) {
         self.loading.insert(path.to_string());
         let (host, full, path_s, tx, ctx) =
-            (self.host.clone(), format!("{}/{}", self.worktree, path), path.to_string(), self.tx.clone(), self.engine.ctx.clone());
+            (self.host.clone(), self.abs_path(path), path.to_string(), self.tx.clone(), self.engine.ctx.clone());
         std::thread::spawn(move || {
-            let result = host.read_file(&full).map_err(|e| format!("{e:#}")).map(|text| FileData {
+            let result = plugin_glue::read_with_meta(&host, &full).map_err(|e| format!("{e:#}")).map(|(meta, text)| FileData {
                 spans: highlight::highlight(&path_s, &text),
                 symbols: kitchen_symbols::extract(&path_s, &text),
+                version: crate::plugins::content_version(&text),
+                meta,
                 text,
             });
             let _ = tx.send(Msg::File { path: path_s, result });
@@ -195,7 +305,7 @@ impl Viewer {
 
     fn ensure_base(&mut self, path: &str) {
         let key = format!("base:{path}");
-        let Some(base) = self.merge_base.clone() else { return };
+        let Some(base) = self.merge_base.clone().filter(|_| !path.starts_with('/')) else { return };
         if self.bases.contains_key(path) || self.loading.contains(&key) {
             return;
         }
@@ -213,16 +323,48 @@ impl Viewer {
     fn poll(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Files { changed, all, base } => {
+                Msg::Files { changed, all, base, quiet: true } => {
+                    let base_moved = self.merge_base.as_deref() != Some(base.as_str());
+                    if !base_moved && changed == self.changed && all == self.all {
+                        continue;
+                    }
+                    if base_moved {
+                        self.bases.clear();
+                        self.merge_base = Some(base);
+                    }
+                    if self.browsing {
+                        // Rebuild the folder view, cursor on the same entry.
+                        self.select_entry = self.entries.get(self.vim.line).map(|e| e.path.clone());
+                        self.doc_key = None;
+                    } else if base_moved {
+                        self.doc_key = None;
+                    }
+                    self.changed = changed;
+                    self.all = all;
+                    // A deleted file may be back.
+                    self.files.retain(|_, f| f.meta != DELETED);
+                }
+                Msg::Changes(f) => {
+                    self.changes_pending = false;
+                    // The first fingerprint may already include changes made
+                    // after the initial listing, so it re-lists too.
+                    if self.changes.as_ref() != Some(&f) {
+                        self.load_file_list(true);
+                    }
+                    self.changes = Some(f);
+                }
+                Msg::Files { changed, all, base, .. } => {
                     self.changed = changed;
                     self.all = all;
                     self.merge_base = Some(base);
                     self.files_state = Some(Ok(()));
-                    if self.current.is_none() {
-                        if let Some(first) = self.changed.iter().find(|c| c.status != 'D').map(|c| c.path.clone()) {
-                            self.diff = true;
-                            self.open(&first, None, false);
-                        }
+                    self.doc_key = None;
+                    if !std::mem::replace(&mut self.routed, true) && self.current.is_none() {
+                        self.route();
+                    }
+                    if let Some((PickerKind::Files, picker)) = &mut self.picker {
+                        let (items, bonus) = file_items(&self.changed, &self.all, &self.dir);
+                        picker.set_items(items, bonus);
                     }
                 }
                 Msg::FilesFailed(e) => self.files_state = Some(Err(e)),
@@ -230,6 +372,13 @@ impl Viewer {
                     self.loading.remove(&path);
                     match result {
                         Ok(data) => {
+                            let changed = self.reloading.remove(&path);
+                            let same = self.files.get(&path).is_some_and(|old| old.version == data.version);
+                            if !(changed && same) {
+                                if let Some(p) = self.engine.plugins() {
+                                    p.file_loaded(self.file_key(&path), std::sync::Arc::from(data.text.as_str()), changed);
+                                }
+                            }
                             self.files.insert(path.clone(), data);
                         }
                         Err(e) => {
@@ -244,6 +393,7 @@ impl Viewer {
                     self.doc_key = None;
                 }
                 Msg::Defs { name, hits } => self.finish_defs(&name, hits),
+                Msg::Nav { token, answer } => self.finish_nav(token, answer),
                 Msg::Summaries { path, map, error } => {
                     self.summary_pending.remove(&path);
                     if let Some(e) = error {
@@ -252,10 +402,14 @@ impl Viewer {
                     self.summaries.entry(path).or_default().extend(map);
                     self.doc_key = None;
                 }
-                Msg::Posted(r) => match r {
-                    Ok(url) => self.engine.toast(format!("comment posted {url}")),
-                    Err(e) => self.engine.toast_err(format!("comment not posted: {e}")),
-                },
+                Msg::Stat { path, meta } => {
+                    self.stat_pending = false;
+                    let known = self.files.get(&path).map(|f| f.meta.clone());
+                    if meta.is_some() && known.is_some() && meta != known && !self.loading.contains(&path) {
+                        self.reloading.insert(path.clone());
+                        self.read_file(&path);
+                    }
+                }
             }
         }
     }
@@ -263,6 +417,9 @@ impl Viewer {
     // ------------------------------------------------------------ navigation
 
     fn here(&self) -> Option<Loc> {
+        if self.browsing {
+            return None;
+        }
         let path = self.current.clone()?;
         let line = self.current_source_line().unwrap_or(1);
         Some(Loc { path, line, col: self.vim.col })
@@ -289,12 +446,19 @@ impl Viewer {
                 self.fwd.clear();
             }
         }
+        self.browsing = false;
+        self.goto_raw = false;
+        // Files outside the worktree (an installed package) keep the list where it was.
+        if !path.starts_with('/') {
+            self.dir = parent_dir(path).to_string();
+        }
         if self.current.as_deref() != Some(path) {
             self.current = Some(path.to_string());
-            self.editor = None;
             self.vim.anchor = None;
             self.doc_key = None;
             self.pending_goto = Some((line.unwrap_or(1), 0));
+            let changed = self.changed.iter().any(|c| c.path == path);
+            self.hunk_goto = (line.is_none() && changed).then_some(HunkGoto::First);
         } else if let Some(l) = line {
             self.pending_goto = Some((l, 0));
         }
@@ -305,13 +469,69 @@ impl Viewer {
         }
     }
 
+    /// Where a fresh viewer opens: the first changed file's diff, or the
+    /// first configured default folder that exists (e.g. `aster/`).
+    fn route(&mut self) {
+        if !self.changed.is_empty() {
+            self.diff = true;
+            self.open_changed(0, false);
+            return;
+        }
+        let defaults = self.engine.settings().viewer_default_dirs;
+        let dir = defaults
+            .iter()
+            .map(|d| d.trim_matches('/'))
+            .find(|d| !d.is_empty() && self.all.iter().any(|p| p.starts_with(&format!("{d}/"))))
+            .unwrap_or("")
+            .to_string();
+        self.browse(&dir, None);
+    }
+
+    /// Show folder `dir` in the main area, cursor on `select` if given.
+    fn browse(&mut self, dir: &str, select: Option<String>) {
+        self.dir = dir.trim_matches('/').to_string();
+        self.browsing = true;
+        self.outline = false;
+        self.vim.anchor = None;
+        self.doc_key = None;
+        self.select_entry = select;
+        self.vim.set_cursor(0, 0);
+        self.view.top = 0;
+    }
+
+    /// `-`: up one folder (from a file: its folder).
+    fn browse_parent(&mut self) {
+        if self.browsing {
+            if self.dir.is_empty() {
+                return;
+            }
+            let from = self.dir.clone();
+            self.browse(&parent_dir(&from).to_string(), Some(from));
+        } else if let Some(cur) = self.current.clone() {
+            self.browse(&parent_dir(&cur).to_string(), Some(cur));
+        } else {
+            self.browse("", None);
+        }
+    }
+
+    fn open_entry(&mut self, idx: usize) {
+        let Some(e) = self.entries.get(idx).cloned() else { return };
+        if e.is_dir {
+            let select = if e.label == "../" { Some(self.dir.clone()) } else { None };
+            self.browse(&e.path, select);
+        } else {
+            self.outline = false;
+            self.open(&e.path, None, true);
+        }
+    }
+
     fn goto_loc(&mut self, loc: Loc) {
         self.outline = false;
         self.open(&loc.path.clone(), None, false);
         self.pending_goto = Some((loc.line, loc.col));
     }
 
-    fn jump_to_def(&mut self, name: String) {
+    fn grep_definition(&mut self, name: String) {
         let Some(here) = self.here() else { return };
         let local: Vec<(String, Symbol)> = self
             .files
@@ -391,19 +611,32 @@ impl Viewer {
         self.goto_loc(loc);
     }
 
+    /// ⌘J / ⌘K, `]f` / `[f`: the next / previous changed file (wrapping).
     fn step_file(&mut self, delta: isize) {
-        let paths: Vec<String> = self.changed.iter().filter(|c| c.status != 'D').map(|c| c.path.clone()).collect();
-        if paths.is_empty() {
+        let n = self.changed.len();
+        if n == 0 {
             self.status = Some(("no changed files".into(), false));
             return;
         }
-        let cur = self.current.as_ref().and_then(|c| paths.iter().position(|p| p == c));
-        let next = match cur {
-            Some(i) => (i as isize + delta).rem_euclid(paths.len() as isize) as usize,
+        let next = match self.current_changed() {
+            Some(i) => (i as isize + delta).rem_euclid(n as isize) as usize,
+            None if delta < 0 => n - 1,
             None => 0,
         };
+        self.open_changed(next, true);
+    }
+
+    /// Index of the open file among the changed files.
+    fn current_changed(&self) -> Option<usize> {
+        let cur = self.current.as_deref().filter(|_| !self.browsing)?;
+        self.changed.iter().position(|c| c.path == cur)
+    }
+
+    fn open_changed(&mut self, i: usize, record: bool) {
+        let Some(path) = self.changed.get(i).map(|c| c.path.clone()) else { return };
         self.outline = false;
-        self.open(&paths[next].clone(), None, true);
+        self.open(&path, None, record);
+        self.list_scroll = true;
     }
 
     fn step_hunk(&mut self, fwd: bool) {
@@ -415,8 +648,13 @@ impl Viewer {
         let cur = self.vim.line;
         let target = if fwd { starts.iter().find(|&&s| s > cur).copied() } else { starts.iter().rev().find(|&&s| s < cur).copied() };
         match target {
-            Some(t) => self.vim.set_cursor(t, 0),
+            Some(t) => self.cursor_to_row(t),
             None if fwd => self.step_file(1),
+            // Back past the first change: the previous file's last one.
+            None if self.changed.len() > 1 || self.current_changed().is_none() => {
+                self.step_file(-1);
+                self.hunk_goto = Some(HunkGoto::Last);
+            }
             None => self.status = Some(("first change".into(), false)),
         }
     }
@@ -424,7 +662,13 @@ impl Viewer {
     fn handle_actions(&mut self, actions: Vec<VimAction>) {
         for a in actions {
             match a {
+                VimAction::Enter if self.browsing => self.open_entry(self.vim.line),
+                VimAction::Parent => self.browse_parent(),
+                VimAction::NextDiag => self.step_diag(true),
+                VimAction::PrevDiag => self.step_diag(false),
+                VimAction::JumpToDef(_) | VimAction::References(_) | VimAction::NextHunk | VimAction::PrevHunk if self.browsing => {}
                 VimAction::JumpToDef(name) => self.jump_to_def(name),
+                VimAction::References(name) => self.find_references(name),
                 VimAction::JumpBack => self.jump_back(),
                 VimAction::JumpForward => self.jump_forward(),
                 VimAction::Enter => {
@@ -458,6 +702,20 @@ impl Viewer {
     // ------------------------------------------------------------ doc
 
     fn rebuild_doc(&mut self) {
+        if self.browsing {
+            let key = (format!("\0{}", self.dir), false, false, self.files_state.is_some());
+            if self.doc_key.as_ref() != Some(&key) {
+                self.doc_key = Some(key);
+                self.entries = dir_entries(&self.all, &self.dir);
+                self.doc = folder_doc(&self.entries, &self.changed);
+                let sel = self.select_entry.take();
+                let idx = sel.and_then(|s| self.entries.iter().position(|e| e.path == s)).unwrap_or(if self.dir.is_empty() { 0 } else { 1.min(self.entries.len().saturating_sub(1)) });
+                self.vim.set_cursor(idx, 0);
+                let rows = if self.view.rows == 0 { 30 } else { self.view.rows };
+                self.view.top = idx.saturating_sub(rows.saturating_sub(3));
+            }
+            return;
+        }
         let Some(path) = self.current.clone() else {
             self.doc = Doc::default();
             return;
@@ -467,6 +725,7 @@ impl Viewer {
         if self.doc_key.as_ref() == Some(&key) {
             if self.files.contains_key(&path) {
                 if let Some((line, col)) = self.pending_goto.take() {
+                    let col = self.goto_col(line, col);
                     self.place_cursor(line, col);
                 }
             }
@@ -511,7 +770,21 @@ impl Viewer {
             Doc::plain(&file.text, file.spans.as_deref())
         };
         if let Some((line, col)) = keep {
+            let col = self.goto_col(line, col);
             self.place_cursor(line, col);
+        }
+        if !self.diff || self.outline {
+            self.hunk_goto = None;
+        } else if has_base {
+            let starts = self.doc.hunk_starts();
+            let row = match self.hunk_goto.take() {
+                Some(HunkGoto::First) => starts.first().copied(),
+                Some(HunkGoto::Last) => starts.last().copied(),
+                None => None,
+            };
+            if let Some(r) = row {
+                self.cursor_to_row(r);
+            }
         }
         self.vim.anchor = None;
         if self.outline {
@@ -527,6 +800,16 @@ impl Viewer {
             self.doc.index_of_new(line).unwrap_or(self.doc.lines.len().saturating_sub(1))
         };
         self.vim.set_cursor(idx, col);
+        self.scroll_to_row(idx);
+    }
+
+    /// Put the cursor on document row `idx`, a third of the way down.
+    fn cursor_to_row(&mut self, idx: usize) {
+        self.vim.set_cursor(idx, 0);
+        self.scroll_to_row(idx);
+    }
+
+    fn scroll_to_row(&mut self, idx: usize) {
         // rows is 0 before the first frame: assume a typical viewport.
         let rows = if self.view.rows == 0 { 30 } else { self.view.rows };
         if idx < self.view.top || idx >= self.view.top + rows {
@@ -586,118 +869,12 @@ impl Viewer {
         });
     }
 
-    // ------------------------------------------------------------ comments
-
-    fn open_editor(&mut self) {
-        if self.outline || self.doc.lines.is_empty() || self.current.is_none() {
-            self.status = Some(("open a file (not the outline) to comment".into(), false));
-            return;
-        }
-        let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
-        let anchor = self.anchor_for(start, end);
-        let pr = review::pr_for_tab(&self.engine, &self.tab_id);
-        let target = match &pr {
-            Some(p) => format!("→ PR #{} on GitHub", p.number),
-            None => "→ no open PR for this branch yet (posting will fail)".into(),
-        };
-        let lines = match anchor.start_line {
-            Some(s) => format!("L{s}–{}", anchor.line.unwrap_or(s)),
-            None => format!("L{}", anchor.line.unwrap_or(0)),
-        };
-        self.editor = Some(Editor {
-            start,
-            end,
-            text: String::new(),
-            label: format!("Comment on {} {lines} ({}) {target}", anchor.path, anchor.side),
-            needs_focus: true,
-        });
-    }
-
-    /// GitHub anchor for doc lines `start..=end`: LEFT (base) when the last
-    /// line is a deleted line, RIGHT otherwise.
-    fn anchor_for(&self, start: usize, end: usize) -> CommentAnchor {
-        let path = self.current.clone().unwrap_or_default();
-        let end_line = &self.doc.lines[end];
-        let left = end_line.kind == LineKind::Removed;
-        let no = |l: &DocLine| if left { l.old_no.filter(|_| l.kind != LineKind::Added) } else { l.new_no };
-        let line = no(end_line).map(|n| n as i64);
-        let start_line = self.doc.lines[start..=end].iter().find_map(no).map(|n| n as i64).filter(|s| Some(*s) != line);
-        CommentAnchor { path, line, start_line, side: if left { "LEFT".into() } else { "RIGHT".into() } }
-    }
-
-    fn submit_editor(&mut self) {
-        let Some(ed) = self.editor.take() else { return };
-        let body = ed.text.trim().to_string();
-        if body.is_empty() {
-            self.editor = Some(ed);
-            self.status = Some(("empty comment".into(), true));
-            return;
-        }
-        let anchor = self.anchor_for(ed.start, ed.end);
-        self.vim.anchor = None;
-        self.status = Some(("posting comment…".into(), false));
-        let (engine, tab, tx) = (self.engine.clone(), self.tab_id.clone(), self.tx.clone());
-        std::thread::spawn(move || {
-            let r = review::post_comment(&engine, &tab, anchor, &body).map(|p| p.url).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Msg::Posted(r));
-            engine.ctx.request_repaint();
-        });
-    }
-
-    /// Inline notes for the current file: PR threads and agent drafts.
-    fn blocks(&self) -> Vec<Block> {
-        let Some(path) = &self.current else { return Vec::new() };
-        if self.outline {
-            return Vec::new();
-        }
-        let find = |side: &str, line: Option<i64>| -> Option<usize> {
-            let n = line? as usize;
-            if side == "LEFT" && self.diff {
-                self.doc.index_of_old(n).or_else(|| self.doc.lines.iter().position(|l| l.old_no == Some(n)))
-            } else {
-                self.doc.lines.iter().position(|l| l.new_no == Some(n))
-            }
-        };
-        let mut out = Vec::new();
-        for t in review::threads_for_tab(&self.engine, &self.tab_id).iter().filter(|t| &t.path == path) {
-            let after = find(&t.side, t.anchor_line());
-            let first = t.comments.first();
-            let title = format!(
-                "{}{} · {} comment{}{}",
-                if t.is_resolved { "✓ resolved · " } else { "" },
-                first.map(|c| c.author.as_str()).unwrap_or("?"),
-                t.comments.len(),
-                if t.comments.len() == 1 { "" } else { "s" },
-                if t.is_outdated { " · outdated" } else { "" }
-            );
-            let body = t.comments.iter().map(|c| format!("{}: {}", c.author, c.body.trim())).collect::<Vec<_>>().join("\n\n");
-            out.push(Block { after, title, body, color: if t.is_resolved { theme::DIM } else { theme::ACCENT }, dim: t.is_resolved });
-        }
-        for d in review::drafts_for_tab(&self.engine, &self.tab_id).iter().filter(|d| &d.path == path && d.state == "draft") {
-            let after = find(&d.side, d.line);
-            let title = format!(
-                "agent draft #{}{} — not public until approved in the inbox (⌘I)",
-                d.id,
-                d.severity.as_deref().map(|s| format!(" · {s}")).unwrap_or_default()
-            );
-            out.push(Block { after, title, body: d.body.clone(), color: theme::PURPLE, dim: false });
-        }
-        out
-    }
-
     // ------------------------------------------------------------ panel API
 
     pub fn command(&mut self, cmd: PanelCmd, _engine: &Arc<Engine>) {
         match cmd {
-            PanelCmd::Comment => self.open_editor(),
-            PanelCmd::Submit => {
-                if self.editor.is_some() {
-                    // Submit after this frame's typing reaches the editor.
-                    self.submit_pending = true;
-                } else {
-                    self.status = Some(("⌘M opens a comment field first".into(), false));
-                }
-            }
+            // Comments live in the plan reviewer only.
+            PanelCmd::Comment | PanelCmd::Submit => {}
             PanelCmd::ToggleDiff => {
                 self.diff = !self.diff;
                 self.outline = false;
@@ -707,19 +884,40 @@ impl Viewer {
                         self.ensure_base(&p);
                     }
                 }
+                if self.browsing {
+                    let mode = if self.diff { "diff" } else { "plain" };
+                    self.status = Some((format!("files open in {mode} mode"), false));
+                }
             }
+            PanelCmd::ToggleOutline if self.browsing => self.status = Some(("open a file for its outline".into(), false)),
             PanelCmd::ToggleOutline => {
                 self.outline = !self.outline;
-                self.editor = None;
                 self.doc_key = None;
             }
             PanelCmd::FilePicker => self.open_file_picker(),
+            PanelCmd::FocusList => {
+                if !self.list_focus {
+                    self.list_focus = true;
+                    self.show_files = true;
+                    self.outline = false;
+                    self.list_cursor = self.list_home();
+                    self.list_scroll = true;
+                }
+            }
+            PanelCmd::FocusCode => self.list_focus = false,
+            PanelCmd::ToggleFiles => {
+                self.show_files = !self.show_files;
+                self.list_focus = self.list_focus && self.show_files;
+            }
+            PanelCmd::NextFile => self.step_file(1),
+            PanelCmd::PrevFile => self.step_file(-1),
+            PanelCmd::Diagnostics => self.open_diagnostics_picker(),
             PanelCmd::Reload => {
                 self.files.clear();
                 self.bases.clear();
                 self.load_errors.clear();
                 self.doc_key = None;
-                self.load_file_list();
+                self.load_file_list(false);
                 if let Some(p) = self.current.clone() {
                     self.ensure_loaded(&p);
                 }
@@ -742,15 +940,18 @@ impl Viewer {
     }
 
     fn open_file_picker(&mut self) {
-        let mut items: Vec<(String, String)> =
-            self.changed.iter().map(|c| (c.path.clone(), format!("{} +{} −{}", c.status, c.added, c.removed))).collect();
-        let changed: HashSet<&str> = self.changed.iter().map(|c| c.path.as_str()).collect();
-        items.extend(self.all.iter().filter(|p| !changed.contains(p.as_str())).map(|p| (p.clone(), String::new())));
-        self.picker = Some((PickerKind::Files, Picker::new("open file (PR files first)", items)));
+        let (items, bonus) = file_items(&self.changed, &self.all, &self.dir);
+        let mut picker = Picker::with_bonus("open file · changed files and this folder first", items, bonus);
+        picker.loading = self.files_state.is_none();
+        self.picker = Some((PickerKind::Files, picker));
     }
 
     pub fn ui(&mut self, ui: &mut Ui, cx: &mut PanelCtx) {
         self.poll();
+        self.check_nav_timeout();
+        self.check_fresh();
+        self.check_changes();
+        self.refresh_overlay();
         // The base may only become known after the file was opened.
         if let (true, Some(p)) = (self.diff, self.current.clone()) {
             self.ensure_base(&p);
@@ -764,22 +965,27 @@ impl Viewer {
         // Header.
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            let path = self.current.clone().unwrap_or_else(|| "no file — ⌘P to pick".into());
+            let path = if self.browsing {
+                format!("{}/", self.dir)
+            } else {
+                self.current.clone().unwrap_or_else(|| "no file — ⌘P to pick".into())
+            };
             ui.label(RichText::new(path).monospace().size(12.5).color(theme::TEXT));
-            let mode = if self.outline { "OUTLINE" } else if self.diff { "DIFF" } else { "FILE" };
-            ui.label(RichText::new(mode).size(10.5).strong().color(theme::BG).background_color(if self.diff { theme::GREEN } else { theme::CYAN }));
-            if self.diff && !self.outline {
+            let (mode, color) = match (self.browsing, self.outline, self.diff) {
+                (true, ..) => ("FOLDER", theme::PURPLE),
+                (_, true, _) => ("OUTLINE", theme::CYAN),
+                (_, _, true) => ("DIFF", theme::GREEN),
+                _ => ("FILE", theme::CYAN),
+            };
+            ui.label(RichText::new(mode).size(10.5).strong().color(theme::BG).background_color(color));
+            if self.diff && !self.outline && !self.browsing {
                 let (a, d) = self.doc.changed_count();
                 ui.label(RichText::new(format!("+{a} −{d}")).size(11.0).color(theme::DIM));
             }
-            match review::pr_for_tab(cx.engine, &self.tab_id) {
-                Some(pr) => ui.label(RichText::new(format!("PR #{}", pr.number)).size(11.0).color(theme::ACCENT)),
-                None => ui.label(RichText::new("no PR").size(11.0).color(theme::DIM)),
-            };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
-                let label = if self.show_files { "hide files" } else { "files" };
-                if ui.add(egui::Button::new(RichText::new(label).size(11.0).color(theme::DIM)).frame(false)).clicked() {
+                let label = if self.show_files { "hide files ⌘B" } else { "files ⌘B" };
+                if ui.add(egui::Button::new(RichText::new(label).size(11.0).color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                     self.show_files = !self.show_files;
                 }
             });
@@ -794,37 +1000,45 @@ impl Viewer {
 
         let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body_rect));
         let mut code_rect = body_rect;
+        if !self.show_files || self.outline {
+            self.list_focus = false;
+        }
         if self.show_files && !self.outline {
             let list_w = (body_rect.width() * 0.28).clamp(150.0, 260.0);
             let list_rect = egui::Rect::from_min_size(body_rect.min, egui::vec2(list_w, body_rect.height()));
             code_rect = egui::Rect::from_min_max(egui::pos2(list_rect.right() + 1.0, body_rect.top()), body_rect.max);
             let mut list_ui = body_ui.new_child(egui::UiBuilder::new().max_rect(list_rect));
-            self.file_list(&mut list_ui);
+            let keys = cx.focused && self.list_focus && self.picker.is_none();
+            self.file_list(&mut list_ui, keys);
+            // Mark which half of the viewer has the keyboard.
+            if cx.focused && self.picker.is_none() {
+                let r = if self.list_focus { list_rect } else { code_rect };
+                ui.painter().rect_stroke(r.shrink(1.0), egui::CornerRadius::same(2), egui::Stroke::new(1.5, theme::FOCUS.gamma_multiply(0.7)), egui::StrokeKind::Inside);
+            }
         }
         let mut code_ui = body_ui.new_child(egui::UiBuilder::new().max_rect(code_rect));
-        let picked = self.picker.as_mut().map(|(_, picker)| picker.ui(&mut code_ui));
+        let picked = self.picker.as_mut().map(|(_, picker)| picker.ui(&mut code_ui, cx.focused));
         match picked {
             None | Some(PickerResult::Open) => {}
             Some(PickerResult::Cancelled) => self.picker = None,
-            Some(PickerResult::Chosen(i)) => match self.picker.take().map(|(k, _)| k) {
-                Some(PickerKind::Files) => {
-                    let path = picker_path(&self.changed, &self.all, i);
+            Some(PickerResult::Chosen(i)) => match self.picker.take() {
+                Some((PickerKind::Files, picker)) => {
+                    let path = picker.items[i].0.clone();
                     self.outline = false;
                     self.open(&path, None, true);
                 }
-                Some(PickerKind::Defs(locs)) => self.record_and_go(locs[i].clone()),
+                Some((PickerKind::Defs(locs), _)) => self.record_and_go(locs[i].clone()),
+                Some((PickerKind::RawLocs(locs), _)) => self.record_and_go_raw(locs[i].clone()),
                 None => {}
             },
         }
         self.rebuild_doc();
-        let placeholder = match &self.current {
-            None => Some(match &self.files_state {
-                None => "loading changed files…".to_string(),
-                Some(Err(e)) => format!("cannot list files: {e}"),
-                Some(Ok(())) if self.changed.is_empty() => "no changes vs the base branch — ⌘P to open any file".into(),
-                Some(Ok(())) => "⌘P to open a file".into(),
-            }),
-            Some(p) if !self.files.contains_key(p) => {
+        let placeholder = match (&self.current, &self.files_state) {
+            (_, None) if self.browsing => Some("loading files…".to_string()),
+            (_, Some(Err(e))) if self.browsing => Some(format!("cannot list files: {e}")),
+            _ if self.browsing => None,
+            (None, _) => Some("⌘P to open a file".into()),
+            (Some(p), _) if !self.files.contains_key(p) => {
                 Some(self.load_errors.get(p).map(|e| format!("cannot read {p}: {e}")).unwrap_or_else(|| format!("loading {p}…")))
             }
             _ => None,
@@ -832,30 +1046,30 @@ impl Viewer {
         if let Some(text) = placeholder {
             code_ui.centered_and_justified(|ui| ui.label(RichText::new(text).color(theme::DIM)));
         } else {
-            let blocks = self.blocks();
-            let focused = cx.focused && self.picker.is_none();
+            let focused = cx.focused && self.picker.is_none() && !self.list_focus;
+            if focused {
+                self.leader_keys(&mut code_ui);
+            }
+            let overlay = self.overlay.as_ref().filter(|o| !self.browsing && !self.outline && self.current.as_deref() == Some(o.path.as_str())).map(|o| &o.overlay);
             let out = CodeView {
                 doc: &self.doc,
                 vim: &mut self.vim,
                 state: &mut self.view,
-                blocks: &blocks,
-                editor: self.editor.as_mut(),
+                blocks: &[],
+                editor: None,
                 focused,
                 font_size,
-                two_gutters: self.diff && !self.outline,
+                two_gutters: self.diff && !self.outline && !self.browsing,
+                relative: cx.engine.settings().relative_line_numbers,
+                overlay,
                 id: egui::Id::new(("viewer", &self.tab_id)),
             }
             .show(&mut code_ui);
             if out.clicked {
                 cx.clicked = true;
-            }
-            if out.cancel_editor {
-                self.editor = None;
+                self.list_focus = false;
             }
             self.handle_actions(out.actions);
-            if std::mem::take(&mut self.submit_pending) {
-                self.submit_editor();
-            }
         }
 
         // Status line.
@@ -870,28 +1084,260 @@ impl Viewer {
             } else if let Some((s, err)) = &self.status {
                 ui.label(RichText::new(s).size(11.5).color(if *err { theme::RED } else { theme::YELLOW }));
             } else if self.vim.anchor.is_some() {
-                ui.label(RichText::new("-- VISUAL --  ⌘M comment on selection").size(11.5).color(theme::PURPLE));
+                ui.label(RichText::new("-- VISUAL --").size(11.5).color(theme::PURPLE));
+            } else if let Some((keys, _)) = &self.leader {
+                ui.label(RichText::new(format!("\\{keys}")).monospace().size(12.0).color(theme::PURPLE));
+            } else if let Some((text, color)) = self.cursor_diagnostic() {
+                ui.label(RichText::new(text).size(11.5).color(color));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 let pos = format!("{}  L{}:{}", self.vim.pending_display(), self.current_source_line().unwrap_or(0), self.vim.col + 1);
                 ui.label(RichText::new(pos).monospace().size(11.0).color(theme::DIM));
                 if !busy {
-                    ui.label(RichText::new("gd def · ^o back · ]c hunk · ]f file · ⌘D ⌘O ⌘M").size(10.5).color(theme::DIM));
+                    let hint = if self.browsing { "j/k move · Enter open · - up · / search · ⌘J next changed file · ⌘P find" } else { "⌘J/⌘K file · ]c/[c change · gd def · gr refs · ^o back · - folder · ⌘D ⌘O ⌘B" };
+                    ui.label(RichText::new(hint).size(10.5).color(theme::DIM));
                 }
             });
         });
         ui.advance_cursor_after_rect(body);
     }
 
-    fn file_list(&mut self, ui: &mut Ui) {
+    /// Folder entries shown under the changed files.
+    fn list_entries(&self) -> Vec<Entry> {
+        if self.browsing && self.doc_key.as_ref().is_some_and(|k| k.0 == format!("\0{}", self.dir)) {
+            self.entries.clone()
+        } else {
+            dir_entries(&self.all, &self.dir)
+        }
+    }
+
+    /// The file list is the changed-files tree (else the folder list).
+    fn tree_mode(&self) -> bool {
+        !self.list_all && !self.changed.is_empty()
+    }
+
+    /// Where the list cursor lands on ⌘H: the open file, else the first folder entry.
+    fn list_home(&self) -> usize {
+        let entries = self.list_entries();
+        let pr = self.changed.len();
+        let cur = self.current.as_deref().filter(|_| !self.browsing);
+        if let Some(i) = cur.and_then(|c| entries.iter().position(|e| e.path == c)) {
+            return pr + i;
+        }
+        if let Some(i) = cur.and_then(|c| self.changed.iter().position(|e| e.path == c)) {
+            return i;
+        }
+        let skip_up = entries.first().is_some_and(|e| e.label == "../") && entries.len() > 1;
+        pr + skip_up as usize
+    }
+
+    /// Open list row `idx` (a changed file or a folder entry).
+    fn activate_row(&mut self, idx: usize, entries: &[Entry]) {
+        let pr = self.changed.len();
+        if idx < pr {
+            let c = &self.changed[idx];
+            if c.status == 'D' {
+                self.status = Some((format!("{} was deleted", c.path), false));
+                return;
+            }
+            let p = c.path.clone();
+            self.outline = false;
+            self.open(&p, None, true);
+            return;
+        }
+        let Some(e) = entries.get(idx - pr).cloned() else { return };
+        if e.is_dir {
+            let from = self.dir.clone();
+            self.browse(&e.path, (e.path.len() < from.len()).then_some(from.clone()));
+            // Cursor: the folder we came up from, else the first entry.
+            let entries = dir_entries(&self.all, &e.path);
+            let going_up = e.path.len() < from.len();
+            let pos = entries
+                .iter()
+                .position(|x| going_up && x.label != "../" && x.path == from)
+                .unwrap_or((!e.path.is_empty() && entries.len() > 1) as usize);
+            self.list_cursor = pr + pos;
+            self.list_scroll = true;
+        } else {
+            self.outline = false;
+            self.open(&e.path, None, true);
+        }
+    }
+
+    /// vim-style keys for the file list: j/k, gg/G, ctrl-d/u, Enter/l/o
+    /// open, h/- up a folder.
+    fn list_keys(&mut self, ui: &mut Ui, entries: &[Entry]) {
+        let rows = self.changed.len() + entries.len();
+        if rows == 0 {
+            return;
+        }
+        let mut activate = false;
+        let mut up = false;
+        let keys = code_view::collect_keys(ui);
+        for k in keys {
+            use vim::VimKey as K;
+            let g = std::mem::take(&mut self.list_g);
+            let before = self.list_cursor;
+            match k {
+                K::Char('j') | K::Down => self.list_cursor = (self.list_cursor + 1).min(rows - 1),
+                K::Char('k') | K::Up => self.list_cursor = self.list_cursor.saturating_sub(1),
+                K::Ctrl('d') | K::PageDown => self.list_cursor = (self.list_cursor + 15).min(rows - 1),
+                K::Ctrl('u') | K::PageUp => self.list_cursor = self.list_cursor.saturating_sub(15),
+                K::Char('G') | K::End => self.list_cursor = rows - 1,
+                K::Char('g') if g => self.list_cursor = 0,
+                K::Char('g') => self.list_g = true,
+                K::Home => self.list_cursor = 0,
+                K::Enter | K::Char('l') | K::Char('o') | K::Right => activate = true,
+                K::Char('h') | K::Char('-') | K::Left | K::Backspace => up = true,
+                K::Char('a') if !self.changed.is_empty() => {
+                    self.list_all = false;
+                    self.list_scroll = true;
+                    return;
+                }
+                K::Esc => self.list_focus = false,
+                _ => {}
+            }
+            if self.list_cursor != before {
+                self.list_scroll = true;
+            }
+        }
+        self.list_cursor = self.list_cursor.min(rows - 1);
+        if activate {
+            self.activate_row(self.list_cursor, entries);
+        } else if up && !self.dir.is_empty() {
+            let parent = parent_dir(&self.dir).to_string();
+            let pr = self.changed.len();
+            let up_row = entries.iter().position(|e| e.label == "../").map(|i| pr + i);
+            match up_row {
+                Some(r) => self.activate_row(r, entries),
+                None => self.browse(&parent, None),
+            }
+        }
+    }
+
+    /// Keys for the changed-files tree: j/k (gg/G, ctrl-d/u) open the
+    /// next / previous changed file right away; Enter/l/Esc go to the code,
+    /// `a` switches to the folder list.
+    fn tree_keys(&mut self, ui: &mut Ui) {
+        let last = self.changed.len().saturating_sub(1);
+        for k in code_view::collect_keys(ui) {
+            use vim::VimKey as K;
+            let g = std::mem::take(&mut self.list_g);
+            let at = self.current_changed();
+            let target = match k {
+                K::Char('j') | K::Down => Some(at.map_or(0, |i| (i + 1).min(last))),
+                K::Char('k') | K::Up => Some(at.map_or(0, |i| i.saturating_sub(1))),
+                K::Ctrl('d') | K::PageDown => Some(at.map_or(0, |i| (i + 15).min(last))),
+                K::Ctrl('u') | K::PageUp => Some(at.map_or(0, |i| i.saturating_sub(15))),
+                K::Char('G') | K::End => Some(last),
+                K::Char('g') if g => Some(0),
+                K::Char('g') => {
+                    self.list_g = true;
+                    None
+                }
+                K::Home => Some(0),
+                K::Enter | K::Char('l') | K::Char('o') | K::Right | K::Esc => {
+                    self.list_focus = false;
+                    None
+                }
+                K::Char('a') => {
+                    self.list_all = true;
+                    self.list_cursor = self.list_home();
+                    self.list_scroll = true;
+                    return;
+                }
+                _ => None,
+            };
+            if let Some(t) = target.filter(|t| Some(*t) != at) {
+                self.open_changed(t, false);
+            }
+        }
+    }
+
+    /// The changed files as a tree (see [`changes_tree`]); the open file is the cursor.
+    fn changes_list(&mut self, ui: &mut Ui, keys: bool) {
+        if keys {
+            self.tree_keys(ui);
+        }
+        let cur = self.current_changed();
+        let scroll = std::mem::take(&mut self.list_scroll);
+        let paths: Vec<&str> = self.changed.iter().map(|c| c.path.as_str()).collect();
+        let rows = changes_tree::rows(&paths);
+        let mut clicked: Option<usize> = None;
+        let mut all = false;
+        egui::ScrollArea::vertical().id_salt(("changes", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("  CHANGED FILES ({})", self.changed.len())).size(10.5).strong().color(theme::DIM));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    all = ui.add(egui::Button::new(RichText::new("a: all files").size(10.0).color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary);
+                });
+            });
+            let f = |col, size| egui::TextFormat { font_id: egui::FontId::proportional(size), color: col, ..Default::default() };
+            for r in &rows {
+                let indent = r.depth as f32 * 12.0;
+                let mut job = egui::text::LayoutJob::default();
+                let Some(i) = r.file else {
+                    job.append(&r.label, indent, f(theme::ACCENT.gamma_multiply(0.85), 11.0));
+                    list_row(ui, false, job);
+                    continue;
+                };
+                let c = &self.changed[i];
+                let open = cur == Some(i);
+                let color = match c.status {
+                    'A' => theme::GREEN,
+                    'D' => theme::RED,
+                    'R' => theme::YELLOW,
+                    _ => theme::ACCENT,
+                };
+                job.append(&format!("{} ", c.status), indent, f(color, 11.0));
+                job.append(&r.label, 0.0, f(if open { theme::TEXT } else { theme::TEXT.gamma_multiply(0.85) }, 12.0));
+                job.append(&format!("  +{} −{}", c.added, c.removed), 0.0, f(theme::DIM, 10.5));
+                let resp = row(ui, open && self.list_focus, open, job).on_hover_text(&c.path);
+                if scroll && open {
+                    resp.scroll_to_me(None);
+                }
+                if resp.clicked_by(egui::PointerButton::Primary) {
+                    clicked = Some(i);
+                }
+            }
+        });
+        if let Some(i) = clicked {
+            self.open_changed(i, true);
+        }
+        if all {
+            self.list_all = true;
+            self.list_cursor = self.list_home();
+        }
+    }
+
+    /// `keys`: the list has the keyboard.
+    fn file_list(&mut self, ui: &mut Ui, keys: bool) {
         ui.painter().rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, theme::PANEL);
-        let mut open: Option<String> = None;
+        if self.tree_mode() {
+            return self.changes_list(ui, keys);
+        }
+        let entries = self.list_entries();
+        if keys {
+            self.list_keys(ui, &entries);
+        }
+        // The keys may have changed folders.
+        let entries = self.list_entries();
+        let pr = self.changed.len();
+        self.list_cursor = self.list_cursor.min((pr + entries.len()).saturating_sub(1));
+        let cursor = self.list_focus.then_some(self.list_cursor);
+        let scroll = std::mem::take(&mut self.list_scroll);
+        let mut clicked: Option<usize> = None;
+        let mut browse: Option<String> = None;
         egui::ScrollArea::vertical().id_salt(("files", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
-            ui.label(RichText::new(format!("  PR FILES ({})", self.changed.len())).size(10.5).strong().color(theme::DIM));
-            for c in &self.changed {
-                let sel = self.current.as_deref() == Some(c.path.as_str());
+            if !self.changed.is_empty() {
+                ui.label(RichText::new(format!("  CHANGED FILES ({}) · a: tree", self.changed.len())).size(10.5).strong().color(theme::DIM));
+            }
+            for (i, c) in self.changed.iter().enumerate() {
+                let open = self.current.as_deref() == Some(c.path.as_str()) && !self.browsing;
                 let color = match c.status {
                     'A' => theme::GREEN,
                     'D' => theme::RED,
@@ -902,47 +1348,184 @@ impl Viewer {
                 let mut job = egui::text::LayoutJob::default();
                 let f = |col, size| egui::TextFormat { font_id: egui::FontId::proportional(size), color: col, ..Default::default() };
                 job.append(&format!("{} ", c.status), 0.0, f(color, 11.0));
-                job.append(name, 0.0, f(if sel { theme::TEXT } else { theme::TEXT.gamma_multiply(0.85) }, 12.0));
+                job.append(name, 0.0, f(if open { theme::TEXT } else { theme::TEXT.gamma_multiply(0.85) }, 12.0));
                 job.append(&format!("  +{} −{}", c.added, c.removed), 0.0, f(theme::DIM, 10.5));
-                let r = list_row(ui, sel, job).on_hover_text(&c.path);
-                if r.clicked() && c.status != 'D' {
-                    open = Some(c.path.clone());
+                let r = row(ui, cursor == Some(i), open, job).on_hover_text(&c.path);
+                if scroll && cursor == Some(i) {
+                    r.scroll_to_me(None);
+                }
+                if r.clicked_by(egui::PointerButton::Primary) {
+                    clicked = Some(i);
                 }
             }
             ui.add_space(8.0);
-            let changed: HashSet<&str> = self.changed.iter().map(|c| c.path.as_str()).collect();
-            let rest: Vec<&String> = self.all.iter().filter(|p| !changed.contains(p.as_str())).collect();
-            ui.label(RichText::new(format!("  ALL FILES ({})", rest.len())).size(10.5).strong().color(theme::DIM));
-            for p in rest.iter().take(2000) {
-                let sel = self.current.as_deref() == Some(p.as_str());
-                let color = if sel { theme::TEXT } else { theme::DIM };
-                if list_row(ui, sel, RichText::new(p.as_str()).size(11.5).color(color)).clicked() {
-                    open = Some((*p).clone());
+            // Breadcrumb: each segment browses to that folder.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(8.0);
+                let crumb = |ui: &mut Ui, text: &str| ui.add(egui::Button::new(RichText::new(text).size(10.5).strong().color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary);
+                if crumb(ui, "ROOT") {
+                    browse = Some(String::new());
+                }
+                let mut acc = String::new();
+                for seg in self.dir.split('/').filter(|s| !s.is_empty()) {
+                    acc = if acc.is_empty() { seg.to_string() } else { format!("{acc}/{seg}") };
+                    ui.label(RichText::new(" / ").size(10.5).color(theme::DIM));
+                    if crumb(ui, seg) {
+                        browse = Some(acc.clone());
+                    }
+                }
+            });
+            let changed_under = changed_counts(&self.changed);
+            for (i, e) in entries.iter().enumerate() {
+                let open = !e.is_dir && self.current.as_deref() == Some(e.path.as_str()) && !self.browsing;
+                let n = if e.label == "../" { 0 } else { changed_under.get(e.path.as_str()).copied().unwrap_or(0) };
+                let color = match (e.is_dir, n > 0) {
+                    (true, _) => theme::ACCENT,
+                    (false, true) => theme::YELLOW,
+                    _ if open => theme::TEXT,
+                    _ => theme::TEXT.gamma_multiply(0.8),
+                };
+                let text = if n > 0 && e.is_dir { format!("{}  ●{n}", e.label) } else { e.label.clone() };
+                let r = row(ui, cursor == Some(pr + i), open, RichText::new(text).size(11.5).color(color)).on_hover_text(&e.path);
+                if scroll && cursor == Some(pr + i) {
+                    r.scroll_to_me(None);
+                }
+                if r.clicked_by(egui::PointerButton::Primary) {
+                    clicked = Some(pr + i);
                 }
             }
-            if rest.len() > 2000 {
-                ui.label(RichText::new("… ⌘P to search the rest").size(11.0).color(theme::DIM));
+            if entries.is_empty() && self.files_state.is_some() {
+                ui.label(RichText::new("  (empty)").size(11.0).color(theme::DIM));
             }
         });
-        if let Some(p) = open {
-            self.outline = false;
-            self.open(&p, None, true);
+        if let Some(i) = clicked {
+            self.list_cursor = i;
+            self.activate_row(i, &entries);
+        }
+        if let Some(d) = browse {
+            let select = (d.len() < self.dir.len()).then(|| self.dir.clone());
+            self.browse(&d, select);
         }
     }
 }
 
-/// A full-width, flat row in the file list.
-pub(crate) fn list_row(ui: &mut Ui, selected: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
-    let fill = if selected { theme::SELECTED } else { egui::Color32::TRANSPARENT };
-    ui.add(egui::Button::new(text).fill(fill).stroke(egui::Stroke::NONE).min_size(egui::vec2(ui.available_width(), 0.0)).wrap_mode(egui::TextWrapMode::Truncate))
+/// A file-list row: `cursor` is the keyboard cursor, `open` the open file.
+fn row(ui: &mut Ui, cursor: bool, open: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let r = list_row(ui, cursor || open, text);
+    if cursor {
+        let bar = egui::Rect::from_min_size(r.rect.min, egui::vec2(2.5, r.rect.height()));
+        ui.painter().rect_filled(bar, egui::CornerRadius::ZERO, theme::FOCUS);
+    }
+    r
 }
 
-fn picker_path(changed: &[ChangedFile], all: &[String], i: usize) -> String {
-    if i < changed.len() {
-        return changed[i].path.clone();
+/// A full-width, flat, left-aligned row (file list, picker).
+pub(crate) fn list_row(ui: &mut Ui, selected: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let pad = egui::vec2(6.0, 2.0);
+    let width = ui.available_width();
+    let galley = text.into().into_galley(ui, Some(egui::TextWrapMode::Truncate), width - 2.0 * pad.x, egui::TextStyle::Button);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, galley.size().y + 2.0 * pad.y), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if selected {
+            theme::SELECTED
+        } else if resp.hovered() {
+            theme::SELECTED.gamma_multiply(0.5)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(3), fill);
+        ui.painter().galley(rect.min + pad, galley, theme::TEXT);
     }
-    let set: HashSet<&str> = changed.iter().map(|c| c.path.as_str()).collect();
-    all.iter().filter(|p| !set.contains(p.as_str())).nth(i - changed.len()).cloned().unwrap_or_default()
+    resp
+}
+
+fn parent_dir(path: &str) -> &str {
+    path.trim_end_matches('/').rsplit_once('/').map(|(d, _)| d).unwrap_or("")
+}
+
+/// Rows of folder `dir`: `../`, subfolders, then files (both sorted).
+fn dir_entries(all: &[String], dir: &str) -> Vec<Entry> {
+    let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+    let mut dirs: Vec<&str> = Vec::new();
+    let mut files: Vec<&str> = Vec::new();
+    // `all` is sorted, so everything under `prefix` is contiguous.
+    let start = all.partition_point(|p| p.as_str() < prefix.as_str());
+    for p in all[start..].iter().take_while(|p| p.starts_with(&prefix)) {
+        let rest = &p[prefix.len()..];
+        match rest.split_once('/') {
+            Some((d, _)) => {
+                if dirs.last() != Some(&d) {
+                    dirs.push(d);
+                }
+            }
+            None => files.push(rest),
+        }
+    }
+    dirs.sort_unstable();
+    dirs.dedup();
+    let mut out = Vec::new();
+    if !dir.is_empty() {
+        out.push(Entry { label: "../".into(), path: parent_dir(dir).to_string(), is_dir: true });
+    }
+    out.extend(dirs.into_iter().map(|d| Entry { label: format!("{d}/"), path: format!("{prefix}{d}"), is_dir: true }));
+    out.extend(files.into_iter().map(|f| Entry { label: f.to_string(), path: format!("{prefix}{f}"), is_dir: false }));
+    out
+}
+
+/// Changed files per path and per containing folder (at every level).
+fn changed_counts(changed: &[ChangedFile]) -> HashMap<&str, usize> {
+    let mut m = HashMap::new();
+    for c in changed {
+        *m.entry(c.path.as_str()).or_default() += 1;
+        let mut p = c.path.as_str();
+        while let Some((d, _)) = p.rsplit_once('/') {
+            *m.entry(d).or_default() += 1;
+            p = d;
+        }
+    }
+    m
+}
+
+/// The folder view as a document, so vim motions and search work in it.
+fn folder_doc(entries: &[Entry], changed: &[ChangedFile]) -> Doc {
+    let counts = changed_counts(changed);
+    let by_path: HashMap<&str, &ChangedFile> = changed.iter().map(|c| (c.path.as_str(), c)).collect();
+    let lines = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let mut l = DocLine::plain(e.label.clone(), i + 1);
+            let color = if e.is_dir { theme::ACCENT } else if by_path.contains_key(e.path.as_str()) { theme::YELLOW } else { theme::TEXT };
+            l.spans = vec![(0..l.text.len(), color)];
+            if e.label != "../" {
+                if let Some(c) = by_path.get(e.path.as_str()) {
+                    l.suffix = Some(format!("{} +{} −{}", c.status, c.added, c.removed));
+                } else if let Some(n) = counts.get(e.path.as_str()).filter(|_| e.is_dir) {
+                    l.suffix = Some(format!("● {n} changed"));
+                }
+            }
+            l
+        })
+        .collect();
+    Doc { lines }
+}
+
+/// File picker items: every file, with changed files and files in `dir` boosted.
+fn file_items(changed: &[ChangedFile], all: &[String], dir: &str) -> (Vec<(String, String)>, Vec<i64>) {
+    let by_path: HashMap<&str, &ChangedFile> = changed.iter().map(|c| (c.path.as_str(), c)).collect();
+    let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+    let mut items = Vec::with_capacity(all.len() + changed.len());
+    let mut bonus = Vec::with_capacity(all.len() + changed.len());
+    for c in changed.iter().filter(|c| c.status != 'D') {
+        items.push((c.path.clone(), format!("{} +{} −{}", c.status, c.added, c.removed)));
+        bonus.push(120);
+    }
+    for p in all.iter().filter(|p| !by_path.contains_key(p.as_str())) {
+        items.push((p.clone(), String::new()));
+        bonus.push(if !prefix.is_empty() && p.starts_with(&prefix) { 40 } else { 0 });
+    }
+    (items, bonus)
 }
 
 fn kind_color(kind: &str) -> egui::Color32 {
@@ -1007,5 +1590,206 @@ mod tests {
         let found: Vec<(String, usize)> = hits.iter().map(|(p, s)| (p.clone(), s.line)).collect();
         assert_eq!(found, vec![("pkg/b.py".to_string(), 1), ("c.rs".to_string(), 1)]);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn paths(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn folders() {
+        let all = paths(&["README.md", "aster/a.py", "aster/sub/b.py", "aster/sub/c.py", "asterisk/x", "rust/lib.rs"]);
+        let e = dir_entries(&all, "aster");
+        let labels: Vec<&str> = e.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, vec!["../", "sub/", "a.py"]);
+        assert_eq!(e[1].path, "aster/sub");
+        let root: Vec<String> = dir_entries(&all, "").into_iter().map(|e| e.label).collect();
+        assert_eq!(root, vec!["aster/", "asterisk/", "rust/", "README.md"]);
+        assert_eq!(parent_dir("aster/sub"), "aster");
+        assert_eq!(parent_dir("aster"), "");
+    }
+
+    #[test]
+    fn file_list_keyboard() {
+        let tmp = std::env::temp_dir().join(format!("kt-list-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let d = tmp.display().to_string();
+        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
+        run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p aster/a aster/b && echo 1 > aster/a/x.py && echo 2 > aster/b/y.py && echo 3 > aster/top.py && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
+        let ctx = egui::Context::default();
+        let db = kitchen_core::db::Db::open_in_memory().unwrap();
+        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_tab(&tab).unwrap();
+        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let w = engine.workspaces()[0].clone();
+        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
+        let frame = |v: &mut Viewer, text: &str| {
+            let events = if text == "\n" {
+                vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]
+            } else if text.is_empty() {
+                vec![]
+            } else {
+                vec![egui::Event::Text(text.into())]
+            };
+            let mut out = ctx.run_ui(egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
+                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
+                v.ui(ui, &mut cx);
+            });
+            out.textures_delta.clear();
+        };
+        for _ in 0..100 {
+            frame(&mut v, "");
+            if v.files_state.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        frame(&mut v, "");
+        assert_eq!(v.dir, "aster", "no changes: default folder");
+        v.command(PanelCmd::FocusList, &engine);
+        frame(&mut v, "");
+        // Rows: ../ a/ b/ top.py — the cursor starts on a/.
+        assert_eq!(v.list_cursor, 1);
+        frame(&mut v, "\n");
+        assert_eq!(v.dir, "aster/a");
+        frame(&mut v, "\n"); // x.py
+        assert_eq!(v.current.as_deref(), Some("aster/a/x.py"));
+        assert!(v.list_focus, "opening a file keeps the list focused");
+        frame(&mut v, "h");
+        assert_eq!(v.dir, "aster");
+        assert_eq!(v.list_entries()[v.list_cursor].path, "aster/a", "cursor back on the folder we left");
+        frame(&mut v, "j");
+        frame(&mut v, "j");
+        frame(&mut v, "l");
+        assert_eq!(v.current.as_deref(), Some("aster/top.py"));
+        v.command(PanelCmd::FocusCode, &engine);
+        assert!(!v.list_focus);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A tab with changes opens on the first changed file's diff; the tree
+    /// list, ⌘J/⌘K, `[c` and ⌘B step through them without browsing folders.
+    #[test]
+    fn changed_files_flow() {
+        let tmp = std::env::temp_dir().join(format!("kt-changes-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let d = tmp.display().to_string();
+        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
+        run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p src/deep/er && printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n' > src/a.rs && echo gone > old.txt && echo z > z.md && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
+        run("printf '1\\nX\\n3\\n4\\n5\\n6\\nY\\n8\\n' > src/a.rs && echo new > src/deep/er/b.rs && git rm -q old.txt && git add . && git commit -qm change");
+        let ctx = egui::Context::default();
+        let db = kitchen_core::db::Db::open_in_memory().unwrap();
+        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_tab(&tab).unwrap();
+        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let w = engine.workspaces()[0].clone();
+        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
+        let frame = |v: &mut Viewer, text: &str| {
+            let events = if text.is_empty() { vec![] } else { vec![egui::Event::Text(text.into())] };
+            let mut out = ctx.run_ui(egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
+                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
+                v.ui(ui, &mut cx);
+            });
+            out.textures_delta.clear();
+        };
+        // Settle: list, file and base reads run on threads.
+        let settle = |v: &mut Viewer| {
+            for _ in 0..100 {
+                frame(v, "");
+                let p = v.current.clone().unwrap_or_default();
+                if v.files_state.is_some() && v.files.contains_key(&p) && v.bases.contains_key(&p) && v.hunk_goto.is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            frame(v, "");
+        };
+        settle(&mut v);
+        let order: Vec<&str> = v.changed.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(order, vec!["src/deep/er/b.rs", "src/a.rs", "old.txt"], "tree order: folders first");
+        assert!(!v.browsing && v.diff && v.tree_mode());
+        assert_eq!(v.current.as_deref(), Some("src/deep/er/b.rs"), "opens on the first changed file");
+        assert!(v.doc.hunk_starts().contains(&v.vim.line), "cursor on its first change");
+        // ⌘J: next changed file, cursor on its first change (line 2 of a.rs).
+        v.command(PanelCmd::NextFile, &engine);
+        settle(&mut v);
+        assert_eq!(v.current.as_deref(), Some("src/a.rs"));
+        assert_eq!(v.current_source_line(), Some(2));
+        // The deleted file shows as removed lines.
+        v.command(PanelCmd::NextFile, &engine);
+        settle(&mut v);
+        assert_eq!(v.current.as_deref(), Some("old.txt"));
+        assert_eq!(v.doc.changed_count(), (0, 1));
+        // `[c` at the first change: the previous file's last change.
+        frame(&mut v, "[");
+        frame(&mut v, "c");
+        settle(&mut v);
+        assert_eq!(v.current.as_deref(), Some("src/a.rs"));
+        assert_eq!(v.current_source_line(), Some(7));
+        // The tree list: j/k open files straight away; `a` toggles the folder list.
+        v.command(PanelCmd::FocusList, &engine);
+        frame(&mut v, "k");
+        assert_eq!(v.current.as_deref(), Some("src/deep/er/b.rs"));
+        frame(&mut v, "G");
+        assert_eq!(v.current.as_deref(), Some("old.txt"));
+        frame(&mut v, "a");
+        assert!(!v.tree_mode());
+        frame(&mut v, "a");
+        assert!(v.tree_mode());
+        // ⌘B hides and shows the list.
+        v.command(PanelCmd::ToggleFiles, &engine);
+        assert!(!v.show_files && !v.list_focus);
+        v.command(PanelCmd::ToggleFiles, &engine);
+        assert!(v.show_files);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Drives a real viewer against `KT_VIEWER_HOST`:`KT_VIEWER_WT` (e.g. a devbox worktree).
+    #[test]
+    #[ignore]
+    fn live_picker() {
+        let host = std::env::var("KT_VIEWER_HOST").unwrap_or_else(|_| "local".into());
+        let wt = std::env::var("KT_VIEWER_WT").expect("KT_VIEWER_WT");
+        let ctx = egui::Context::default();
+        let db = kitchen_core::db::Db::open_in_memory().unwrap();
+        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host, repo_path: wt.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: wt, branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_tab(&tab).unwrap();
+        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let w = engine.workspaces()[0].clone();
+        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
+        let frame = |v: &mut Viewer, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
+                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
+                v.ui(ui, &mut cx);
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut v, vec![]);
+        v.command(PanelCmd::FilePicker, &engine);
+        for _ in 0..3 {
+            frame(&mut v, vec![]);
+        }
+        for c in ["m", "a", "i", "n"] {
+            frame(&mut v, vec![egui::Event::Text(c.into())]);
+        }
+        let start = std::time::Instant::now();
+        while v.files_state.is_none() && start.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            frame(&mut v, vec![]);
+        }
+        frame(&mut v, vec![]);
+        let (_, p) = v.picker.as_ref().expect("picker open");
+        eprintln!("files={} query={:?} items={} dir={:?} browsing={} entries={}", v.all.len(), p.query, p.items.len(), v.dir, v.browsing, v.entries.len());
+        assert!(!p.items.is_empty(), "late file list reaches the open picker");
+        eprintln!("top match for 'main': {:?}", p.filtered.first().map(|f| &p.items[f.0].0));
+        for e in v.entries.iter().take(8) {
+            eprintln!("  {}", e.label);
+        }
     }
 }

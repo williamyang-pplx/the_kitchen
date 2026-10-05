@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build and install the kitchen on this mac:
 #   * release builds of the app and kitchenctl (+ Linux kitchenctl for devboxes)
-#   * ~/Applications/The Kitchen.app (plain bundle, ad-hoc signed; no Xcode needed)
+#   * ~/Applications/The Kitchen.app (plain bundle; no Xcode needed), signed with
+#     "Kitchen Local Signing" if scripts/make-signing-cert.sh created it, else ad-hoc
 #   * ~/.local/bin/kitchenctl -> the bundle's kitchenctl
 #
 #   scripts/install.sh               # everything
@@ -30,6 +31,7 @@ if [ "$bundle" = 1 ]; then
   macos="$app/Contents/MacOS"
   mkdir -p "$macos" "$app/Contents/Resources"
   cp "$bin_dir/kitchen-app" "$bin_dir/kitchenctl" "$macos/"
+  cp assets/kitchen.icns "$app/Contents/Resources/kitchen.icns"
   # The app uploads these to devboxes (see kitchen_core::bootstrap::cli_binary_candidates).
   for triple in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     [ -f "target/$triple/release/kitchenctl" ] && cp "target/$triple/release/kitchenctl" "$macos/kitchenctl-$triple"
@@ -45,6 +47,7 @@ if [ "$bundle" = 1 ]; then
   <key>CFBundleIdentifier</key><string>ai.perplexity.william.kitchen</string>
   <key>CFBundleExecutable</key><string>kitchen-app</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>kitchen</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
@@ -52,7 +55,14 @@ if [ "$bundle" = 1 ]; then
 </dict>
 </plist>
 PLIST
-  codesign --force --deep -s - "$app" >/dev/null 2>&1 || echo "warn: ad-hoc codesign failed (app still runs locally)" >&2
+  # A stable identity keeps macOS privacy grants (Documents access) across
+  # rebuilds; an ad-hoc signature changes with every build, so macOS asks again.
+  if security find-identity -v -p codesigning 2>/dev/null | grep -q '"Kitchen Local Signing"'; then
+    codesign --force --deep -s "Kitchen Local Signing" "$app"
+  else
+    codesign --force --deep -s - "$app" >/dev/null 2>&1 || echo "warn: ad-hoc codesign failed (app still runs locally)" >&2
+    echo "note: ad-hoc signed — macOS re-asks for folder access after each rebuild; run scripts/make-signing-cert.sh once to fix" >&2
+  fi
   cli="$macos/kitchenctl"
   echo "installed $app"
 else
@@ -67,4 +77,15 @@ else
   ln -sfn "$cli" "$dest"
   echo "linked $dest -> $cli"
 fi
+# Bundled plugins: link the defaults into ~/.kitchen/plugins unless the user
+# already has a plugin by that name (or removed the link on purpose: .skip-<name>).
+plugins_dir="${KITCHEN_STATE_DIR:-$HOME/.kitchen}/plugins"
+mkdir -p "$plugins_dir"
+for p in ruff todo python github; do
+  if [ ! -e "$plugins_dir/$p" ] && [ ! -e "$plugins_dir/.skip-$p" ]; then
+    ln -s "$root/plugins/$p" "$plugins_dir/$p"
+    echo "plugin: linked $plugins_dir/$p"
+  fi
+done
+
 echo "skill: link $root/skill/kitchen into your dotfiles skills/ so agents learn kitchenctl"

@@ -3,12 +3,11 @@
 mod api;
 mod app;
 mod engine;
-mod inbox;
 mod keymap;
 mod panels;
 mod plan_view;
+mod plugins;
 mod relay;
-mod review;
 mod settings;
 mod terminal;
 mod theme;
@@ -25,7 +24,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("the kitchen")
             .with_inner_size([1400.0, 860.0])
-            .with_min_inner_size([800.0, 480.0]),
+            .with_min_inner_size([800.0, 480.0])
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon-256.png")).unwrap_or_default()),
         // No default macOS menu: its ⌘H (Hide) and ⌘Q items would swallow
         // those chords before the kitchen sees them. ⌘Q is handled in keymap.rs.
         event_loop_builder: Some(Box::new(|builder| {
@@ -44,6 +44,10 @@ fn main() -> eframe::Result {
             if let Err(e) = api::serve(engine.clone()) {
                 engine.toast_err(format!("API socket: {e:#}"));
             }
+            let mut dirs = vec![kitchen_proto::state_dir().join("plugins")];
+            let home = std::env::var("HOME").unwrap_or_default();
+            dirs.extend(engine.settings().plugin_dirs.iter().map(|d| std::path::PathBuf::from(d.replacen('~', &home, 1))));
+            engine.set_plugins(plugins::PluginHost::start(&engine, dirs));
             startup(&engine);
             Ok(Box::new(app::KitchenApp::new(engine)))
         }),
@@ -53,7 +57,6 @@ fn main() -> eframe::Result {
 /// Background setup on launch: relink local skills, refresh every devbox
 /// (pull dotfiles, relink skills, update kitchenctl, start its relay).
 fn startup(engine: &Arc<engine::Engine>) {
-    review::start_poller(engine);
     engine.spawn("local setup", |e| {
         let s = e.settings();
         let report = kitchen_core::bootstrap::bootstrap_host(

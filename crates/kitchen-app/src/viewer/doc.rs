@@ -124,10 +124,6 @@ impl Doc {
         self.lines.iter().position(|l| l.new_no.map(|x| x >= n).unwrap_or(false))
     }
 
-    pub fn index_of_old(&self, n: usize) -> Option<usize> {
-        self.lines.iter().position(|l| l.kind == LineKind::Removed && l.old_no == Some(n))
-    }
-
     pub fn changed_count(&self) -> (usize, usize) {
         let add = self.lines.iter().filter(|l| l.kind == LineKind::Added).count();
         let del = self.lines.iter().filter(|l| l.kind == LineKind::Removed).count();
@@ -157,7 +153,6 @@ mod tests {
         );
         assert_eq!(d.hunk_starts(), vec![1, 5]);
         assert_eq!(d.index_of_new(2), Some(2));
-        assert_eq!(d.index_of_old(2), Some(1));
         assert_eq!(d.changed_count(), (2, 1));
     }
 

@@ -20,6 +20,8 @@ pub const ENV_TAB: &str = "KITCHEN_TAB_ID";
 pub const ENV_TAB_KIND: &str = "KITCHEN_TAB_KIND";
 pub const ENV_READONLY: &str = "KITCHEN_READONLY";
 pub const ENV_PLAN_FILE: &str = "KITCHEN_PLAN_FILE";
+/// Rev the tab's changes are measured against (diff with `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`).
+pub const ENV_DIFF_BASE: &str = "KITCHEN_DIFF_BASE";
 
 /// `~/.kitchen` on every host (mac and devbox alike). `KITCHEN_STATE_DIR`
 /// overrides it (tests run an isolated kitchen this way).
@@ -106,6 +108,8 @@ pub struct WorkspaceInfo {
     pub repo_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
     pub selected: bool,
     pub tabs: Vec<TabInfo>,
 }
@@ -143,12 +147,13 @@ pub struct TabInfo {
     pub worktree: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pr_number: Option<u64>,
     pub tmux_session: String,
     pub selected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_file: Option<String>,
+    /// Rev the viewer diffs against (`origin/<default>` when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_base: Option<String>,
     #[serde(default)]
     pub unread: bool,
 }

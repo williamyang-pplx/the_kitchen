@@ -6,11 +6,9 @@
 
 pub mod bootstrap;
 pub mod db;
-pub mod gh;
 pub mod git;
 pub mod host;
 pub mod plan;
-pub mod review;
 pub mod summaries;
 pub mod tmux;
 pub mod util;

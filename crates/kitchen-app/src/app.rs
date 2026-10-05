@@ -1,5 +1,5 @@
 //! The window: workspace sidebar, tab strip, terminal, side panel
-//! (viewer / plan / inbox), dialogs, and the Cmd keymap.
+//! (viewer / plan), dialogs, and the Cmd keymap.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use egui::{Align, Color32, Key, Layout, Modifiers, RichText, Sense, Ui};
 use kitchen_proto::TabKind;
 
-use crate::engine::{Engine, NewTab, Tab, UiCommand, Workspace};
+use crate::engine::{Engine, Tab, UiCommand, Workspace};
 use crate::keymap::{self, Action};
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::terminal::{TermSession, TerminalView};
@@ -26,7 +26,6 @@ pub enum Focus {
 pub enum SideKind {
     Viewer,
     Plan,
-    Inbox,
 }
 
 enum TermSlot {
@@ -49,13 +48,23 @@ pub struct KitchenApp {
     side: Option<SideKind>,
     viewers: HashMap<String, crate::viewer::Viewer>,
     plans: HashMap<String, crate::plan_view::PlanView>,
-    inbox: crate::inbox::Inbox,
     dialog: Option<Dialog>,
     screenshots: Vec<(String, Sender<Result<(), String>>)>,
+    /// Input events from `kitchenctl debug keys`, fed to the next frame.
+    injected: Vec<egui::Event>,
     /// ⌘Q pressed; closes the window at the end of the frame.
     quit_requested: bool,
     /// Test hook: take a screenshot after a delay, then exit.
     auto_shot: Option<(Instant, String)>,
+    /// ⌘⇧P command palette.
+    palette: Option<(Vec<PaletteItem>, crate::viewer::picker::Picker)>,
+}
+
+#[derive(Clone)]
+enum PaletteItem {
+    Command(String),
+    ReloadPlugins,
+    Diagnostics,
 }
 
 impl KitchenApp {
@@ -65,7 +74,6 @@ impl KitchenApp {
             let secs = std::env::var("KITCHEN_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
             (Instant::now() + Duration::from_secs(secs), p)
         });
-        let inbox = crate::inbox::Inbox::new(&engine);
         Self {
             engine,
             slots: HashMap::new(),
@@ -76,11 +84,12 @@ impl KitchenApp {
             side: None,
             viewers: HashMap::new(),
             plans: HashMap::new(),
-            inbox,
             dialog: None,
             screenshots: Vec::new(),
+            injected: Vec::new(),
             quit_requested: false,
             auto_shot,
+            palette: None,
         }
     }
 
@@ -166,19 +175,21 @@ impl KitchenApp {
                     self.focus = Focus::Side;
                     self.panel_command_for(&tab_id, SideKind::Plan, PanelCmd::Reload);
                 }
+                UiCommand::ResetViewer { tab_id } => {
+                    self.viewers.remove(&tab_id);
+                }
                 UiCommand::ReloadPlan { tab_id } => {
                     if let Some(p) = self.plans.get_mut(&tab_id) {
                         p.command(PanelCmd::Reload, &self.engine);
                     }
                 }
-                UiCommand::OpenInbox => {
-                    self.side = Some(SideKind::Inbox);
-                    self.focus = Focus::Side;
-                }
-                UiCommand::FocusTerminal => self.focus = Focus::Terminal,
                 UiCommand::Screenshot { path, reply } => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                     self.screenshots.push((path, reply));
+                }
+                UiCommand::Keys(events) => {
+                    self.injected.extend(events);
+                    ctx.request_repaint();
                 }
             }
         }
@@ -197,7 +208,6 @@ impl KitchenApp {
                 .entry(tab_id.to_string())
                 .or_insert_with(|| crate::plan_view::PlanView::new(&self.engine, &ws, &tab))
                 .command(cmd, &self.engine),
-            SideKind::Inbox => self.inbox.command(cmd, &self.engine),
         }
     }
 
@@ -207,12 +217,20 @@ impl KitchenApp {
         let tab = ws.as_ref().and_then(|w| w.selected().cloned());
         match action {
             Action::NewWorkspace => self.dialog = Some(Dialog::new_workspace()),
+            // Inside a focused viewer, ⌘J / ⌘K step through the changed files.
+            Action::NextWorkspace if self.viewer_focused() => self.side_command(PanelCmd::NextFile),
+            Action::PrevWorkspace if self.viewer_focused() => self.side_command(PanelCmd::PrevFile),
             Action::NextWorkspace => engine.cycle_workspace(1),
             Action::PrevWorkspace => engine.cycle_workspace(-1),
             Action::GoToTab(n) => {
                 engine.select_tab_index(n);
                 self.focus = Focus::Terminal;
             }
+            // Inside a focused viewer, ⌘H / ⌘L move between its file list and code.
+            Action::PrevTab if self.viewer_focused() => self.side_command(PanelCmd::FocusList),
+            Action::NextTab if self.viewer_focused() => self.side_command(PanelCmd::FocusCode),
+            Action::Palette => self.open_palette(),
+            Action::Plugin(_) => {} // resolved in `ui` against the registry snapshot
             Action::PrevTab => engine.cycle_tab(-1),
             Action::NextTab => engine.cycle_tab(1),
             Action::Quit => self.quit_requested = true,
@@ -224,14 +242,21 @@ impl KitchenApp {
                 }
             }
             Action::NewReadonlyTab => {
-                if let Some(ws) = ws {
-                    let id = ws.row.id.clone();
-                    engine.spawn("read-only tab", move |e| {
-                        e.create_tab(&id, NewTab { kind: Some("readonly".into()), ..Default::default() }).map(|_| ())
-                    });
+                if ws.is_some() {
+                    self.dialog = Some(Dialog::new_readonly_tab());
                     self.focus = Focus::Terminal;
                 } else {
                     engine.toast_err("create a workspace first (⌘N)");
+                }
+            }
+            Action::RenameTab => {
+                if let Some(t) = tab {
+                    self.dialog = Some(Dialog::rename_tab(&t));
+                }
+            }
+            Action::RenameWorkspace => {
+                if let Some(ws) = ws {
+                    self.dialog = Some(Dialog::rename_workspace(&ws));
                 }
             }
             Action::CloseTab => {
@@ -256,9 +281,16 @@ impl KitchenApp {
                 }
                 self.focus = Focus::Side;
             }
+            // VS Code's ⌘B: the viewer's file list (opening the viewer if needed).
+            Action::ToggleFiles => {
+                if self.side == Some(SideKind::Viewer) {
+                    self.side_command(PanelCmd::ToggleFiles);
+                } else {
+                    self.open_side(SideKind::Viewer, None);
+                }
+            }
             Action::OpenViewer => self.open_side(SideKind::Viewer, Some(PanelCmd::FilePicker)),
             Action::OpenPlan => self.open_side(SideKind::Plan, Some(PanelCmd::Reload)),
-            Action::OpenInbox => self.open_side(SideKind::Inbox, None),
             Action::Comment => self.side_command(PanelCmd::Comment),
             Action::Submit => self.side_command(PanelCmd::Submit),
             Action::ToggleDiff => {
@@ -300,12 +332,113 @@ impl KitchenApp {
         }
     }
 
-    fn side_command(&mut self, cmd: PanelCmd) {
-        let Some(kind) = self.side else { return };
-        if kind == SideKind::Inbox {
-            self.inbox.command(cmd, &self.engine);
+    /// Where plugin chords apply right now.
+    fn plugin_context(&self) -> crate::plugins::When {
+        use crate::plugins::When;
+        match (self.focus, self.side) {
+            (Focus::Side, Some(SideKind::Viewer)) => When::Viewer,
+            (Focus::Side, Some(SideKind::Plan)) => When::Plan,
+            _ => When::Terminal,
+        }
+    }
+
+    fn selected_tab_id(&self) -> Option<String> {
+        self.engine.selected_workspace().and_then(|w| w.selected().map(|t| t.row.id.clone()))
+    }
+
+    /// Plugin chords for the focused context (context-specific ones first).
+    fn plugin_chords(&self) -> (Option<Arc<crate::plugins::Registry>>, keymap::PluginChords) {
+        use crate::plugins::When;
+        let Some(p) = self.engine.plugins() else { return (None, Vec::new()) };
+        let reg = p.registry();
+        if reg.chords.is_empty() {
+            return (Some(reg), Vec::new());
+        }
+        let here = self.plugin_context();
+        let ft = if here == When::Viewer { self.selected_tab_id().and_then(|t| self.viewers.get(&t)).and_then(|v| v.current_filetype()) } else { None };
+        let mut chords: Vec<(usize, crate::plugins::keys::Chord, bool)> = reg
+            .chords
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| (c.when == When::Any || c.when == here) && c.filetype.as_ref().is_none_or(|f| ft.as_ref() == Some(f)))
+            .map(|(i, c)| (i, c.chord, c.when == When::Any))
+            .collect();
+        chords.sort_by_key(|c| c.2);
+        (Some(reg.clone()), chords.into_iter().map(|(i, c, _)| (i, c)).collect())
+    }
+
+    fn run_plugin_command(&mut self, command: &str) {
+        let Some(p) = self.engine.plugins().cloned() else { return };
+        let tab = self.selected_tab_id().unwrap_or_default();
+        let viewer = self.viewers.get(&tab).map(|v| v.context());
+        let ctx = crate::plugins::command_context(&self.engine, &tab, viewer);
+        if let Err(e) = p.invoke(command, ctx, false) {
+            self.engine.toast_err(format!("{e:#}"));
+        }
+    }
+
+    fn open_palette(&mut self) {
+        if self.palette.is_some() {
+            self.palette = None;
             return;
         }
+        let mut items: Vec<(PaletteItem, (String, String))> = Vec::new();
+        if let Some(p) = self.engine.plugins() {
+            let reg = p.registry();
+            for c in &reg.commands {
+                let chords: Vec<String> = reg.chords.iter().filter(|k| k.command == c.name).map(|k| k.chord.label()).chain(reg.viewer_maps.iter().filter(|m| m.command == c.name).map(|m| format!("\\{}", m.keys))).collect();
+                let detail = [c.desc.clone(), chords.join(" ")].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ·  ");
+                items.push((PaletteItem::Command(c.name.clone()), (c.name.clone(), detail)));
+            }
+        }
+        items.push((PaletteItem::Diagnostics, ("viewer: diagnostics in this file".into(), "]d / [d".into())));
+        items.push((PaletteItem::ReloadPlugins, ("plugins: reload all".into(), format!("{}", kitchen_proto::state_dir().join("plugins").display()))));
+        let (kinds, labels): (Vec<PaletteItem>, Vec<(String, String)>) = items.into_iter().unzip();
+        self.palette = Some((kinds, crate::viewer::picker::Picker::new("command palette · ⌘⇧P", labels)));
+    }
+
+    fn palette_ui(&mut self, ctx: &egui::Context) {
+        let Some((_, picker)) = &mut self.palette else { return };
+        let mut result = crate::viewer::picker::PickerResult::Open;
+        egui::Area::new(egui::Id::new("palette")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 70.0)).show(ctx, |ui| {
+            ui.set_width(620.0);
+            ui.set_max_height(440.0);
+            result = picker.ui(ui, true);
+        });
+        match result {
+            crate::viewer::picker::PickerResult::Open => {}
+            crate::viewer::picker::PickerResult::Cancelled => self.palette = None,
+            crate::viewer::picker::PickerResult::Chosen(i) => {
+                let item = self.palette.take().and_then(|(kinds, _)| kinds.get(i).cloned());
+                match item {
+                    Some(PaletteItem::Command(c)) => self.run_plugin_command(&c),
+                    Some(PaletteItem::ReloadPlugins) => {
+                        if let Some(p) = self.engine.plugins().cloned() {
+                            match p.reload(None) {
+                                Ok(names) => self.engine.toast(format!("reloaded {} plugin(s)", names.len())),
+                                Err(e) => self.engine.toast_err(format!("{e:#}")),
+                            }
+                        }
+                    }
+                    Some(PaletteItem::Diagnostics) => {
+                        if let Some(tab) = self.selected_tab_id() {
+                            self.side = Some(SideKind::Viewer);
+                            self.focus = Focus::Side;
+                            self.panel_command_for(&tab, SideKind::Viewer, PanelCmd::Diagnostics);
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    fn viewer_focused(&self) -> bool {
+        self.focus == Focus::Side && self.side == Some(SideKind::Viewer)
+    }
+
+    fn side_command(&mut self, cmd: PanelCmd) {
+        let Some(kind) = self.side else { return };
         let Some(tab) = self.engine.selected_workspace().and_then(|w| w.selected().map(|t| t.row.id.clone())) else {
             return;
         };
@@ -323,11 +456,28 @@ impl KitchenApp {
             ui.label(RichText::new("WORKSPACES").size(11.0).color(theme::DIM).strong());
         });
         ui.add_space(4.0);
+        let pinned_count = workspaces.iter().filter(|w| w.row.pinned).count();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut rects = Vec::with_capacity(workspaces.len());
+            // (index, released this frame) of the row being dragged.
+            let mut drag: Option<(usize, bool)> = None;
             for (i, ws) in workspaces.iter().enumerate() {
+                if i == pinned_count && i > 0 {
+                    // Divider between the pinned group and the rest.
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 7.0), Sense::hover());
+                    ui.painter().hline(r.x_range().shrink(12.0), r.center().y, egui::Stroke::new(1.0, theme::BORDER));
+                }
                 let is_sel = selected.as_deref() == Some(&ws.row.id);
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), Sense::click());
-                if is_sel {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), Sense::click_and_drag());
+                rects.push(rect);
+                if resp.dragged_by(egui::PointerButton::Primary) {
+                    drag = Some((i, false));
+                } else if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                    drag = Some((i, true));
+                }
+                if drag.is_some_and(|(d, _)| d == i) {
+                    ui.painter().rect_filled(rect.shrink2(egui::vec2(4.0, 1.0)), 6.0, Color32::from_rgb(0x1c, 0x1d, 0x28));
+                } else if is_sel {
                     ui.painter().rect_filled(rect.shrink2(egui::vec2(4.0, 1.0)), 6.0, theme::SELECTED);
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 8.0), egui::vec2(3.0, rect.height() - 16.0)),
@@ -347,6 +497,9 @@ impl KitchenApp {
                 }
                 let hint = if i < 9 { format!("{}", i + 1) } else { String::new() };
                 p.text(egui::pos2(rect.right() - 28.0, rect.top() + 9.0), egui::Align2::RIGHT_TOP, hint, egui::FontId::monospace(10.0), theme::DIM);
+                if ws.row.pinned {
+                    p.text(egui::pos2(rect.right() - 40.0, rect.top() + 8.0), egui::Align2::RIGHT_TOP, "📌", egui::FontId::proportional(11.0), theme::DIM);
+                }
                 let sub = format!("{} · {} · {} tab{}", ws.row.host, ws.repo_name(), ws.tabs.len(), if ws.tabs.len() == 1 { "" } else { "s" });
                 p.text(egui::pos2(x, rect.top() + 27.0), egui::Align2::LEFT_TOP, sub, egui::FontId::proportional(11.5), host_color);
                 let (status, color) = match (&ws.error, &ws.status) {
@@ -358,21 +511,31 @@ impl KitchenApp {
                     let status: String = status.chars().take(40).collect();
                     p.text(egui::pos2(x, rect.top() + 42.0), egui::Align2::LEFT_TOP, status, egui::FontId::proportional(10.5), color);
                 }
-                if resp.clicked() {
+                if resp.clicked_by(egui::PointerButton::Primary) {
                     self.engine.select_workspace(&ws.row.id);
                     self.focus = Focus::Terminal;
                 }
                 resp.context_menu(|ui| {
-                    if ui.button("Re-run setup (dotfiles, skills, kitchenctl)").clicked() {
+                    let pin_label = if ws.row.pinned { "Unpin" } else { "Pin to top" };
+                    if ui.button(pin_label).clicked_by(egui::PointerButton::Primary) {
+                        if let Err(e) = self.engine.set_workspace_pinned(&ws.row.id, !ws.row.pinned) {
+                            self.engine.toast_err(format!("{e:#}"));
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Re-run setup (dotfiles, skills, kitchenctl)").clicked_by(egui::PointerButton::Primary) {
                         let id = ws.row.id.clone();
                         self.engine.spawn("bootstrap", move |e| e.bootstrap_workspace(&id));
                         ui.close();
                     }
-                    if ui.button("Remove workspace").clicked() {
+                    if ui.button("Remove workspace").clicked_by(egui::PointerButton::Primary) {
                         self.dialog = Some(Dialog::confirm_close_workspace(ws));
                         ui.close();
                     }
                 });
+            }
+            if let Some((from, released)) = drag {
+                self.workspace_drag(ui, &workspaces, &rects, pinned_count, from, released);
             }
             if workspaces.is_empty() {
                 ui.add_space(20.0);
@@ -384,21 +547,36 @@ impl KitchenApp {
         });
     }
 
+    /// Drag-to-reorder in the sidebar: draw the drop line while dragging,
+    /// move the workspace on release. Drops stay inside the dragged
+    /// workspace's group (pinned or unpinned).
+    fn workspace_drag(&mut self, ui: &Ui, workspaces: &[Workspace], rects: &[egui::Rect], pinned_count: usize, from: usize, released: bool) {
+        let Some(pointer) = ui.ctx().pointer_interact_pos() else { return };
+        let slot = rects.iter().position(|r| pointer.y < r.center().y).unwrap_or(rects.len());
+        let slot = if workspaces[from].row.pinned { slot.min(pinned_count) } else { slot.clamp(pinned_count, rects.len()) };
+        if released {
+            if slot != from && slot != from + 1 {
+                if let Err(e) = self.engine.move_workspace(&workspaces[from].row.id, slot) {
+                    self.engine.toast_err(format!("{e:#}"));
+                }
+            }
+            return;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let y = match rects.get(slot) {
+            Some(r) => r.top(),
+            None => rects[rects.len() - 1].bottom(),
+        };
+        let x = rects[from].x_range().shrink(8.0);
+        ui.painter().hline(x, y, egui::Stroke::new(2.0, theme::ACCENT));
+    }
+
     fn footer(&mut self, ui: &mut Ui) {
-        let drafts = self.inbox.pending_count();
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new("＋ Workspace  ⌘N").size(12.0)).frame(false)).clicked() {
+            if ui.add(egui::Button::new(RichText::new("＋ Workspace  ⌘N").size(12.0)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewWorkspace);
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(8.0);
-                let label = if drafts > 0 { format!("Inbox {drafts}  ⌘I") } else { "Inbox  ⌘I".into() };
-                let color = if drafts > 0 { theme::YELLOW } else { theme::DIM };
-                if ui.add(egui::Button::new(RichText::new(label).size(12.0).color(color)).frame(false)).clicked() {
-                    self.run_action(Action::OpenInbox);
-                }
-            });
         });
     }
 
@@ -426,12 +604,11 @@ impl KitchenApp {
                     .corner_radius(5.0)
                     .min_size(egui::vec2(0.0, 24.0));
                 let resp = ui.add(btn).on_hover_text(format!(
-                    "{}\n{}{}",
+                    "{}\n{}",
                     tab.row.worktree,
-                    tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into()),
-                    tab.row.pr_number.map(|n| format!(" · PR #{n}")).unwrap_or_default()
+                    tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
                 ));
-                if resp.clicked() {
+                if resp.clicked_by(egui::PointerButton::Primary) {
                     self.engine.select_tab(&tab.row.id);
                     self.focus = Focus::Terminal;
                 }
@@ -446,22 +623,21 @@ impl KitchenApp {
                     .on_hover_text("fetching origin and preparing the worktree…");
             }
             ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new("＋ edit ⌘E").size(11.5).color(theme::GREEN)).frame(false)).clicked() {
+            if ui.add(egui::Button::new(RichText::new("＋ edit ⌘E").size(11.5).color(theme::GREEN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewEditTab);
             }
-            if ui.add(egui::Button::new(RichText::new("＋ read-only ⌘R").size(11.5).color(theme::CYAN)).frame(false)).clicked() {
+            if ui.add(egui::Button::new(RichText::new("＋ read-only ⌘I").size(11.5).color(theme::CYAN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewReadonlyTab);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
                 for (kind, label, action) in [
-                    (SideKind::Inbox, "Inbox ⌘I", Action::OpenInbox),
-                    (SideKind::Plan, "Plan ⌘⇧R", Action::OpenPlan),
+                    (SideKind::Plan, "Plan ⌘⇧I", Action::OpenPlan),
                     (SideKind::Viewer, "Files ⌘P", Action::OpenViewer),
                 ] {
                     let on = self.side == Some(kind);
                     let text = RichText::new(label).size(11.5).color(if on { theme::ACCENT } else { theme::DIM });
-                    if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                    if ui.add(egui::Button::new(text).frame(false)).clicked_by(egui::PointerButton::Primary) {
                         if on {
                             self.side = None;
                             self.focus = Focus::Terminal;
@@ -485,7 +661,6 @@ impl KitchenApp {
                 (Focus::Terminal, _) => "TERMINAL",
                 (Focus::Side, Some(SideKind::Viewer)) => "VIEWER",
                 (Focus::Side, Some(SideKind::Plan)) => "PLAN",
-                (Focus::Side, Some(SideKind::Inbox)) => "INBOX",
                 (Focus::Side, None) => "TERMINAL",
             };
             ui.label(RichText::new(focus).size(10.5).strong().color(theme::BG).background_color(theme::ACCENT));
@@ -495,7 +670,11 @@ impl KitchenApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("⌘J/K workspace · ⌘H/L or ⌘1-9 tab · ⌘⇧H/L pane · ⌘M comment · ⌘D diff · ⌘O outline")
+                    RichText::new(match (self.focus, self.side) {
+                        (Focus::Side, Some(SideKind::Viewer)) => "⌘H/L files ↔ code · ⌘J/K changed file · ⌘B files · ⌘D diff · ⌘O outline · ⌥H/L pane",
+                        (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘J/K workspace",
+                        _ => "⌘H/L or ⌘1-9 tab · ⌘E edit · ⌘I read-only · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
+                    })
                         .size(10.5)
                         .color(theme::DIM),
                 );
@@ -509,14 +688,14 @@ impl KitchenApp {
     fn terminal_area(&mut self, ui: &mut Ui, ws: &Workspace, tab: &Tab) {
         self.ensure_terminal(ui.ctx(), ws, tab);
         let font_size = self.engine.settings().font_size;
-        let focused = self.focus == Focus::Terminal && self.dialog.is_none();
+        let focused = self.focus == Focus::Terminal && self.dialog.is_none() && self.palette.is_none();
         match self.slots.get_mut(&tab.row.id) {
             Some(TermSlot::Live(session)) => {
                 if session.take_bell() {
                     // A bell in a background tab marks it unread.
                 }
                 let resp = TerminalView::new(session).font_size(font_size).focused(focused).show(ui);
-                if resp.clicked() || resp.drag_started() {
+                if resp.clicked_by(egui::PointerButton::Primary) || resp.drag_started() {
                     self.focus = Focus::Terminal;
                 }
             }
@@ -534,11 +713,10 @@ impl KitchenApp {
     }
 
     fn side_area(&mut self, ui: &mut Ui, ws: &Workspace, tab: Option<&Tab>) {
-        let focused = self.focus == Focus::Side && self.dialog.is_none();
+        let focused = self.focus == Focus::Side && self.dialog.is_none() && self.palette.is_none();
         let kind = self.side.unwrap_or(SideKind::Viewer);
         let mut cx = PanelCtx { engine: &self.engine, focused, clicked: false };
         match (kind, tab) {
-            (SideKind::Inbox, _) => self.inbox.ui(ui, &mut cx),
             (SideKind::Viewer, Some(tab)) => self
                 .viewers
                 .entry(tab.row.id.clone())
@@ -549,7 +727,7 @@ impl KitchenApp {
                 .entry(tab.row.id.clone())
                 .or_insert_with(|| crate::plan_view::PlanView::new(&self.engine, ws, tab))
                 .ui(ui, &mut cx),
-            (_, None) => centered_note(ui, "open a tab first (⌘E / ⌘R)", theme::DIM),
+            (_, None) => centered_note(ui, "open a tab first (⌘E / ⌘I)", theme::DIM),
         }
         if cx.clicked {
             self.focus = Focus::Side;
@@ -594,6 +772,12 @@ impl KitchenApp {
 }
 
 impl eframe::App for KitchenApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if !self.injected.is_empty() {
+            raw_input.events.append(&mut self.injected);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
         let ctx = ui.ctx().clone();
@@ -611,8 +795,22 @@ impl eframe::App for KitchenApp {
                 }
             }
         } else {
-            for action in keymap::collect(&ctx) {
-                self.run_action(action);
+            let (reg, chords) = self.plugin_chords();
+            for action in keymap::collect(&ctx, &chords) {
+                // Chords belong to the focused pane; out-of-scope ones are swallowed.
+                let side_focused = self.focus == Focus::Side && self.side.is_some();
+                if !action.allowed(side_focused, self.viewer_focused()) {
+                    continue;
+                }
+                match (action, &reg) {
+                    (Action::Plugin(i), Some(reg)) => {
+                        if let Some(c) = reg.chords.get(i) {
+                            let command = c.command.clone();
+                            self.run_plugin_command(&command);
+                        }
+                    }
+                    _ => self.run_action(action),
+                }
             }
             // Esc in a side panel that did not use it hands focus back.
             if self.focus == Focus::Side && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Escape)) {
@@ -643,24 +841,15 @@ impl eframe::App for KitchenApp {
         }
         let mut side_rect = None;
         if self.side.is_some() {
-            // The inbox is global; the viewer and plan need a workspace.
-            if ws.is_some() || self.side == Some(SideKind::Inbox) {
+            // The viewer and plan need a workspace.
+            if let Some(ws) = &ws {
                 let width = ui.available_width();
                 let shown = egui::Panel::right("side")
                     .resizable(true)
                     .default_size(width * 0.5)
                     .size_range(280.0..=width - 200.0)
                     .frame(egui::Frame::NONE.fill(theme::BG).stroke(egui::Stroke::new(1.0, theme::BORDER)))
-                    .show(ui, |ui| match &ws {
-                        Some(ws) => self.side_area(ui, ws, tab.as_ref()),
-                        None => {
-                            let mut cx = PanelCtx { engine: &self.engine, focused: self.focus == Focus::Side && self.dialog.is_none(), clicked: false };
-                            self.inbox.ui(ui, &mut cx);
-                            if cx.clicked {
-                                self.focus = Focus::Side;
-                            }
-                        }
-                    });
+                    .show(ui, |ui| self.side_area(ui, ws, tab.as_ref()));
                 side_rect = Some(shown.response.rect);
             }
         }
@@ -675,7 +864,7 @@ impl eframe::App for KitchenApp {
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();
-                centered_note(ui, &format!("{}\n\n⌘E  new edit tab (own worktree + branch, starts planning)\n⌘R  new read-only tab (latest {})\n{status}", ws.row.name, ws.row.default_branch.as_deref().unwrap_or("main")), theme::DIM)
+                centered_note(ui, &format!("{}\n\n⌘E  new edit tab (own worktree + branch, starts planning)\n⌘I  new read-only tab (latest {})\n{status}", ws.row.name, ws.row.default_branch.as_deref().unwrap_or("main")), theme::DIM)
             }
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });
@@ -686,6 +875,7 @@ impl eframe::App for KitchenApp {
             };
             paint_focus_glow(&ctx, focused);
         }
+        self.palette_ui(&ctx);
         self.save_screenshots(&ctx);
         if profiling() {
             let ms = frame_start.elapsed().as_secs_f64() * 1000.0;
@@ -746,3 +936,67 @@ fn write_png(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
 
 #[allow(dead_code)]
 fn _assert_modifiers(_: Modifiers) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(key: Key, modifiers: Modifiers) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers },
+            egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers },
+        ]
+    }
+
+    /// Enter in the viewer's file list (into a folder, or `../`) keeps the
+    /// keyboard in the viewer; it must never land in the terminal.
+    #[test]
+    fn enter_in_file_list_keeps_viewer_focus() {
+        let tmp = std::env::temp_dir().join(format!("kt-focus-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let d = tmp.display().to_string();
+        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
+        run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p .agents/skills aster/x && echo 1 > .agents/skills/a.md && echo 2 > aster/x/b.py && echo 3 > README.md && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
+        let ctx = egui::Context::default();
+        let db = kitchen_core::db::Db::open_in_memory().unwrap();
+        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_tab(&tab).unwrap();
+        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let mut app = KitchenApp::new(engine.clone());
+        let term = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), "cat >/dev/null".into()], None, HashMap::new()).unwrap();
+        app.slots.insert("t".into(), TermSlot::Live(term));
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut step = |app: &mut KitchenApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for _ in 0..3 {
+            step(&mut app, vec![]);
+        }
+        assert_eq!(app.focus, Focus::Terminal);
+        // ⌥L: the viewer; wait for the file list; ⌘H: into the list.
+        step(&mut app, key(Key::L, Modifiers::ALT));
+        assert_eq!(app.focus, Focus::Side);
+        for _ in 0..200 {
+            step(&mut app, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        step(&mut app, key(Key::H, Modifiers::COMMAND));
+        step(&mut app, vec![]);
+        // Root rows: .agents/ aster/ README.md — gg, then Enter into .agents/.
+        for c in ["-", "-", "g", "g"] {
+            step(&mut app, vec![egui::Event::Text(c.into())]);
+        }
+        for round in 0..3 {
+            step(&mut app, key(Key::Enter, Modifiers::NONE));
+            step(&mut app, vec![]);
+            assert_eq!(app.focus, Focus::Side, "Enter #{round} moved focus to the terminal");
+            step(&mut app, vec![egui::Event::Text("g".into())]);
+            step(&mut app, vec![egui::Event::Text("g".into())]);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}

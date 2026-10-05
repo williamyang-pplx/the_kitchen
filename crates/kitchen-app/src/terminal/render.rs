@@ -57,6 +57,10 @@ impl<'a> TerminalView<'a> {
                 )
             });
             handle_keyboard(ui, session);
+        } else if resp.has_focus() {
+            // Another pane has the keyboard: holding egui focus here would turn
+            // its Enter/Space into a fake click on the terminal (and steal focus).
+            resp.surrender_focus();
         }
         if has_focus != session.focused {
             session.focused = has_focus;
@@ -69,16 +73,10 @@ impl<'a> TerminalView<'a> {
         if let Some(text) = session.take_clipboard() {
             ui.ctx().copy_text(text);
         }
-        if session.predictor.pending() {
-            let cursor_row = live_cursor(session).map(|(r, _)| r);
-            let term = session.term.lock();
-            session.predictor.validate(|row, col| term.grid()[Point::new(Line(row as i32), Column(col))].c, cursor_row);
-            drop(term);
-            if session.predictor.pending() {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
-            }
-        }
         paint(ui, rect, session, &geom, &font, has_focus);
+        if session.predictor.pending() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
         resp
     }
 }
@@ -112,7 +110,10 @@ impl Geom {
 
 /// The cursor's viewport cell when it is visible on the live screen.
 fn live_cursor(session: &TermSession) -> Option<(usize, usize)> {
-    let term = session.term.lock();
+    cursor_of(&session.term.lock())
+}
+
+fn cursor_of(term: &alacritty_terminal::Term<super::Listener>) -> Option<(usize, usize)> {
     if term.grid().display_offset() != 0 || !term.mode().contains(TermMode::SHOW_CURSOR) {
         return None;
     }
@@ -255,21 +256,33 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
         }
     } else if resp.double_clicked() {
         session.term.lock().selection = Some(Selection::new(SelectionType::Semantic, point, side));
-    } else if resp.clicked() {
+    } else if resp.clicked_by(egui::PointerButton::Primary) {
         session.term.lock().selection = None;
     }
 }
 
-fn paint(ui: &mut Ui, rect: Rect, session: &TermSession, geom: &Geom, font: &FontId, focused: bool) {
+fn paint(ui: &mut Ui, rect: Rect, session: &mut TermSession, geom: &Geom, font: &FontId, focused: bool) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
 
-    let term = session.term.lock();
+    let term_arc = session.term.clone();
+    let term = term_arc.lock();
+    // Check predictions against exactly what is painted: cursor and cells from
+    // this one lock (cmux drew guesses a cell off when they were read apart).
+    if session.predictor.pending() {
+        let cursor = cursor_of(&term);
+        session.predictor.validate(|row, col| term.grid()[Point::new(Line(row as i32), Column(col))].c, cursor);
+    }
     let content = term.renderable_content();
     let overrides = content.colors;
     let offset = content.display_offset as i32;
     let selection = content.selection;
     let cursor = content.cursor;
+
+    // Cells covered by a shown prediction: the prediction replaces the cell's
+    // glyph (never drawn on top of it — that overlapped real text).
+    let preds = session.predictor.visible();
+    let covered = |row: usize, col: usize| offset == 0 && preds.iter().any(|p| p.row == row && p.col == col);
 
     // Per-row text jobs (ASCII only, so every glyph is exactly one cell wide)
     // plus a list of wide/non-ASCII glyphs painted individually.
@@ -319,7 +332,7 @@ fn paint(ui: &mut Ui, rect: Rect, session: &TermSession, geom: &Geom, font: &Fon
         if row_cols[row] < col {
             job.append(&" ".repeat(col - row_cols[row]), 0.0, default_fmt.clone());
         }
-        let c = cell.c;
+        let c = if covered(row, col) { ' ' } else { cell.c };
         let ascii = c.is_ascii() && !c.is_ascii_control() && width == 1;
         let fmt = TextFormat {
             font_id: font.clone(),
@@ -356,11 +369,9 @@ fn paint(ui: &mut Ui, rect: Rect, session: &TermSession, geom: &Geom, font: &Fon
     }
 
     // Predicted (not yet echoed) characters, underlined; the cursor is drawn after them.
-    let preds = session.predictor.visible();
-    for p in preds {
+    for p in preds.iter().filter(|_| offset == 0) {
         if p.row < geom.rows && p.col < geom.cols {
             let r = geom.cell_rect(p.col, p.row, 1);
-            painter.rect_filled(r, CornerRadius::ZERO, BACKGROUND);
             painter.text(r.left_top(), egui::Align2::LEFT_TOP, p.c, font.clone(), colors::FOREGROUND);
             painter.hline(r.x_range(), r.bottom() - 1.0, Stroke::new(1.0, colors::FOREGROUND.gamma_multiply(0.5)));
         }
@@ -551,5 +562,80 @@ mod perceived {
         }
         println!("{}", out.iter().map(|(i, ms)| format!("#{i}:{ms:.1}ms")).collect::<Vec<_>>().join(" "));
         s.write(&b"\x15"[..]);
+    }
+}
+
+
+#[cfg(test)]
+mod devbox_typing {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Fast typing on a real devbox shell (zsh + autosuggestions):
+    /// predictions stay contiguous from the real cursor every frame, never
+    /// stack on one cell, and the line ends up right.
+    /// `KT_ATTACH=... cargo test -p kitchen-app typing_burst -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn typing_burst() {
+        let Ok(cmd) = std::env::var("KT_ATTACH") else { return };
+        let ctx = egui::Context::default();
+        let mut s = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), cmd], None, HashMap::new()).unwrap();
+        s.set_predictive_echo(true);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let frame = |s: &mut TermSession, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    TerminalView::new(s).focused(true).show(ui);
+                });
+            });
+            out.textures_delta.clear();
+        };
+        let check = |s: &mut TermSession| -> usize {
+            let term_arc = s.term.clone();
+            let term = term_arc.lock();
+            let cur = cursor_of(&term);
+            s.predictor.validate(|row, col| term.grid()[Point::new(Line(row as i32), Column(col))].c, cur);
+            let preds = s.predictor.visible();
+            if let (Some(first), Some((r, c))) = (preds.first(), cur) {
+                assert_eq!(first.row, r, "predictions on the cursor's row");
+                assert!(first.col >= c, "prediction behind the cursor: {first:?} cursor {c}");
+            }
+            for w in preds.windows(2) {
+                assert_eq!(w[1].col, w[0].col + 1, "predictions contiguous");
+            }
+            preds.len()
+        };
+        let line = "echo hello world";
+        for round in 0..3 {
+            frame(&mut s, vec![]);
+            let mut max_shown = 0;
+            for ch in line.chars() {
+                frame(&mut s, vec![egui::Event::Text(ch.to_string())]);
+                max_shown = max_shown.max(check(&mut s));
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                frame(&mut s, vec![]);
+                max_shown = max_shown.max(check(&mut s));
+            }
+            let t0 = std::time::Instant::now();
+            while s.predictor.pending() && t0.elapsed().as_secs() < 3 {
+                frame(&mut s, vec![]);
+                check(&mut s);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!s.predictor.pending(), "every prediction confirmed");
+            let row = live_cursor(&s).unwrap().0;
+            let text: String = {
+                let t = s.term.lock();
+                (0..t.columns()).map(|c| t.grid()[Point::new(Line(row as i32), Column(c))].c).collect()
+            };
+            assert!(text.contains(line), "line on screen: {text:?}");
+            println!("round {round}: up to {max_shown} characters shown ahead of the echo; line ok");
+            // Clear the line (Ctrl-U) for the next round.
+            s.write(&b"\x15"[..]);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            frame(&mut s, vec![]);
+        }
     }
 }

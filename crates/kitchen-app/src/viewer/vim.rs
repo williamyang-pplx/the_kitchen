@@ -26,6 +26,8 @@ pub enum VimKey {
 pub enum VimAction {
     /// gd / Ctrl-]: jump to the definition of this identifier.
     JumpToDef(String),
+    /// gr: list references to this identifier.
+    References(String),
     /// Ctrl-o / Ctrl-t.
     JumpBack,
     /// Ctrl-i.
@@ -49,6 +51,11 @@ pub enum VimAction {
     BigMove { from: (usize, usize) },
     /// Esc with nothing to cancel.
     Escape,
+    /// `-`: the folder view one level up (from a file: its folder).
+    Parent,
+    /// ]d / [d: next / previous plugin diagnostic.
+    NextDiag,
+    PrevDiag,
 }
 
 /// What the owner tells the machine about the viewport.
@@ -142,18 +149,7 @@ impl Vim {
 
     /// Identifier under (or right after) the cursor.
     pub fn word_under_cursor(&self, lines: &[String]) -> Option<String> {
-        let cs = chars(lines.get(self.line)?);
-        let mut i = self.col.min(cs.len().saturating_sub(1));
-        let is_w = |c: char| c.is_alphanumeric() || c == '_';
-        if cs.is_empty() {
-            return None;
-        }
-        if !is_w(cs[i]) {
-            i = (i..cs.len()).find(|&j| is_w(cs[j]))?;
-        }
-        let start = (0..=i).rev().take_while(|&j| is_w(cs[j])).last().unwrap_or(i);
-        let end = (i..cs.len()).take_while(|&j| is_w(cs[j])).last().unwrap_or(i);
-        Some(cs[start..=end].iter().collect())
+        word_at(lines.get(self.line)?, self.col)
     }
 
     /// Feed one key. Returns the actions the owner must perform.
@@ -214,6 +210,7 @@ impl Vim {
         match key {
             VimKey::Char('j') | VimKey::Down => self.vertical(n as isize, lines),
             VimKey::Enter => out.push(VimAction::Enter),
+            VimKey::Char('-') => out.push(VimAction::Parent),
             VimKey::Char('k') | VimKey::Up => self.vertical(-(n as isize), lines),
             VimKey::Char('h') | VimKey::Left | VimKey::Backspace => {
                 self.col = self.col.saturating_sub(n);
@@ -340,10 +337,13 @@ impl Vim {
                 vec![VimAction::BigMove { from }]
             }
             ('g', 'd') => self.word_under_cursor(lines).map(VimAction::JumpToDef).into_iter().collect(),
+            ('g', 'r') => self.word_under_cursor(lines).map(VimAction::References).into_iter().collect(),
             ('z', 'z') => vec![VimAction::Center],
             ('z', 't') => vec![VimAction::Top],
             ('z', 'b') => vec![VimAction::Bottom],
             (']', 'c') => vec![VimAction::NextHunk],
+            (']', 'd') => vec![VimAction::NextDiag],
+            ('[', 'd') => vec![VimAction::PrevDiag],
             ('[', 'c') => vec![VimAction::PrevHunk],
             (']', 'f') => vec![VimAction::NextFile],
             ('[', 'f') => vec![VimAction::PrevFile],
@@ -618,6 +618,22 @@ impl Vim {
     }
 }
 
+/// The identifier at (or right after) display column `col` of `line`.
+pub fn word_at(line: &str, col: usize) -> Option<String> {
+    let cs = chars(line);
+    if cs.is_empty() {
+        return None;
+    }
+    let is_w = |c: char| c.is_alphanumeric() || c == '_';
+    let mut i = col.min(cs.len() - 1);
+    if !is_w(cs[i]) {
+        i = (i..cs.len()).find(|&j| is_w(cs[j]))?;
+    }
+    let start = (0..=i).rev().take_while(|&j| is_w(cs[j])).last().unwrap_or(i);
+    let end = (i..cs.len()).take_while(|&j| is_w(cs[j])).last().unwrap_or(i);
+    Some(cs[start..=end].iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +767,7 @@ mod tests {
         let mut v = Vim::default();
         keys(&mut v, &b, "fc");
         assert_eq!(keys(&mut v, &b, "gd"), vec![VimAction::JumpToDef("compute".into())]);
+        assert_eq!(keys(&mut v, &b, "gr"), vec![VimAction::References("compute".into())]);
         assert_eq!(v.key(VimKey::Ctrl(']'), &b, Viewport::default()), vec![VimAction::JumpToDef("compute".into())]);
         assert_eq!(v.key(VimKey::Ctrl('o'), &b, Viewport::default()), vec![VimAction::JumpBack]);
         assert_eq!(keys(&mut v, &b, "]c[f"), vec![VimAction::NextHunk, VimAction::PrevFile]);

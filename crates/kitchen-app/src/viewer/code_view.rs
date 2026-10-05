@@ -1,6 +1,6 @@
 //! Read-only code widget with vim navigation, used by the file viewer and
-//! the plan reviewer. It paints a [`Doc`], inline blocks (review threads,
-//! drafts, plan comments) and an optional comment editor, and turns plain
+//! the plan reviewer. It paints a [`Doc`], inline blocks (plan
+//! comments) and an optional comment editor, and turns plain
 //! keys into [`Vim`] motions while focused.
 
 use egui::text::{LayoutJob, TextFormat};
@@ -29,6 +29,26 @@ pub struct Block {
     pub body: String,
     pub color: Color32,
     pub dim: bool,
+}
+
+/// Plugin decorations for one display line, in display (tab-expanded) byte
+/// offsets. Applied while painting; never baked into the [`Doc`].
+#[derive(Debug, Clone, Default)]
+pub struct LineOverlay {
+    /// Foreground colors that override the syntax colors.
+    pub spans: Vec<(std::ops::Range<usize>, Color32)>,
+    /// Underlined ranges (diagnostics).
+    pub underlines: Vec<(std::ops::Range<usize>, Color32)>,
+    /// Gutter sign.
+    pub sign: Option<(char, Color32)>,
+    /// Dim text after the line (the first diagnostic's message).
+    pub virt: Option<(String, Color32)>,
+}
+
+/// Decorations by 1-based current-file line (`DocLine::new_no`).
+#[derive(Debug, Clone, Default)]
+pub struct Overlay {
+    pub lines: std::collections::HashMap<usize, LineOverlay>,
 }
 
 /// The ⌘M comment field.
@@ -60,6 +80,11 @@ pub struct CodeView<'a> {
     pub font_size: f32,
     /// Show base-side line numbers too (diff mode).
     pub two_gutters: bool,
+    /// vim `relativenumber`: other rows show their distance from the cursor
+    /// (the count for `5j`); the cursor row shows its real line number.
+    pub relative: bool,
+    /// Plugin highlights / diagnostics for the current file.
+    pub overlay: Option<&'a Overlay>,
     pub id: egui::Id,
 }
 
@@ -67,7 +92,7 @@ const EDITOR_HEIGHT: f32 = 118.0;
 
 impl CodeView<'_> {
     pub fn show(self, ui: &mut Ui) -> Output {
-        let CodeView { doc, vim, state, blocks, mut editor, focused, font_size, two_gutters, id } = self;
+        let CodeView { doc, vim, state, blocks, mut editor, focused, font_size, two_gutters, relative, overlay, id } = self;
         let mut out = Output::default();
         let rect = ui.available_rect_before_wrap();
         let resp = ui.interact(rect, id.with("area"), Sense::click());
@@ -128,8 +153,10 @@ impl CodeView<'_> {
 
         let max_no = doc.lines.iter().filter_map(|l| l.new_no.max(l.old_no)).max().unwrap_or(1);
         let digits = max_no.to_string().len().max(3) as f32;
+        // A sign column only when some line has a sign.
+        let sign_w = if overlay.is_some_and(|o| o.lines.values().any(|l| l.sign.is_some())) { cw + 6.0 } else { 0.0 };
         let one_gutter = digits * cw + 12.0;
-        let gutter = if two_gutters { one_gutter * 2.0 } else { one_gutter };
+        let gutter = sign_w + if two_gutters { one_gutter * 2.0 } else { one_gutter };
         let text_x = rect.left() + gutter + 6.0;
         let visible_cols = (((rect.right() - text_x) / cw).floor() as usize).max(8);
         if vim.col < state.left {
@@ -204,11 +231,17 @@ impl CodeView<'_> {
             // Gutter numbers.
             let num_color = if idx == vim.line { theme::TEXT } else { theme::DIM };
             let small = FontId::monospace(font_size - 1.0);
+            // The current-file gutter; relative rows count doc rows, like vim motions.
+            let number = if relative && idx != vim.line {
+                Some(idx.abs_diff(vim.line))
+            } else {
+                line.new_no.or(if relative { line.old_no } else { None })
+            };
             if two_gutters {
                 if let Some(o) = line.old_no.filter(|_| line.kind != LineKind::Added) {
-                    painter.text(Pos2::new(rect.left() + one_gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, o, small.clone(), num_color);
+                    painter.text(Pos2::new(rect.left() + sign_w + one_gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, o, small.clone(), num_color);
                 }
-                if let Some(nn) = line.new_no {
+                if let Some(nn) = number {
                     painter.text(Pos2::new(rect.left() + gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, nn, small.clone(), num_color);
                 }
                 let marker = match line.kind {
@@ -217,16 +250,22 @@ impl CodeView<'_> {
                     LineKind::Normal => "",
                 };
                 painter.text(Pos2::new(rect.left() + gutter + 1.0, y + 1.0), egui::Align2::LEFT_TOP, marker, small, if line.kind == LineKind::Added { theme::GREEN } else { theme::RED });
-            } else if let Some(nn) = line.new_no {
+            } else if let Some(nn) = number {
                 painter.text(Pos2::new(rect.left() + gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, nn, small, num_color);
             }
+            let over = line.new_no.filter(|_| line.kind != LineKind::Removed).and_then(|n| overlay.and_then(|o| o.lines.get(&n)));
+            if let Some((c, color)) = over.and_then(|o| o.sign) {
+                painter.text(Pos2::new(rect.left() + 3.0, y + 1.0), egui::Align2::LEFT_TOP, c, FontId::monospace(font_size - 1.0), color);
+            }
             // Text.
-            let job = line_job(line, state.left, &font);
+            let job = line_job(line, state.left, &font, over);
             let galley = ui.fonts_mut(|f| f.layout_job(job));
             painter.galley(Pos2::new(text_x, y + 1.0), galley, theme::TEXT);
+            let after_x = text_x + (line.text.chars().count().saturating_sub(state.left) + 2) as f32 * cw;
             if let Some(suffix) = &line.suffix {
-                let x = text_x + (line.text.chars().count().saturating_sub(state.left) + 2) as f32 * cw;
-                painter.text(Pos2::new(x, y + 1.0), egui::Align2::LEFT_TOP, suffix, FontId::proportional(font_size - 0.5), theme::DIM);
+                painter.text(Pos2::new(after_x, y + 1.0), egui::Align2::LEFT_TOP, suffix, FontId::proportional(font_size - 0.5), theme::DIM);
+            } else if let Some((text, color)) = over.and_then(|o| o.virt.as_ref()) {
+                painter.text(Pos2::new(after_x, y + 1.0), egui::Align2::LEFT_TOP, text, FontId::proportional(font_size - 0.5), color.gamma_multiply(0.75));
             }
             // Cursor.
             if idx == vim.line && vim.col >= state.left {
@@ -289,7 +328,7 @@ impl CodeView<'_> {
         }
 
         // ---- mouse
-        if resp.clicked() {
+        if resp.clicked_by(egui::PointerButton::Primary) {
             out.clicked = true;
             if let Some(pos) = resp.interact_pointer_pos() {
                 if let Some((_, idx)) = row_hits.iter().find(|(r, _)| r.contains(pos)) {
@@ -304,33 +343,31 @@ impl CodeView<'_> {
 }
 
 /// Layout for one line from its spans, starting at char column `left`.
-fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId) -> LayoutJob {
+fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId, over: Option<&LineOverlay>) -> LayoutJob {
     let mut job = LayoutJob::default();
     let text = &line.text;
     let start = text.char_indices().nth(left).map(|(b, _)| b).unwrap_or(text.len());
-    let fmt = |c: Color32| TextFormat { font_id: font.clone(), color: c, ..Default::default() };
-    if line.spans.is_empty() {
-        let color = if line.kind == LineKind::Removed { theme::TEXT.gamma_multiply(0.8) } else { theme::TEXT };
-        job.append(&text[start..], 0.0, fmt(color));
-        return job;
+    let base = if line.kind == LineKind::Removed && line.spans.is_empty() { theme::TEXT.gamma_multiply(0.8) } else { theme::TEXT };
+    // Segment boundaries from every span edge; each segment takes the last
+    // covering color (plugin spans after syntax spans) and any underline.
+    let empty = Vec::new();
+    let (ospans, ounder) = over.map(|o| (&o.spans, &o.underlines)).unwrap_or((&empty, &empty));
+    let mut cuts: Vec<usize> = vec![start, text.len()];
+    for (r, _) in line.spans.iter().chain(ospans).chain(ounder) {
+        cuts.push(r.start.clamp(start, text.len()));
+        cuts.push(r.end.clamp(start, text.len()));
     }
-    let mut pos = start;
-    for (range, color) in &line.spans {
-        if range.end <= pos {
+    cuts.sort_unstable();
+    cuts.dedup();
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b || !text.is_char_boundary(a) || !text.is_char_boundary(b) {
             continue;
         }
-        let s = range.start.max(pos);
-        if s > pos {
-            job.append(&text[pos..s], 0.0, fmt(theme::TEXT));
-        }
-        let e = range.end.min(text.len());
-        if e > s && text.is_char_boundary(s) && text.is_char_boundary(e) {
-            job.append(&text[s..e], 0.0, fmt(*color));
-        }
-        pos = e;
-    }
-    if pos < text.len() {
-        job.append(&text[pos..], 0.0, fmt(theme::TEXT));
+        let covers = |r: &std::ops::Range<usize>| r.start <= a && r.end >= b;
+        let color = ospans.iter().rev().find(|(r, _)| covers(r)).or_else(|| line.spans.iter().rev().find(|(r, _)| covers(r))).map(|(_, c)| *c).unwrap_or(base);
+        let underline = ounder.iter().rev().find(|(r, _)| covers(r)).map(|(_, c)| Stroke::new(1.5, *c)).unwrap_or(Stroke::NONE);
+        job.append(&text[a..b], 0.0, TextFormat { font_id: font.clone(), color, underline, ..Default::default() });
     }
     job
 }
@@ -352,7 +389,7 @@ fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32)
 }
 
 /// This frame's plain keys as vim keys (Cmd chords were consumed upstream).
-fn collect_keys(ui: &Ui) -> Vec<VimKey> {
+pub(crate) fn collect_keys(ui: &Ui) -> Vec<VimKey> {
     let mut out = Vec::new();
     ui.input(|i| {
         for e in &i.events {

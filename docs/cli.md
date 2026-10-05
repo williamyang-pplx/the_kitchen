@@ -51,7 +51,8 @@ app is not reachable.
 | `workspace close W` | `workspace.close` | ends tmux sessions; repo + worktrees stay |
 | `workspace bootstrap [-w W]` | `workspace.bootstrap` | pull dotfiles, relink skills, install kitchenctl, start relay |
 | `tab list [-w W]` | `tab.list` | |
-| `tab new [--edit\|--readonly] [--task T\|--task-file F] [--pr N] [--branch B] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | edit: own worktree + branch off fresh origin; `--task` starts `/low-level-plan`. readonly: shared read-only worktree synced to origin; `--pr` = read-only PR head |
+| `tab open TEXT` | `tab.open` | ⌘I: plugins open the text (github: a PR link → read-only tab at the PR head, diffed against its base) |
+| `tab new [--edit\|--readonly] [--task T\|--task-file F] [--branch B] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | edit: own worktree + branch off fresh origin; `--task` starts `/low-level-plan`. readonly: shared read-only worktree synced to origin |
 | `tab select T [-w W]` | `tab.select` | ⌘1…⌘9 |
 | `tab rename TITLE [-t T]` | `tab.rename` | |
 | `tab close [-t T]` | `tab.close` | ends the tmux session; worktree stays |
@@ -65,20 +66,9 @@ app is not reachable.
 | `plan path` / `open` / `ready` | `plan.path` / `.open` / `.ready` | `ready` reloads the reviewer and notifies William |
 | `plan comments [--all]` | `plan.comments` | open (and sent) comments; `--all` includes resolved |
 | `plan resolve ID` | `plan.resolve` | |
-| `pr threads [--unresolved] [-t T]` | `pr.threads` | review threads on the tab's PR |
-| `pr resolve THREAD [--reply TEXT] [-t T]` | `pr.resolve` | |
-| `review runs` | `review.runs` | |
-| `review start PR_URL` | `review.start` | |
-| `review done --run N [--failed MSG]` | `review.done` | |
-| `review drafts [--pr-url U] [--state S]` | `review.draft.list` | |
-| `review draft (--run N\|--pr-url U) --path P [--line L] [--start-line S] [--side RIGHT\|LEFT] [--severity S] (--body B\|--body-file F)` | `review.draft.add` | private until approved in the inbox |
-| `review watch list` / `add LOGIN` / `remove LOGIN` | `review.watch.list` / `.add` / `.remove` | |
 | `notify --title T [--body B] [-t T]` | `notify` | badge + macOS banner |
 | `notifications [--unread] [--limit N]` | `notification.list` | |
 | `debug screenshot PATH` | `debug.screenshot` | PNG of the window |
-
-There is deliberately **no API method that publishes a review draft**:
-publishing happens only on William's keypress in the inbox.
 
 Hidden helpers: `__relay` (devbox tunnel, above) and `__index` (symbol
 extraction for devbox viewers; not wired up yet — it exits with an error).

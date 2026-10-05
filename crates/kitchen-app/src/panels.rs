@@ -1,5 +1,5 @@
 //! The contract between the window and its side panels (viewer, plan
-//! reviewer, inbox). The window owns focus and the Cmd keymap; panels read
+//! reviewer). The window owns focus and the Cmd keymap; panels read
 //! plain (vim) keys themselves while `PanelCtx::focused` is true.
 
 use std::sync::Arc;
@@ -21,6 +21,16 @@ pub enum PanelCmd {
     FilePicker,
     /// Re-read files / refresh remote state.
     Reload,
+    /// ⌘H / ⌘L while the viewer is focused: its file list / its code.
+    FocusList,
+    FocusCode,
+    /// ⌘B: show / hide the viewer's file list.
+    ToggleFiles,
+    /// ⌘J / ⌘K while the viewer is focused: next / previous changed file.
+    NextFile,
+    PrevFile,
+    /// Palette: pick among the current file's plugin diagnostics.
+    Diagnostics,
     /// Open a file (from `kitchenctl viewer open`).
     Open { path: Option<String>, line: Option<usize>, diff: Option<bool> },
 }

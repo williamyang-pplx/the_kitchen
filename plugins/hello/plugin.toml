@@ -1,0 +1,4 @@
+name = "hello"
+version = "0.1.0"
+description = "Example plugin: a command, a chord, a leader map, a job"
+api = 1

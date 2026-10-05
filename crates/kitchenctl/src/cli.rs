@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Map, Value, json};
 
@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 #[command(
     name = "kitchenctl",
     version,
-    about = "Control the kitchen (workspaces, tabs, worktrees, plans, reviews) from a terminal or an agent",
+    about = "Control the kitchen (workspaces, tabs, worktrees, plans) from a terminal or an agent",
     long_about = "Control the kitchen from a terminal or an agent.\n\n\
         Inside a kitchen tab, commands default to the caller's workspace and tab \
         (from KITCHEN_WORKSPACE_ID / KITCHEN_TAB_ID). Handles accept an id, a 1-based \
@@ -67,12 +67,12 @@ pub enum Command {
     /// The planning phase of an edit tab.
     #[command(subcommand)]
     Plan(PlanCmd),
-    /// Review threads on the tab's GitHub PR.
+    /// Plugins: Lua in ~/.kitchen/plugins/<name>/ (see docs/plugins.md).
     #[command(subcommand)]
-    Pr(PrCmd),
-    /// Agent reviews of other people's PRs (drafts need William's approval).
+    Plugin(PluginCmd),
+    /// Push diagnostics / highlights into the file viewer from any program.
     #[command(subcommand)]
-    Review(ReviewCmd),
+    Decor(DecorCmd),
     /// Raise a notification (badges the tab, shows a macOS banner).
     #[command(after_help = "Example:\n  kitchenctl notify --title \"tests green\" --body \"ready for review\"")]
     Notify {
@@ -163,6 +163,10 @@ pub enum WorkspaceCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum TabCmd {
+    /// Open something in a read-only tab: plugins handle the text (the github
+    /// plugin opens PR links in the workspace for that repo).
+    #[command(after_help = "Example:\n  kitchenctl tab open https://github.com/ppl-ai/air/pull/14211")]
+    Open { text: String },
     /// List tabs of a workspace.
     #[command(visible_alias = "ls")]
     List {
@@ -172,8 +176,7 @@ pub enum TabCmd {
     /// Open a tab. Edit tabs get their own worktree and branch off the latest
     /// origin; with --task the agent starts planning (/low-level-plan).
     #[command(after_help = "Examples:\n  kitchenctl tab new --edit --task \"AI-9586: retry judge calls\"\n  \
-        kitchenctl tab new --edit --pr 1234\n  kitchenctl tab new --readonly\n  \
-        kitchenctl tab new --readonly --pr 1234 --no-agent")]
+        kitchenctl tab new --edit --branch william/old-work\n  kitchenctl tab new --readonly --no-agent")]
     New {
         /// Read/write tab with its own worktree (default).
         #[arg(long, conflicts_with = "readonly")]
@@ -187,9 +190,6 @@ pub enum TabCmd {
         /// Read the task text from a file (`-` for stdin).
         #[arg(long, conflicts_with = "task", value_name = "FILE")]
         task_file: Option<String>,
-        /// Existing PR: number, `#N`, or URL.
-        #[arg(long)]
-        pr: Option<String>,
         /// Existing branch to check out (edit tabs).
         #[arg(long)]
         branch: Option<String>,
@@ -254,6 +254,66 @@ pub enum TabCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum PluginCmd {
+    /// List plugins, their status and commands.
+    #[command(visible_alias = "ls")]
+    List,
+    /// Reload one plugin (or all). Plugins also reload when their files change.
+    Reload { name: Option<String> },
+    /// Run a plugin command, e.g. `ruff.explain`.
+    Run {
+        command: String,
+        #[command(flatten)]
+        target: TabTarget,
+    },
+    /// Print the end of a plugin's log (~/.kitchen/logs/plugins/<name>.log; no app needed).
+    Logs {
+        name: String,
+        #[arg(long, short = 'n', default_value_t = 40)]
+        lines: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DecorCmd {
+    /// Replace the diagnostics (or highlights) of namespace `ext.<ns>` for a file.
+    #[command(after_help = "Items are JSON: [{\"line\":3,\"col\":5,\"end_col\":9,\"severity\":\"error\",\"message\":\"…\"}]\n(lines/cols 1-based, cols in characters, end_col exclusive).\nExample:\n  mypy --output json app.py | my-convert | kitchenctl decor set --ns mypy app.py --items -")]
+    Set {
+        /// Worktree-relative (or absolute) path.
+        path: String,
+        #[arg(long)]
+        ns: String,
+        /// JSON list, or `-` for stdin.
+        #[arg(long)]
+        items: String,
+        /// `diagnostics` (default) or `highlights`.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Content hash the items were computed for (hidden once the file changes).
+        #[arg(long)]
+        version: Option<String>,
+        /// Default: the calling tab's host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Default: the calling tab's worktree.
+        #[arg(long)]
+        worktree: Option<String>,
+    },
+    /// Clear namespace `ext.<ns>` (for one file, or everywhere).
+    Clear {
+        path: Option<String>,
+        #[arg(long)]
+        ns: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        worktree: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum WorktreeCmd {
     /// List worktrees of the workspace's repo and which tab uses each.
     #[command(visible_alias = "ls")]
@@ -289,7 +349,7 @@ pub enum ViewerCmd {
         path: Option<String>,
         #[arg(long)]
         line: Option<usize>,
-        /// Show the file as a diff against the PR base.
+        /// Show the file as a diff against the branch base (merge base with origin).
         #[arg(long)]
         diff: bool,
         #[command(flatten)]
@@ -304,7 +364,7 @@ pub enum PlanCmd {
         #[command(flatten)]
         target: TabTarget,
     },
-    /// Show the plan in the plan reviewer (⌘⇧R).
+    /// Show the plan in the plan reviewer (⌘⇧I).
     Open {
         #[command(flatten)]
         target: TabTarget,
@@ -327,92 +387,12 @@ pub enum PlanCmd {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum PrCmd {
-    /// List review threads on the tab's PR.
-    Threads {
-        /// Only unresolved threads.
-        #[arg(long)]
-        unresolved: bool,
-        #[command(flatten)]
-        target: TabTarget,
-    },
-    /// Resolve a review thread you addressed (optionally replying first).
-    #[command(after_help = "Example:\n  kitchenctl pr resolve PRRT_kwDO... --reply \"Done in 3f2a1c\"")]
-    Resolve {
-        thread_id: String,
-        #[arg(long)]
-        reply: Option<String>,
-        #[command(flatten)]
-        target: TabTarget,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ReviewCmd {
-    /// List agent review runs.
-    Runs,
-    /// Start an agent review of a PR now.
-    Start { pr_url: String },
-    /// Signal that the review run is finished.
-    Done {
-        #[arg(long)]
-        run: i64,
-        /// Mark the run failed with this message.
-        #[arg(long)]
-        failed: Option<String>,
-    },
-    /// List draft comments (never public until approved in the inbox).
-    Drafts {
-        /// Limit to one PR (URL).
-        #[arg(long)]
-        pr_url: Option<String>,
-        /// draft | published | rejected
-        #[arg(long)]
-        state: Option<String>,
-    },
-    /// Add one draft review comment. It stays private until William approves it.
-    #[command(after_help = "Example:\n  kitchenctl review draft --run 7 --path src/a.rs --line 42 --severity bug \\\n    --body \"This unwrap panics when the list is empty.\"")]
-    Draft {
-        #[arg(long)]
-        run: Option<i64>,
-        /// PR URL (needed without --run).
-        #[arg(long)]
-        pr_url: Option<String>,
-        #[arg(long)]
-        path: String,
-        /// Line in the new file (omit for a file-level comment).
-        #[arg(long)]
-        line: Option<i64>,
-        #[arg(long)]
-        start_line: Option<i64>,
-        /// RIGHT (new code, default) or LEFT (deleted code).
-        #[arg(long)]
-        side: Option<String>,
-        /// e.g. bug, nit, question, test
-        #[arg(long)]
-        severity: Option<String>,
-        #[arg(long, required_unless_present = "body_file")]
-        body: Option<String>,
-        #[arg(long, conflicts_with = "body", value_name = "FILE")]
-        body_file: Option<String>,
-    },
-    /// People whose PRs get an automatic review when they request William's review.
-    #[command(subcommand)]
-    Watch(WatchCmd),
-}
-
-#[derive(Subcommand, Debug)]
-pub enum WatchCmd {
-    #[command(visible_alias = "ls")]
-    List,
-    Add { login: String },
-    Remove { login: String },
-}
-
-#[derive(Subcommand, Debug)]
 pub enum DebugCmd {
     /// Save a PNG of the kitchen window.
     Screenshot { path: String },
+    /// Type into the focused pane: plain characters, plus <esc> <cr> <c-o> <cmd-shift-p> <alt-h>.
+    #[command(after_help = "Example:\n  kitchenctl debug keys 'gd'\n  kitchenctl debug keys '<cmd-p>main<cr>'")]
+    Keys { keys: String },
 }
 
 /// cmux-style aliases that clap cannot express: `kitchenctl --skill` = `guide`.
@@ -427,6 +407,7 @@ pub fn normalize_args(mut argv: Vec<String>) -> Vec<String> {
 #[derive(Debug, PartialEq)]
 pub enum Call {
     Api { method: String, params: Value },
+    PluginLogs { name: String, lines: usize },
     Guide,
     Version,
     Relay,
@@ -458,21 +439,6 @@ fn merge(mut base: Value, extra: Value) -> Value {
         b.extend(e);
     }
     base
-}
-
-/// `1234`, `#1234`, or a `.../pull/1234` URL -> 1234.
-pub fn parse_pr(s: &str) -> Result<u64> {
-    let t = s.trim().trim_start_matches('#');
-    if let Ok(n) = t.parse() {
-        return Ok(n);
-    }
-    if let Some(rest) = t.split("/pull/").nth(1) {
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(n) = digits.parse() {
-            return Ok(n);
-        }
-    }
-    bail!("not a PR number or URL: {s:?}")
 }
 
 /// Read `-` as stdin, anything else as a file path.
@@ -515,20 +481,20 @@ impl Cli {
                 WorkspaceCmd::Bootstrap { target } => api("workspace.bootstrap", ws(target)),
             },
             Command::Tab(c) => match c {
+                TabCmd::Open { text } => api("tab.open", json!({"text": text})),
                 TabCmd::List { target } => api("tab.list", ws(target)),
-                TabCmd::New { edit: _, readonly, task, task_file, pr, branch, title, command, no_agent, no_focus, target } => {
+                TabCmd::New { edit: _, readonly, task, task_file, branch, title, command, no_agent, no_focus, target } => {
                     let task = match task_file {
                         Some(f) => Some(read_text(f, stdin)?),
                         None => task.clone(),
                     };
-                    let pr = pr.as_deref().map(parse_pr).transpose()?;
                     api(
                         "tab.create",
                         merge(
                             ws(target),
                             json!({
                                 "kind": if *readonly { "readonly" } else { "edit" },
-                                "task": task, "pr": pr, "branch": branch, "title": title, "command": command,
+                                "task": task, "branch": branch, "title": title, "command": command,
                                 "no_agent": no_agent, "focus": !no_focus,
                             }),
                         ),
@@ -564,39 +530,20 @@ impl Cli {
                 PlanCmd::Comments { all, target } => api("plan.comments", merge(tab(target), json!({"all": all}))),
                 PlanCmd::Resolve { id } => api("plan.resolve", json!({"id": id})),
             },
-            Command::Pr(c) => match c {
-                PrCmd::Threads { unresolved, target } => api("pr.threads", merge(tab(target), json!({"unresolved": unresolved}))),
-                PrCmd::Resolve { thread_id, reply, target } => {
-                    api("pr.resolve", merge(tab(target), json!({"thread_id": thread_id, "reply": reply})))
-                }
+            Command::Plugin(c) => match c {
+                PluginCmd::List => api("plugin.list", json!({})),
+                PluginCmd::Reload { name } => api("plugin.reload", json!({"name": name})),
+                PluginCmd::Run { command, target } => api("plugin.run", merge(tab(target), json!({"command": command}))),
+                PluginCmd::Logs { name, lines } => Call::PluginLogs { name: name.clone(), lines: *lines },
             },
-            Command::Review(c) => match c {
-                ReviewCmd::Runs => api("review.runs", json!({})),
-                ReviewCmd::Start { pr_url } => api("review.start", json!({"pr_url": pr_url})),
-                ReviewCmd::Done { run, failed } => api(
-                    "review.done",
-                    json!({"run": run, "status": if failed.is_some() { "failed" } else { "done" }, "error": failed}),
-                ),
-                ReviewCmd::Drafts { pr_url, state } => api("review.draft.list", json!({"pr_url": pr_url, "state": state})),
-                ReviewCmd::Draft { run, pr_url, path, line, start_line, side, severity, body, body_file } => {
-                    if run.is_none() && pr_url.is_none() {
-                        bail!("review draft needs --run or --pr-url");
-                    }
-                    let body = match body_file {
-                        Some(f) => read_text(f, stdin)?,
-                        None => body.clone().unwrap_or_default(),
-                    };
-                    api(
-                        "review.draft.add",
-                        json!({"run": run, "pr_url": pr_url, "path": path, "line": line, "start_line": start_line,
-                               "side": side.as_ref().map(|s| s.to_uppercase()), "severity": severity, "body": body}),
-                    )
+            Command::Decor(c) => match c {
+                DecorCmd::Set { path, ns, items, kind, version, host, worktree } => {
+                    let items: Value = serde_json::from_str(&read_text(items, stdin)?).context("--items must be JSON")?;
+                    api("decor.set", json!({"path": path, "ns": ns, "items": items, "kind": kind, "version": version, "host": host, "worktree": worktree}))
                 }
-                ReviewCmd::Watch(w) => match w {
-                    WatchCmd::List => api("review.watch.list", json!({})),
-                    WatchCmd::Add { login } => api("review.watch.add", json!({"login": login})),
-                    WatchCmd::Remove { login } => api("review.watch.remove", json!({"login": login})),
-                },
+                DecorCmd::Clear { path, ns, kind, host, worktree } => {
+                    api("decor.clear", json!({"path": path, "ns": ns, "kind": kind, "host": host, "worktree": worktree}))
+                }
             },
             Command::Notify { title, body, target } => api("notify", merge(tab(target), json!({"title": title, "body": body}))),
             Command::Notifications { unread, limit } => api("notification.list", json!({"unread": unread, "limit": limit})),
@@ -604,6 +551,7 @@ impl Cli {
                 let abs = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));
                 api("debug.screenshot", json!({"path": abs}))
             }
+            Command::Debug(DebugCmd::Keys { keys }) => api("debug.keys", json!({"keys": keys})),
             Command::Relay => Call::Relay,
             Command::Index { paths } => Call::Index(paths.clone()),
         })
@@ -635,9 +583,9 @@ mod tests {
 
     #[test]
     fn tab_new_edit_with_task() {
-        let (m, p) = api_call(&["tab", "new", "--task", "AI-1: x", "--pr", "#12", "-w", "2"]);
+        let (m, p) = api_call(&["tab", "new", "--task", "AI-1: x", "--branch", "b", "-w", "2"]);
         assert_eq!(m, "tab.create");
-        assert_eq!(p, json!({"workspace": "2", "kind": "edit", "task": "AI-1: x", "pr": 12, "no_agent": false, "focus": true}));
+        assert_eq!(p, json!({"workspace": "2", "kind": "edit", "task": "AI-1: x", "branch": "b", "no_agent": false, "focus": true}));
     }
 
     #[test]
@@ -669,28 +617,14 @@ mod tests {
     }
 
     #[test]
-    fn review_draft() {
-        let (m, p) = api_call(&["review", "draft", "--run", "7", "--path", "a.rs", "--line", "3", "--side", "left", "--body", "b"]);
-        assert_eq!(m, "review.draft.add");
-        assert_eq!(p, json!({"run": 7, "path": "a.rs", "line": 3, "side": "LEFT", "body": "b"}));
-        let bad = Cli::try_parse_from(["kitchenctl", "review", "draft", "--path", "a", "--body", "b"])
-            .unwrap()
-            .to_call_with(&mut || Ok(String::new()));
-        assert!(bad.is_err(), "needs --run or --pr-url");
+    fn tab_open() {
+        assert_eq!(api_call(&["tab", "open", "https://github.com/o/r/pull/3"]), ("tab.open".into(), json!({"text": "https://github.com/o/r/pull/3"})));
     }
 
     #[test]
-    fn review_done_failed() {
-        let (_, p) = api_call(&["review", "done", "--run", "3", "--failed", "boom"]);
-        assert_eq!(p, json!({"run": 3, "status": "failed", "error": "boom"}));
-    }
-
-    #[test]
-    fn plan_and_pr() {
+    fn plan_commands() {
         assert_eq!(api_call(&["plan", "resolve", "9"]), ("plan.resolve".into(), json!({"id": 9})));
         assert_eq!(api_call(&["plan", "comments", "--all"]).1, json!({"all": true}));
-        let (m, p) = api_call(&["pr", "resolve", "PRRT_x", "--reply", "done"]);
-        assert_eq!((m.as_str(), p), ("pr.resolve", json!({"thread_id": "PRRT_x", "reply": "done"})));
     }
 
     #[test]
@@ -702,13 +636,5 @@ mod tests {
         assert_eq!(call(&["__relay"]), Call::Relay);
         assert!(Cli::try_parse_from(["kitchenctl", "--json", "ping"]).unwrap().json);
         assert!(Cli::try_parse_from(["kitchenctl", "ping", "--json"]).unwrap().json, "--json is global");
-    }
-
-    #[test]
-    fn pr_parsing() {
-        assert_eq!(parse_pr("12").unwrap(), 12);
-        assert_eq!(parse_pr("#12").unwrap(), 12);
-        assert_eq!(parse_pr("https://github.com/o/r/pull/77/files").unwrap(), 77);
-        assert!(parse_pr("abc").is_err());
     }
 }

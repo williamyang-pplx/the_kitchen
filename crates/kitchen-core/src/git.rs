@@ -157,32 +157,48 @@ impl<'a> Repo<'a> {
     }
 
     /// Detached, read-only worktree at `rev`, re-used and moved when it
-    /// exists. Files are made non-writable so edits fail loudly. With
-    /// `fetch = Some(branch)`, `git fetch origin <branch>` runs first. One
-    /// round trip to the host.
+    /// exists. Files are made non-writable so edits fail loudly. `fetch`
+    /// refspecs (`+src:dst`) are fetched from origin first. One round trip
+    /// to the host; a worktree already at `rev` is left alone.
+    ///
+    /// chmod bumps a file's ctime, which makes git re-hash it on the next
+    /// checkout or status (2.3 GB for agi: ~12 s). So only directories are
+    /// unlocked (checkout and clean replace files by unlink + create), and
+    /// only still-writable entries (what checkout just wrote) are locked.
     pub fn sync_readonly_worktree(&self, path: &str, rev: &str) -> Result<Worktree> {
-        self.sync_readonly_worktree_fetching(path, rev, None)
+        Ok(self.sync_readonly_worktree_fetching(path, rev, &[])?.0)
     }
 
-    pub fn sync_readonly_worktree_fetching(&self, path: &str, rev: &str, fetch: Option<&str>) -> Result<Worktree> {
-        let (r, p, rv) = (shell_quote(self.path), shell_quote(path), shell_quote(rev));
-        let fetch = fetch.map(|b| format!("{} || exit 11\n", fetch_branch_cmd(&r, b))).unwrap_or_default();
+    /// [`Self::sync_readonly_worktree`] after fetching `fetch`; also says
+    /// whether HEAD moved (a new worktree counts as moved).
+    pub fn sync_readonly_worktree_fetching(&self, path: &str, rev: &str, fetch: &[String]) -> Result<(Worktree, bool)> {
+        let (r, p, rv) = (shell_quote(self.path), shell_quote(path), shell_quote(&format!("{rev}^{{commit}}")));
+        let fetch = if fetch.is_empty() { String::new() } else { format!("{} || exit 11\n", fetch_cmd(&r, fetch)) };
         let script = format!(
-            r#"{fetch}lock() {{ find {p} -path {p}/.git -prune -o -exec chmod "$1" {{}} + 2>/dev/null; true; }}
-if [ -e {p} ]; then
+            r#"{fetch}moved=1
+unlock() {{ find {p} -path {p}/.git -prune -o -type d ! -perm -200 -exec chmod u+w {{}} + 2>/dev/null; true; }}
+lock() {{ find {p} -path {p}/.git -prune -o \( -perm -200 -o -perm -020 -o -perm -002 \) -exec chmod a-w {{}} + 2>/dev/null; true; }}
+if [ -e {p} ] && [ "$(git -C {p} rev-parse HEAD 2>/dev/null)" = "$(git -C {r} rev-parse --verify --quiet {rv})" ]; then
+  moved=0
+elif [ -e {p} ]; then
   git -C {p} rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "{path} exists but is not a git worktree" >&2; exit 12; }}
-  lock u+w
+  unlock
   git -C {p} checkout --quiet --detach --force {rv} && git -C {p} clean -fdq; rc=$?
-  lock a-w
+  lock
   [ $rc = 0 ] || exit $rc
 else
   git -C {r} worktree add --quiet --detach {p} {rv} || exit 13
-  lock a-w
+  lock
+  # Every file's ctime just moved; refresh the index once here rather than
+  # on the agent's first `git status`.
+  git -C {p} update-index -q --refresh >/dev/null 2>&1
 fi
+echo "KT_MOVED=$moved"
 {report}"#,
             report = report_snippet(&p),
         );
-        parse_report(&self.host.sh_ok(&script, None)?)
+        let out = self.host.sh_ok(&script, None)?;
+        Ok((parse_report(&out)?, out.lines().any(|l| l == "KT_MOVED=1")))
     }
 
     /// New branch `<prefix><slug>` (first free slug: `slug`, `slug-2`, …)
@@ -305,6 +321,23 @@ fi
         Ok(files)
     }
 
+    /// Everything the file viewer needs in one round trip: the merge base of
+    /// HEAD and `base_ref`, the files changed since it, and every file.
+    pub fn listing(&self, dir: &str, base_ref: &str) -> Result<Listing> {
+        let (d, b) = (shell_quote(dir), shell_quote(base_ref));
+        let script = format!(
+            "cd {d} || exit 3\n\
+             base=$(git merge-base HEAD {b} 2>/dev/null) || base={b}\n\
+             printf '%s' \"$base\"; printf '\\036'\n\
+             git diff -M --name-status -z \"$base\"; printf '\\036'\n\
+             git diff -M --numstat -z \"$base\"; printf '\\036'\n\
+             git ls-files --others --exclude-standard -z; printf '\\036'\n\
+             git ls-files --cached -z\n"
+        );
+        let out = self.host.sh_ok(&script, None).with_context(|| format!("list files in {dir}"))?;
+        parse_listing(&out)
+    }
+
     /// Every tracked (and untracked-but-not-ignored) file in the worktree.
     pub fn ls_files(&self, dir: &str) -> Result<Vec<String>> {
         let out = self.git_in(dir, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"])?;
@@ -325,8 +358,18 @@ fi
 /// Fetch exactly one branch into its remote-tracking ref: no tags, no
 /// FETCH_HEAD, no other refs (big repos have thousands). `repo` is quoted.
 fn fetch_branch_cmd(repo: &str, branch: &str) -> String {
-    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    format!("git -C {repo} fetch --quiet --no-tags --no-write-fetch-head origin {}", shell_quote(&refspec))
+    fetch_cmd(repo, &[branch_refspec(branch)])
+}
+
+/// `+refs/heads/<b>:refs/remotes/origin/<b>`.
+pub fn branch_refspec(branch: &str) -> String {
+    format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+}
+
+/// `git fetch origin <refspecs…>` in the already-quoted `repo`.
+fn fetch_cmd(repo: &str, refspecs: &[String]) -> String {
+    let specs: Vec<String> = refspecs.iter().map(|s| shell_quote(s)).collect();
+    format!("git -C {repo} fetch --quiet --no-tags --no-write-fetch-head origin {}", specs.join(" "))
 }
 
 /// Shell lines that append `.kitchen/` to the repo's shared `info/exclude`
@@ -397,6 +440,42 @@ pub fn parse_worktree_porcelain(s: &str) -> Vec<Worktree> {
         }
     }
     out
+}
+
+/// Result of [`Repo::listing`].
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    pub base: String,
+    /// Largest change first; untracked files count as added.
+    pub changed: Vec<ChangedFile>,
+    /// Tracked + untracked-not-ignored files, sorted.
+    pub all: Vec<String>,
+}
+
+fn parse_listing(out: &str) -> Result<Listing> {
+    let parts: Vec<&str> = out.split('\x1e').collect();
+    let [base, status, numstat, others, cached] = parts[..] else {
+        bail!("unexpected listing output ({} sections)", parts.len());
+    };
+    let mut changed = parse_name_status_z(status);
+    let stats = parse_numstat_z(numstat);
+    for f in &mut changed {
+        if let Some((a, r)) = stats.get(&f.path) {
+            f.added = *a;
+            f.removed = *r;
+        }
+    }
+    let untracked: Vec<&str> = others.split('\0').filter(|p| !p.is_empty()).collect();
+    for p in &untracked {
+        if !changed.iter().any(|f| f.path == *p) {
+            changed.push(ChangedFile { path: p.to_string(), old_path: None, status: 'A', added: 0, removed: 0 });
+        }
+    }
+    changed.sort_by(|a, b| (b.added + b.removed).cmp(&(a.added + a.removed)).then(a.path.cmp(&b.path)));
+    let mut all: Vec<String> = cached.split('\0').chain(untracked).filter(|p| !p.is_empty()).map(String::from).collect();
+    all.sort();
+    all.dedup();
+    Ok(Listing { base: base.trim().to_string(), changed, all })
 }
 
 fn parse_name_status_z(s: &str) -> Vec<ChangedFile> {
@@ -472,6 +551,25 @@ mod tests {
         assert_eq!(n["new.rs"], (3, 4));
     }
 
+    #[test]
+    fn one_trip_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sh(
+            root,
+            "git init -q -b main origin && cd origin && git config user.email t@t && git config user.name t \
+             && mkdir -p aster/src && echo one > aster/src/a.rs && echo x > top.md && git add . && git commit -qm init \
+             && cd .. && git clone -q origin repo && cd repo && echo two >> aster/src/a.rs && echo new > 'aster/sp ace.rs'",
+        );
+        let dir = root.join("repo").display().to_string();
+        let l = Repo::new(&Host::Local, &dir).listing(&dir, "origin/main").unwrap();
+        assert_eq!(l.base.len(), 40, "{:?}", l.base);
+        let changed: Vec<&str> = l.changed.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(changed, vec!["aster/src/a.rs", "aster/sp ace.rs"]);
+        assert_eq!(l.changed[0].added, 1);
+        assert_eq!(l.all, vec!["aster/sp ace.rs", "aster/src/a.rs", "top.md"]);
+    }
+
     fn sh(dir: &std::path::Path, script: &str) {
         let ok = std::process::Command::new("sh").arg("-c").arg(script).current_dir(dir).status().unwrap().success();
         assert!(ok, "{script}");
@@ -509,6 +607,20 @@ mod tests {
         repo.fetch().unwrap();
         repo.sync_readonly_worktree(&ro, "origin/main").unwrap();
         assert!(std::path::Path::new(&format!("{ro}/c.txt")).exists());
+        assert!(std::fs::write(format!("{ro}/c.txt"), "x").is_err(), "newly checked-out files are locked too");
+        // Resyncing leaves unchanged files' ctime alone (else git re-hashes
+        // the whole tree), still replaces changed files and drops strays.
+        use std::os::unix::fs::MetadataExt;
+        let ctime = |f: &str| std::fs::metadata(format!("{ro}/{f}")).map(|m| (m.ctime(), m.ctime_nsec())).unwrap();
+        let a_before = ctime("a.txt");
+        sh(root, "cd origin && mkdir d && echo four > d/e.txt && echo changed > c.txt && git add . && git commit -qm again");
+        sh(std::path::Path::new(&ro), "chmod u+w . && touch stray && chmod a-w .");
+        repo.fetch().unwrap();
+        repo.sync_readonly_worktree(&ro, "origin/main").unwrap();
+        assert_eq!(ctime("a.txt"), a_before, "unchanged file was chmod-ed");
+        assert_eq!(std::fs::read_to_string(format!("{ro}/c.txt")).unwrap(), "changed\n");
+        assert!(std::fs::write(format!("{ro}/d/e.txt"), "x").is_err());
+        assert!(!std::path::Path::new(&format!("{ro}/stray")).exists());
 
         // Re-opening an existing branch reuses its worktree.
         let again = repo.add_worktree_existing_branch("william/feature", "/nonexistent").unwrap();
@@ -529,7 +641,22 @@ mod tests {
         let excl = std::fs::read_to_string(root.join("repo/.git/info/exclude")).unwrap();
         assert_eq!(excl.matches(".kitchen/").count(), 1);
         // Read-only sync with a fetch in the same round trip.
-        let ro2 = repo.sync_readonly_worktree_fetching(&repo.readonly_path(), "origin/main", Some("main")).unwrap();
+        let (ro2, _) = repo.sync_readonly_worktree_fetching(&repo.readonly_path(), "origin/main", &[branch_refspec("main")]).unwrap();
         assert!(ro2.detached);
+
+        // A PR-style ref (refs/pull/N/head on the remote) fetched and checked
+        // out in one trip; re-syncing at the same commit does nothing.
+        sh(root, "cd origin && git checkout -qb pr && echo pr > p.txt && git add . && git commit -qm pr \
+                  && git update-ref refs/pull/7/head HEAD && git checkout -q main");
+        let pr_path = repo.sibling_path("kitchen-ro-pr-7");
+        let specs = ["+refs/pull/7/head:refs/kitchen/pr/7".to_string(), branch_refspec("main")];
+        let (wt, moved) = repo.sync_readonly_worktree_fetching(&pr_path, "refs/kitchen/pr/7", &specs).unwrap();
+        assert!(moved && std::path::Path::new(&wt.path).join("p.txt").exists());
+        let (_, moved) = repo.sync_readonly_worktree_fetching(&pr_path, "refs/kitchen/pr/7", &specs).unwrap();
+        assert!(!moved, "same head: no checkout");
+        sh(root, "cd origin && git checkout -q pr && echo more >> p.txt && git commit -qam more \
+                  && git update-ref refs/pull/7/head HEAD && git checkout -q main");
+        let (_, moved) = repo.sync_readonly_worktree_fetching(&pr_path, "refs/kitchen/pr/7", &specs).unwrap();
+        assert!(moved, "new push moves the worktree");
     }
 }
