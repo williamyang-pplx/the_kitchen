@@ -1,6 +1,6 @@
 name = "python"
 version = "0.1.0"
-description = "Python syntax highlighting, plus go-to-definition (gd) and references (gr) from a language server (ty by default), run where the code lives"
+description = "Python go-to-definition (gd) and references (gr) from a language server (ty by default), run where the code lives"
 api = 2
 filetypes = ["py", "pyi"]
 

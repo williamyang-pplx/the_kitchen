@@ -77,6 +77,28 @@ fn language(lang: Lang) -> Language {
     }
 }
 
+/// The tree-sitter grammar for `path` with its highlights and locals queries,
+/// combined the way each grammar's tree-sitter.json does (TypeScript builds
+/// on the JavaScript queries).
+pub fn highlight_grammar(path: &str) -> Option<(Language, String, String)> {
+    use tree_sitter_javascript as js;
+    use tree_sitter_typescript as ts;
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    if ext == "yaml" || ext == "yml" {
+        return Some((tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY.into(), String::new()));
+    }
+    let lang = lang_for(path)?;
+    let (highlights, locals) = match lang {
+        Lang::Python => (vec![tree_sitter_python::HIGHLIGHTS_QUERY], vec![]),
+        Lang::Rust => (vec![tree_sitter_rust::HIGHLIGHTS_QUERY], vec![]),
+        Lang::Go => (vec![tree_sitter_go::HIGHLIGHTS_QUERY], vec![]),
+        Lang::JavaScript => (vec![js::JSX_HIGHLIGHT_QUERY, js::HIGHLIGHT_QUERY], vec![js::LOCALS_QUERY]),
+        Lang::TypeScript => (vec![ts::HIGHLIGHTS_QUERY, js::HIGHLIGHT_QUERY], vec![ts::LOCALS_QUERY, js::LOCALS_QUERY]),
+        Lang::Tsx => (vec![ts::HIGHLIGHTS_QUERY, js::JSX_HIGHLIGHT_QUERY, js::HIGHLIGHT_QUERY], vec![js::LOCALS_QUERY]),
+    };
+    Some((language(lang), highlights.join("\n"), locals.join("\n")))
+}
+
 /// Whether `path` is a language the parser (not just the fallback) handles.
 pub fn is_supported(path: &str) -> bool {
     lang_for(path).is_some()

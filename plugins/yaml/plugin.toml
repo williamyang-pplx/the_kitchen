@@ -1,4 +1,0 @@
-name = "yaml"
-version = "0.1.0"
-description = "YAML syntax highlighting (keys, anchors/aliases, tags, block scalars, YAML 1.2 booleans)"
-api = 1

@@ -1,4 +1,0 @@
-name = "typescript"
-version = "0.1.0"
-description = "TypeScript / TSX syntax highlighting (.ts, .mts, .cts, .tsx)"
-api = 1
