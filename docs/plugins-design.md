@@ -199,3 +199,19 @@ about LSP:
   stores comments: the plugin owns them (GitHub is the store for PRs).
 * `kitchen.workspaces()` so file events can be tied to tabs.
 
+## Level 5 (2026-10-05): terminal links
+
+* ⌘-click in a terminal opens what is under the pointer. ⌘ because Claude
+  Code turns mouse reporting on, so a plain click belongs to the program
+  (Shift already bypasses reporting for selection).
+* Matching is Rust (`links.rs`) over the logical line under the pointer
+  (wrapped rows joined), only while ⌘ is held: built-ins for URLs and file
+  paths, plus OSC 8 hyperlinks straight from the cells.
+* `kitchen.link(pattern, target)` — plugins give a regex once; the host
+  compiles and matches it, and Lua runs only on a click (through the
+  command machinery, so `target` is a command name or a function, like
+  `kitchen.keymap`). Running every plugin's matcher in Lua on hover would put
+  a thread round trip in front of every frame.
+* Files go through `UiCommand::OpenViewer` (jump list included), after one
+  existence check on the tab's host so a misread path toasts instead of
+  stealing focus. Relative paths resolve against the worktree.

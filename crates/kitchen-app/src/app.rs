@@ -715,9 +715,14 @@ impl KitchenApp {
                 if session.take_bell() {
                     // A bell in a background tab marks it unread.
                 }
-                let resp = TerminalView::new(session).font_size(font_size).focused(focused).show(ui);
+                let reg = self.engine.plugins().map(|p| p.registry());
+                let rules = reg.as_ref().map(|r| &r.links[..]).unwrap_or(&[]);
+                let (resp, link) = TerminalView::new(session).font_size(font_size).focused(focused).links(rules).show(ui);
                 if resp.clicked_by(egui::PointerButton::Primary) || resp.drag_started() {
                     self.focus = Focus::Terminal;
+                }
+                if let Some(link) = link {
+                    self.engine.open_link(&tab.row.id, link);
                 }
             }
             Some(TermSlot::Preparing) | None => centered_note(ui, &format!("attaching to {} on {}…", tab.row.tmux_session, ws.row.host), theme::DIM),

@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod engine;
 mod keymap;
+mod links;
 mod panels;
 mod plan_view;
 mod plugins;

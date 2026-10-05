@@ -52,9 +52,9 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 4)
+## API (level 5)
 
-Level 4 added `kitchen.comments`, the `comment` event and
+Level 5 added `kitchen.link` (see "Links"). Level 4 added `kitchen.comments`, the `comment` event and
 `kitchen.workspaces()` (see "Comments"). Level 3 added `kitchen.tab_open` and the `open` event (see "Tabs"). Level 2 added `kitchen.spawn`, `kitchen.provide`, `kitchen.json.null`,
 `kitchen.lsp`, and `ctx.viewer.file` / `word`; `ctx.viewer.col` became a raw
 column. Plugins written for level 1 keep working.
@@ -91,6 +91,28 @@ Chords need cmd, alt or ctrl; built-in shortcuts can't be taken (the call
 errors). `when`: `any` (default), `terminal`, `viewer`, `plan`;
 ctrl-only chords aren't allowed in terminals. `remote = true` lets
 `kitchenctl plugin run` from a devbox run the command.
+
+### Links
+
+```lua
+kitchen.link("AI-(\\d+)", function(ctx)    -- ⌘-click "AI-9586" in a terminal
+  kitchen.run({ cmd = { "open", "https://linear.app/team/issue/AI-" .. ctx.link.groups[1] } })
+end)
+kitchen.link("PR-\\d+", "open_pr")        -- or a command name
+```
+
+⌘-clicking a match in a terminal tab runs `target` (a command name or a
+function) with the command `ctx` plus `ctx.link = {text, groups}` (`groups`
+are the capture groups, nil for one that didn't take part). The pattern is
+Rust regex syntax, not a Lua pattern; a bad one makes `kitchen.link` error.
+The kitchen matches the text itself, so Lua only runs on a click.
+
+Rules are tried in order, first match under the pointer wins: OSC 8
+hyperlinks, then plugin rules (in registration order), then the built-ins:
+http(s) URLs (opened in the browser) and file paths (`path`, `path:line`,
+`path:line:col`, `path#Lline`; opened in the viewer). A plugin rule shadows the
+built-ins on the text it matches, so keep it no looser than its handler can
+resolve.
 
 ### Diagnostics and highlights
 

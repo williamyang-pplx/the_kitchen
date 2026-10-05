@@ -11,7 +11,9 @@ use egui::{Color32, CornerRadius, EventFilter, FontId, Modifiers, PointerButton,
 
 use super::colors::{self, BACKGROUND, CURSOR, SELECTION};
 use super::input::{key_bytes, paste_bytes, sgr_mouse};
-use super::{GridSize, TermSession};
+use super::{GridSize, Listener, TermSession};
+use crate::links::{self, Link};
+use crate::plugins::LinkEntry;
 
 const PAD: f32 = 6.0;
 
@@ -19,11 +21,18 @@ pub struct TerminalView<'a> {
     session: &'a mut TermSession,
     font_size: f32,
     has_focus: bool,
+    plugin_links: &'a [LinkEntry],
 }
 
 impl<'a> TerminalView<'a> {
     pub fn new(session: &'a mut TermSession) -> Self {
-        Self { session, font_size: 13.0, has_focus: false }
+        Self { session, font_size: 13.0, has_focus: false, plugin_links: &[] }
+    }
+
+    /// Plugin link rules to match on ⌘-hover (built-ins are always on).
+    pub fn links(mut self, rules: &'a [LinkEntry]) -> Self {
+        self.plugin_links = rules;
+        self
     }
 
     pub fn font_size(mut self, size: f32) -> Self {
@@ -37,8 +46,9 @@ impl<'a> TerminalView<'a> {
         self
     }
 
-    pub fn show(self, ui: &mut Ui) -> Response {
-        let TerminalView { session, font_size, has_focus } = self;
+    /// The widget's response, and the link ⌘-clicked this frame.
+    pub fn show(self, ui: &mut Ui) -> (Response, Option<Link>) {
+        let TerminalView { session, font_size, has_focus, plugin_links } = self;
         let rect = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let font = FontId::monospace(font_size);
@@ -69,15 +79,23 @@ impl<'a> TerminalView<'a> {
             }
         }
         let geom = Geom { origin: inner.min, cw, ch, cols, rows };
+        let hovered = match resp.hover_pos() {
+            Some(pos) if ui.input(|i| i.modifiers.command) => hovered_link(session, &geom, pos, plugin_links),
+            _ => None,
+        };
+        if hovered.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
         handle_mouse(ui, &resp, session, &geom);
         if let Some(text) = session.take_clipboard() {
             ui.ctx().copy_text(text);
         }
-        paint(ui, rect, session, &geom, &font, has_focus);
+        paint(ui, rect, session, &geom, &font, has_focus, hovered.as_ref().map(|h| &h.cells[..]));
         if session.predictor.pending() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         }
-        resp
+        let link = hovered.filter(|_| resp.clicked_by(PointerButton::Primary)).map(|h| h.link);
+        (resp, link)
     }
 }
 
@@ -106,6 +124,72 @@ impl Geom {
             Vec2::new(self.cw * width as f32, self.ch),
         )
     }
+}
+
+/// A link under the pointer and the viewport cells it covers (for the underline).
+struct HoveredLink {
+    link: Link,
+    /// (row, first col, last col) per viewport row it spans.
+    cells: Vec<(usize, usize, usize)>,
+}
+
+/// The link under `pos`: the cell's OSC 8 hyperlink first, else
+/// `links::link_at` on the logical line (wrapped rows joined).
+fn hovered_link(session: &TermSession, geom: &Geom, pos: Pos2, plugin_links: &[LinkEntry]) -> Option<HoveredLink> {
+    let term = session.term.lock();
+    let (col, row, _) = geom.cell_at(pos);
+    let offset = term.grid().display_offset() as i32;
+    let point = Point::new(Line(row as i32 - offset), Column(col));
+    let (text, points) = logical_line(&term, point);
+    // The char under the pointer (the wide char, on its spacer cell).
+    let i = points.partition_point(|(_, p)| *p <= point).checked_sub(1)?;
+    let (link, covered) = match term.grid()[points[i].1].hyperlink() {
+        Some(h) => {
+            let same = |j: &usize| term.grid()[points[*j].1].hyperlink().as_ref() == Some(&h);
+            let lo = (0..=i).rev().take_while(|j| same(j)).last().unwrap_or(i);
+            let hi = (i..points.len()).take_while(|j| same(j)).last().unwrap_or(i);
+            (links::from_uri(h.uri()), lo..hi + 1)
+        }
+        None => {
+            let m = links::link_at(&text, points[i].0, plugin_links)?;
+            let lo = points.partition_point(|(b, _)| *b < m.range.start);
+            let hi = points.partition_point(|(b, _)| *b < m.range.end);
+            (m.link, lo..hi)
+        }
+    };
+    let mut cells: Vec<(usize, usize, usize)> = Vec::new();
+    for (_, p) in &points[covered] {
+        let r = p.line.0 + offset;
+        if r < 0 || r as usize >= geom.rows {
+            continue;
+        }
+        let last = p.column.0 + term.grid()[*p].flags.contains(Flags::WIDE_CHAR) as usize;
+        match cells.last_mut() {
+            Some((row, _, end)) if *row == r as usize => *end = last,
+            _ => cells.push((r as usize, p.column.0, last)),
+        }
+    }
+    Some(HoveredLink { link, cells })
+}
+
+/// The text of the wrapped line through `point`, with each char's byte
+/// offset and grid point (in order).
+fn logical_line(term: &alacritty_terminal::Term<Listener>, point: Point) -> (String, Vec<(usize, Point)>) {
+    let (start, end) = (term.line_search_left(point), term.line_search_right(point));
+    let mut text = String::new();
+    let mut points = Vec::new();
+    for line in start.line.0..=end.line.0 {
+        for col in 0..term.columns() {
+            let p = Point::new(Line(line), Column(col));
+            let cell = &term.grid()[p];
+            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
+            points.push((text.len(), p));
+            text.push(cell.c);
+        }
+    }
+    (text, points)
 }
 
 /// The cursor's viewport cell when it is visible on the live screen.
@@ -184,7 +268,8 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
     let mode = *session.term.lock().mode();
     let mods: Modifiers = ui.input(|i| i.modifiers);
     let (col, row, side) = geom.cell_at(pos);
-    // Shift bypasses mouse reporting so local selection always works.
+    // Shift bypasses mouse reporting so local selection always works. A
+    // ⌘-click is a link click (see `show`): neither reported nor selecting.
     let report = mode.intersects(TermMode::MOUSE_MODE) && !mods.shift;
     let now = std::time::Instant::now();
 
@@ -234,7 +319,8 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
     if report {
         for (button, code) in [(PointerButton::Primary, 0u8), (PointerButton::Middle, 1), (PointerButton::Secondary, 2)] {
             let bit = 1 << code;
-            if hovered && ui.input(|i| i.pointer.button_pressed(button)) {
+            // ⌘-presses are ours; releases of reported presses always go out.
+            if hovered && !mods.command && ui.input(|i| i.pointer.button_pressed(button)) {
                 session.mouse_buttons_down |= bit;
                 session.write(sgr_mouse(code, col, row, true, false, mods));
             }
@@ -250,6 +336,9 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
             session.write(sgr_mouse(0, col, row, true, true, mods));
         }
         return;
+    }
+    if mods.command {
+        return; // no local selection either
     }
 
     let display_offset = session.term.lock().grid().display_offset();
@@ -267,7 +356,7 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
     }
 }
 
-fn paint(ui: &mut Ui, rect: Rect, session: &mut TermSession, geom: &Geom, font: &FontId, focused: bool) {
+fn paint(ui: &mut Ui, rect: Rect, session: &mut TermSession, geom: &Geom, font: &FontId, focused: bool, link_cells: Option<&[(usize, usize, usize)]>) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
 
@@ -372,6 +461,12 @@ fn paint(ui: &mut Ui, rect: Rect, session: &mut TermSession, geom: &Geom, font: 
     for (col, row, c, color) in singles {
         let r = geom.cell_rect(col, row, 1);
         painter.text(r.left_top(), egui::Align2::LEFT_TOP, c, font.clone(), color);
+    }
+
+    // The ⌘-hovered link, underlined.
+    for &(row, first, last) in link_cells.unwrap_or(&[]) {
+        let r = geom.cell_rect(first, row, last - first + 1);
+        painter.hline(r.x_range(), r.bottom() - 1.0, Stroke::new(1.0, colors::FOREGROUND));
     }
 
     // Predicted (not yet echoed) characters, underlined; the cursor is drawn after them.
@@ -643,5 +738,87 @@ mod devbox_typing {
             std::thread::sleep(std::time::Duration::from_millis(300));
             frame(&mut s, vec![]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    fn term_with(cols: usize, rows: usize, bytes: &[u8]) -> Term<Listener> {
+        let listener = Listener { ctx: egui::Context::default(), shared: Default::default(), sender: Default::default() };
+        let mut term = Term::new(Config::default(), &GridSize { cols, rows }, listener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, bytes);
+        term
+    }
+
+    /// A path wrapped over three rows is one link, found from any of them.
+    #[test]
+    fn logical_line_joins_wrapped_rows() {
+        let term = term_with(10, 4, b"see aster/longname.py:4");
+        for point in [Point::new(Line(0), Column(6)), Point::new(Line(1), Column(3)), Point::new(Line(2), Column(1))] {
+            let (text, points) = logical_line(&term, point);
+            assert!(text.starts_with("see aster/longname.py:4"), "{text:?}");
+            let i = points.partition_point(|(_, p)| *p <= point) - 1;
+            let m = links::link_at(&text, points[i].0, &[]).unwrap();
+            assert_eq!(m.link, Link::File(links::FileRef { path: "aster/longname.py".into(), line: Some(4) }));
+        }
+        let (text, _) = logical_line(&term, Point::new(Line(3), Column(0)));
+        assert!(!text.contains("aster"), "the row after the wrapped line is its own line: {text:?}");
+    }
+
+    /// ⌘-click on a printed path reports it (even with mouse reporting on);
+    /// a plain click doesn't.
+    #[test]
+    fn cmd_click_reports_the_link() {
+        let ctx = egui::Context::default();
+        // `\e[?1000h` turns mouse reporting on, as Claude Code does.
+        let script = "printf '\\033[?1000hsee crates/a.rs:7 ok'; sleep 30";
+        let mut session = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), script.into()], None, Default::default()).unwrap();
+        let start = std::time::Instant::now();
+        while !session.term.lock().mode().intersects(TermMode::MOUSE_MODE) && start.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(session.term.lock().mode().intersects(TermMode::MOUSE_MODE), "mouse reporting on");
+        let font = FontId::monospace(13.0);
+        let mut frame = |mods: Modifiers, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0))),
+                events: [vec![egui::Event::ModifiersChanged(mods)], events].concat(),
+                ..Default::default()
+            };
+            let mut link = None;
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+                    link = TerminalView::new(&mut session).focused(true).show(ui).1;
+                });
+            });
+            out.textures_delta.clear();
+            link
+        };
+        frame(Modifiers::NONE, vec![]);
+        let (cw, ch) = ctx.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+        // Column 6 of row 0: inside `crates/a.rs:7`.
+        let pos = Pos2::new(PAD + 6.5 * cw, PAD + 0.5 * ch);
+        let click = |mods: Modifiers| {
+            vec![
+                vec![egui::Event::PointerMoved(pos)],
+                vec![egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers: mods }],
+                vec![egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: mods }],
+            ]
+        };
+        let mut got = None;
+        for events in click(Modifiers::COMMAND) {
+            got = got.or(frame(Modifiers::COMMAND, events));
+        }
+        assert_eq!(got, Some(Link::File(links::FileRef { path: "crates/a.rs".into(), line: Some(7) })));
+        let mut got = None;
+        for events in click(Modifiers::NONE) {
+            got = got.or(frame(Modifiers::NONE, events));
+        }
+        assert_eq!(got, None, "a plain click goes to the program");
     }
 }

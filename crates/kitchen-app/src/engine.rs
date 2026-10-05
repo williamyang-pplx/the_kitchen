@@ -17,6 +17,7 @@ use kitchen_core::util::{new_id, shell_quote, slugify};
 use kitchen_core::plan;
 use kitchen_proto::{Caller, TabInfo, TabKind, WorkspaceInfo};
 
+use crate::links::Link;
 use crate::settings::Settings;
 
 #[derive(Debug, Clone)]
@@ -790,6 +791,39 @@ impl Engine {
         Ok(row)
     }
 
+    /// Act on a ⌘-clicked terminal link of `tab_id`.
+    pub fn open_link(self: &Arc<Self>, tab_id: &str, link: Link) {
+        let tab_id = tab_id.to_string();
+        match link {
+            Link::File(f) => self.spawn("open link", move |engine| {
+                let (ws, tab) = engine.find_tab(&tab_id).context("the tab is gone")?;
+                let host = ws.host();
+                let path = file_link_path(&host, &tab.row.worktree, &f.path)?;
+                if !host.exists(&path) {
+                    bail!("no such file {path}");
+                }
+                engine.push_ui(UiCommand::OpenViewer { tab_id, path: Some(path), line: f.line, diff: None });
+                Ok(())
+            }),
+            // Opened on this Mac, devbox tabs included.
+            Link::Url(url) => self.spawn("open url", move |_| {
+                let status = std::process::Command::new("open").arg(&url).status()?;
+                if !status.success() {
+                    bail!("open {url} failed");
+                }
+                Ok(())
+            }),
+            Link::Plugin { command, text, groups } => {
+                let Some(plugins) = self.plugins() else { return };
+                let mut ctx = crate::plugins::command_context(self, &tab_id, None);
+                ctx["link"] = serde_json::json!({ "text": text, "groups": groups });
+                if let Err(e) = plugins.invoke(&command, ctx, false) {
+                    self.toast_err(format!("{e:#}"));
+                }
+            }
+        }
+    }
+
     /// Text from ⌘I / `kitchenctl tab open` (a PR link, …): handed to the
     /// plugins' `open` handlers, which open a tab with `kitchen.tab_open`.
     pub fn open_text(&self, text: &str) -> Result<()> {
@@ -1035,6 +1069,18 @@ fn edit_agent_command(
 /// plan reviewer looks (edit tabs), and Stop/Notification hooks badge the
 /// tab through `kitchenctl notify` so a finished or blocked agent is visible
 /// from any workspace.
+/// Where a printed path points: `~/…` expanded on the host, absolute as-is,
+/// anything else under `worktree`.
+fn file_link_path(host: &Host, worktree: &str, path: &str) -> Result<String> {
+    if path.starts_with("~/") {
+        return host.expand_home(path);
+    }
+    if path.starts_with('/') {
+        return Ok(path.to_string());
+    }
+    Ok(format!("{worktree}/{}", path.trim_start_matches("./")))
+}
+
 fn agent_settings_json(plans: bool) -> String {
     let hook = |title: &str| {
         serde_json::json!([{ "hooks": [{ "type": "command",
@@ -1091,6 +1137,21 @@ fn applescript_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_link_paths() {
+        let home = std::env::var("HOME").unwrap();
+        let wt = "/w/repo-x";
+        for (path, want) in [
+            ("aster/foo.py", format!("{wt}/aster/foo.py")),
+            ("./aster/foo.py", format!("{wt}/aster/foo.py")),
+            ("../other/a.rs", format!("{wt}/../other/a.rs")),
+            ("/home/dev/agi/a.rs", "/home/dev/agi/a.rs".to_string()),
+            ("~/x.lua", format!("{home}/x.lua")),
+        ] {
+            assert_eq!(file_link_path(&Host::Local, wt, path).unwrap(), want, "path={path:?}");
+        }
+    }
 
     fn engine_with(ids: &[&str]) -> Arc<Engine> {
         let db = Db::open_in_memory().unwrap();

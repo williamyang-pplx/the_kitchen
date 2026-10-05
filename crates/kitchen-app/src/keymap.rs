@@ -15,6 +15,7 @@
 //! | ⌘H / ⌘L     | previous / next tab (focused viewer: files ↔ code) |
 //! | ⌘E          | new edit (read/write) tab — own worktree      |
 //! | ⌘I          | new read-only tab (PR link, or empty = main)  |
+//! | ⌘-click     | open the path / URL under the pointer (terminal) |
 //! | ⌘R          | rename the current tab                        |
 //! | ⌘W          | close tab                                     |
 //! | ⌘P          | fuzzy file picker (focused viewer only)       |

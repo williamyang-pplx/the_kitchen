@@ -27,7 +27,7 @@ use decor::{DecorStore, FileKey};
 use keys::Chord;
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 4;
+pub const API_LEVEL: u32 = 5;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (text typed into ⌘I), `comment` (a viewer comment to post).
 pub const EMITTED: &[&str] = &["open", "comment"];
@@ -119,6 +119,15 @@ pub struct ChordEntry {
     pub filetype: Option<String>,
 }
 
+/// A plugin's terminal link rule: ⌘-click on a `regex` match runs `command`.
+#[derive(Debug, Clone)]
+pub struct LinkEntry {
+    pub plugin: String,
+    pub regex: regex::Regex,
+    /// `<plugin>.<name>`.
+    pub command: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ViewerMap {
     pub plugin: String,
@@ -148,6 +157,8 @@ pub struct Registry {
     pub providers: Vec<ProviderEntry>,
     /// (event, plugin) for each [`EMITTED`] event a plugin listens to.
     pub listeners: Vec<(String, String)>,
+    /// `kitchen.link` rules, in registration order.
+    pub links: Vec<LinkEntry>,
 }
 
 /// A place a provider points at. `path` is worktree-relative, or absolute
@@ -390,6 +401,7 @@ impl PluginHost {
             r.viewer_maps.retain(|c| c.plugin != name);
             r.providers.retain(|c| c.plugin != name);
             r.listeners.retain(|(_, p)| p != name);
+            r.links.retain(|l| l.plugin != name);
         });
         self.decor.clear_owner(name);
         self.fail_requests(name);
@@ -607,6 +619,16 @@ impl PluginHost {
         self.edit_registry(|r| {
             r.commands.retain(|c| c.name != entry.name);
             r.commands.push(entry);
+        });
+    }
+
+    fn register_link(&self, plugin: &str, generation: u64, entry: LinkEntry) {
+        if !self.current(plugin, generation) {
+            return;
+        }
+        self.edit_registry(|r| {
+            r.links.retain(|l| !(l.plugin == entry.plugin && l.regex.as_str() == entry.regex.as_str()));
+            r.links.push(entry);
         });
     }
 
@@ -1055,6 +1077,38 @@ end)
         host.reload(Some("demo")).unwrap();
         wait(&|| host.decor.get(&key).is_some() && host.registry().commands.len() == 2);
         assert_eq!(host.list()[0].status, Status::Running);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `kitchen.link` rules land in the registry in order, a function target
+    /// becomes a command that sees `ctx.link`, and a bad regex is an error.
+    #[test]
+    fn link_rules() {
+        let root = std::env::temp_dir().join(format!("kt-plugins-{}", kitchen_core::util::new_id()));
+        let dir = root.join("lk");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.toml"), "name = \"lk\"\n").unwrap();
+        std::fs::write(
+            dir.join("init.lua"),
+            r#"
+kitchen.command("pr", function() end)
+kitchen.link("AI-(\\d+)", function(ctx) kitchen.notify("ticket " .. ctx.link.groups[1] .. " " .. ctx.link.text) end)
+kitchen.link("PR-\\d+", "pr")
+local ok, err = pcall(kitchen.link, "(bad", "pr")
+assert(not ok and tostring(err):find("bad regex"), tostring(err))
+"#,
+        )
+        .unwrap();
+        let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
+        let host = host_with(&engine, vec![root.clone()]);
+        wait(&|| host.registry().links.len() == 2);
+        assert_eq!(host.list()[0].status, Status::Running);
+        let reg = host.registry();
+        assert_eq!(reg.links.iter().map(|l| (l.regex.as_str(), l.command.as_str())).collect::<Vec<_>>(), vec![(r"AI-(\d+)", "lk.link1"), (r"PR-\d+", "lk.pr")]);
+        host.invoke("lk.link1", serde_json::json!({ "link": { "text": "AI-7", "groups": ["7"] } }), false).unwrap();
+        wait(&|| engine.state().toasts.iter().any(|t| t.text.contains("ticket 7 AI-7")));
+        host.reload(Some("lk")).unwrap();
+        wait(&|| host.registry().links.len() == 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

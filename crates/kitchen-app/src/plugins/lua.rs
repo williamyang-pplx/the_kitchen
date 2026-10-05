@@ -17,7 +17,7 @@ use super::decor::{self, FileKey};
 use super::jobs::{self, JobSpec};
 use super::procs::{self, Proc, ProcSpec, Stream};
 use super::keys::Chord;
-use super::{ChordEntry, CommandEntry, FileEvent, Location, MAX_TEXT, PROVIDER_KINDS, PluginHost, ProviderEntry, ToPlugin, ViewerMap, When};
+use super::{ChordEntry, CommandEntry, FileEvent, LinkEntry, Location, MAX_TEXT, PROVIDER_KINDS, PluginHost, ProviderEntry, ToPlugin, ViewerMap, When};
 use crate::engine::UiCommand;
 
 /// Lua instructions one callback may run before it is stopped.
@@ -375,6 +375,30 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
         Ok(full)
     })?;
     k.set("command", command.clone())?;
+
+    // kitchen.link(pattern, target): ⌘-clicking a match in a terminal runs
+    // target (a command name, or a function given the command context plus
+    // ctx.link = { text, groups }). The host matches; Lua runs on click only.
+    let c = cx.clone();
+    let link_command = command.clone();
+    let link_anon = Cell::new(0u32);
+    k.set(
+        "link",
+        lua.create_function(move |lua, (pattern, target): (String, Value)| {
+            let regex = regex::Regex::new(&pattern).map_err(|e| mlua::Error::runtime(format!("kitchen.link: bad regex {pattern:?}: {e}")))?;
+            let command = match target {
+                Value::String(s) => qualify(&c.name, &s.to_str()?),
+                Value::Function(f) => {
+                    link_anon.set(link_anon.get() + 1);
+                    let name = format!("{}.link{}", c.name, link_anon.get());
+                    link_command.call::<String>((name, f, lua.create_table_from([("desc", pattern.clone())])?))?
+                }
+                _ => return Err(mlua::Error::runtime("link target must be a command name or a function")),
+            };
+            c.host.register_link(&c.name, c.generation, LinkEntry { plugin: c.name.clone(), regex, command });
+            Ok(())
+        })?,
+    )?;
 
     let c = cx.clone();
     let anon = Rc::new(Cell::new(0u32));
