@@ -149,8 +149,12 @@ local function prune_workspace(ws)
     if v.action == "keep" then
       log("kept", wt.path, "(" .. v.why .. ")")
     else
-      local rm = sh({ host = "local", timeout = 60, sh = "kitchenctl --json worktree remove " .. q(wt.path) .. " -w " .. q(ws.id) })
-      if rm.code ~= 0 then
+      -- Deleting a big checkout on a devbox takes minutes. A timeout only
+      -- kills kitchenctl: the app carries on, so the outcome is unknown.
+      local rm = sh({ host = "local", timeout = 900, sh = "kitchenctl --json worktree remove " .. q(wt.path) .. " -w " .. q(ws.id) })
+      if rm.timed_out then
+        log("gave up waiting on", wt.path, "(" .. v.why .. "); the removal may still finish, branch kept")
+      elseif rm.code ~= 0 then
         log("kept", wt.path, "(" .. v.why .. ", but remove refused: " .. why(rm) .. ")")
       else
         log("removed", wt.path, "(" .. v.why .. ")")
