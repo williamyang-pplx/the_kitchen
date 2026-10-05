@@ -1055,12 +1055,7 @@ impl Engine {
                 }
             }
         }
-        let script = format!(
-            "display notification {} with title {}",
-            applescript_string(body),
-            applescript_string(&format!("kitchen: {title}"))
-        );
-        let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
+        crate::notify::post(id, title, body, tab_id);
         self.toast(format!("{title}: {body}"));
         Ok(id)
     }
@@ -1206,10 +1201,6 @@ fn unique_path(host: &Host, path: &str) -> String {
 fn local_socket_env(host: &Host) -> Option<(String, String)> {
     host.is_local()
         .then(|| (kitchen_proto::ENV_SOCKET.to_string(), kitchen_proto::default_socket_path().display().to_string()))
-}
-
-fn applescript_string(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]

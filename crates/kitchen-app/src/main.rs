@@ -5,6 +5,7 @@ mod app;
 mod engine;
 mod keymap;
 mod links;
+mod notify;
 mod panels;
 mod plan_view;
 mod plugins;
@@ -47,6 +48,7 @@ fn main() -> eframe::Result {
             theme::install(&cc.egui_ctx);
             let db = kitchen_core::db::Db::open(&db_path)?;
             let engine = engine::Engine::new(cc.egui_ctx.clone(), db)?;
+            notify::install(&engine);
             if let Err(e) = api::serve(engine.clone()) {
                 engine.toast_err(format!("API socket: {e:#}"));
             }
