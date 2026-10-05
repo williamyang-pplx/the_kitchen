@@ -493,6 +493,7 @@ fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) 
     match method {
         "worktree.list" => {
             let list = repo.worktrees()?;
+            let spares = repo.spare_paths();
             let out: Vec<Value> = list
                 .iter()
                 .enumerate()
@@ -500,8 +501,10 @@ fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) 
                     // git lists the main checkout first.
                     let role = if i == 0 {
                         "main"
-                    } else if w.path.ends_with(READONLY_SUFFIX) {
+                    } else if w.path.ends_with(READONLY_SUFFIX) || w.path.contains("-kitchen-ro-") {
                         "readonly"
+                    } else if spares.contains(&w.path) {
+                        "spare"
                     } else {
                         "edit"
                     };
@@ -517,7 +520,9 @@ fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) 
                 Some(b) => b.clone(),
                 None => repo.default_branch()?,
             };
+            let _held = engine.hold_readonly(&ws)?;
             let wt = repo.sync_readonly_worktree(&repo.readonly_path(), &format!("origin/{base}"))?;
+            engine.refill_spare(&ws_id);
             Ok(json!({"path": wt.path, "head": wt.head}))
         }
         "worktree.remove" => {
