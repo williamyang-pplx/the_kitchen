@@ -214,7 +214,8 @@ end)
 default branch when the text is empty; otherwise every plugin's `open`
 handler gets the text, and the one that recognises it calls
 `kitchen.tab_open` (the rest return). Fetch and checkout run in one round
-trip on the workspace's host; the worktree is read-only. Opening the same
+trip on the workspace's host (a new worktree takes over a spare); the
+worktree is read-only (its folders are locked). Opening the same
 `name` again re-fetches, moves the worktree only if the rev moved, and
 reloads the viewer. Every tab's shell gets `KITCHEN_DIFF_BASE`. See
 `plugins/github/init.lua` (PR links).

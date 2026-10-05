@@ -28,8 +28,9 @@ Environment in every kitchen tab: `KITCHEN_WORKSPACE_ID`, `KITCHEN_TAB_ID`,
   `william/<slug>`, cut from freshly fetched `origin/<default>`. One PR per tab.
 - **Read-only tab** — the shared read-only worktree `<repo>-kitchen-readonly`,
   synced to the latest `origin/<default>`, or (opened from a PR link) the PR
-  head in `<repo>-kitchen-ro-pr-<N>`. Files are not writable. Use it for
-  code understanding and review only; never try to make it writable.
+  head in `<repo>-kitchen-ro-pr-<N>`. Its folders are locked (no file can be
+  created, deleted or renamed). Use it for code understanding and review
+  only: never edit its files, and never try to make it writable.
 - Every tab has `$KITCHEN_DIFF_BASE`: the tab's changes (an edit tab's work,
   or a PR's diff) are `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`.
 - William's review comments on a PR (⌘M in the viewer) are posted to GitHub
