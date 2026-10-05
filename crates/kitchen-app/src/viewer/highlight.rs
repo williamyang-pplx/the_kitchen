@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use egui::Color32;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxDefinition, SyntaxSet};
 
 use super::doc::expand_tabs;
 
@@ -16,25 +16,44 @@ pub type Spans = Vec<Vec<(Range<usize>, Color32)>>;
 /// Files longer than this are shown unhighlighted.
 const MAX_LINES: usize = 20_000;
 
-/// Extra grammar folders (plugins' `syntaxes/`), set once at startup before
-/// the first file is highlighted.
-static EXTRA_SYNTAX_DIRS: OnceLock<Vec<std::path::PathBuf>> = OnceLock::new();
+/// Enabled plugin folders, set once at startup before the first file is
+/// highlighted: their `syntaxes/*.sublime-syntax` join the grammars, and the
+/// first `themes/*.tmTheme` replaces the default theme.
+static PLUGIN_DIRS: OnceLock<Vec<std::path::PathBuf>> = OnceLock::new();
 
-pub fn set_extra_syntax_dirs(dirs: Vec<std::path::PathBuf>) {
-    let _ = EXTRA_SYNTAX_DIRS.set(dirs);
+pub fn set_plugin_dirs(dirs: Vec<std::path::PathBuf>) {
+    let _ = PLUGIN_DIRS.set(dirs);
+}
+
+/// Files with `ext` in the `sub` folder of each plugin, sorted per plugin.
+fn plugin_files(sub: &str, ext: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for d in PLUGIN_DIRS.get().into_iter().flatten() {
+        let Ok(rd) = std::fs::read_dir(d.join(sub)) else { continue };
+        let mut files: Vec<_> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == ext)).collect();
+        files.sort();
+        out.extend(files);
+    }
+    out
 }
 
 fn syntaxes() -> &'static SyntaxSet {
     static S: OnceLock<SyntaxSet> = OnceLock::new();
     S.get_or_init(|| {
-        let dirs = EXTRA_SYNTAX_DIRS.get().cloned().unwrap_or_default();
-        if dirs.is_empty() {
+        let files = plugin_files("syntaxes", "sublime-syntax");
+        if files.is_empty() {
             return SyntaxSet::load_defaults_newlines();
         }
+        // One file at a time, so a grammar that fails to compile skips only itself.
         let mut b = SyntaxSet::load_defaults_newlines().into_builder();
-        for d in dirs {
-            if let Err(e) = b.add_from_folder(&d, true) {
-                log::warn!("plugin syntaxes in {}: {e}", d.display());
+        for f in files {
+            let name = f.file_stem().map(|n| n.to_string_lossy().into_owned());
+            let def = std::fs::read_to_string(&f)
+                .map_err(|e| e.to_string())
+                .and_then(|s| SyntaxDefinition::load_from_str(&s, true, name.as_deref()).map_err(|e| e.to_string()));
+            match def {
+                Ok(def) => b.add(def),
+                Err(e) => log::warn!("plugin syntax {}: {e}", f.display()),
             }
         }
         b.build()
@@ -71,18 +90,27 @@ pub fn group_color(group: &str) -> Option<Color32> {
 fn theme() -> &'static Theme {
     static T: OnceLock<Theme> = OnceLock::new();
     T.get_or_init(|| {
+        let plugin = plugin_files("themes", "tmTheme").into_iter().find_map(|f| {
+            ThemeSet::get_theme(&f).inspect_err(|e| log::warn!("plugin theme {}: {e}", f.display())).ok()
+        });
+        if let Some(t) = plugin {
+            return t;
+        }
         let mut set = ThemeSet::load_defaults();
         set.themes.remove("base16-ocean.dark").or_else(|| set.themes.into_values().next()).expect("syntect ships themes")
     })
 }
 
-/// Highlight `text` as the language of `path` (by extension, then first line).
+/// Highlight `text` as the language of `path` (by file name, extension,
+/// then first line).
 pub fn highlight(path: &str, text: &str) -> Option<Spans> {
     let ss = syntaxes();
-    let ext = path.rsplit('.').next().unwrap_or("");
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let ext = file.rsplit('.').next().unwrap_or("");
     let first = text.lines().next().unwrap_or("");
     let syntax = ss
-        .find_syntax_by_extension(ext)
+        .find_syntax_by_extension(file)
+        .or_else(|| ss.find_syntax_by_extension(ext))
         .or_else(|| match ext {
             "ts" | "tsx" | "mts" | "cts" | "jsx" | "mjs" | "cjs" => ss.find_syntax_by_extension("js"),
             "toml" | "cfg" | "ini" => ss.find_syntax_by_extension("ini"),

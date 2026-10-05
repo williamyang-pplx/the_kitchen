@@ -33,6 +33,7 @@ languages rejected (ecosystem). Cost: ~10 s build, ~0.5 MB.
   init.lua                        entry (optional → data-only plugin)
   lua/**.lua                      require() path
   syntaxes/*.sublime-syntax       extra grammars (loaded at startup; restart to change)
+  themes/*.tmTheme                color theme (first enabled one wins; startup)
 ~/.kitchen/plugins.toml           [<name>] enabled = false / config overrides
 ~/.kitchen/logs/plugins/<name>.log
 ```
