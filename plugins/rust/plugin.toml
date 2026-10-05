@@ -1,4 +1,0 @@
-name = "rust"
-version = "0.1.0"
-description = "Rust syntax highlighting (.rs), from sublimehq/Packages"
-api = 1

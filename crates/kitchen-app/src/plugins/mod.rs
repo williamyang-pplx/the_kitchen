@@ -284,9 +284,7 @@ impl PluginHost {
             requests: Mutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
         });
-        let overrides = user_overrides();
-        let enabled = |name: &str| overrides.get(name).and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()) != Some(false);
-        crate::viewer::highlight::set_plugin_dirs(host.discover().into_iter().filter(|(n, _)| enabled(n)).map(|(_, d)| d).collect());
+        crate::viewer::highlight::set_extra_syntax_dirs(host.discover().iter().map(|(_, d)| d.join("syntaxes")).filter(|d| d.is_dir()).collect());
         host.rescan();
         let weak = Arc::downgrade(&host);
         std::thread::Builder::new()
@@ -851,7 +849,7 @@ mod tests {
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 11 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        wait(&|| host.list().len() == 5 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);
