@@ -282,13 +282,15 @@ impl CodeView<'_> {
                 cursor_drawn = y + row_h <= rect.bottom();
             }
             y += row_h;
-            draw_blocks(Some(idx), &mut y, ui);
+            // The comment field goes right under its line, above the line's
+            // blocks (a long thread would push it out of view).
             if let Some(ed) = editor.as_deref() {
                 if ed.end == idx {
                     editor_rect = Some(Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, y + 2.0), Vec2::new(block_width, EDITOR_HEIGHT)));
                     y += EDITOR_HEIGHT + 8.0;
                 }
             }
+            draw_blocks(Some(idx), &mut y, ui);
         }
         if n == 0 {
             painter.text(Pos2::new(text_x, rect.top() + 8.0), egui::Align2::LEFT_TOP, "(empty)", font.clone(), theme::DIM);
@@ -321,8 +323,10 @@ impl CodeView<'_> {
             }
         }
 
-        // ---- scroll correction when blocks pushed the cursor below the fold
-        if !cursor_drawn && vim.line >= state.top && n > 0 && editor.is_none() {
+        // ---- scroll correction when blocks pushed the cursor (or the
+        // comment field) below the fold
+        let editor_hidden = editor.as_deref().is_some_and(|ed| ed.end >= state.top && editor_rect.is_none_or(|r| r.bottom() > rect.bottom()));
+        if editor_hidden || (!cursor_drawn && vim.line >= state.top && n > 0 && editor.is_none()) {
             state.top += 1;
             ui.ctx().request_repaint();
         }

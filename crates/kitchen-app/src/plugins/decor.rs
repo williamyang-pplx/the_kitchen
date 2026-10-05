@@ -1,5 +1,5 @@
 //! Decorations pushed by plugins (and by any program over the socket):
-//! diagnostics and highlights, in namespaced sets per file. A set replaces
+//! diagnostics, highlights and comments, in namespaced sets per file. A set replaces
 //! the previous set of the same namespace and kind wholesale.
 
 use std::collections::HashMap;
@@ -91,6 +91,37 @@ pub struct Highlight {
     pub group: String,
 }
 
+/// Which side of a diff a comment's line numbers refer to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    /// The current file (the PR head).
+    #[default]
+    New,
+    /// The diff base (a removed line).
+    Old,
+}
+
+/// A note drawn under a line, e.g. a review comment thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Comment {
+    /// The plugin's id, handed back as `reply_to` when replying.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// 1-based; `None` = about the whole file (drawn above the first line).
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub side: Side,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    /// Drawn faded (outdated, resolved, pending).
+    #[serde(default)]
+    pub dim: bool,
+}
+
 fn one() -> usize {
     1
 }
@@ -143,18 +174,40 @@ pub fn parse_highlights(v: serde_json::Value) -> Result<Vec<Highlight>, String> 
         .collect()
 }
 
+pub fn parse_comments(v: serde_json::Value) -> Result<Vec<Comment>, String> {
+    let serde_json::Value::Array(items) = v else { return Err("comments must be a list".into()) };
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let c: Comment = serde_json::from_value(item).map_err(|e| format!("comment #{}: {e}", i + 1))?;
+            if c.line == Some(0) {
+                return Err(format!("comment #{}: lines are 1-based", i + 1));
+            }
+            Ok(c)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Diagnostics,
     Highlights,
+    Comments,
 }
 
 impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Diagnostics, Kind::Highlights, Kind::Comments];
+
     pub fn parse(s: &str) -> Option<Kind> {
-        match s {
-            "diagnostics" => Some(Kind::Diagnostics),
-            "highlights" => Some(Kind::Highlights),
-            _ => None,
+        Kind::ALL.into_iter().find(|k| k.name() == s)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Diagnostics => "diagnostics",
+            Kind::Highlights => "highlights",
+            Kind::Comments => "comments",
         }
     }
 }
@@ -168,6 +221,21 @@ pub struct Set {
     pub diagnostics: Vec<Diagnostic>,
     pub hl_version: Option<String>,
     pub highlights: Vec<Highlight>,
+    pub comments: Vec<Comment>,
+}
+
+impl Set {
+    fn is_empty(&self) -> bool {
+        self.diagnostics.is_empty() && self.highlights.is_empty() && self.comments.is_empty()
+    }
+
+    fn clear(&mut self, kind: Kind) {
+        match kind {
+            Kind::Diagnostics => self.diagnostics.clear(),
+            Kind::Highlights => self.highlights.clear(),
+            Kind::Comments => self.comments.clear(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,6 +258,11 @@ impl FileDecor {
 
     pub fn highlights(&self, version: &str) -> Vec<&Highlight> {
         self.sets.iter().filter(|s| s.hl_version.as_deref().is_none_or(|v| v == version)).flat_map(|s| s.highlights.iter()).collect()
+    }
+
+    /// Comments of every namespace (they follow lines, not text versions).
+    pub fn comments(&self) -> impl Iterator<Item = &Comment> {
+        self.sets.iter().flat_map(|s| s.comments.iter())
     }
 }
 
@@ -234,6 +307,11 @@ impl DecorStore {
         });
     }
 
+    pub fn set_comments(&self, key: &FileKey, ns: &str, mut items: Vec<Comment>) {
+        items.truncate(MAX_ITEMS);
+        self.update(key, ns, |s| s.comments = items);
+    }
+
     fn update(&self, key: &FileKey, ns: &str, f: impl FnOnce(&mut Set)) {
         let mut files = self.files();
         let mut decor = files.get(key).map(|d| (**d).clone()).unwrap_or_default();
@@ -245,7 +323,7 @@ impl DecorStore {
             }
         };
         f(&mut decor.sets[idx]);
-        decor.sets.retain(|s| !s.diagnostics.is_empty() || !s.highlights.is_empty());
+        decor.sets.retain(|s| !s.is_empty());
         if decor.sets.is_empty() {
             files.remove(key);
         } else {
@@ -266,14 +344,11 @@ impl DecorStore {
             let Some(d) = files.get(&k) else { continue };
             let mut decor = (**d).clone();
             for s in decor.sets.iter_mut().filter(|s| s.ns == ns) {
-                if kind != Some(Kind::Highlights) {
-                    s.diagnostics.clear();
-                }
-                if kind != Some(Kind::Diagnostics) {
-                    s.highlights.clear();
+                for k in Kind::ALL.into_iter().filter(|k| kind.is_none_or(|only| only == *k)) {
+                    s.clear(k);
                 }
             }
-            decor.sets.retain(|s| !s.diagnostics.is_empty() || !s.highlights.is_empty());
+            decor.sets.retain(|s| !s.is_empty());
             if decor.sets.is_empty() {
                 files.remove(&k);
             } else {
@@ -332,6 +407,14 @@ mod tests {
         s.clear_owner("ruff");
         assert_eq!(s.get(&key()).unwrap().sets.len(), 1);
         s.clear(None, "ext.tool", None);
+        assert!(s.get(&key()).is_none());
+        let c = parse_comments(serde_json::json!([{ "id": "7", "line": 3, "side": "old", "title": "@a", "body": "hi" }, { "body": "file-level" }])).unwrap();
+        assert_eq!((c[0].side, c[1].line, c[1].side), (Side::Old, None, Side::New));
+        s.set_comments(&key(), "github", c);
+        s.set_diagnostics(&key(), "github", vec![diag(1)], None);
+        s.clear(Some(&key()), "github", Some(Kind::Diagnostics));
+        assert_eq!(s.get(&key()).unwrap().comments().count(), 2, "clearing diagnostics keeps comments");
+        s.clear(Some(&key()), "github", Some(Kind::Comments));
         assert!(s.get(&key()).is_none());
     }
 }

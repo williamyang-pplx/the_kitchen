@@ -27,7 +27,10 @@ use decor::{DecorStore, FileKey};
 use keys::Chord;
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 3;
+pub const API_LEVEL: u32 = 4;
+/// Events the kitchen hands to the plugins that listen (`kitchen.on`):
+/// `open` (text typed into ⌘I), `comment` (a viewer comment to post).
+pub const EMITTED: &[&str] = &["open", "comment"];
 /// File text above this is not handed to plugins (`ev.text()` returns nil).
 pub const MAX_TEXT: usize = 2 * 1024 * 1024;
 
@@ -143,8 +146,8 @@ pub struct Registry {
     pub chords: Vec<ChordEntry>,
     pub viewer_maps: Vec<ViewerMap>,
     pub providers: Vec<ProviderEntry>,
-    /// Plugins with a `kitchen.on("open", …)` handler.
-    pub openers: Vec<String>,
+    /// (event, plugin) for each [`EMITTED`] event a plugin listens to.
+    pub listeners: Vec<(String, String)>,
 }
 
 /// A place a provider points at. `path` is worktree-relative, or absolute
@@ -211,8 +214,8 @@ pub enum ToPlugin {
     JobDone { generation: u64, callback: u64, result: jobs::JobResult },
     /// Answer a viewer query; the plugin replies via [`PluginHost::reply`].
     Provide { kind: String, request: u64, ctx: serde_json::Value },
-    /// Text typed into ⌘I (a link, …) for `kitchen.on("open")` handlers.
-    Open(serde_json::Value),
+    /// An [`EMITTED`] event for its `kitchen.on` handlers.
+    Event { name: String, value: serde_json::Value },
     ProcOut { generation: u64, proc: u64, stream: procs::Stream, data: Vec<u8> },
     ProcExit { generation: u64, proc: u64, code: i32 },
     Stop,
@@ -386,7 +389,7 @@ impl PluginHost {
             r.chords.retain(|c| c.plugin != name);
             r.viewer_maps.retain(|c| c.plugin != name);
             r.providers.retain(|c| c.plugin != name);
-            r.openers.retain(|p| p != name);
+            r.listeners.retain(|(_, p)| p != name);
         });
         self.decor.clear_owner(name);
         self.fail_requests(name);
@@ -536,25 +539,30 @@ impl PluginHost {
         }
     }
 
-    fn register_opener(&self, plugin: &str, generation: u64) {
+    fn register_listener(&self, plugin: &str, generation: u64, event: &str) {
         if self.current(plugin, generation) {
+            let entry = (event.to_string(), plugin.to_string());
             self.edit_registry(|r| {
-                if !r.openers.iter().any(|p| p == plugin) {
-                    r.openers.push(plugin.to_string());
+                if !r.listeners.contains(&entry) {
+                    r.listeners.push(entry);
                 }
             });
         }
     }
 
-    /// Hand `ev` (`{text, workspaces}`) to every `open` handler. False when
-    /// no plugin listens.
-    pub fn open(&self, ev: serde_json::Value) -> bool {
-        let reg = self.registry();
+    /// Plugins listening to `event`.
+    pub fn listeners(&self, event: &str) -> Vec<String> {
+        self.registry().listeners.iter().filter(|(e, _)| e == event).map(|(_, p)| p.clone()).collect()
+    }
+
+    /// Hand `value` to every `event` handler. False when no plugin listens.
+    pub fn emit(&self, event: &str, value: serde_json::Value) -> bool {
+        let listeners = self.listeners(event);
         let slots = lock(&self.slots);
         let mut sent = false;
-        for s in slots.iter().filter(|s| reg.openers.contains(&s.name)) {
+        for s in slots.iter().filter(|s| listeners.contains(&s.name)) {
             if let Some(tx) = &s.tx {
-                sent |= tx.send(ToPlugin::Open(ev.clone())).is_ok();
+                sent |= tx.send(ToPlugin::Event { name: event.to_string(), value: value.clone() }).is_ok();
             }
         }
         sent
@@ -774,7 +782,7 @@ mod tests {
     fn github_plugin_turns_links_into_tab_specs() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
-        lua.load("kitchen = { on = function() end, config = {}, json = {} }").exec().unwrap();
+        lua.load("kitchen = { on = function() end, command = function() end, config = {}, json = {} }").exec().unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let parse: mlua::Function = m.get("parse").unwrap();
@@ -802,6 +810,38 @@ mod tests {
         assert_eq!(to_json(spec.call((ws.clone(), 12, merged)).unwrap())["diff_base"], "abc^1");
         let no_gh = to_json(spec.call((ws, 12, mlua::Value::Nil)).unwrap());
         assert_eq!((no_gh["title"].as_str(), no_gh["diff_base"].as_str()), (Some("PR #12"), Some("origin/main")));
+
+        // Review comments: threads from gh's list, items for the viewer, post arguments.
+        let pr_number: mlua::Function = m.get("pr_number").unwrap();
+        assert_eq!(pr_number.call::<Option<u64>>("/r/air-kitchen-ro-pr-14211").unwrap(), Some(14211));
+        assert_eq!(pr_number.call::<Option<u64>>("/r/air-kitchen-ro-main").unwrap(), None);
+        let list = lua
+            .to_value(&serde_json::json!([
+                { "id": 2, "in_reply_to_id": 1, "path": "a.py", "user": "bo", "body": "agreed", "created_at": "2026-10-02T00:00:00Z" },
+                { "id": 1, "path": "a.py", "line": 40, "side": "RIGHT", "user": "al", "body": "use a set", "created_at": "2026-10-01T00:00:00Z" },
+                { "id": 3, "path": "a.py", "original_line": 7, "side": "LEFT", "user": "cy", "body": "old", "created_at": "2026-10-03T00:00:00Z" },
+                { "id": 4, "path": "b.py", "line": 1, "user": "dee", "body": "x", "created_at": "2026-10-03T00:00:00Z" },
+            ]))
+            .unwrap();
+        let threads: mlua::Value = m.get::<mlua::Function>("threads").unwrap().call(list).unwrap();
+        let items = to_json(m.get::<mlua::Function>("items").unwrap().call((threads, "a.py")).unwrap());
+        assert_eq!(items.as_array().unwrap().len(), 2, "the reply joins its thread; b.py is elsewhere");
+        assert_eq!(items[0]["id"], "1");
+        assert_eq!(items[0]["line"], 40);
+        assert_eq!(items[0]["side"], "new");
+        assert_eq!(items[0]["title"], "@al · L40 · 2026-10-01 · 1 reply");
+        assert_eq!(items[0]["body"], "use a set\n\n↳ @bo: agreed");
+        assert_eq!((items[1]["line"].clone(), items[1]["dim"].clone()), (serde_json::Value::Null, serde_json::json!(true)), "outdated: file level, faded");
+        let post: mlua::Function = m.get("post_args").unwrap();
+        let ev = lua.to_value(&serde_json::json!({ "path": "a.py", "line": 12, "side": "old", "start_line": 10, "start_side": "new", "text": "hm", "quote": "x = 1\ny = 2" })).unwrap();
+        let args = to_json(post.call(("o/r", 5, ev.clone(), "abc")).unwrap());
+        assert_eq!(
+            args,
+            serde_json::json!(["api", "-X", "POST", "repos/o/r/pulls/5/comments", "-f", "commit_id=abc", "-f", "path=a.py", "-f", "body=hm", "-F", "line=12", "-f", "side=LEFT", "-F", "start_line=10", "-f", "start_side=RIGHT"])
+        );
+        let file_level = to_json(post.call(("o/r", 5, ev, "abc", true)).unwrap());
+        assert_eq!(file_level[9], "subject_type=file");
+        assert_eq!(file_level[11], "body=**L12**: `x = 1`\n\nhm");
     }
 
     #[test]
@@ -809,7 +849,7 @@ mod tests {
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 5 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.registry().openers == ["github"]);
+        wait(&|| host.list().len() == 5 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);

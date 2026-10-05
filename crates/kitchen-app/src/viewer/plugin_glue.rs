@@ -7,10 +7,11 @@ use egui::{Color32, Ui};
 use kitchen_core::host::Host;
 use kitchen_core::util::shell_quote;
 
-use super::code_view::Overlay;
+use super::code_view::{Block, Editor, Overlay};
+use super::doc::LineKind;
 use super::picker::Picker;
 use super::{Loc, Msg, PickerKind, Viewer};
-use crate::plugins::decor::{FileKey, Severity};
+use crate::plugins::decor::{FileKey, Severity, Side};
 use crate::theme;
 
 /// How often the open file is re-`stat`ed while the viewer is shown.
@@ -252,6 +253,96 @@ impl Viewer {
         let locs: Vec<Loc> = o.diags.iter().map(|d| Loc { path: path.clone(), line: d.0, col: d.1 }).collect();
         let items = o.diags.iter().map(|d| (format!("{}:{}  {}", d.0, d.1 + 1, d.3), String::new())).collect();
         self.picker = Some((PickerKind::Defs(locs), Picker::new(format!("diagnostics in {path}"), items)));
+    }
+
+    /// Plugin comments on the open file as blocks under their rows, with
+    /// their ids. Old-side lines only map onto a diff.
+    pub(super) fn comment_blocks(&self) -> Vec<(Block, Option<String>)> {
+        let Some(plugins) = self.engine.plugins() else { return Vec::new() };
+        let Some(path) = self.current.as_ref().filter(|_| !self.browsing && !self.outline) else { return Vec::new() };
+        let Some(decor) = plugins.decor.get(&self.file_key(path)) else { return Vec::new() };
+        let is_diff = self.doc_key.as_ref().is_some_and(|k| k.1);
+        decor
+            .comments()
+            .map(|c| {
+                let row = c.line.and_then(|n| {
+                    self.doc.lines.iter().position(|l| match c.side {
+                        Side::New => l.new_no == Some(n),
+                        Side::Old => is_diff && l.old_no == Some(n),
+                    })
+                });
+                let mut title = c.title.clone();
+                if let (None, Some(n)) = (row, c.line) {
+                    let side = if c.side == Side::Old { "base " } else { "" };
+                    title.push_str(&format!(" · {side}L{n}"));
+                }
+                let block = Block { after: row, title, body: c.body.clone(), color: theme::CYAN, dim: c.dim };
+                (block, c.id.clone())
+            })
+            .collect()
+    }
+
+    /// ⌘M: a comment field under the cursor line or visual selection. On a
+    /// line with a comment it replies to that comment.
+    pub(super) fn start_comment(&mut self) {
+        if self.browsing || self.outline || !self.current.as_ref().is_some_and(|p| self.files.contains_key(p)) {
+            self.status = Some(("open a file to comment on it".into(), false));
+            return;
+        }
+        let who = self.engine.plugins().map(|p| p.listeners("comment")).unwrap_or_default();
+        if who.is_empty() {
+            self.status = Some(("no plugin takes comments (the github plugin does, in PR tabs opened with ⌘I)".into(), false));
+            return;
+        }
+        let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
+        let thread = self.comment_blocks().into_iter().find(|(b, id)| b.after == Some(end) && id.is_some());
+        let lines = |i: usize| self.doc.lines.get(i).and_then(|l| l.new_no.or(l.old_no)).unwrap_or(i + 1);
+        let what = match &thread {
+            Some((b, _)) => format!("Reply to {}", b.title),
+            None if end > start => format!("Comment on lines {}–{}", lines(start), lines(end)),
+            None => format!("Comment on line {}", lines(end)),
+        };
+        self.reply_to = thread.and_then(|(_, id)| id);
+        self.list_focus = false;
+        self.editor = Some(Editor { start, end, text: String::new(), label: format!("{what} — ⌘Enter sends it to {} · Esc cancels", who.join(", ")), needs_focus: true });
+    }
+
+    /// Hand the comment field to the `comment` listeners.
+    pub(super) fn submit_comment(&mut self) {
+        let Some(ed) = self.editor.take() else { return };
+        let text = ed.text.trim().to_string();
+        if text.is_empty() {
+            self.editor = Some(ed);
+            return;
+        }
+        let Some(path) = self.current.clone() else { return };
+        // A removed line is on the base side; everything else on the current file.
+        let pos = |i: usize| -> (&'static str, Option<usize>) {
+            match self.doc.lines.get(i) {
+                Some(l) if l.kind == LineKind::Removed => ("old", l.old_no),
+                Some(l) => ("new", l.new_no),
+                None => ("new", None),
+            }
+        };
+        let ((side, line), (start_side, start_line)) = (pos(ed.end), pos(ed.start));
+        let multi = ed.end > ed.start;
+        let quote: Vec<&str> = (ed.start..=ed.end).filter_map(|i| self.doc.lines.get(i).map(|l| l.text.as_str())).collect();
+        let k = self.file_key(&path);
+        let ev = serde_json::json!({
+            "file": { "host": k.host, "worktree": k.worktree, "path": k.path, "abs": k.abs() },
+            "path": path,
+            "line": line,
+            "side": side,
+            "start_line": if multi { start_line } else { None },
+            "start_side": if multi { Some(start_side) } else { None },
+            "text": text,
+            "quote": quote.join("\n"),
+            "reply_to": self.reply_to.take(),
+            "tab": crate::plugins::command_context(&self.engine, &self.tab_id, None),
+        });
+        let sent = self.engine.plugins().is_some_and(|p| p.emit("comment", ev));
+        self.status = Some(if sent { ("comment sent".into(), false) } else { ("no plugin took the comment".into(), true) });
+        self.vim.anchor = None;
     }
 
     /// The viewer state handed to plugin commands.

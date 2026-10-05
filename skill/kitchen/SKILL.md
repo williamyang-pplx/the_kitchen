@@ -32,6 +32,10 @@ Environment in every kitchen tab: `KITCHEN_WORKSPACE_ID`, `KITCHEN_TAB_ID`,
   code understanding and review only; never try to make it writable.
 - Every tab has `$KITCHEN_DIFF_BASE`: the tab's changes (an edit tab's work,
   or a PR's diff) are `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`.
+- William's review comments on a PR (⌘M in the viewer) are posted to GitHub
+  as PR review comments. To address them, read them with
+  `gh api repos/<owner>/<repo>/pulls/<N>/comments --paginate` (`path`,
+  `line`, `side`, `body`, `in_reply_to_id` for replies).
 - Handles: ids, 1-based indexes (`2`, `workspace:2`, `tab:3`), or names.
 
 ## Common tasks

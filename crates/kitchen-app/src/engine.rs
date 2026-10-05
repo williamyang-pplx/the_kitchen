@@ -743,7 +743,7 @@ impl Engine {
     /// plugins' `open` handlers, which open a tab with `kitchen.tab_open`.
     pub fn open_text(&self, text: &str) -> Result<()> {
         let ev = serde_json::json!({ "text": text.trim(), "workspaces": self.workspace_info() });
-        let handled = self.plugins().is_some_and(|p| p.open(ev));
+        let handled = self.plugins().is_some_and(|p| p.emit("open", ev));
         if !handled {
             bail!("no plugin opens {:?} (enable the github plugin for PR links)", text.trim());
         }

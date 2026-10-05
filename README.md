@@ -21,7 +21,9 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   edits, followed live) ⌘P opens straight on the first changed file's diff,
   next to a tree of just the changed files: j/k in the tree, or ⌘J/⌘K and
   `]c`/`[c` in the code, step through them; `a` in the list switches to the
-  whole repo, ⌘B hides the list. Tabs without changes open on a folder view
+  whole repo, ⌘B hides the list. In PR tabs the PR's review comments show
+  under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
+  commented line) to the PR on GitHub. Tabs without changes open on a folder view
   (`aster/`, set by `viewer_default_dirs`). Vim
   navigation (`-` up a folder, Enter opens), an fzf-style ⌘P file finder
   (space-separated terms, smart case), diff/plain mode, jump-to-definition and an
@@ -30,7 +32,7 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   viewer diagnostics/highlights, `gd`/`gr` providers, and jobs or
   long-running processes (language servers) on the tab's devbox. Ships with
   `ruff` (Python lint), `python` (`gd` / `gr` from the ty language server),
-  `github` (PR links in ⌘I) and `todo`. ⌘⇧P is the command palette.
+  `github` (PR links in ⌘I, PR review comments) and `todo`. ⌘⇧P is the command palette.
   See [docs/plugins.md](docs/plugins.md).
 - **`kitchenctl`**: the public CLI, so agents can do everything you do from
   the keyboard. See [docs/cli.md](docs/cli.md) or run `kitchenctl guide`.
@@ -84,7 +86,7 @@ fall back to text search.
 | ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins) |
 | ⌥H / ⌥L | focus the terminal pane (left) / side panel (right) |
 | ⌘` | switch focus terminal ↔ side panel |
-| ⌘M | comment on the cursor line / selection |
+| ⌘M | comment on the cursor line / selection (viewer, PR tab: posted to the PR on GitHub; on a commented line: a reply) |
 | ⌘Enter | submit comment (plan: send comments to agent) |
 | ⌘D | toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |

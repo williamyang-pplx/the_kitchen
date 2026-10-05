@@ -188,3 +188,14 @@ about LSP:
   filetype-keyed and first-match only). No handler → an error toast.
 * GitHub knowledge lives only in `plugins/github`.
 
+## Level 4 (2026-10-04): comments
+
+* `kitchen.comments.set(file, items)` — a third decoration kind (next to
+  diagnostics and highlights, same namespaces and socket `decor.set
+  kind=comments`), drawn as blocks under their rows. `side` picks the diff
+  side the line number belongs to.
+* `kitchen.on("comment", ev)` — ⌘M/⌘Enter in the viewer, broadcast like
+  `open` (one registry of listeners for emitted events). The core never
+  stores comments: the plugin owns them (GitHub is the store for PRs).
+* `kitchen.workspaces()` so file events can be tied to tabs.
+

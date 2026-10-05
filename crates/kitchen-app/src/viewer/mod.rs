@@ -2,7 +2,8 @@
 //! agent worked in) it opens on the first changed file's diff, next to a
 //! tree of just the changed files; without, on a folder view at a default
 //! folder such as `aster/`. Plain / diff / outline modes, vim
-//! navigation, and jump-to-definition with a jump list. All file access goes
+//! navigation, jump-to-definition with a jump list, and ⌘M comments that
+//! plugins post and draw (the github plugin: PR review comments). All file access goes
 //! through the workspace's [`Host`] on background threads, so devbox
 //! workspaces work the same.
 
@@ -184,6 +185,11 @@ pub struct Viewer {
     nav_token: u64,
     /// `pending_goto`'s column is a raw 1-based column, not a display one.
     goto_raw: bool,
+    /// The ⌘M comment field, and the comment id it replies to.
+    editor: Option<code_view::Editor>,
+    reply_to: Option<String>,
+    /// ⌘Enter arrived; submit once the editor has seen this frame's input.
+    submit_pending: bool,
 }
 
 impl Viewer {
@@ -245,6 +251,9 @@ impl Viewer {
             pending_nav: None,
             nav_token: 0,
             goto_raw: false,
+            editor: None,
+            reply_to: None,
+            submit_pending: false,
         };
         v.load_file_list(false);
         v
@@ -454,6 +463,7 @@ impl Viewer {
         }
         if self.current.as_deref() != Some(path) {
             self.current = Some(path.to_string());
+            self.editor = None;
             self.vim.anchor = None;
             self.doc_key = None;
             self.pending_goto = Some((line.unwrap_or(1), 0));
@@ -873,8 +883,10 @@ impl Viewer {
 
     pub fn command(&mut self, cmd: PanelCmd, _engine: &Arc<Engine>) {
         match cmd {
-            // Comments live in the plan reviewer only.
-            PanelCmd::Comment | PanelCmd::Submit => {}
+            PanelCmd::Comment => self.start_comment(),
+            // Submit after this frame's typing reaches the editor.
+            PanelCmd::Submit if self.editor.is_some() => self.submit_pending = true,
+            PanelCmd::Submit => self.status = Some(("⌘M comments on the cursor line (V: a range)".into(), false)),
             PanelCmd::ToggleDiff => {
                 self.diff = !self.diff;
                 self.outline = false;
@@ -1047,16 +1059,18 @@ impl Viewer {
             code_ui.centered_and_justified(|ui| ui.label(RichText::new(text).color(theme::DIM)));
         } else {
             let focused = cx.focused && self.picker.is_none() && !self.list_focus;
-            if focused {
+            if focused && self.editor.is_none() {
                 self.leader_keys(&mut code_ui);
             }
+            let comments = self.comment_blocks();
+            let blocks: Vec<code_view::Block> = comments.into_iter().map(|(b, _)| b).collect();
             let overlay = self.overlay.as_ref().filter(|o| !self.browsing && !self.outline && self.current.as_deref() == Some(o.path.as_str())).map(|o| &o.overlay);
             let out = CodeView {
                 doc: &self.doc,
                 vim: &mut self.vim,
                 state: &mut self.view,
-                blocks: &[],
-                editor: None,
+                blocks: &blocks,
+                editor: self.editor.as_mut(),
                 focused,
                 font_size,
                 two_gutters: self.diff && !self.outline && !self.browsing,
@@ -1068,6 +1082,12 @@ impl Viewer {
             if out.clicked {
                 cx.clicked = true;
                 self.list_focus = false;
+            }
+            if out.cancel_editor {
+                self.editor = None;
+            }
+            if std::mem::take(&mut self.submit_pending) {
+                self.submit_comment();
             }
             self.handle_actions(out.actions);
         }
@@ -1095,7 +1115,7 @@ impl Viewer {
                 let pos = format!("{}  L{}:{}", self.vim.pending_display(), self.current_source_line().unwrap_or(0), self.vim.col + 1);
                 ui.label(RichText::new(pos).monospace().size(11.0).color(theme::DIM));
                 if !busy {
-                    let hint = if self.browsing { "j/k move · Enter open · - up · / search · ⌘J next changed file · ⌘P find" } else { "⌘J/⌘K file · ]c/[c change · gd def · gr refs · ^o back · - folder · ⌘D ⌘O ⌘B" };
+                    let hint = if self.browsing { "j/k move · Enter open · - up · / search · ⌘J next changed file · ⌘P find" } else { "⌘J/⌘K file · ]c/[c change · ⌘M comment · gd def · gr refs · ^o back · - folder · ⌘D ⌘O ⌘B" };
                     ui.label(RichText::new(hint).size(10.5).color(theme::DIM));
                 }
             });
@@ -1745,6 +1765,82 @@ mod tests {
         assert!(!v.show_files && !v.list_focus);
         v.command(PanelCmd::ToggleFiles, &engine);
         assert!(v.show_files);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ⌘M … ⌘Enter hands the comment to the `comment` listener with its
+    /// side and line; the comments it sets draw under their rows, and ⌘M on
+    /// such a row replies.
+    #[test]
+    fn comments_go_to_plugins_and_come_back() {
+        let tmp = std::env::temp_dir().join(format!("kt-comments-{}", kitchen_core::util::new_id()));
+        let wt = tmp.join("wt");
+        let plug = tmp.join("plugins/notes");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&plug).unwrap();
+        std::fs::write(plug.join("plugin.toml"), "name = \"notes\"\napi = 4\n").unwrap();
+        std::fs::write(
+            plug.join("init.lua"),
+            r#"kitchen.on("comment", function(ev)
+  local body = ev.text .. "|" .. ev.side .. ":" .. ev.line .. "|" .. tostring(ev.start_line) .. "|" .. (ev.reply_to or "-")
+  kitchen.comments.set(ev.file, { { id = "c1", line = ev.line, side = ev.side, title = "@me", body = body } })
+end)"#,
+        )
+        .unwrap();
+        let d = wt.display().to_string();
+        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
+        run("git init -q -b main && git config user.email t@t && git config user.name t && printf 'a\\nb\\nc\\n' > a.py && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
+        run("printf 'a\\nB\\nc\\n' > a.py && git commit -qam change");
+        let ctx = egui::Context::default();
+        let db = kitchen_core::db::Db::open_in_memory().unwrap();
+        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        db.insert_workspace(&ws).unwrap();
+        db.insert_tab(&tab).unwrap();
+        let engine = Engine::new(ctx.clone(), db).unwrap();
+        engine.set_plugins(crate::plugins::PluginHost::start(&engine, vec![tmp.join("plugins")]));
+        let w = engine.workspaces()[0].clone();
+        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
+        let frame = |v: &mut Viewer, text: &str| {
+            let events = if text.is_empty() { vec![] } else { vec![egui::Event::Text(text.into())] };
+            let mut out = ctx.run_ui(egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
+                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
+                v.ui(ui, &mut cx);
+            });
+            out.textures_delta.clear();
+        };
+        let settle = |v: &mut Viewer, done: &dyn Fn(&Viewer) -> bool| {
+            for _ in 0..300 {
+                frame(v, "");
+                if done(v) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("viewer never settled");
+        };
+        settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none() && !engine.plugins().unwrap().listeners("comment").is_empty());
+        // The first change starts with the removed `b`: a base-side line.
+        assert_eq!(v.doc.lines[v.vim.line].text, "b");
+        v.command(PanelCmd::Comment, &engine);
+        assert!(v.editor.is_some());
+        frame(&mut v, "");
+        frame(&mut v, "why?");
+        v.command(PanelCmd::Submit, &engine);
+        frame(&mut v, "");
+        assert!(v.editor.is_none(), "submitted");
+        settle(&mut v, &|v| !v.comment_blocks().is_empty());
+        let (block, id) = v.comment_blocks().remove(0);
+        assert_eq!((block.after, id.as_deref()), (Some(v.vim.line), Some("c1")));
+        assert_eq!(block.body, "why?|old:2|nil|-");
+        // ⌘M on the commented row replies to it.
+        v.command(PanelCmd::Comment, &engine);
+        assert!(v.editor.as_ref().unwrap().label.starts_with("Reply to @me"));
+        frame(&mut v, "");
+        frame(&mut v, "ok");
+        v.command(PanelCmd::Submit, &engine);
+        frame(&mut v, "");
+        settle(&mut v, &|v| v.comment_blocks().first().is_some_and(|(b, _)| b.body.ends_with("|c1")));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

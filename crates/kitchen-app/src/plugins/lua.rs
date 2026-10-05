@@ -101,9 +101,9 @@ fn run(host: Arc<PluginHost>, name: &str, dir: &Path, entry: &str, config: serde
                 Ok(t) => fire(&lua, &cx, &used, if ev.changed { "file_changed" } else { "file_opened" }, Value::Table(t)),
                 Err(e) => host.report_error(name, &format!("event: {e}")),
             },
-            ToPlugin::Open(ev) => match to_lua(&lua, &ev) {
-                Ok(v) => fire(&lua, &cx, &used, "open", v),
-                Err(e) => host.report_error(name, &format!("open: {e}")),
+            ToPlugin::Event { name: event, value } => match to_lua(&lua, &value) {
+                Ok(v) => fire(&lua, &cx, &used, &event, v),
+                Err(e) => host.report_error(name, &format!("{event}: {e}")),
             },
             ToPlugin::Invoke { command, ctx } => {
                 let result = (|| -> mlua::Result<()> {
@@ -345,11 +345,11 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
     k.set(
         "on",
         lua.create_function(move |lua, (event, f): (String, Function)| {
-            if !matches!(event.as_str(), "startup" | "file_opened" | "file_changed" | "open") {
-                return Err(mlua::Error::runtime(format!("unknown event {event:?} (startup, file_opened, file_changed, open)")));
+            if !matches!(event.as_str(), "startup" | "file_opened" | "file_changed") && !super::EMITTED.contains(&event.as_str()) {
+                return Err(mlua::Error::runtime(format!("unknown event {event:?} (startup, file_opened, file_changed, open, comment)")));
             }
-            if event == "open" {
-                c.host.register_opener(&c.name, c.generation);
+            if super::EMITTED.contains(&event.as_str()) {
+                c.host.register_listener(&c.name, c.generation, &event);
             }
             let handlers: Table = state(lua)?.get("handlers")?;
             let list: Table = match handlers.get::<Option<Table>>(event.as_str())? {
@@ -421,8 +421,8 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
         })?,
     )?;
 
-    // Decorations: kitchen.diagnostics / kitchen.highlights.
-    for kind in [decor::Kind::Diagnostics, decor::Kind::Highlights] {
+    // Decorations: kitchen.diagnostics / kitchen.highlights / kitchen.comments.
+    for kind in decor::Kind::ALL {
         let t = lua.create_table()?;
         let c = cx.clone();
         t.set(
@@ -440,6 +440,10 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                     decor::Kind::Highlights => {
                         let items = decor::parse_highlights(items).map_err(mlua::Error::runtime)?;
                         c.host.decor.set_highlights(&key, &ns, items, version);
+                    }
+                    decor::Kind::Comments => {
+                        let items = decor::parse_comments(items).map_err(mlua::Error::runtime)?;
+                        c.host.decor.set_comments(&key, &ns, items);
                     }
                 }
                 repaint(&c);
@@ -459,7 +463,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                 Ok(())
             })?,
         )?;
-        k.set(if kind == decor::Kind::Diagnostics { "diagnostics" } else { "highlights" }, t)?;
+        k.set(kind.name(), t)?;
     }
 
     // Processes.
@@ -543,6 +547,16 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                 }
             }
             Ok(())
+        })?,
+    )?;
+
+    // Workspaces and their tabs, as in the `open` event.
+    let c = cx.clone();
+    k.set(
+        "workspaces",
+        lua.create_function(move |lua, ()| match c.host.engine() {
+            Some(e) => to_lua(lua, &serde_json::to_value(e.workspace_info()).map_err(mlua::Error::external)?),
+            None => Ok(Value::Table(lua.create_table()?)),
         })?,
     )?;
 

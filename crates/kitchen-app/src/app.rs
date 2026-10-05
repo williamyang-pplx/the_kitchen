@@ -671,7 +671,7 @@ impl KitchenApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(match (self.focus, self.side) {
-                        (Focus::Side, Some(SideKind::Viewer)) => "⌘H/L files ↔ code · ⌘J/K changed file · ⌘B files · ⌘D diff · ⌘O outline · ⌥H/L pane",
+                        (Focus::Side, Some(SideKind::Viewer)) => "⌘H/L files ↔ code · ⌘J/K changed file · ⌘M comment · ⌘B files · ⌘D diff · ⌘O outline · ⌥H/L pane",
                         (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘J/K workspace",
                         _ => "⌘H/L or ⌘1-9 tab · ⌘E edit · ⌘I read-only · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
                     })
