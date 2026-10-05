@@ -2,7 +2,7 @@
 //!
 //! Every subcommand maps to exactly one API method (see [`Cli::to_call`]),
 //! except the few that run without the app: `guide`, `version`, and the
-//! hidden `__relay` / `__index` helpers.
+//! hidden `__relay` / `__index` / `__agent-stopped` helpers.
 
 use std::path::PathBuf;
 
@@ -101,6 +101,15 @@ pub enum Command {
     /// Print symbols of a file as JSON (used by the viewer on devboxes).
     #[command(name = "__index", hide = true)]
     Index { paths: Vec<PathBuf> },
+    /// Claude Code Stop hook (hook JSON on stdin): `notify`, unless background
+    /// subagents are still running.
+    #[command(name = "__agent-stopped", hide = true)]
+    AgentStopped {
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+    },
 }
 
 #[derive(Args, Debug, Default, Clone)]
@@ -412,6 +421,8 @@ pub enum Call {
     Version,
     Relay,
     Index(Vec<PathBuf>),
+    /// Nothing to do (exit 0).
+    Skip,
 }
 
 fn api(method: &str, params: Value) -> Call {
@@ -546,6 +557,13 @@ impl Cli {
                 }
             },
             Command::Notify { title, body, target } => api("notify", merge(tab(target), json!({"title": title, "body": body}))),
+            Command::AgentStopped { title, body } => {
+                if crate::hook::should_notify_on_stop(&stdin()?) {
+                    api("notify", json!({"title": title, "body": body}))
+                } else {
+                    Call::Skip
+                }
+            }
             Command::Notifications { unread, limit } => api("notification.list", json!({"unread": unread, "limit": limit})),
             Command::Debug(DebugCmd::Screenshot { path }) => {
                 let abs = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));

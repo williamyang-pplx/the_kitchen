@@ -2,6 +2,7 @@
 
 mod cli;
 mod client;
+mod hook;
 mod relay;
 mod render;
 
@@ -72,6 +73,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Call::Skip => ExitCode::SUCCESS,
         Call::Index(paths) => {
             // Symbol extraction lives in kitchen-symbols; not wired into the CLI yet.
             eprintln!("kitchenctl __index: symbol indexing is not available in this build ({} paths)", paths.len());

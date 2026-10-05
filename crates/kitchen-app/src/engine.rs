@@ -1127,10 +1127,6 @@ fn edit_agent_command(
     Ok((format!("{base} \"$(cat {})\"", shell_quote(&prompt_path)), Some(setup)))
 }
 
-/// `--settings` for agents the kitchen starts: plan files land where the
-/// plan reviewer looks (edit tabs), and Stop/Notification hooks badge the
-/// tab through `kitchenctl notify` so a finished or blocked agent is visible
-/// from any workspace.
 /// Where a printed path points: `~/…` expanded on the host, absolute as-is,
 /// anything else under `worktree`.
 fn file_link_path(host: &Host, worktree: &str, path: &str) -> Result<String> {
@@ -1154,12 +1150,27 @@ fn closest(matches: &[String]) -> Option<&String> {
     matches.iter().min_by_key(|m| (m.matches('/').count(), m.as_str()))
 }
 
+/// `--settings` for agents the kitchen starts: plan files land where the
+/// plan reviewer looks (edit tabs), and Stop/Notification hooks badge the
+/// tab through `kitchenctl notify` so a finished or blocked agent is visible
+/// from any workspace. Stop stays quiet while background subagents run.
 fn agent_settings_json(plans: bool) -> String {
-    let hook = |title: &str| {
-        serde_json::json!([{ "hooks": [{ "type": "command",
-            "command": format!("command -v kitchenctl >/dev/null && kitchenctl notify --title '{title}' --body \"$(basename \"$PWD\")\" >/dev/null 2>&1; true") }] }])
+    let hook = |matcher: &str, command: String| {
+        serde_json::json!([{ "matcher": matcher, "hooks": [{ "type": "command",
+            "command": format!("command -v kitchenctl >/dev/null && {{ {command}; }} >/dev/null 2>&1; true") }] }])
     };
-    let mut v = serde_json::json!({ "hooks": { "Stop": hook("agent finished"), "Notification": hook("agent needs you") } });
+    let args = |title: &str| format!("--title '{title}' --body \"$(basename \"$PWD\")\"");
+    let stop = hook(
+        "",
+        // A kitchenctl older than __agent-stopped exits 2; plain notify then.
+        format!("kitchenctl __agent-stopped {a} || kitchenctl notify {a}", a = args("agent finished")),
+    );
+    // Only prompts that block the agent; idle_prompt repeats Stop a minute later.
+    let blocked = hook(
+        "permission_prompt|elicitation_dialog|elicitation_url_dialog",
+        format!("kitchenctl notify {}", args("agent needs you")),
+    );
+    let mut v = serde_json::json!({ "hooks": { "Stop": stop, "Notification": blocked } });
     if plans {
         v["plansDirectory"] = serde_json::json!(".kitchen/plans");
     }
