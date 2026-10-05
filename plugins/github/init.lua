@@ -40,8 +40,16 @@ local function q(s)
   return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
+-- The PR head and the default branch, fetched while gh answers.
+function M.prefetch(ws, n)
+  local dflt = ws.default_branch or "main"
+  return { "+refs/pull/" .. n .. "/head:refs/kitchen/pr/" .. n, "+refs/heads/" .. dflt .. ":refs/remotes/origin/" .. dflt }
+end
+
 -- The tab for PR `n` of `ws`, given gh's answer (`nil` when gh failed).
-function M.spec(ws, n, info)
+-- `prefetched`: M.prefetch already ran, so an open PR on the default branch
+-- needs no fetch at all.
+function M.spec(ws, n, info, prefetched)
   local base = (info and info.baseRefName) or ws.default_branch or "main"
   local head_ref = "refs/kitchen/pr/" .. n
   local fetch = { "+refs/pull/" .. n .. "/head:" .. head_ref }
@@ -58,6 +66,9 @@ function M.spec(ws, n, info)
   local title = "PR #" .. n
   if info and info.title and info.title ~= "" then
     title = "#" .. n .. " " .. info.title
+  end
+  if prefetched and diff_base == "origin/" .. (ws.default_branch or "main") then
+    fetch = nil -- (nil, not {}: an empty table would reach tab_open as an object)
   end
   return { workspace = ws.id, name = "pr-" .. n, rev = head_ref, fetch = fetch, diff_base = diff_base, title = title }
 end
@@ -76,10 +87,18 @@ kitchen.on("open", function(ev)
     return
   end
   kitchen.notify("opening " .. slug .. "#" .. n .. "…")
+  -- Ask gh (on the mac) and fetch the PR on the workspace's host at once;
+  -- the tab opens when both are done.
+  local pending, info, prefetched = 2, nil, false
+  local function done()
+    pending = pending - 1
+    if pending == 0 then
+      kitchen.tab_open(M.spec(ws, n, info, prefetched))
+    end
+  end
   local sh = "export PATH=" .. (kitchen.config.path or "") .. ':"$PATH"; gh pr view ' .. n .. " -R " .. q(slug)
     .. " --json title,baseRefName,state,mergeCommit"
   kitchen.run({ sh = sh, host = "local", timeout = 20 }, function(res)
-    local info
     if res.code == 0 then
       local ok, v = pcall(kitchen.json.decode, res.stdout)
       info = ok and v or nil
@@ -88,7 +107,15 @@ kitchen.on("open", function(ev)
       local why = (res.stderr ~= "" and res.stderr or res.stdout):gsub("%s+$", "")
       kitchen.notify("gh pr view failed (" .. why .. ") — diffing against " .. (ws.default_branch or "main"), "warn")
     end
-    kitchen.tab_open(M.spec(ws, n, info))
+    done()
+  end)
+  local fetch = { "git", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin" }
+  for _, r in ipairs(M.prefetch(ws, n)) do
+    table.insert(fetch, r)
+  end
+  kitchen.run({ cmd = fetch, host = ws.host, cwd = ws.repo_path, timeout = 60 }, function(res)
+    prefetched = res.code == 0
+    done()
   end)
 end)
 

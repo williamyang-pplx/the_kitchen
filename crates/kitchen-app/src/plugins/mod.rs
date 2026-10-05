@@ -808,8 +808,17 @@ mod tests {
         assert_eq!(s["fetch"], serde_json::json!(["+refs/pull/12/head:refs/kitchen/pr/12", "+refs/heads/dev:refs/remotes/origin/dev"]));
         let merged = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "dev", "state": "MERGED", "mergeCommit": {"oid": "abc"}})).unwrap();
         assert_eq!(to_json(spec.call((ws.clone(), 12, merged)).unwrap())["diff_base"], "abc^1");
-        let no_gh = to_json(spec.call((ws, 12, mlua::Value::Nil)).unwrap());
+        let no_gh = to_json(spec.call((ws.clone(), 12, mlua::Value::Nil)).unwrap());
         assert_eq!((no_gh["title"].as_str(), no_gh["diff_base"].as_str()), (Some("PR #12"), Some("origin/main")));
+        // After the prefetch (PR head + default branch), an open PR on the
+        // default branch fetches nothing; other bases still fetch theirs.
+        let on_main = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "main", "state": "OPEN"})).unwrap();
+        assert!(to_json(spec.call((ws.clone(), 12, on_main.clone(), true)).unwrap()).get("fetch").is_none());
+        assert!(to_json(spec.call((ws.clone(), 12, on_main, false)).unwrap())["fetch"].is_array());
+        let on_dev = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "dev", "state": "OPEN"})).unwrap();
+        assert!(to_json(spec.call((ws.clone(), 12, on_dev, true)).unwrap())["fetch"].is_array());
+        let prefetch: Vec<String> = lua.from_value(m.get::<mlua::Function>("prefetch").unwrap().call((ws, 12)).unwrap()).unwrap();
+        assert_eq!(prefetch, ["+refs/pull/12/head:refs/kitchen/pr/12", "+refs/heads/main:refs/remotes/origin/main"]);
 
         // Review comments: threads from gh's list, items for the viewer, post arguments.
         let pr_number: mlua::Function = m.get("pr_number").unwrap();
