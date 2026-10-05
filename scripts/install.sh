@@ -100,6 +100,13 @@ if [ "$bundle" = 1 ]; then
     for _ in $(seq 50); do pgrep -f "^$exe" >/dev/null || break; sleep 0.2; done
     pkill -f "^$exe" || true
   fi
-  open "$app"
+  # Launched from a kitchen tab, this shell has the tab's KITCHEN_* and tmux
+  # variables; `open` would pass them on (KITCHEN_STATE_DIR from a test would
+  # start the app on an empty state). Open it as the Dock would.
+  (
+    for v in $(env | sed -n 's/^\(KITCHEN_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+    unset TMUX TMUX_PANE
+    open "$app"
+  )
   echo "restarted $app"
 fi
