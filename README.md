@@ -16,7 +16,8 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   (`https://github.com/<org>/<repo>/pull/<n>`, any suffix): the `github`
   plugin opens that PR's head read-only in its own worktree, and the viewer
   shows its diff against the PR's base (as on GitHub). Re-opening the link
-  picks up new pushes. Empty = latest main.
+  picks up new pushes. Empty = latest main. Read-only worktrees have their
+  folders locked (no file can be added, removed or renamed).
 - File viewer. With changes (a PR tab, or an edit tab after the agent's
   edits, followed live) ⌘. opens straight on the first changed file's diff,
   next to a tree of just the changed files: j/k in the tree, or ⌘J/⌘K and
