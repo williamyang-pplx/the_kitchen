@@ -38,8 +38,8 @@ fn plugin_files(sub: &str, ext: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// Build the grammars and theme on a thread, so the first file opened
-/// doesn't wait for them. Call after [`set_extra_syntax_dirs`]: the set is
-/// built once, with whatever folders are known then.
+/// doesn't wait for them. Call after [`set_plugin_dirs`]: grammars and theme are
+/// built once, from whatever plugin folders are known then.
 pub fn warm() {
     std::thread::spawn(|| {
         let start = std::time::Instant::now();
