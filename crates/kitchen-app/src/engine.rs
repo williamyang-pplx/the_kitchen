@@ -873,6 +873,25 @@ impl Engine {
         self.select_tab(&next);
     }
 
+    /// Tab-strip drag: move tab `tab_id` to insertion slot `to` (0..=len, in
+    /// the current order of its workspace), then persist every position.
+    pub fn move_tab(&self, tab_id: &str, to: usize) -> Result<()> {
+        let order = {
+            let mut st = self.state();
+            let w = st.workspaces.iter_mut().find(|w| w.tabs.iter().any(|t| t.row.id == tab_id)).context("no such tab")?;
+            let from = w.tabs.iter().position(|t| t.row.id == tab_id).unwrap();
+            let tab = w.tabs.remove(from);
+            let to = if to > from { to - 1 } else { to };
+            w.tabs.insert(to.min(w.tabs.len()), tab);
+            for (i, t) in w.tabs.iter_mut().enumerate() {
+                t.row.position = i as i64;
+            }
+            w.tabs.iter().map(|t| (t.row.id.clone(), t.row.position)).collect::<Vec<_>>()
+        };
+        self.repaint();
+        self.db().reorder_tabs(&order)
+    }
+
     pub fn rename_tab(&self, tab_id: &str, title: &str) -> Result<()> {
         let row = {
             let mut st = self.state();
@@ -1138,5 +1157,48 @@ mod tests {
         let rows = e.db().workspaces().unwrap();
         assert_eq!(rows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["c", "a", "b", "d"]);
         assert_eq!(rows.iter().map(|w| w.pinned).collect::<Vec<_>>(), [true, false, false, false]);
+    }
+
+    #[test]
+    fn move_tabs() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_workspace(&WorkspaceRow {
+            id: "w".into(),
+            name: "w".into(),
+            host: "local".into(),
+            repo_path: "/r".into(),
+            github_slug: None,
+            default_branch: None,
+            position: 0,
+            pinned: false,
+        })
+        .unwrap();
+        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+            db.insert_tab(&TabRow {
+                id: id.to_string(),
+                workspace_id: "w".into(),
+                kind: "readonly".into(),
+                title: id.to_string(),
+                worktree: "/r".into(),
+                branch: None,
+                tmux_session: id.to_string(),
+                plan_file: None,
+                position: i as i64,
+                diff_base: None,
+            })
+            .unwrap();
+        }
+        let e = Engine::new(egui::Context::default(), db).unwrap();
+        let tabs = |e: &Engine| e.workspaces()[0].tabs.iter().map(|t| t.row.id.clone()).collect::<Vec<_>>();
+        e.move_tab("a", 3).unwrap();
+        assert_eq!(tabs(&e), ["b", "c", "a", "d"]);
+        e.move_tab("d", 0).unwrap();
+        assert_eq!(tabs(&e), ["d", "b", "c", "a"]);
+        e.move_tab("b", 4).unwrap();
+        assert_eq!(tabs(&e), ["d", "c", "a", "b"]);
+
+        // The order survives a restart.
+        let rows = e.db().tabs("w").unwrap();
+        assert_eq!(rows.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["d", "c", "a", "b"]);
     }
 }

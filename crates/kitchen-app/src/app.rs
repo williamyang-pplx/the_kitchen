@@ -589,6 +589,8 @@ impl KitchenApp {
         ui.horizontal_centered(|ui| {
             ui.add_space(6.0);
             let sel = ws.selected().map(|t| t.row.id.clone());
+            let mut rects = Vec::with_capacity(ws.tabs.len());
+            let mut drag = None;
             for (i, tab) in ws.tabs.iter().enumerate() {
                 let is_sel = sel.as_deref() == Some(&tab.row.id);
                 let (badge, badge_color) = match tab.kind() {
@@ -607,12 +609,19 @@ impl KitchenApp {
                 let btn = egui::Button::new(job)
                     .fill(if is_sel { theme::SELECTED } else { Color32::TRANSPARENT })
                     .corner_radius(5.0)
-                    .min_size(egui::vec2(0.0, 26.0));
+                    .min_size(egui::vec2(0.0, 26.0))
+                    .sense(Sense::click_and_drag());
                 let resp = ui.add(btn).on_hover_text(format!(
                     "{}\n{}",
                     tab.row.worktree,
                     tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
                 ));
+                rects.push(resp.rect);
+                if resp.dragged_by(egui::PointerButton::Primary) {
+                    drag = Some((i, false));
+                } else if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                    drag = Some((i, true));
+                }
                 if resp.clicked_by(egui::PointerButton::Primary) {
                     self.engine.select_tab(&tab.row.id);
                     self.focus = Focus::Terminal;
@@ -620,6 +629,9 @@ impl KitchenApp {
                 if resp.middle_clicked() {
                     self.dialog = Some(Dialog::confirm_close(tab));
                 }
+            }
+            if let Some((from, released)) = drag {
+                self.tab_drag(ui, ws, &rects, from, released);
             }
             for p in &ws.pending {
                 let color = if p.kind == TabKind::Edit { theme::GREEN } else { theme::CYAN };
@@ -653,6 +665,29 @@ impl KitchenApp {
                 }
             });
         });
+    }
+
+    /// Drag-to-reorder in the tab strip: draw the drop line while dragging,
+    /// move the tab on release.
+    fn tab_drag(&mut self, ui: &Ui, ws: &Workspace, rects: &[egui::Rect], from: usize, released: bool) {
+        let Some(pointer) = ui.ctx().pointer_interact_pos() else { return };
+        let slot = rects.iter().position(|r| pointer.x < r.center().x).unwrap_or(rects.len());
+        if released {
+            if slot != from && slot != from + 1 {
+                if let Err(e) = self.engine.move_tab(&ws.tabs[from].row.id, slot) {
+                    self.engine.toast_err(format!("{e:#}"));
+                }
+            }
+            return;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let x = match rects.get(slot) {
+            Some(r) if slot > 0 => (rects[slot - 1].right() + r.left()) / 2.0,
+            Some(r) => r.left() - 2.0,
+            None => rects[rects.len() - 1].right() + 2.0,
+        };
+        let y = rects[from].y_range().shrink(2.0);
+        ui.painter().vline(x, y, egui::Stroke::new(2.0, theme::ACCENT));
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {

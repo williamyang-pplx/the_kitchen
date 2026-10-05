@@ -296,6 +296,16 @@ impl Db {
         Ok(())
     }
 
+    /// Persist a new tab-strip order: each tab's position, atomically.
+    pub fn reorder_tabs(&self, order: &[(String, i64)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, position) in order {
+            tx.execute("UPDATE tabs SET position = ?2 WHERE id = ?1", params![id, position])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_tab(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM tabs WHERE id = ?1", [id])?;
         Ok(())
