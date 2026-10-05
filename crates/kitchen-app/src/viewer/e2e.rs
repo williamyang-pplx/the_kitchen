@@ -413,7 +413,7 @@ fn e2e_fast_tabs() {
         r.check(out.as_deref() == Some("") && secs < 2.5, format!("edit tab {name:?} clean, status {secs:.2}s"));
         edits.push(row);
     }
-    r.check(sh(&host, &format!("grep -cxF .kitchen/ \"$(git -C {r_q} rev-parse --git-common-dir)/info/exclude\"")).as_deref() == Some("1"), ".kitchen/ excluded exactly once");
+    r.check(sh(&host, &format!("grep -cxF .kitchen/ \"$(git -C {r_q} rev-parse --path-format=absolute --git-common-dir)/info/exclude\"")).as_deref() == Some("1"), ".kitchen/ excluded exactly once");
 
     // 5. Re-opening the PR link: same tab, no move, selected again.
     if let (Some(t), Some(e)) = (&pr_tab, edits.first()) {
@@ -642,7 +642,7 @@ fn e2e_fast_tabs() {
     // Nothing of ours left behind.
     let left = sh(&host, &format!("git -C {r_q} worktree list | grep -c -e kt-e2e -e kitchen-ro-pr-{n} ; git -C {r_q} branch --list '*kt-e2e*' | wc -l; ls -d {p}/*kt-e2e* 2>/dev/null | wc -l; git -C {r_q} for-each-ref refs/kt-e2e refs/kitchen/pr/{n} | wc -l", n = env.pr, p = q(repo.parent_dir())));
     r.check(left.as_deref().is_some_and(|l| l.split_whitespace().all(|n| n == "0")), format!("cleanup left nothing ({left:?})"));
-    let locks = sh(&host, &format!("for d in \"$(git -C {r_q} rev-parse --git-common-dir)\"/worktrees/*; do [ -e \"$d/locked\" ] && echo \"$d\"; done; true"));
+    let locks = sh(&host, &format!("for d in \"$(git -C {r_q} rev-parse --path-format=absolute --git-common-dir)\"/worktrees/*; do [ -e \"$d/locked\" ] && echo \"$d\"; done; true"));
     r.check(locks.as_deref() == Some(""), format!("no worktree locks left ({locks:?})"));
     r.check(head(&host, &ro_path) == origin_head(&host, &env.repo, &base), "shared read-only worktree left at origin/<base>");
     r.finish();
