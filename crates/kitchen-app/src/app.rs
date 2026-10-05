@@ -16,6 +16,9 @@ use crate::terminal::{TermSession, TerminalView};
 use crate::theme;
 use crate::ui::dialogs::{Dialog, DialogOutcome};
 
+/// Height of the macOS title bar the window draws under.
+const TITLEBAR_HEIGHT: f32 = 28.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     Terminal,
@@ -576,6 +579,18 @@ impl KitchenApp {
         ui.painter().hline(x, y, egui::Stroke::new(2.0, theme::ACCENT));
     }
 
+    /// The strip behind the transparent macOS title bar: the window title,
+    /// and dragging it moves the window.
+    fn titlebar(&mut self, ui: &mut Ui) {
+        let rect = ui.max_rect();
+        let resp = ui.interact(rect, ui.id().with("titlebar"), Sense::click_and_drag());
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "the kitchen", theme::ui_font_semibold(12.0), theme::MUTED);
+        ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, theme::BORDER));
+    }
+
     fn footer(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
@@ -826,6 +841,10 @@ impl eframe::App for KitchenApp {
         let ws = self.engine.selected_workspace();
         let tab = ws.as_ref().and_then(|w| w.selected().cloned());
 
+        egui::Panel::top("titlebar")
+            .exact_size(TITLEBAR_HEIGHT)
+            .frame(egui::Frame::NONE.fill(theme::SIDEBAR))
+            .show(ui, |ui| self.titlebar(ui));
         egui::Panel::left("workspaces")
             .exact_size(236.0)
             .resizable(false)

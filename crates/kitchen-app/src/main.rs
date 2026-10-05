@@ -25,6 +25,11 @@ fn main() -> eframe::Result {
             .with_title("the kitchen")
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([800.0, 480.0])
+            // Draw under a transparent title bar so it takes the app's dark
+            // colors instead of the light system one; app.rs paints it.
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon-256.png")).unwrap_or_default()),
         // No default macOS menu: its ⌘H (Hide) and ⌘Q items would swallow
         // those chords before the kitchen sees them. ⌘Q is handled in keymap.rs.
