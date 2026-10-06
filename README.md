@@ -99,7 +99,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘Enter | submit comment (plan: send comments to agent) |
 | ⌘D | workspace dashboard; in a focused side panel: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |
-| ⌘. | open the file viewer; close the side panel if one is open |
+| ⌘. | open the file viewer; close the side panel if one is open; in a focused viewer (or plan): hide / show the terminal, so the panel fills the tab (⌥H and ⌘` also bring it back) |
 | ⌘C / ⌘V | copy / paste |
 
 ## Layout

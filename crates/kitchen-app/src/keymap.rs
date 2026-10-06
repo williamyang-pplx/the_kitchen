@@ -6,7 +6,8 @@
 //! (⌘E ⌘I ⌘W ⌘1-9 ⌘H/L) work in the terminal, panel keys (⌘M ⌘O ⌘Enter)
 //! in a focused side panel, ⌘P in a focused viewer; elsewhere they are
 //! swallowed. The rest is global; ⌘D toggles diff in a focused side panel
-//! and the workspace dashboard elsewhere.
+//! and the workspace dashboard elsewhere, and ⌘. hides the other pane: the
+//! side panel from the terminal, the terminal from a focused side panel.
 //!
 //! | keys        | action                                        |
 //! |-------------|-----------------------------------------------|
@@ -30,7 +31,7 @@
 //! | ⌘Enter      | submit comment (plan: send comments to agent) |
 //! | ⌘D          | dashboard (focused side panel: diff / plain)  |
 //! | ⌘O          | toggle outline (collapsed) mode               |
-//! | ⌘.          | open the file viewer / close the side panel   |
+//! | ⌘.          | open the file viewer / close the side panel (focused side panel: hide / show the terminal) |
 //! | ⌘Q          | quit                                          |
 //! | ⌘C / ⌘V     | copy / paste (handled by the focused widget)  |
 
