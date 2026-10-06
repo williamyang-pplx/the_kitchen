@@ -1028,8 +1028,16 @@ mod tests {
         let edit = |head: &str| val(serde_json::json!({ "kind": "edit", "head": head, "branch": "b" }));
         let pr = |n: u64, state: &str, oid: &str| serde_json::json!({ "number": n, "state": state, "headRefOid": oid });
         let judge = |wt: mlua::Value, prs: serde_json::Value| to_json(verdict.call((wt, val(prs))).unwrap());
+        let judge_on_default = |wt: mlua::Value, prs: serde_json::Value| to_json(verdict.call((wt, val(prs), true)).unwrap());
         let v = judge(edit("abc"), serde_json::json!([]));
         assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("no PR")));
+        // Merged without a PR, or after its PR closed: HEAD is on origin/<default>.
+        let v = judge_on_default(edit("abc"), serde_json::json!([]));
+        assert_eq!((v["action"].as_str(), v["why"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some("on the default branch"), Some(true)));
+        let v = judge_on_default(edit("def"), serde_json::json!([pr(3, "CLOSED", "abc")]));
+        assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some(true)));
+        let v = judge_on_default(edit("abc"), serde_json::json!([pr(2, "OPEN", "abc")]));
+        assert_eq!(v["action"].as_str(), Some("keep"), "an open PR wins");
         let v = judge(edit("abc"), serde_json::json!([pr(1, "MERGED", "abc"), pr(2, "OPEN", "abc")]));
         assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("PR #2 open")));
         let v = judge(edit("def"), serde_json::json!([pr(3, "MERGED", "abc")]));
@@ -1045,6 +1053,8 @@ mod tests {
         assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("local commits not on PR #12")));
         let v = judge(review(), serde_json::json!([{ "number": 12, "state": "OPEN" }]));
         assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("PR #12 open")));
+        let v = judge_on_default(review(), serde_json::json!([pr(12, "CLOSED", "abc")]));
+        assert_eq!(v["action"].as_str(), Some("keep"), "a detached PR worktree goes only by its PR");
 
         let del: String = m.get::<mlua::Function>("delete_branch_sh").unwrap().call(("william/x'y", "abc")).unwrap();
         assert_eq!(del, r#"[ "$(git rev-parse --verify -q 'refs/heads/william/x'\''y')" = 'abc' ] && git branch -D 'william/x'\''y'"#);

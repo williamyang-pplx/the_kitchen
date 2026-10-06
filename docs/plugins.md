@@ -37,8 +37,8 @@ Run commands from **⌘⇧P** (command palette), their keys, or
 Examples in the repo's `plugins/`: `ruff` (Python lint), `python` (`gd`/`gr`
 via the ty language server), `github` (PR links in ⌘T, PR review comments),
 `todo` (highlights), `hello` (commands, keys, jobs), `prune-worktrees` (a
-`kitchen.every` timer; removes edit and PR review worktrees of merged/closed
-PRs) and `dashboard` (worktrees, disk and RAM on the dashboard). `install.sh`
+`kitchen.every` timer; removes worktrees of merged/closed PRs, and of
+branches already on the default branch) and `dashboard` (worktrees, disk and RAM on the dashboard). `install.sh`
 links `ruff`, `python`, `todo`, `github`, `prune-worktrees` and `dashboard`
 into `~/.kitchen/plugins/`.
 

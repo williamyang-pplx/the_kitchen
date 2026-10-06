@@ -1,14 +1,16 @@
--- prune-worktrees: every interval_minutes, remove the worktrees of PRs that
--- are done.
+-- prune-worktrees: every interval_minutes, remove the worktrees of work that
+-- is done.
 --
--- Two kinds go: worktrees on a branch whose PRs are all merged/closed, and
+-- Three kinds go: worktrees on a branch whose PRs are all merged/closed,
 -- detached PR worktrees (<repo>-kitchen-pr-<N>, opened by the github plugin
--- when the PR's branch wasn't usable) whose PR #N is merged/closed. Neither
--- may have an open tab.
+-- when the PR's branch wasn't usable) whose PR #N is merged/closed, and
+-- worktrees on a branch with no open PR whose HEAD is already on
+-- origin/<default> (merged without a PR). None may have an open tab.
 --
 -- Per workspace (on its own host): `kitchenctl worktree list` says which
 -- worktrees have no tab; gh (on the mac) says whether their PRs are done and
--- which commit GitHub has. A worktree goes only when its HEAD is that commit. `kitchenctl worktree remove` (never
+-- which commit GitHub has. A worktree goes only when its HEAD is that commit
+-- or is on origin/<default>. `kitchenctl worktree remove` (never
 -- --force) re-checks the tab and refuses dirty worktrees at removal time.
 -- Anything doubtful is kept and logged.
 
@@ -50,13 +52,20 @@ function M.candidates(list, tabs)
   return out
 end
 
--- What to do with candidate `wt` given its PRs: the branch's PR list for
--- kind "edit", { PR #number } for kind "pr".
--- Returns { action = "remove" | "keep", why, pr, delete_branch }.
-function M.verdict(wt, prs)
-  if #prs == 0 then
-    return { action = "keep", why = "no PR" }
+function M.has_open(prs)
+  for _, pr in ipairs(prs) do
+    if pr.state == "OPEN" then
+      return true
+    end
   end
+  return false
+end
+
+-- What to do with candidate `wt` given its PRs: the branch's PR list for
+-- kind "edit", { PR #number } for kind "pr". `on_default`: wt.head is on
+-- origin/<default> (only looked up when no PR is open).
+-- Returns { action = "remove" | "keep", why, pr, delete_branch }.
+function M.verdict(wt, prs, on_default)
   local newest
   for _, pr in ipairs(prs) do
     if pr.state == "OPEN" then
@@ -66,17 +75,23 @@ function M.verdict(wt, prs)
       newest = pr
     end
   end
-  local done = "PR #" .. newest.number .. " " .. newest.state:lower()
-  if not newest.headRefOid or wt.head ~= newest.headRefOid then
-    return { action = "keep", why = "local commits not on PR #" .. newest.number, pr = newest }
+  if newest and newest.headRefOid and wt.head == newest.headRefOid then
+    -- (a detached PR worktree has no branch to delete)
+    local done = "PR #" .. newest.number .. " " .. newest.state:lower()
+    return { action = "remove", why = done, pr = newest, delete_branch = wt.kind == "edit" and newest.state == "MERGED" }
   end
-  -- (a detached PR worktree has no branch to delete)
-  return { action = "remove", why = done, pr = newest, delete_branch = wt.kind == "edit" and newest.state == "MERGED" }
+  if on_default and wt.kind == "edit" then
+    return { action = "remove", why = "on the default branch", pr = newest, delete_branch = true }
+  end
+  if not newest then
+    return { action = "keep", why = "no PR" }
+  end
+  return { action = "keep", why = "local commits not on PR #" .. newest.number, pr = newest }
 end
 
 -- Shell line that deletes `branch` only while its tip is still `oid` (the
--- merged PR's head, so the work is on GitHub). `-D` because `-d` refuses
--- squash-merged branches.
+-- worktree's HEAD, which is a merged PR's head or on the default branch, so
+-- the work is on GitHub). `-D` because `-d` refuses squash-merged branches.
 function M.delete_branch_sh(branch, oid)
   return '[ "$(git rev-parse --verify -q ' .. q("refs/heads/" .. branch) .. ')" = ' .. q(oid) .. " ] && git branch -D " .. q(branch)
 end
@@ -117,6 +132,12 @@ local function prs_for(slug, wt)
   return v
 end
 
+-- Whether commit `oid` is on origin/<default> in `ws`'s repo.
+local function on_default(ws, oid)
+  local ref = "refs/remotes/origin/" .. (ws.default_branch or "main")
+  return kitchen.run_sync({ host = ws.host, cwd = ws.repo_path, cmd = { "git", "merge-base", "--is-ancestor", oid, ref } }).code == 0
+end
+
 -- One pass over workspace `ws`; returns the removed worktree paths and how many it kept.
 local function prune_workspace(ws)
   local log = function(...)
@@ -135,7 +156,11 @@ local function prune_workspace(ws)
   local removed, kept = {}, 0
   for _, wt in ipairs(M.candidates(list, ws.tabs)) do
     local prs, err = prs_for(ws.github_slug, wt)
-    local v = prs and M.verdict(wt, prs) or { action = "keep", why = err }
+    local v = { action = "keep", why = err }
+    if prs then
+      local merged = wt.kind == "edit" and wt.branch ~= ws.default_branch and not M.has_open(prs) and on_default(ws, wt.head)
+      v = M.verdict(wt, prs, merged)
+    end
     if v.action == "remove" then
       -- worktree.remove doesn't re-check HEAD: a commit made since the list must not be lost.
       local head = kitchen.run_sync({ host = ws.host, cmd = { "git", "-C", wt.path, "rev-parse", "HEAD" } })
@@ -159,7 +184,7 @@ local function prune_workspace(ws)
         log("removed", wt.path, "(" .. v.why .. ")")
         table.insert(removed, wt.path)
         if v.delete_branch then
-          local del = kitchen.run_sync({ host = ws.host, cwd = ws.repo_path, sh = M.delete_branch_sh(wt.branch, v.pr.headRefOid) })
+          local del = kitchen.run_sync({ host = ws.host, cwd = ws.repo_path, sh = M.delete_branch_sh(wt.branch, wt.head) })
           log(del.code == 0 and "deleted branch" or "kept branch", wt.branch, del.code == 0 and "" or why(del))
         end
       end

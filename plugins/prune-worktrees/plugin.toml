@@ -1,6 +1,6 @@
 name = "prune-worktrees"
 version = "0.1.0"
-description = "Every so often, remove clean worktrees whose PR is merged or closed (no open tab, no unpushed commits)"
+description = "Every so often, remove clean worktrees whose PR is merged or closed, or whose branch is already on the default branch (no open tab, no unpushed commits)"
 api = 7
 
 [config]
