@@ -21,7 +21,7 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   folders locked (no file can be added, removed or renamed).
 - File viewer. With changes (a PR tab, or an edit tab after the agent's
   edits, followed live) ⌘. opens straight on the first changed file's diff,
-  next to a tree of just the changed files: j/k in the tree, or ⌘J/⌘K and
+  next to a tree of just the changed files: j/k in the tree, or ⌘⇧J/⌘⇧K and
   `]c`/`[c` in the code, step through them; `a` in the list switches to the
   whole repo, ⌘B hides the list. In PR tabs the PR's review comments show
   under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
@@ -70,7 +70,7 @@ the next workspace setup.
 ## Keybindings
 
 Every app shortcut is ⌘+key, and acts on the focused pane: tab keys (⌘E ⌘I
-⌘W ⌘1-9 ⌘H/L) only when the terminal is focused, panel keys (⌘M ⌘O
+⌘W) only when the terminal is focused, panel keys (⌘M ⌘O
 ⌘Enter) only in a focused side panel; the rest are global (⌘D: diff in a
 focused side panel, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
 keys (`gd` definition, `gr` references, `Ctrl-o` back, `]d` next diagnostic, …).
@@ -80,9 +80,11 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | keys | action |
 |---|---|
 | ⌘N | new workspace |
-| ⌘J / ⌘K | next / previous workspace; in a focused viewer: next / previous changed file |
+| ⌘J / ⌘K | next / previous workspace |
 | ⌘1 … ⌘9 | go to tab N of the current workspace |
-| ⌘H / ⌘L | previous / next tab; in a focused viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
+| ⌘H / ⌘L | previous / next tab |
+| ⌘⇧J / ⌘⇧K | in a focused viewer: next / previous changed file |
+| ⌘⇧H / ⌘⇧L | in a focused viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
 | ⌘E | new edit (read/write) tab — own worktree |
 | ⌘I | new read-only tab: paste a PR link, or empty for latest main |
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |

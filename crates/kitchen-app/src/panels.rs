@@ -21,12 +21,12 @@ pub enum PanelCmd {
     FilePicker,
     /// Re-read files / refresh remote state.
     Reload,
-    /// ⌘H / ⌘L while the viewer is focused: its file list / its code.
+    /// ⌘⇧H / ⌘⇧L while the viewer is focused: its file list / its code.
     FocusList,
     FocusCode,
     /// ⌘B: show / hide the viewer's file list.
     ToggleFiles,
-    /// ⌘J / ⌘K while the viewer is focused: next / previous changed file.
+    /// ⌘⇧J / ⌘⇧K while the viewer is focused: next / previous changed file.
     NextFile,
     PrevFile,
     /// Palette: pick among the current file's plugin diagnostics.

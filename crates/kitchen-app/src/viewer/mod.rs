@@ -138,7 +138,7 @@ pub struct Viewer {
     select_entry: Option<String>,
     /// The first file list decided where the viewer opens.
     routed: bool,
-    /// Keyboard is in the file list (⌘H), not the code (⌘L).
+    /// Keyboard is in the file list (⌘⇧H), not the code (⌘⇧L).
     list_focus: bool,
     /// Keyboard cursor in the file list: changed files, then folder entries.
     list_cursor: usize,
@@ -607,7 +607,7 @@ impl Viewer {
         self.goto_loc(loc);
     }
 
-    /// ⌘J / ⌘K, `]f` / `[f`: the next / previous changed file (wrapping).
+    /// ⌘⇧J / ⌘⇧K, `]f` / `[f`: the next / previous changed file (wrapping).
     fn step_file(&mut self, delta: isize) {
         let n = self.changed.len();
         if n == 0 {
@@ -1125,7 +1125,7 @@ impl Viewer {
                 let pos = format!("{}  L{}:{}", self.vim.pending_display(), self.current_source_line().unwrap_or(0), self.vim.col + 1);
                 ui.label(RichText::new(pos).monospace().size(11.0).color(theme::DIM));
                 if !busy {
-                    let hint = if self.browsing { "j/k move · Enter open · - up · / search · ⌘J next changed file · ⌘P find" } else { "⌘J/⌘K file · ]c/[c change · ⌘M comment · gd def · gr refs · ^o back · - folder · ⌘D ⌘O ⌘B" };
+                    let hint = if self.browsing { "j/k move · Enter open · - up · / search · ⌘⇧J next changed file · ⌘P find" } else { "⌘⇧J/K file · ]c/[c change · ⌘M comment · gd def · gr refs · ^o back · - folder · ⌘D ⌘O ⌘B" };
                     ui.label(RichText::new(hint).size(10.5).color(theme::DIM));
                 }
             });
@@ -1147,7 +1147,7 @@ impl Viewer {
         !self.list_all && !self.changed.is_empty()
     }
 
-    /// Where the list cursor lands on ⌘H: the open file, else the first folder entry.
+    /// Where the list cursor lands on ⌘⇧H: the open file, else the first folder entry.
     fn list_home(&self) -> usize {
         let entries = self.list_entries();
         let pr = self.changed.len();
@@ -1770,7 +1770,7 @@ mod tests {
     }
 
     /// A tab with changes opens on the first changed file's diff; the tree
-    /// list, ⌘J/⌘K, `[c` and ⌘B step through them without browsing folders.
+    /// list, ⌘⇧J/⌘⇧K, `[c` and ⌘B step through them without browsing folders.
     #[test]
     fn changed_files_flow() {
         let tmp = std::env::temp_dir().join(format!("kt-changes-{}", kitchen_core::util::new_id()));
@@ -1815,7 +1815,7 @@ mod tests {
         assert!(!v.browsing && v.diff && v.tree_mode());
         assert_eq!(v.current.as_deref(), Some("src/deep/er/b.rs"), "opens on the first changed file");
         assert!(v.doc.hunk_starts().contains(&v.vim.line), "cursor on its first change");
-        // ⌘J: next changed file, cursor on its first change (line 2 of a.rs).
+        // ⌘⇧J: next changed file, cursor on its first change (line 2 of a.rs).
         v.command(PanelCmd::NextFile, &engine);
         settle(&mut v);
         assert_eq!(v.current.as_deref(), Some("src/a.rs"));

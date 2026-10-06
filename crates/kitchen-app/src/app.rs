@@ -232,9 +232,6 @@ impl KitchenApp {
         let tab = ws.as_ref().and_then(|w| w.selected().cloned());
         match action {
             Action::NewWorkspace => self.dialog = Some(Dialog::new_workspace()),
-            // Inside a focused viewer, ⌘J / ⌘K step through the changed files.
-            Action::NextWorkspace if self.viewer_focused() => self.side_command(PanelCmd::NextFile),
-            Action::PrevWorkspace if self.viewer_focused() => self.side_command(PanelCmd::PrevFile),
             Action::NextWorkspace => engine.cycle_workspace(1),
             Action::PrevWorkspace => engine.cycle_workspace(-1),
             Action::GoToTab(n) => {
@@ -242,9 +239,10 @@ impl KitchenApp {
                 self.hide_dashboard();
                 self.focus = Focus::Terminal;
             }
-            // Inside a focused viewer, ⌘H / ⌘L move between its file list and code.
-            Action::PrevTab if self.viewer_focused() => self.side_command(PanelCmd::FocusList),
-            Action::NextTab if self.viewer_focused() => self.side_command(PanelCmd::FocusCode),
+            Action::FocusFileList => self.side_command(PanelCmd::FocusList),
+            Action::FocusCode => self.side_command(PanelCmd::FocusCode),
+            Action::NextFile => self.side_command(PanelCmd::NextFile),
+            Action::PrevFile => self.side_command(PanelCmd::PrevFile),
             Action::Palette => self.open_palette(),
             Action::Plugin(_) => {} // resolved in `ui` against the registry snapshot
             Action::PrevTab => {
@@ -798,8 +796,8 @@ impl KitchenApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(match (self.focus, self.side()) {
-                        (Focus::Side, Some(SideKind::Viewer)) => "⌘H/L files ↔ code · ⌘J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘. terminal · ⌘D diff · ⌘O outline · ⌥H/L pane",
-                        (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘J/K workspace",
+                        (Focus::Side, Some(SideKind::Viewer)) => "⌘⇧H/L files ↔ code · ⌘⇧J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘. terminal · ⌘D diff · ⌘O outline · ⌥H/L pane",
+                        (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘H/L tab · ⌘J/K workspace",
                         _ => "⌘H/L or ⌘1-9 tab · ⌘E edit · ⌘I read-only · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
                     })
                         .size(10.5)
@@ -1134,14 +1132,14 @@ mod tests {
             step(&mut app, vec![]);
         }
         assert_eq!(app.focus, Focus::Terminal);
-        // ⌥L: the viewer; wait for the file list; ⌘H: into the list.
+        // ⌥L: the viewer; wait for the file list; ⌘⇧H: into the list.
         step(&mut app, key(Key::L, Modifiers::ALT));
         assert_eq!(app.focus, Focus::Side);
         for _ in 0..200 {
             step(&mut app, vec![]);
             std::thread::sleep(Duration::from_millis(10));
         }
-        step(&mut app, key(Key::H, Modifiers::COMMAND));
+        step(&mut app, key(Key::H, Modifiers::COMMAND | Modifiers::SHIFT));
         step(&mut app, vec![]);
         // Root rows: .agents/ aster/ README.md — gg, then Enter into .agents/.
         for c in ["-", "-", "g", "g"] {
@@ -1200,6 +1198,12 @@ mod tests {
         engine.select_tab_index(1);
         step(&mut app, vec![]);
         assert_eq!(app.side(), Some(SideKind::Viewer));
+        // Tab keys work from the focused viewer too: ⌘L to t2, ⌘1 back.
+        step(&mut app, key(Key::L, Modifiers::ALT));
+        step(&mut app, key(Key::L, Modifiers::COMMAND));
+        assert_eq!(app.selected_tab_id().as_deref(), Some("t2"));
+        step(&mut app, key(Key::Num1, Modifiers::COMMAND));
+        assert_eq!(app.selected_tab_id().as_deref(), Some("t1"));
         // ⌘. in the focused viewer hides t1's terminal; the keyboard stays there.
         step(&mut app, key(Key::L, Modifiers::ALT));
         step(&mut app, key(Key::Period, Modifiers::COMMAND));

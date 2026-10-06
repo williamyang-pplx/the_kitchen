@@ -1,7 +1,7 @@
 //! The changed files as a tree, GitHub style: folders first, then files,
 //! both sorted, and folder chains with a single subfolder merged into one
 //! row (`crates/app/src/`). The viewer keeps its changed files in this
-//! order, so the list, `⌘J`/`⌘K` and `]f`/`[f` all step the same way.
+//! order, so the list, `⌘⇧J`/`⌘⇧K` and `]f`/`[f` all step the same way.
 
 use std::collections::BTreeMap;
 

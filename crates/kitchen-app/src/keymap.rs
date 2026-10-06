@@ -3,18 +3,20 @@
 //! viewer never see these chords.
 //!
 //! Chords act on the focused pane only (see [`Action::scope`]): tab keys
-//! (⌘E ⌘I ⌘W ⌘1-9 ⌘H/L) work in the terminal, panel keys (⌘M ⌘O ⌘Enter)
-//! in a focused side panel, ⌘P in a focused viewer; elsewhere they are
-//! swallowed. The rest is global; ⌘D toggles diff in a focused side panel
+//! (⌘E ⌘I ⌘W) work in the terminal, panel keys (⌘M ⌘O ⌘Enter) in a focused
+//! side panel, ⌘P and ⌘⇧H/J/K/L in a focused viewer; elsewhere they are
+//! swallowed. Tab and workspace switching (⌘H/L ⌘1-9 ⌘J/K) work everywhere. The rest is global; ⌘D toggles diff in a focused side panel
 //! and the workspace dashboard elsewhere, and ⌘. hides the other pane: the
 //! side panel from the terminal, the terminal from a focused side panel.
 //!
 //! | keys        | action                                        |
 //! |-------------|-----------------------------------------------|
 //! | ⌘N          | new workspace                                 |
-//! | ⌘J / ⌘K     | next / previous workspace (focused viewer: changed file) |
+//! | ⌘J / ⌘K     | next / previous workspace                     |
 //! | ⌘1 … ⌘9     | go to tab N of the current workspace          |
-//! | ⌘H / ⌘L     | previous / next tab (focused viewer: files ↔ code) |
+//! | ⌘H / ⌘L     | previous / next tab                           |
+//! | ⌘⇧H / ⌘⇧L   | focused viewer: file list ↔ code              |
+//! | ⌘⇧J / ⌘⇧K   | focused viewer: next / previous changed file  |
 //! | ⌘E          | new edit (read/write) tab — own worktree      |
 //! | ⌘I          | new read-only tab (PR link, or empty = main)  |
 //! | ⌘-click     | open the path / URL under the pointer (terminal) |
@@ -49,6 +51,12 @@ pub enum Action {
     NewReadonlyTab,
     CloseTab,
     FilePicker,
+    /// Viewer: ⌘⇧H / ⌘⇧L move between its file list and code.
+    FocusFileList,
+    FocusCode,
+    /// Viewer: ⌘⇧J / ⌘⇧K step through the changed files.
+    NextFile,
+    PrevFile,
     ToggleFiles,
     OpenPlan,
     RenameTab,
@@ -82,26 +90,39 @@ pub enum Scope {
 impl Action {
     pub fn scope(self) -> Scope {
         match self {
-            Action::NewEditTab | Action::NewReadonlyTab | Action::CloseTab | Action::GoToTab(_) | Action::PrevTab | Action::NextTab => Scope::Terminal,
-            Action::Comment | Action::Submit | Action::ToggleOutline | Action::FilePicker => Scope::Side,
+            Action::NewEditTab | Action::NewReadonlyTab | Action::CloseTab => Scope::Terminal,
+            Action::Comment | Action::Submit | Action::ToggleOutline | Action::FilePicker | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile => Scope::Side,
             _ => Scope::Global,
         }
     }
 
     /// May this chord act with the given pane focused? `viewer`: the focused
-    /// side panel is the file viewer (where ⌘H/⌘L switch files ↔ code).
+    /// side panel is the file viewer.
     pub fn allowed(self, side_focused: bool, viewer: bool) -> bool {
         match self.scope() {
             Scope::Global => true,
-            Scope::Terminal => !side_focused || (viewer && matches!(self, Action::PrevTab | Action::NextTab)),
-            Scope::Side => side_focused && (viewer || !matches!(self, Action::FilePicker)),
+            Scope::Terminal => !side_focused,
+            Scope::Side => side_focused && (viewer || !self.viewer_only()),
         }
+    }
+
+    /// Side-panel keys only the file viewer has.
+    fn viewer_only(self) -> bool {
+        matches!(self, Action::FilePicker | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile)
     }
 }
 
 /// Chords that need Shift, checked before the plain ⌘ table (egui matches
 /// ⌘I against ⌘⇧I too, so the shifted chord must be consumed first).
-pub const SHIFT_BINDINGS: &[(Key, Action)] = &[(Key::I, Action::OpenPlan), (Key::R, Action::RenameWorkspace), (Key::P, Action::Palette)];
+pub const SHIFT_BINDINGS: &[(Key, Action)] = &[
+    (Key::I, Action::OpenPlan),
+    (Key::R, Action::RenameWorkspace),
+    (Key::P, Action::Palette),
+    (Key::H, Action::FocusFileList),
+    (Key::L, Action::FocusCode),
+    (Key::J, Action::NextFile),
+    (Key::K, Action::PrevFile),
+];
 
 /// Option chords (no Cmd).
 pub const ALT_BINDINGS: &[(Key, Action)] = &[(Key::H, Action::FocusLeft), (Key::L, Action::FocusRight)];
@@ -220,19 +241,19 @@ mod tests {
         assert!(Action::GoToTab(2).allowed(false, false));
         assert!(!Action::Comment.allowed(false, false));
         assert!(!Action::FilePicker.allowed(false, false));
-        // Viewer focused: panel keys yes, tab keys no — except ⌘H/⌘L (files ↔ code).
+        assert!(!Action::FocusFileList.allowed(false, false));
+        // Viewer focused: panel keys yes, tab create / close keys no.
         assert!(!Action::NewEditTab.allowed(true, true));
         assert!(!Action::NewReadonlyTab.allowed(true, true));
         assert!(!Action::CloseTab.allowed(true, true));
-        assert!(!Action::GoToTab(1).allowed(true, true));
-        assert!(Action::PrevTab.allowed(true, true) && Action::NextTab.allowed(true, true));
         assert!(Action::ToggleOutline.allowed(true, true));
-        // Plan focused: no tab keys at all.
-        assert!(!Action::NextTab.allowed(true, false));
-        assert!(Action::FilePicker.allowed(true, true) && !Action::FilePicker.allowed(true, false));
+        // Viewer-only keys are swallowed in the plan.
+        for a in [Action::FilePicker, Action::FocusFileList, Action::FocusCode, Action::NextFile, Action::PrevFile] {
+            assert!(a.allowed(true, true) && !a.allowed(true, false), "{a:?}");
+        }
         // Global keys work everywhere.
         for (side, viewer) in [(false, false), (true, true), (true, false)] {
-            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::FocusLeft, Action::FocusRight, Action::ToggleFocus, Action::ToggleViewer, Action::Quit] {
+            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::PrevWorkspace, Action::PrevTab, Action::NextTab, Action::GoToTab(3), Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::FocusLeft, Action::FocusRight, Action::ToggleFocus, Action::ToggleViewer, Action::Quit] {
                 assert!(a.allowed(side, viewer), "{a:?}");
             }
         }
@@ -275,7 +296,8 @@ mod tests {
         assert!(builtin_conflict(&Chord::parse("cmd+shift+p").unwrap()).is_some());
         assert!(builtin_conflict(&Chord::parse("alt+l").unwrap()).is_some());
         assert!(builtin_conflict(&Chord::parse("cmd+c").unwrap()).is_some());
-        assert!(builtin_conflict(&Chord::parse("cmd+shift+h").unwrap()).is_none());
+        assert!(builtin_conflict(&Chord::parse("cmd+shift+h").unwrap()).is_some());
+        assert!(builtin_conflict(&Chord::parse("cmd+shift+u").unwrap()).is_none());
     }
 
     #[test]
@@ -294,6 +316,11 @@ mod tests {
         assert_eq!(press(Key::I, cmd_shift), vec![Action::OpenPlan]);
         assert_eq!(press(Key::R, cmd_shift), vec![Action::RenameWorkspace]);
         assert_eq!(press(Key::H, Modifiers::COMMAND), vec![Action::PrevTab]);
+        assert_eq!(press(Key::H, cmd_shift), vec![Action::FocusFileList]);
+        assert_eq!(press(Key::L, cmd_shift), vec![Action::FocusCode]);
+        assert_eq!(press(Key::J, cmd_shift), vec![Action::NextFile]);
+        assert_eq!(press(Key::K, cmd_shift), vec![Action::PrevFile]);
+        assert_eq!(press(Key::J, Modifiers::COMMAND), vec![Action::NextWorkspace]);
         assert_eq!(press(Key::L, Modifiers::COMMAND), vec![Action::NextTab]);
         assert_eq!(press(Key::I, Modifiers::COMMAND), vec![Action::NewReadonlyTab]);
         assert_eq!(press(Key::R, Modifiers::COMMAND), vec![Action::RenameTab]);
