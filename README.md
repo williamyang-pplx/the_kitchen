@@ -6,7 +6,8 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
 - **Workspaces** in a vertical sidebar. Each is a repo on this mac or on a
   Perplexity devbox (any ssh alias). Setting up a devbox workspace pulls the
   latest dotfiles from `github.com/williamyang-pplx/dotfiles`, links skills
-  from it, and installs `kitchenctl`. Drag workspaces to reorder them;
+  from it, points `~/.bazelrc` at its `bazelrc` (the shared Bazel remote
+  cache, on the mac too), and installs `kitchenctl`. Drag workspaces to reorder them;
   right-click → Pin to top keeps one above the rest.
 - **Tabs**: one PR each, in a fresh worktree + branch cut from
   `origin/<default>` as last fetched (a background fetch every 5 minutes and

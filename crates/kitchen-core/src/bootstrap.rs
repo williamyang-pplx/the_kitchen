@@ -1,8 +1,9 @@
 //! Host setup run when a workspace is created (and once per app start):
 //!
 //! * devbox: pull (or clone) the dotfiles repo from GitHub, relink skills,
-//!   install the `kitchenctl` binary, probe the tools the kitchen needs;
-//! * mac: relink skills from the local dotfiles checkout.
+//!   import its `bazelrc`, install the `kitchenctl` binary, probe the tools
+//!   the kitchen needs;
+//! * mac: relink skills and import `bazelrc` from the local dotfiles checkout.
 //!
 //! Skills are always symlinks into the dotfiles checkout, one per skill,
 //! mirroring the dotfiles `install.sh` layout (`skills/<category>/<skill>`).
@@ -43,6 +44,7 @@ pub fn bootstrap_host(host: &Host, opts: &Options) -> Result<Report> {
         }
     };
     link_skills(host, &dotfiles, &mut report)?;
+    import_bazelrc(host, &dotfiles, &mut report)?;
     probe_tools(host, &mut report)?;
     if host.is_local() {
         // An isolated test kitchen (KITCHEN_STATE_DIR) must not repoint the real install.
@@ -137,6 +139,21 @@ echo "LINKED $n""#,
     Ok(())
 }
 
+/// Make `~/.bazelrc` `try-import` the dotfiles `bazelrc` (the shared remote
+/// cache), as the dotfiles `install.sh` does, so every repo and worktree on
+/// the host gets it. Appends the line once; the rest of the file is left alone.
+pub fn import_bazelrc(host: &Host, dotfiles: &str, report: &mut Report) -> Result<()> {
+    let line = shell_quote(&format!("try-import {dotfiles}/bazelrc"));
+    let script = format!(
+        "grep -qxF {line} \"$HOME/.bazelrc\" 2>/dev/null || \
+         printf '\\n# Added by the kitchen: shared Bazel settings (remote cache).\\n%s\\n' {line} >> \"$HOME/.bazelrc\" \
+         || echo 'WARN could not update ~/.bazelrc'"
+    );
+    let out = host.sh_ok(&script, None).context("import bazelrc")?;
+    collect_warnings(&out, report);
+    Ok(())
+}
+
 fn probe_tools(host: &Host, report: &mut Report) -> Result<()> {
     let all: Vec<&str> = REQUIRED_TOOLS.iter().chain(OPTIONAL_TOOLS).copied().collect();
     let script = format!("for t in {}; do command -v \"$t\" >/dev/null 2>&1 || echo \"MISSING $t\"; done; true", all.join(" "));
@@ -214,6 +231,9 @@ pub fn install_cli(host: &Host) -> Result<bool> {
 mod tests {
     use super::*;
 
+    /// Held by tests that point HOME at a temp dir.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn links_skills_idempotently() {
         let tmp = tempfile::tempdir().unwrap();
@@ -232,8 +252,9 @@ mod tests {
         let dot_s = dot.display().to_string();
         let run = || {
             let mut r = Report::default();
+            let _home = HOME_LOCK.lock().unwrap();
             let old = std::env::var("HOME").unwrap();
-            // SAFETY: test-only; tests in this module do not race on HOME.
+            // SAFETY: test-only; HOME_LOCK serializes the tests that set HOME.
             unsafe { std::env::set_var("HOME", &home) };
             let res = link_skills(&script_host, &dot_s, &mut r);
             unsafe { std::env::set_var("HOME", old) };
@@ -248,6 +269,25 @@ mod tests {
         assert_eq!(link, dot.join("skills/cat/alpha"));
         assert!(r1.warnings.iter().any(|w| w.contains("blocker")), "{:?}", r1.warnings);
         assert!(!home.join(".claude/skills/not-a-skill").exists());
+    }
+
+    #[test]
+    fn imports_bazelrc_once_keeping_existing_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::write(home.join(".bazelrc"), "startup --max_idle_secs=600").unwrap();
+        let _home = HOME_LOCK.lock().unwrap();
+        let old = std::env::var("HOME").unwrap();
+        // SAFETY: test-only; HOME_LOCK serializes the tests that set HOME.
+        unsafe { std::env::set_var("HOME", home) };
+        let mut r = Report::default();
+        let res = import_bazelrc(&Host::Local, "/dot files", &mut r).and_then(|_| import_bazelrc(&Host::Local, "/dot files", &mut r));
+        unsafe { std::env::set_var("HOME", old) };
+        res.unwrap();
+        let rc = std::fs::read_to_string(home.join(".bazelrc")).unwrap();
+        assert!(rc.starts_with("startup --max_idle_secs=600\n"), "{rc}");
+        assert_eq!(rc.matches("try-import /dot files/bazelrc\n").count(), 1, "{rc}");
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     #[test]
