@@ -32,7 +32,7 @@ use keys::Chord;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 7;
+pub const API_LEVEL: u32 = 8;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘T), `comment` (a viewer comment to post),
 /// `dashboard` (a workspace's dashboard was shown or hidden).
@@ -908,7 +908,7 @@ mod tests {
     fn github_plugin_turns_links_into_tab_specs() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
-        lua.load("kitchen = { on = function() end, command = function() end, config = {}, json = {} }").exec().unwrap();
+        lua.load("kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {} }").exec().unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let parse: mlua::Function = m.get("parse").unwrap();
@@ -983,6 +983,92 @@ mod tests {
         let file_level = to_json(post.call(("o/r", 5, ev, "abc", true)).unwrap());
         assert_eq!(file_level[9], "subject_type=file");
         assert_eq!(file_level[11], "body=**L12**: `x = 1`\n\nhm");
+    }
+
+    /// github: any tab is the PR of its current branch, for comments and
+    /// for the diff toggle (git and gh faked).
+    #[test]
+    fn github_plugin_follows_the_tab_branch() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        let decode = lua
+            .create_function(|lua, s: String| lua.to_value(&serde_json::from_str::<serde_json::Value>(&s).map_err(mlua::Error::external)?))
+            .unwrap();
+        lua.globals().set("DECODE", decode).unwrap();
+        lua.load(
+            r#"
+            calls = { notes = {}, posts = {}, fetches = {}, shown = {} }
+            state = { branch = "al/top", prs = { ["al/top"] = '{"number":12,"baseRefName":"al/bottom","state":"OPEN"}' } }
+            handlers, commands = {}, {}
+            local function ok(out) return { code = 0, stdout = out or "", stderr = "" } end
+            kitchen = {
+              config = {}, json = { decode = DECODE },
+              on = function(e, f) handlers[e] = f end,
+              command = function(n, f) commands[n] = f end,
+              keymap = function() end,
+              notify = function(m) table.insert(calls.notes, m) end,
+              comments = {
+                set = function(file, items) calls.shown[file.abs] = #items end,
+                clear = function(file) calls.shown[file.abs] = nil end,
+              },
+              set_diff_base = function(_, base) state.diff_base = base end,
+              workspaces = function()
+                return { { id = "w", host = "local", github_slug = "o/r", default_branch = "main",
+                  tabs = { { id = "t", worktree = "/r/air-tab-1", diff_base = state.diff_base } } } }
+              end,
+              run = function(spec, cb)
+                local cmd = spec.cmd or {}
+                if cmd[2] == "symbolic-ref" then
+                  cb(state.branch and ok(state.branch .. "\n") or { code = 1, stdout = "", stderr = "" })
+                elseif cmd[2] == "fetch" then
+                  table.insert(calls.fetches, cmd[#cmd]); cb(ok())
+                elseif cmd[2] == "rev-parse" then
+                  cb(ok("abc\n"))
+                elseif spec.sh:find("'pr' 'view'") then
+                  local sel = spec.sh:match("'pr' 'view' '([^']+)'")
+                  cb(state.prs[sel] and ok(state.prs[sel]) or { code = 1, stdout = "", stderr = 'no pull requests found for branch "' .. sel .. '"' })
+                elseif spec.sh:find("'%-%-paginate'") then
+                  cb(ok('{"id":1,"path":"a.py","line":3,"user":"al","body":"x","created_at":"2026"}\n'))
+                elseif spec.sh:find("'POST'") then
+                  table.insert(calls.posts, spec.sh:match("'repos/([^']+)'")); cb(ok("{}"))
+                end
+              end,
+            }
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
+        lua.load(std::fs::read_to_string(path).unwrap()).exec().unwrap();
+        let get = |expr: &str| -> serde_json::Value { lua.from_value(lua.load(format!("return {expr}")).eval().unwrap()).unwrap() };
+        let run = |code: &str| lua.load(code).exec().unwrap();
+        run(r#"
+            file = { host = "local", worktree = "/r/air-tab-1", path = "a.py", abs = "/r/air-tab-1/a.py" }
+            function comment() handlers.comment({ file = file, path = "a.py", line = 3, side = "new", text = "hi" }) end
+            function toggle() commands.toggle_pr_diff({ worktree = "/r/air-tab-1" }) end
+        "#);
+
+        // On al/top (#12, stacked on al/bottom): its threads show, and the
+        // toggle fetches the base and diffs against it, then goes back.
+        run("handlers.file_opened({ file = file })");
+        assert_eq!(get("calls.shown['/r/air-tab-1/a.py']"), 1);
+        run("toggle()");
+        assert_eq!(get("state.diff_base"), "origin/al/bottom");
+        assert_eq!(get("calls.fetches"), serde_json::json!(["+refs/heads/al/bottom:refs/remotes/origin/al/bottom"]));
+        run("toggle()");
+        assert_eq!(get("state.diff_base"), serde_json::Value::Null);
+
+        // Switched to a branch with no PR: nothing is posted and #12's threads go.
+        run("state.branch = 'al/wip'; comment()");
+        assert_eq!(get("#calls.posts"), 0);
+        assert!(get("calls.notes[#calls.notes]").as_str().unwrap().contains("no open PR for branch al/wip"));
+        assert_eq!(get("calls.shown['/r/air-tab-1/a.py']"), serde_json::Value::Null);
+
+        // On al/mid (#11, against main): comments go to #11; the toggle has nothing to switch to.
+        run(r#"state.branch = 'al/mid'; state.prs['al/mid'] = '{"number":11,"baseRefName":"main","state":"OPEN"}'; comment(); toggle()"#);
+        assert_eq!(get("calls.posts"), serde_json::json!(["o/r/pulls/11/comments"]));
+        assert_eq!(get("state.diff_base"), serde_json::Value::Null);
+        assert!(get("calls.notes[#calls.notes]").as_str().unwrap().contains("#11 is against main"));
     }
 
     fn prune_module(lua: &mlua::Lua) -> mlua::Table {
@@ -1229,7 +1315,7 @@ end)
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 7 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        wait(&|| host.list().len() == 7 && host.registry().viewer_maps.len() == 4 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);

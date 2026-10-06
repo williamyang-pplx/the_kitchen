@@ -951,6 +951,28 @@ impl Engine {
         self.db().update_tab(&row)
     }
 
+    /// Diff the tab's viewer against `base` (`None`: `origin/<default>`).
+    /// The tab's shell keeps the KITCHEN_DIFF_BASE it started with.
+    pub fn set_diff_base(&self, tab_id: &str, base: Option<String>) -> Result<()> {
+        let row = {
+            let mut st = self.state();
+            let t = st
+                .workspaces
+                .iter_mut()
+                .flat_map(|w| w.tabs.iter_mut())
+                .find(|t| t.row.id == tab_id)
+                .context("no such tab")?;
+            if t.row.diff_base == base {
+                return Ok(());
+            }
+            t.row.diff_base = base;
+            t.row.clone()
+        };
+        self.db().update_tab(&row)?;
+        self.push_ui(UiCommand::ResetViewer { tab_id: row.id });
+        Ok(())
+    }
+
     /// Close a tab: end its tmux session. The worktree stays on disk (it may
     /// hold unpushed work); remove it with `kitchenctl worktree remove`.
     pub fn close_tab(&self, tab_id: &str) -> Result<()> {
@@ -1167,6 +1189,22 @@ fn local_socket_env(host: &Host) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new diff base is saved and resets the viewer; the same one does nothing.
+    #[test]
+    fn set_diff_base() {
+        let (_ctx, engine) = crate::test_util::engine("local", "/w/repo", &["t"]);
+        let base = |e: &Engine| e.find_tab("t").unwrap().1.row.diff_base;
+        let resets = |e: &Engine| e.take_ui_commands().iter().filter(|c| matches!(c, UiCommand::ResetViewer { tab_id } if tab_id == "t")).count();
+        engine.set_diff_base("t", Some("origin/al/base".into())).unwrap();
+        assert_eq!((base(&engine).as_deref(), resets(&engine)), (Some("origin/al/base"), 1));
+        assert_eq!(engine.db().tab("t").unwrap().unwrap().diff_base.as_deref(), Some("origin/al/base"));
+        engine.set_diff_base("t", Some("origin/al/base".into())).unwrap();
+        assert_eq!(resets(&engine), 0);
+        engine.set_diff_base("t", None).unwrap();
+        assert_eq!((base(&engine), resets(&engine)), (None, 1));
+        assert!(engine.set_diff_base("gone", None).is_err());
+    }
 
     #[test]
     fn file_link_paths() {

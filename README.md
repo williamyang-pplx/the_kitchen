@@ -21,9 +21,11 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   edits, followed live) ⌘. opens straight on the first changed file's diff,
   next to a tree of just the changed files: j/k in the tree, or ⌘⇧J/⌘⇧K and
   `]c`/`[c` in the code, step through them; `a` in the list switches to the
-  whole repo, ⌘B hides the list. In PR tabs the PR's review comments show
-  under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
-  commented line) to the PR on GitHub. Tabs without changes open on a folder view
+  whole repo, ⌘B hides the list. In PR tabs (any tab whose branch has an
+  open PR) the PR's review comments show under their lines, and ⌘M …
+  ⌘Enter posts a comment (or a reply, on a commented line) to the PR on
+  GitHub. `\p` switches the diff between the default branch and the PR's
+  base, so one tab can step through a PR stack by checking out each branch. Tabs without changes open on a folder view
   (`aster/`, set by `viewer_default_dirs`). Vim
   navigation (`-` up a folder, Enter opens), an fzf-style ⌘P file finder (in the viewer)
   (space-separated terms, smart case), diff/plain mode, jump-to-definition and an
@@ -95,6 +97,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘⇧R | rename the current workspace |
 | ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins) |
 | ⌘M | comment on the cursor line / selection (viewer, PR tab: posted to the PR on GitHub; on a commented line: a reply) |
+| `\p` | in the viewer: diff against the PR's base branch / against the default branch (github plugin) |
 | ⌘Enter | submit comment (plan: send comments to agent) |
 | ⌘D | workspace dashboard; in the viewer or plan: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |
