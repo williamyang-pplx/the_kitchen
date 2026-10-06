@@ -42,7 +42,6 @@ impl Dimensions for GridSize {
 /// Side effects the emulator asks the UI to perform.
 #[derive(Default)]
 struct Shared {
-    title: Mutex<Option<String>>,
     clipboard: Mutex<Option<String>>,
     bell: AtomicBool,
     exited: AtomicBool,
@@ -59,8 +58,7 @@ impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
         match event {
             TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {}
-            TermEvent::Title(t) => *self.shared.title.lock().unwrap() = Some(t),
-            TermEvent::ResetTitle => *self.shared.title.lock().unwrap() = None,
+            TermEvent::Title(_) | TermEvent::ResetTitle => {}
             TermEvent::ClipboardStore(_, text) => *self.shared.clipboard.lock().unwrap() = Some(text),
             TermEvent::PtyWrite(text) => {
                 if let Some(s) = self.sender.get() {
@@ -155,10 +153,6 @@ impl TermSession {
 
     pub fn exited(&self) -> bool {
         self.shared.exited.load(Ordering::Relaxed)
-    }
-
-    pub fn title(&self) -> Option<String> {
-        self.shared.title.lock().unwrap().clone()
     }
 
     /// Text the program asked to put on the clipboard (OSC 52, e.g. tmux copy-mode).

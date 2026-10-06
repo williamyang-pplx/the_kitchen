@@ -340,11 +340,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_plan_comment(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM plan_comments WHERE id = ?1", [id])?;
-        Ok(())
-    }
-
     // ------------------------------------------------------------ summaries
 
     pub fn summary(&self, symbol: &str, content_hash: &str) -> Result<Option<String>> {

@@ -151,10 +151,6 @@ impl<'a> Tmux<'a> {
         }
         Ok(out.stdout.lines().filter(|l| l.starts_with(SESSION_PREFIX)).map(String::from).collect())
     }
-
-    pub fn set_environment(&self, name: &str, key: &str, value: &str) -> Result<()> {
-        self.tmux(&["set-environment", "-t", name, key, value]).map(|_| ())
-    }
 }
 
 /// Shell script behind [`Tmux::new_session`].

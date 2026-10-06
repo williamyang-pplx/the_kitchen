@@ -99,11 +99,6 @@ pub fn highlight_grammar(path: &str) -> Option<(Language, String, String)> {
     Some((language(lang), highlights.join("\n"), locals.join("\n")))
 }
 
-/// Whether `path` is a language the parser (not just the fallback) handles.
-pub fn is_supported(path: &str) -> bool {
-    lang_for(path).is_some()
-}
-
 /// Every definition in `source`, in file order.
 pub fn extract(path: &str, source: &str) -> Vec<Symbol> {
     let Some(lang) = lang_for(path) else {

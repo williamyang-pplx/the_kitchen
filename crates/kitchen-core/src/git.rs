@@ -349,15 +349,6 @@ true"#
         Ok(!self.git_in(dir, &["status", "--porcelain"])?.trim().is_empty())
     }
 
-    pub fn head_sha(&self, dir: &str) -> Result<String> {
-        Ok(self.git_in(dir, &["rev-parse", "HEAD"])?.trim().to_string())
-    }
-
-    pub fn current_branch(&self, dir: &str) -> Option<String> {
-        let b = self.git_in(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok()?;
-        Some(b.trim().to_string()).filter(|s| !s.is_empty())
-    }
-
     pub fn merge_base(&self, dir: &str, a: &str, b: &str) -> Result<String> {
         Ok(self.git_in(dir, &["merge-base", a, b])?.trim().to_string())
     }
