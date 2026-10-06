@@ -55,30 +55,19 @@ fn local_meta(path: &str) -> Option<String> {
     Some(format!("{} {secs}", m.len()))
 }
 
+/// The tab-expanded text before 1-based raw column `col`.
+fn expanded_prefix(raw: &str, col: usize) -> String {
+    super::doc::expand_tabs(&raw.chars().take(col.saturating_sub(1)).collect::<String>())
+}
+
 /// Byte offset in the tab-expanded line of 1-based raw column `col`.
 fn display_offset(raw: &str, col: usize) -> usize {
-    let mut off = 0;
-    let mut width = 0;
-    for c in raw.chars().take(col.saturating_sub(1)) {
-        if c == '\t' {
-            let n = 4 - width % 4;
-            off += n;
-            width += n;
-        } else {
-            off += c.len_utf8();
-            width += 1;
-        }
-    }
-    off
+    expanded_prefix(raw, col).len()
 }
 
 /// Character column in the tab-expanded line of 1-based raw column `col`.
 pub(super) fn display_col(raw: &str, col: usize) -> usize {
-    let mut width = 0;
-    for c in raw.chars().take(col.saturating_sub(1)) {
-        width += if c == '\t' { 4 - width % 4 } else { 1 };
-    }
-    width
+    expanded_prefix(raw, col).chars().count()
 }
 
 /// 1-based raw column of display column `display` (0-based, tabs expanded).

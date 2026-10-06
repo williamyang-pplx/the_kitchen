@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
         (from KITCHEN_WORKSPACE_ID / KITCHEN_TAB_ID). Handles accept an id, a 1-based \
         index (`2`, `workspace:2`, `tab:3`), or a name/title.\n\n\
         Run `kitchenctl guide` for the agent guide (works without the app running).",
-    after_help = "Examples:\n  kitchenctl identify\n  kitchenctl tab new --edit --task \"AI-123: add retries\"\n  \
+    after_help = "Examples:\n  kitchenctl identify\n  kitchenctl tab new --task \"AI-123: add retries\"\n  \
         kitchenctl tab send --tab 2 --enter \"git status\"\n  kitchenctl plan comments\n  kitchenctl --json workspace list"
 )]
 pub struct Cli {

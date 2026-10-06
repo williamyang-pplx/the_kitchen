@@ -149,12 +149,12 @@ pub struct NewTab {
 /// Releases a worktree from [`Engine::opening`] when a rev tab is done.
 struct OpeningGuard<'a> {
     engine: &'a Engine,
-    path: String,
+    key: String,
 }
 
 impl Drop for OpeningGuard<'_> {
     fn drop(&mut self) {
-        self.engine.opening.lock().unwrap().remove(&self.path);
+        self.engine.opening.lock().unwrap().remove(&self.key);
     }
 }
 
@@ -495,7 +495,7 @@ impl Engine {
         std::thread::Builder::new()
             .name("spare worktrees".into())
             .spawn(move || {
-                let _guard = OpeningGuard { engine: &me, path: key };
+                let _guard = OpeningGuard { engine: &me, key };
                 let host = ws.host();
                 let repo = Repo::new(&host, &ws.row.repo_path);
                 // (no cached default branch: without one the spares would never move)
@@ -512,7 +512,7 @@ impl Engine {
                         let mut opening = me.opening.lock().unwrap();
                         (opening.remove(&again), opening.remove(&again_fetch))
                     };
-                    if !more && !more_fetch {
+                    if !more {
                         break;
                     }
                     fetch = more_fetch;
@@ -535,7 +535,7 @@ impl Engine {
         std::thread::Builder::new()
             .name("spare warmer".into())
             .spawn(move || {
-                let _guard = OpeningGuard { engine: &me, path: key };
+                let _guard = OpeningGuard { engine: &me, key };
                 while me.workspace(&ws_id).is_some() {
                     me.refill_spare(&ws_id, true);
                     std::thread::sleep(SPARE_REFRESH);
@@ -673,46 +673,46 @@ impl Engine {
         let host = ws.host();
         let repo = Repo::new(&host, &ws.row.repo_path);
         let branch = opts.branch.as_deref().filter(|b| !b.is_empty());
-        let to = match (branch, opts.rev.as_deref()) {
-            (Some(b), _) => Some(Checkout::Branch(b)),
-            (None, Some(rev)) => Some(Checkout::Detached(rev)),
-            (None, None) => None,
-        };
-        let fetch = match to {
-            Some(Checkout::Branch(b)) if opts.fetch.is_empty() => vec![branch_refspec(b)],
-            _ => opts.fetch.clone(),
-        };
+        let what = branch.or(opts.rev.as_deref());
         // Where a branch or rev goes: a named worktree as is (re-opening
         // finds it), else one named after it. `kitchen-*` names are the
         // kitchen's (spares, PR tabs).
-        let path = branch.or(opts.rev.as_deref()).map(|what| match &opts.name {
-            Some(name) => repo.sibling_path(&slugify(name, 60)),
-            None => {
-                let slug = slugify(what.rsplit('/').next().unwrap_or(what), 40);
-                let slug = if slug.starts_with("kitchen") { format!("tab-{slug}") } else { slug };
-                unique_path(&host, &repo.sibling_path(&slug))
-            }
+        let target = what.map(|what| {
+            let to = if branch.is_some() { Checkout::Branch(what) } else { Checkout::Detached(what) };
+            let path = match &opts.name {
+                Some(name) => repo.sibling_path(&slugify(name, 60)),
+                None => {
+                    let slug = slugify(what.rsplit('/').next().unwrap_or(what), 40);
+                    let slug = if slug.starts_with("kitchen") { format!("tab-{slug}") } else { slug };
+                    unique_path(&host, &repo.sibling_path(&slug))
+                }
+            };
+            (to, path)
         });
-        let _guard = match &path {
-            Some(path) => {
-                let key = format!("open:{ws_id}:{}", opts.name.as_deref().or(branch).or(opts.rev.as_deref()).unwrap_or(path));
+        let fetch = match (branch, opts.fetch.is_empty()) {
+            (Some(b), true) => vec![branch_refspec(b)],
+            _ => opts.fetch.clone(),
+        };
+        let _guard = match &target {
+            Some((to, path)) => {
+                let key = format!("open:{ws_id}:{}", opts.name.as_deref().or(what).unwrap_or_default());
                 if !self.opening.lock().unwrap().insert(key.clone()) {
                     bail!("{} is already being opened", opts.title.as_deref().unwrap_or(path));
                 }
+                let guard = OpeningGuard { engine: self, key };
                 // Same sibling dir of this workspace's repo (stored paths are
                 // resolved, e.g. /private/tmp, so compare the name), or the
                 // same branch.
                 let dir_name = |p: &str| p.trim_end_matches('/').rsplit('/').next().map(str::to_string);
                 let open = ws.tabs.iter().find(|t| dir_name(&t.row.worktree) == dir_name(path) || (branch.is_some() && t.row.branch.as_deref() == branch));
-                if let (Some(tab), Some(to)) = (open, to) {
-                    let r = self.reopen_tab(&ws, tab, to, &fetch, &opts);
-                    self.opening.lock().unwrap().remove(&key);
-                    return r;
+                if let Some(tab) = open {
+                    return self.reopen_tab(&ws, tab, *to, &fetch, &opts);
                 }
-                Some(OpeningGuard { engine: self, path: key })
+                Some(guard)
             }
             None => None,
         };
+        let focus = opts.focus.unwrap_or(true);
         let settings = self.settings();
         let tab_id = new_id();
         let pending_title = opts
@@ -721,22 +721,22 @@ impl Engine {
             .or_else(|| opts.task.as_deref().and_then(|t| t.lines().next()).map(String::from))
             .or_else(|| branch.map(String::from))
             .unwrap_or_else(|| "new tab".into());
-        self.set_pending(ws_id, Some(PendingTab { id: tab_id.clone(), title: pending_title, focus: opts.focus.unwrap_or(true) }));
+        self.set_pending(ws_id, Some(PendingTab { id: tab_id.clone(), title: pending_title, focus }));
         let result = (|| -> Result<TabRow> {
             // New-branch tabs start from origin/<default> as the spare warmer
             // last fetched it (at most SPARE_REFRESH old, usually fresher:
             // opening ⌘T fetches), so they never wait on the network.
             // Existing branches and revs are fetched in the same host round
             // trip as their checkout.
-            let (wt, title) = match (to, &path) {
-                (Some(to), Some(path)) => {
-                    let checked = repo.checkout_worktree(path, to, &fetch);
+            let (wt, title) = match &target {
+                Some((to, path)) => {
+                    let checked = repo.checkout_worktree(path, *to, &fetch);
                     // The fetch may have moved origin/<default>, and the checkout
                     // may have taken over a spare (even if it failed after).
                     self.refill_spare(ws_id, false);
-                    (checked?.0, branch.or(opts.rev.as_deref()).unwrap_or_default().to_string())
+                    (checked?.0, what.unwrap_or_default().to_string())
                 }
-                _ => {
+                None => {
                     let base = match &ws.row.default_branch {
                         Some(b) => b.clone(),
                         None => repo.default_branch()?,
@@ -790,12 +790,9 @@ impl Engine {
             let mut st = self.state();
             if let Some(w) = st.workspaces.iter_mut().find(|w| w.row.id == ws_id) {
                 w.tabs.push(Tab { row: row.clone(), unread: false });
-                if opts.focus.unwrap_or(true) {
-                    w.selected_tab = Some(row.id.clone());
-                }
             }
         }
-        if opts.focus.unwrap_or(true) {
+        if focus {
             self.select_tab(&row.id);
         }
         self.repaint();

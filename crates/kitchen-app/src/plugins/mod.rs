@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
+use kitchen_core::util::content_hash;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Engine;
@@ -197,7 +198,7 @@ type ReplyFn = Box<dyn FnOnce(ProviderReply) + Send>;
 pub struct FileEvent {
     pub key: FileKey,
     pub filetype: String,
-    /// Content hash of `text` (see [`content_version`]).
+    /// Content hash of `text` (see [`content_hash`]).
     pub version: String,
     pub text: Arc<str>,
     pub changed: bool,
@@ -213,10 +214,6 @@ pub fn command_context(engine: &Arc<Engine>, tab_id: &str, viewer: Option<serde_
         "worktree": found.as_ref().map(|(_, t)| t.row.worktree.clone()),
         "viewer": viewer,
     })
-}
-
-pub fn content_version(text: &str) -> String {
-    blake3::hash(text.as_bytes()).to_hex()[..16].to_string()
 }
 
 pub fn filetype_of(path: &str) -> String {
@@ -488,7 +485,7 @@ impl PluginHost {
     /// The viewer loaded `key` (first time, or again after it changed).
     pub fn file_loaded(&self, key: FileKey, text: Arc<str>, changed: bool) {
         let filetype = filetype_of(&key.path);
-        let version = content_version(&text);
+        let version = content_hash(&text);
         let ev = Arc::new(FileEvent { key: key.clone(), filetype, version, text, changed });
         lock(&self.open_files).insert(key, ev.clone());
         let slots = lock(&self.slots);
@@ -1190,7 +1187,7 @@ end)
         let text = "import os\n\ndef f():\n\t# TODO: é tidy\n\treturn undefined_name\n";
         let key = FileKey { host: "local".into(), worktree: wt.display().to_string(), path: "m.py".into() };
         host.file_loaded(key.clone(), Arc::from(text), false);
-        let v = content_version(text);
+        let v = content_hash(text);
         wait(&|| host.decor.get(&key).is_some_and(|d| !d.highlights(&v).is_empty()));
         let d = host.decor.get(&key).unwrap();
         let h = &d.highlights(&v)[0];
@@ -1218,9 +1215,9 @@ end)
         let key = FileKey { host: h, worktree: wt, path: "aster/kitchen_probe.py".into() };
         let start = Instant::now();
         host.file_loaded(key.clone(), Arc::from(text), false);
-        wait(&|| host.decor.get(&key).is_some_and(|d| !d.diagnostics(&content_version(text)).is_empty()));
+        wait(&|| host.decor.get(&key).is_some_and(|d| !d.diagnostics(&content_hash(text)).is_empty()));
         let d = host.decor.get(&key).unwrap();
-        for (_, d) in d.diagnostics(&content_version(text)) {
+        for (_, d) in d.diagnostics(&content_hash(text)) {
             eprintln!("{:?} {}:{} {}", d.code, d.line, d.col, d.message);
         }
         eprintln!("round trip {:?}", start.elapsed());
@@ -1359,7 +1356,7 @@ end)
         host.file_loaded(FileKey { path: "b.rs".into(), ..key.clone() }, Arc::from("// TODO"), false);
         wait(&|| host.decor.get(&key).is_some());
         let d = host.decor.get(&key).unwrap();
-        let v = content_version("x = 1\n# TODO: fix\n");
+        let v = content_hash("x = 1\n# TODO: fix\n");
         let diags = d.diagnostics(&v);
         assert_eq!(diags.len(), 1);
         assert_eq!((diags[0].1.line, diags[0].1.col), (2, 3));

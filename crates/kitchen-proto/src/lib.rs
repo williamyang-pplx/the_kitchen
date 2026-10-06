@@ -35,6 +35,14 @@ pub fn default_socket_path() -> PathBuf {
     std::env::var_os(ENV_SOCKET).map(PathBuf::from).unwrap_or_else(|| state_dir().join("kitchen.sock"))
 }
 
+/// Write `msg` as one JSON line and flush.
+pub fn write_line(mut w: impl std::io::Write, msg: &impl Serialize) -> std::io::Result<()> {
+    let mut s = serde_json::to_string(msg)?;
+    s.push('\n');
+    w.write_all(s.as_bytes())?;
+    w.flush()
+}
+
 /// Who is calling: filled from the terminal environment so commands can
 /// default to "the workspace/tab I am running in".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

@@ -325,7 +325,7 @@ impl Viewer {
             let result = plugin_glue::read_with_meta(&host, &full).map_err(|e| format!("{e:#}")).map(|(meta, text)| FileData {
                 spans: highlight::highlight(&path_s, &text),
                 symbols: kitchen_symbols::extract(&path_s, &text),
-                version: crate::plugins::content_version(&text),
+                version: kitchen_core::util::content_hash(&text),
                 meta,
                 text,
             });

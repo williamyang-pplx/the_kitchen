@@ -274,7 +274,7 @@ echo "KT_TAKEN=$TAKEN"
         let fetch = if fetch {
             format!(
                 "f() {{ GIT_TERMINAL_PROMPT=0 {NICE} git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 {}; }}\nf || {{ sleep 1; f; }} || echo KT_FETCH_FAILED\n",
-                fetch_branch_cmd(&r, base).trim_start_matches("git ")
+                fetch_cmd(&r, &[branch_refspec(base)]).trim_start_matches("git ")
             )
         } else {
             String::new()
@@ -349,10 +349,6 @@ true"#
         Ok(!self.git_in(dir, &["status", "--porcelain"])?.trim().is_empty())
     }
 
-    pub fn merge_base(&self, dir: &str, a: &str, b: &str) -> Result<String> {
-        Ok(self.git_in(dir, &["merge-base", a, b])?.trim().to_string())
-    }
-
     /// Everything the file viewer needs but the tracked-file list, in one
     /// round trip: HEAD, a checksum of the index's file list (~60 ms on agi),
     /// the merge base of HEAD and `base_ref`, and the files
@@ -415,18 +411,13 @@ true"#
     }
 }
 
-/// Fetch exactly one branch into its remote-tracking ref: no tags, no
-/// FETCH_HEAD, no other refs (big repos have thousands). `repo` is quoted.
-fn fetch_branch_cmd(repo: &str, branch: &str) -> String {
-    fetch_cmd(repo, &[branch_refspec(branch)])
-}
-
 /// `+refs/heads/<b>:refs/remotes/origin/<b>`.
 pub fn branch_refspec(branch: &str) -> String {
     format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
 }
 
-/// `git fetch origin <refspecs…>` in the already-quoted `repo`.
+/// `git fetch origin <refspecs…>` in the already-quoted `repo`: no tags, no
+/// FETCH_HEAD, no other refs (big repos have thousands).
 fn fetch_cmd(repo: &str, refspecs: &[String]) -> String {
     let specs: Vec<String> = refspecs.iter().map(|s| shell_quote(s)).collect();
     format!("git -C {repo} fetch --quiet --no-tags --no-write-fetch-head origin {}", specs.join(" "))

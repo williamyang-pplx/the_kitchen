@@ -3,7 +3,7 @@
 //!
 //! Every human keyboard action has an API method here.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 
@@ -46,9 +46,7 @@ fn serve_conn(engine: &Arc<Engine>, stream: UnixStream) {
             continue;
         }
         let resp = handle_line(engine, &line);
-        let Ok(mut out) = serde_json::to_string(&resp) else { break };
-        out.push('\n');
-        if writer.write_all(out.as_bytes()).is_err() {
+        if kitchen_proto::write_line(&mut writer, &resp).is_err() {
             break;
         }
     }

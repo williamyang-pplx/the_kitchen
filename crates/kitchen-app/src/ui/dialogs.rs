@@ -135,10 +135,15 @@ fn confirm(ui: &mut egui::Ui, title: &str, body: &str, on_yes: impl FnOnce()) ->
     ui.add_space(6.0);
     ui.label(RichText::new(body).color(theme::DIM));
     ui.add_space(10.0);
+    buttons(ui, "Close", true, on_yes)
+}
+
+/// "<label> ⏎" (enabled when `can`; Enter presses it too) and "Cancel esc".
+fn buttons(ui: &mut egui::Ui, label: &str, can: bool, on_yes: impl FnOnce()) -> DialogOutcome {
     let enter = ui.input(|i| i.key_pressed(Key::Enter));
     let mut out = DialogOutcome::Open;
     ui.horizontal(|ui| {
-        if ui.button("Close  ⏎").clicked() || enter {
+        if (ui.add_enabled(can, egui::Button::new(format!("{label}  ⏎"))).clicked() || enter) && can {
             on_yes();
             out = DialogOutcome::Done;
         }
@@ -147,6 +152,15 @@ fn confirm(ui: &mut egui::Ui, title: &str, body: &str, on_yes: impl FnOnce()) ->
         }
     });
     out
+}
+
+/// Focus `field` and select all of its `text` (a dialog's first frame).
+fn focus_select_all(ui: &egui::Ui, field: &egui::Response, text: &str) {
+    field.request_focus();
+    let mut state = egui::TextEdit::load_state(ui.ctx(), field.id).unwrap_or_default();
+    let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()));
+    state.cursor.set_char_range(Some(all));
+    state.store(ui.ctx(), field.id);
 }
 
 impl NewWorkspace {
@@ -196,20 +210,10 @@ impl NewWorkspace {
         ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("defaults to the repo name").desired_width(480.0));
         ui.add_space(10.0);
 
-        let enter = ui.input(|i| i.key_pressed(Key::Enter));
-        let mut out = DialogOutcome::Open;
-        ui.horizontal(|ui| {
-            let can = !self.repo.trim().is_empty();
-            if (ui.add_enabled(can, egui::Button::new("Create  ⏎")).clicked() || enter) && can {
-                let (name, host, repo) = (self.name.clone(), host.alias.clone(), self.repo.clone());
-                engine.spawn("new workspace", move |e| e.create_workspace(&name, &host, &repo).map(|_| ()));
-                out = DialogOutcome::Done;
-            }
-            if ui.button("Cancel  esc").clicked() {
-                out = DialogOutcome::Closed;
-            }
-        });
-        out
+        let (name, host, repo) = (self.name.clone(), host.alias.clone(), self.repo.clone());
+        buttons(ui, "Create", !repo.trim().is_empty(), || {
+            engine.spawn("new workspace", move |e| e.create_workspace(&name, &host, &repo).map(|_| ()));
+        })
     }
 
     /// List git repos on a host once (background), for path suggestions.
@@ -288,28 +292,15 @@ impl Rename {
         ui.add_space(8.0);
         let field = ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(500.0));
         if self.first_frame {
-            field.request_focus();
-            let mut state = egui::TextEdit::load_state(ui.ctx(), field.id).unwrap_or_default();
-            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.name.chars().count()));
-            state.cursor.set_char_range(Some(all));
-            state.store(ui.ctx(), field.id);
+            focus_select_all(ui, &field, &self.name);
             self.first_frame = false;
         }
         ui.add_space(10.0);
         let name = self.name.trim().to_string();
-        let submit = ui.input(|i| i.key_pressed(Key::Enter)) && !name.is_empty();
-        let mut out = DialogOutcome::Open;
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!name.is_empty(), egui::Button::new("Rename  ⏎")).clicked() || submit {
-                let (id, workspace) = (self.id.clone(), self.workspace);
-                engine.spawn("rename", move |e| if workspace { e.rename_workspace(&id, &name) } else { e.rename_tab(&id, &name) });
-                out = DialogOutcome::Done;
-            }
-            if ui.button("Cancel  esc").clicked() {
-                out = DialogOutcome::Closed;
-            }
-        });
-        out
+        let (id, workspace) = (self.id.clone(), self.workspace);
+        buttons(ui, "Rename", !name.is_empty(), || {
+            engine.spawn("rename", move |e| if workspace { e.rename_workspace(&id, &name) } else { e.rename_tab(&id, &name) });
+        })
     }
 }
 
@@ -326,33 +317,20 @@ impl NewTabDialog {
             egui::TextEdit::singleline(&mut self.text).hint_text("tab name, or https://github.com/ppl-ai/air/pull/14211").desired_width(500.0),
         );
         if self.first_frame {
-            field.request_focus();
-            let mut state = egui::TextEdit::load_state(ui.ctx(), field.id).unwrap_or_default();
-            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.text.chars().count()));
-            state.cursor.set_char_range(Some(all));
-            state.store(ui.ctx(), field.id);
+            focus_select_all(ui, &field, &self.text);
             self.first_frame = false;
         }
         ui.add_space(10.0);
-        let submit = ui.input(|i| i.key_pressed(Key::Enter));
-        let mut out = DialogOutcome::Open;
-        ui.horizontal(|ui| {
-            if ui.button("Create  ⏎").clicked() || submit {
-                let text = self.text.trim().to_string();
-                if is_link(&text) {
-                    engine.spawn("open", move |e| e.open_text(&text));
-                } else if let Some(ws) = engine.selected_workspace() {
-                    let opts = NewTab { title: Some(text).filter(|t| !t.is_empty()), ..Default::default() };
-                    let id = ws.row.id.clone();
-                    engine.spawn("new tab", move |e| e.create_tab(&id, opts).map(|_| ()));
-                }
-                out = DialogOutcome::Done;
+        let text = self.text.trim().to_string();
+        buttons(ui, "Create", true, || {
+            if is_link(&text) {
+                engine.spawn("open", move |e| e.open_text(&text));
+            } else if let Some(ws) = engine.selected_workspace() {
+                let opts = NewTab { title: Some(text).filter(|t| !t.is_empty()), ..Default::default() };
+                let id = ws.row.id.clone();
+                engine.spawn("new tab", move |e| e.create_tab(&id, opts).map(|_| ()));
             }
-            if ui.button("Cancel  esc").clicked() {
-                out = DialogOutcome::Closed;
-            }
-        });
-        out
+        })
     }
 }
 

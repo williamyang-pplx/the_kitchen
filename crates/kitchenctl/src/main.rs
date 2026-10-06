@@ -63,7 +63,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Call::Relay => {
-            let socket = cli.socket.clone().unwrap_or_else(relay::default_socket);
+            let socket = cli.socket.clone().unwrap_or_else(kitchen_proto::default_socket_path);
             let stdin = BufReader::new(std::io::stdin());
             match relay::run(&socket, stdin, std::io::stdout()) {
                 Ok(()) => ExitCode::SUCCESS,

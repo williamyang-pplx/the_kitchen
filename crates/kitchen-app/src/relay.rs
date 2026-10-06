@@ -8,7 +8,7 @@
 //! app exits, the relay's stdin closes and it cleans up after itself.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -121,10 +121,7 @@ fn run_once(engine: &Arc<Engine>, alias: &str) -> Result<()> {
         std::thread::spawn(move || {
             let resp = api::handle_line_from(&engine, &frame.line, true);
             let Ok(resp_line) = serde_json::to_string(&resp) else { return };
-            let Ok(mut out) = serde_json::to_string(&RelayFrame { rid: frame.rid, line: resp_line }) else { return };
-            out.push('\n');
-            let mut w = stdin.lock().unwrap();
-            let _ = w.write_all(out.as_bytes()).and_then(|_| w.flush());
+            let _ = kitchen_proto::write_line(&mut *stdin.lock().unwrap(), &RelayFrame { rid: frame.rid, line: resp_line });
         });
     }
     let status = child.wait()?;

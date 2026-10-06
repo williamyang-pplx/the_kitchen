@@ -1,6 +1,6 @@
 //! One request/response over the kitchen socket.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -32,9 +32,7 @@ fn roundtrip(socket: &Path, method: &str, params: Value) -> Result<Response> {
     // Tab creation fetches and builds worktrees; allow it time.
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
     let req = Request { id: 1, method: method.to_string(), params, caller: Caller::from_env() };
-    let mut line = serde_json::to_string(&req)?;
-    line.push('\n');
-    (&stream).write_all(line.as_bytes())?;
+    kitchen_proto::write_line(&stream, &req)?;
     let mut reader = BufReader::new(&stream);
     let mut out = String::new();
     reader.read_line(&mut out).context("read response")?;

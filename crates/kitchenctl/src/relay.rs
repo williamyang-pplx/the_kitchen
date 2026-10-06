@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -97,12 +97,7 @@ fn serve_client<W: Write>(stream: UnixStream, out: &Arc<Mutex<W>>, pending: &Pen
 }
 
 fn write_frame<W: Write>(out: &Arc<Mutex<W>>, frame: &RelayFrame) -> Result<()> {
-    let mut s = serde_json::to_string(frame)?;
-    s.push('\n');
-    let mut w = out.lock().unwrap();
-    w.write_all(s.as_bytes())?;
-    w.flush()?;
-    Ok(())
+    Ok(kitchen_proto::write_line(&mut *out.lock().unwrap(), frame)?)
 }
 
 fn error_response(msg: &str) -> String {
@@ -120,9 +115,6 @@ fn remove_if_ours(socket: &Path, ours: &Option<u64>) {
     }
 }
 
-pub fn default_socket() -> PathBuf {
-    kitchen_proto::default_socket_path()
-}
 
 #[cfg(test)]
 mod tests {

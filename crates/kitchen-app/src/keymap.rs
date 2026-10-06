@@ -111,7 +111,7 @@ impl Action {
 }
 
 /// Chords that need Shift, checked before the plain ⌘ table (egui matches
-/// ⌘I against ⌘⇧I too, so the shifted chord must be consumed first).
+/// ⌘R against ⌘⇧R too, so the shifted chord must be consumed first).
 pub const SHIFT_BINDINGS: &[(Key, Action)] = &[
     (Key::I, Action::OpenPlan),
     (Key::R, Action::RenameWorkspace),

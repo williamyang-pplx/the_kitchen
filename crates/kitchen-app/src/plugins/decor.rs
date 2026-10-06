@@ -65,7 +65,7 @@ impl Severity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub line: usize,
-    #[serde(default = "one")]
+    #[serde(default = "super::one")]
     pub col: usize,
     #[serde(default)]
     pub end_line: Option<usize>,
@@ -81,7 +81,7 @@ pub struct Diagnostic {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Highlight {
     pub line: usize,
-    #[serde(default = "one")]
+    #[serde(default = "super::one")]
     pub col: usize,
     /// Exclusive; `None` = to the end of the line.
     #[serde(default)]
@@ -122,9 +122,6 @@ pub struct Comment {
     pub dim: bool,
 }
 
-fn one() -> usize {
-    1
-}
 fn default_severity() -> Severity {
     Severity::Warning
 }
