@@ -33,7 +33,7 @@ use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 /// The plugin API level this build implements.
 pub const API_LEVEL: u32 = 7;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
-/// `open` (a link typed into ⌘E), `comment` (a viewer comment to post),
+/// `open` (a link typed into ⌘T), `comment` (a viewer comment to post),
 /// `dashboard` (a workspace's dashboard was shown or hidden).
 pub const EMITTED: &[&str] = &["open", "comment", "dashboard"];
 /// File text above this is not handed to plugins (`ev.text()` returns nil).

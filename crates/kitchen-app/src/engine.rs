@@ -21,7 +21,7 @@ use crate::links::Link;
 use crate::settings::Settings;
 
 /// How often each workspace's warmer fetches `origin/<default>` and
-/// fast-forwards its spares (opening the ⌘E dialog also does it once).
+/// fast-forwards its spares (opening the ⌘T dialog also does it once).
 const SPARE_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
@@ -120,7 +120,7 @@ pub struct State {
     pub toasts: Vec<Toast>,
 }
 
-/// Options for a new tab (from ⌘E, plugins or `kitchenctl tab new`).
+/// Options for a new tab (from ⌘T, plugins or `kitchenctl tab new`).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct NewTab {
@@ -471,7 +471,7 @@ impl Engine {
     /// Bring the workspace's spare worktrees to `origin/<default>` in the
     /// background (create missing ones, fast-forward stale ones); `fetch`
     /// fetches it first, in the same round trip. Called by the workspace's
-    /// warmer, when the ⌘E dialog opens, after other fetches of the default
+    /// warmer, when the ⌘T dialog opens, after other fetches of the default
     /// branch and whenever a spare was taken over. One refresh per repo at a
     /// time; a request during one makes it run once more when it is done (a
     /// spare may have been taken meanwhile), fetching if any request asked to.
@@ -725,7 +725,7 @@ impl Engine {
         let result = (|| -> Result<TabRow> {
             // New-branch tabs start from origin/<default> as the spare warmer
             // last fetched it (at most SPARE_REFRESH old, usually fresher:
-            // opening ⌘E fetches), so they never wait on the network.
+            // opening ⌘T fetches), so they never wait on the network.
             // Existing branches and revs are fetched in the same host round
             // trip as their checkout.
             let (wt, title) = match (to, &path) {
@@ -855,7 +855,7 @@ impl Engine {
         }
     }
 
-    /// A link from ⌘E / `kitchenctl tab open` (a PR link, …): handed to the
+    /// A link from ⌘T / `kitchenctl tab open` (a PR link, …): handed to the
     /// plugins' `open` handlers, which open a tab with `kitchen.tab_open`.
     pub fn open_text(&self, text: &str) -> Result<()> {
         let ev = serde_json::json!({ "text": text.trim(), "workspaces": self.workspace_info() });

@@ -3,7 +3,7 @@
 //! viewer never see these chords.
 //!
 //! Chords act on the focused pane only (see [`Action::scope`]): tab keys
-//! (⌘E ⌘W) work in the terminal, panel keys (⌘M ⌘O ⌘Enter) in a focused
+//! (⌘T ⌘W) work in the terminal, panel keys (⌘M ⌘O ⌘Enter) in a focused
 //! side panel, ⌘P and ⌘⇧H/J/K/L in a focused viewer; elsewhere they are
 //! swallowed. Tab and workspace switching (⌘H/L ⌘1-9 ⌘J/K) work everywhere. The rest is global; ⌘D toggles diff in a focused side panel
 //! and the workspace dashboard elsewhere, and ⌘. hides the other pane: the
@@ -17,7 +17,7 @@
 //! | ⌘H / ⌘L     | previous / next tab                           |
 //! | ⌘⇧H / ⌘⇧L   | focused viewer: file list ↔ code              |
 //! | ⌘⇧J / ⌘⇧K   | focused viewer: next / previous changed file  |
-//! | ⌘E          | new tab: a name or a PR link — own worktree   |
+//! | ⌘T          | new tab: a name or a PR link — own worktree   |
 //! | ⌘-click     | open the path / URL under the pointer (terminal) |
 //! | ⌘R          | rename the current tab                        |
 //! | ⌘W          | close tab                                     |
@@ -129,7 +129,7 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::N, Action::NewWorkspace),
     (Key::J, Action::NextWorkspace),
     (Key::K, Action::PrevWorkspace),
-    (Key::E, Action::NewTab),
+    (Key::T, Action::NewTab),
     (Key::R, Action::RenameTab),
     (Key::W, Action::CloseTab),
     (Key::P, Action::FilePicker),
@@ -319,6 +319,8 @@ mod tests {
         assert_eq!(press(Key::J, Modifiers::COMMAND), vec![Action::NextWorkspace]);
         assert_eq!(press(Key::L, Modifiers::COMMAND), vec![Action::NextTab]);
         assert_eq!(press(Key::R, Modifiers::COMMAND), vec![Action::RenameTab]);
+        assert_eq!(press(Key::T, Modifiers::COMMAND), vec![Action::NewTab]);
+        assert!(press(Key::E, Modifiers::COMMAND).is_empty(), "⌘E is no longer bound");
         assert_eq!(press(Key::P, cmd_shift), vec![Action::Palette]);
         assert_eq!(press(Key::P, Modifiers::COMMAND), vec![Action::FilePicker]);
         assert_eq!(press(Key::Period, Modifiers::COMMAND), vec![Action::ToggleViewer]);

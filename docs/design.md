@@ -25,7 +25,7 @@ for agent-driven PR work across local repos and Perplexity devboxes.
     task, the agent starts with `/low-level-plan` and writes `.kitchen/plan.md`.
   - *spares*: two detached worktrees `<repo>-kitchen-spare[-2]` kept at
     `origin/<default>`: a per-workspace warmer fetches it and fast-forwards them
-    every 5 minutes and when the ⌘E dialog opens (also after every other fetch of
+    every 5 minutes and when the ⌘T dialog opens (also after every other fetch of
     it). A new tab takes one over instead of checking out the
     whole repo.
 - `.kitchen/` inside each worktree is git-excluded and holds kitchen files.

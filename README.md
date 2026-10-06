@@ -10,8 +10,8 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   right-click → Pin to top keeps one above the rest.
 - **Tabs**: one PR each, in a fresh worktree + branch cut from
   `origin/<default>` as last fetched (a background fetch every 5 minutes and
-  when ⌘E opens, so ⌘E never waits on the network). Given a task, the agent starts with `/low-level-plan` and
-  writes a plan you comment on inline (⌘⇧I). ⌘E also takes a PR link
+  when ⌘T opens, so ⌘T never waits on the network). Given a task, the agent starts with `/low-level-plan` and
+  writes a plan you comment on inline (⌘⇧I). ⌘T also takes a PR link
   (`https://github.com/<org>/<repo>/pull/<n>`, any suffix): the `github`
   plugin opens that PR's branch in its own worktree, and the viewer shows its
   diff against the PR's base (as on GitHub). Re-opening the link (or `git
@@ -31,7 +31,7 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   viewer diagnostics/highlights, `gd`/`gr` providers, and jobs or
   long-running processes (language servers) on the tab's devbox. Ships with
   `ruff` (Python lint), `python` (`gd` / `gr` from the ty language server),
-  `github` (PR links in ⌘E, PR review comments), `todo`, `prune-worktrees`
+  `github` (PR links in ⌘T, PR review comments), `todo`, `prune-worktrees`
   (hourly, removes the worktrees of merged/closed PRs that no tab uses and
   that hold nothing unpushed) and `dashboard`. ⌘⇧P is the command palette.
 - **Dashboard** (⌘D, or the grid at the right end of the tab strip): each
@@ -66,7 +66,7 @@ the next workspace setup.
 
 ## Keybindings
 
-Every app shortcut is ⌘+key, and acts on the focused pane: tab keys (⌘E
+Every app shortcut is ⌘+key, and acts on the focused pane: tab keys (⌘T
 ⌘W) only when the terminal is focused, panel keys (⌘M ⌘O
 ⌘Enter) only in a focused side panel; the rest are global (⌘D: diff in a
 focused side panel, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
@@ -82,7 +82,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘H / ⌘L | previous / next tab |
 | ⌘⇧J / ⌘⇧K | in a focused viewer: next / previous changed file |
 | ⌘⇧H / ⌘⇧L | in a focused viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
-| ⌘E | new tab — own worktree + branch; type a name, or paste a PR link for the PR's branch |
+| ⌘T | new tab — own worktree + branch; type a name, or paste a PR link for the PR's branch |
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |

@@ -1,4 +1,4 @@
-//! Modal dialogs: new workspace (⌘N), new tab (⌘E), rename tab (⌘R) / workspace (⌘⇧R), close confirmations.
+//! Modal dialogs: new workspace (⌘N), new tab (⌘T), rename tab (⌘R) / workspace (⌘⇧R), close confirmations.
 //! Enter submits, Esc cancels, Tab moves between fields.
 
 use std::collections::HashMap;
@@ -49,7 +49,7 @@ pub struct Rename {
     first_frame: bool,
 }
 
-/// ⌘E: a name, for the tab title and the worktree/branch slug, or a link
+/// ⌘T: a name, for the tab title and the worktree/branch slug, or a link
 /// (a PR) for the plugins to open.
 pub struct NewTabDialog {
     text: String,
@@ -384,7 +384,7 @@ mod tests {
         assert!(h[0].devbox && h[1].devbox && !h[2].devbox);
     }
 
-    /// Enter in the ⌘E dialog once re-locked the egui context inside
+    /// Enter in the ⌘T dialog once re-locked the egui context inside
     /// `ui.input` and hung the app; now it just submits.
     #[test]
     fn edit_tab_enter_does_not_deadlock() {

@@ -182,7 +182,7 @@ about LSP:
   second open of the same name reuses (and moves forward) the tab.
 * `diff_base` is a tab column (NULL = `origin/<default>`), used by the viewer
   and exported as `KITCHEN_DIFF_BASE`, so it survives session re-creation.
-* `kitchen.on("open", ev)` — a link from ⌘E / `tab.open` goes to every
+* `kitchen.on("open", ev)` — a link from ⌘T / `tab.open` goes to every
   plugin with an `open` handler (a broadcast, not a provider: providers are
   filetype-keyed and first-match only). No handler → an error toast.
 * GitHub knowledge lives only in `plugins/github`.
