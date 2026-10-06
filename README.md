@@ -68,7 +68,8 @@ the next workspace setup.
 ## Keybindings
 
 A tab shows either its terminal or its side panel (the file viewer or the
-plan) on the whole screen; ⌘. switches between the terminal and the viewer.
+plan) on the whole screen; ⌘. switches between the terminal and the viewer,
+and each tab remembers which one it was showing when you come back to it.
 Every app shortcut is ⌘+key, and acts on what is shown: tab keys (⌘T ⌘W)
 only in the terminal, panel keys (⌘M ⌘O ⌘Enter) only in the viewer or plan;
 the rest are global (⌘D: diff in the viewer or plan, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
