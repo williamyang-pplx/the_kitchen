@@ -1,13 +1,13 @@
-//! The kitchen's keyboard shortcuts. App-level actions are Cmd+<key>, plus
-//! Option+H/L for tiling-style pane focus; the terminal and the vim-style
-//! viewer never see these chords.
+//! The kitchen's keyboard shortcuts. App-level actions are Cmd+<key>; the
+//! terminal and the vim-style viewer never see these chords.
 //!
-//! Chords act on the focused pane only (see [`Action::scope`]): tab keys
-//! (⌘T ⌘W) work in the terminal, panel keys (⌘M ⌘O ⌘Enter) in a focused
-//! side panel, ⌘P and ⌘⇧H/J/K/L in a focused viewer; elsewhere they are
-//! swallowed. Tab and workspace switching (⌘H/L ⌘1-9 ⌘J/K) work everywhere. The rest is global; ⌘D toggles diff in a focused side panel
-//! and the workspace dashboard elsewhere, and ⌘. hides the other pane: the
-//! side panel from the terminal, the terminal from a focused side panel.
+//! A tab shows either its terminal or its side panel (viewer / plan), and
+//! ⌘. switches between the terminal and the viewer. Chords act on what is
+//! shown (see [`Action::scope`]): tab keys (⌘T ⌘W) work in the terminal,
+//! panel keys (⌘M ⌘O ⌘Enter) in a side panel, ⌘P and ⌘⇧H/J/K/L in the
+//! viewer; elsewhere they are swallowed. Tab and workspace switching (⌘H/L
+//! ⌘1-9 ⌘J/K) work everywhere. The rest is global; ⌘D toggles diff in a
+//! side panel and the workspace dashboard elsewhere.
 //!
 //! | keys        | action                                        |
 //! |-------------|-----------------------------------------------|
@@ -26,13 +26,11 @@
 //! | ⌘⇧I         | plan reviewer                                 |
 //! | ⌘⇧R         | rename the current workspace                  |
 //! | ⌘⇧P         | command palette (plugin commands)             |
-//! | ⌥H / ⌥L     | focus the left (terminal) / right (side) pane |
-//! | ⌘`          | switch focus terminal ↔ side panel            |
 //! | ⌘M          | comment on the cursor line / selection        |
 //! | ⌘Enter      | submit comment (plan: send comments to agent) |
 //! | ⌘D          | dashboard (focused side panel: diff / plain)  |
 //! | ⌘O          | toggle outline (collapsed) mode               |
-//! | ⌘.          | open the file viewer / close the side panel (focused side panel: hide / show the terminal) |
+//! | ⌘.          | switch the whole tab: terminal ↔ file viewer  |
 //! | ⌘Q          | quit                                          |
 //! | ⌘C / ⌘V     | copy / paste (handled by the focused widget)  |
 
@@ -59,10 +57,6 @@ pub enum Action {
     OpenPlan,
     RenameTab,
     RenameWorkspace,
-    ToggleFocus,
-    /// Tiling-style pane focus: terminal is the left pane, side panel the right.
-    FocusLeft,
-    FocusRight,
     Comment,
     Submit,
     /// ⌘D: diff / plain in a focused side panel, else the workspace dashboard.
@@ -122,9 +116,6 @@ pub const SHIFT_BINDINGS: &[(Key, Action)] = &[
     (Key::K, Action::PrevFile),
 ];
 
-/// Option chords (no Cmd).
-pub const ALT_BINDINGS: &[(Key, Action)] = &[(Key::H, Action::FocusLeft), (Key::L, Action::FocusRight)];
-
 pub const BINDINGS: &[(Key, Action)] = &[
     (Key::N, Action::NewWorkspace),
     (Key::J, Action::NextWorkspace),
@@ -136,7 +127,6 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::B, Action::ToggleFiles),
     (Key::H, Action::PrevTab),
     (Key::L, Action::NextTab),
-    (Key::Backtick, Action::ToggleFocus),
     (Key::M, Action::Comment),
     (Key::Enter, Action::Submit),
     (Key::D, Action::DiffOrDashboard),
@@ -153,9 +143,6 @@ const RESERVED: &[Key] = &[Key::C, Key::V, Key::X, Key::A, Key::Z];
 /// The built-in binding a plugin chord would collide with, if any.
 pub fn builtin_conflict(c: &crate::plugins::keys::Chord) -> Option<String> {
     let only = |cmd: bool, shift: bool, alt: bool| c.cmd == cmd && c.shift == shift && c.alt == alt && !c.ctrl;
-    if only(false, false, true) && ALT_BINDINGS.iter().any(|(k, _)| *k == c.key) {
-        return Some(format!("⌥{} pane focus", c.key.name()));
-    }
     if only(true, true, false) && SHIFT_BINDINGS.iter().any(|(k, _)| *k == c.key) {
         return Some(format!("⌘⇧{}", c.key.name()));
     }
@@ -169,16 +156,11 @@ pub fn builtin_conflict(c: &crate::plugins::keys::Chord) -> Option<String> {
 pub type PluginChords = Vec<(usize, crate::plugins::keys::Chord)>;
 
 /// Consume every bound chord pressed this frame and return its action.
-/// Order: built-in ⌥ → built-in ⌘⇧ → plugin chords (exact modifiers) →
+/// Order: built-in ⌘⇧ → plugin chords (exact modifiers) →
 /// built-in ⌘ → digits.
 pub fn collect(ctx: &egui::Context, plugin: &PluginChords) -> Vec<Action> {
     let mut out = Vec::new();
     ctx.input_mut(|i| {
-        for (key, action) in ALT_BINDINGS {
-            if consume_alt(&mut i.events, *key) {
-                out.push(*action);
-            }
-        }
         for (key, action) in SHIFT_BINDINGS {
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, *key)) {
                 out.push(*action);
@@ -209,24 +191,6 @@ pub fn collect(ctx: &egui::Context, plugin: &PluginChords) -> Vec<Action> {
     out
 }
 
-/// Remove an Option+`key` press, along with the composed character macOS
-/// sends right after it (⌥H types "˙"), so neither reaches the terminal.
-fn consume_alt(events: &mut Vec<egui::Event>, key: Key) -> bool {
-    let is_chord = |e: &egui::Event| {
-        matches!(e, egui::Event::Key { key: k, pressed: true, modifiers: m, .. }
-            if *k == key && m.alt && !m.ctrl && !m.command && !m.mac_cmd && !m.shift)
-    };
-    let mut found = false;
-    while let Some(idx) = events.iter().position(is_chord) {
-        found = true;
-        events.remove(idx);
-        if matches!(events.get(idx), Some(egui::Event::Text(_))) {
-            events.remove(idx);
-        }
-    }
-    found
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +213,7 @@ mod tests {
         }
         // Global keys work everywhere.
         for (side, viewer) in [(false, false), (true, true), (true, false)] {
-            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::PrevWorkspace, Action::PrevTab, Action::NextTab, Action::GoToTab(3), Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::FocusLeft, Action::FocusRight, Action::ToggleFocus, Action::ToggleViewer, Action::Quit] {
+            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::PrevWorkspace, Action::PrevTab, Action::NextTab, Action::GoToTab(3), Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::ToggleViewer, Action::Quit] {
                 assert!(a.allowed(side, viewer), "{a:?}");
             }
         }
@@ -290,20 +254,10 @@ mod tests {
         assert!(run(Key::Y, Modifiers::COMMAND).is_empty(), "⌘Y is not ⌘⇧Y");
         assert!(builtin_conflict(&Chord::parse("cmd+h").unwrap()).is_some());
         assert!(builtin_conflict(&Chord::parse("cmd+shift+p").unwrap()).is_some());
-        assert!(builtin_conflict(&Chord::parse("alt+l").unwrap()).is_some());
+        assert!(builtin_conflict(&Chord::parse("alt+l").unwrap()).is_none(), "⌥H/L are free for plugins");
         assert!(builtin_conflict(&Chord::parse("cmd+c").unwrap()).is_some());
         assert!(builtin_conflict(&Chord::parse("cmd+shift+h").unwrap()).is_some());
         assert!(builtin_conflict(&Chord::parse("cmd+shift+u").unwrap()).is_none());
-    }
-
-    #[test]
-    fn option_focus_chords_swallow_composed_text() {
-        let key = egui::Event::Key { key: Key::H, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::ALT };
-        let (actions, left) = press_events(vec![egui::Event::ModifiersChanged(Modifiers::ALT), key, egui::Event::Text("˙".into())]);
-        assert_eq!(actions, vec![Action::FocusLeft]);
-        assert!(!left.iter().any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })), "{left:?}");
-        assert_eq!(press(Key::L, Modifiers::ALT), vec![Action::FocusRight]);
-        assert!(press(Key::B, Modifiers::ALT).is_empty(), "other Option keys stay with the terminal");
     }
 
     #[test]
@@ -326,5 +280,6 @@ mod tests {
         assert_eq!(press(Key::Period, Modifiers::COMMAND), vec![Action::ToggleViewer]);
         assert_eq!(press(Key::Num3, Modifiers::COMMAND), vec![Action::GoToTab(3)]);
         assert!(press(Key::H, Modifiers::NONE).is_empty(), "plain keys belong to the terminal/viewer");
+        assert!(press(Key::H, Modifiers::ALT).is_empty() && press(Key::Backtick, Modifiers::COMMAND).is_empty(), "⌥H/L and ⌘` are no longer bound");
     }
 }

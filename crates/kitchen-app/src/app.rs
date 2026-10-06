@@ -18,6 +18,8 @@ use crate::ui::dialogs::{Dialog, DialogOutcome};
 /// Height of the macOS title bar the window draws under.
 const TITLEBAR_HEIGHT: f32 = 28.0;
 
+/// What fills the tab area (and has the keyboard): the terminal, or the
+/// tab's side panel (viewer / plan). ⌘. switches between them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     Terminal,
@@ -47,10 +49,8 @@ pub struct KitchenApp {
     attach_tx: Sender<(String, anyhow::Result<bool>)>,
     attach_rx: Receiver<(String, anyhow::Result<bool>)>,
     focus: Focus,
-    /// The open side panel per tab id; no entry = closed.
+    /// The side panel per tab id; no entry = none opened yet.
     sides: HashMap<String, SideKind>,
-    /// Tabs whose terminal is hidden (⌘. in the side panel): the side panel fills the tab.
-    terminal_hidden: HashSet<String>,
     viewers: HashMap<String, crate::viewer::Viewer>,
     plans: HashMap<String, crate::plan_view::PlanView>,
     dialog: Option<Dialog>,
@@ -91,7 +91,6 @@ impl KitchenApp {
             attach_rx,
             focus: Focus::Terminal,
             sides: HashMap::new(),
-            terminal_hidden: HashSet::new(),
             viewers: HashMap::new(),
             plans: HashMap::new(),
             dialog: None,
@@ -277,30 +276,9 @@ impl KitchenApp {
                     self.dialog = Some(Dialog::confirm_close(&t));
                 }
             }
-            Action::ToggleFocus => {
-                self.show_terminal();
-                self.focus = match (self.focus, self.side()) {
-                    (Focus::Terminal, Some(_)) => Focus::Side,
-                    (Focus::Terminal, None) => {
-                        self.set_side(Some(SideKind::Viewer));
-                        Focus::Side
-                    }
-                    (Focus::Side, _) => Focus::Terminal,
-                }
-            }
-            Action::FocusLeft => {
-                self.show_terminal();
-                self.focus = Focus::Terminal;
-            }
-            Action::FocusRight => {
-                if self.side().is_none() {
-                    self.set_side(Some(SideKind::Viewer));
-                }
-                self.focus = Focus::Side;
-            }
             // VS Code's ⌘B: the viewer's file list (opening the viewer if needed).
             Action::ToggleFiles => {
-                if self.side() == Some(SideKind::Viewer) {
+                if self.viewer_focused() {
                     self.side_command(PanelCmd::ToggleFiles);
                 } else {
                     self.open_side(SideKind::Viewer, None);
@@ -318,23 +296,14 @@ impl KitchenApp {
             }
             Action::ToggleOutline => {
                 if self.side().is_none() {
-                    self.set_side(Some(SideKind::Viewer));
+                    self.set_side(SideKind::Viewer);
                 }
                 self.focus = Focus::Side;
                 self.side_command(PanelCmd::ToggleOutline);
             }
-            // ⌘. hides the other pane. In a focused side panel: hide the
-            // terminal so the panel fills the tab, or bring it back. From the
-            // terminal: close whichever side panel is open, else open the viewer.
+            // ⌘. switches the whole tab between the terminal and the viewer.
             Action::ToggleViewer => {
                 if self.focus == Focus::Side && self.side().is_some() {
-                    if self.terminal_is_hidden() {
-                        self.show_terminal();
-                    } else if let Some(id) = self.selected_tab_id() {
-                        self.terminal_hidden.insert(id);
-                    }
-                } else if self.side().is_some() {
-                    self.set_side(None);
                     self.focus = Focus::Terminal;
                 } else {
                     self.open_side(SideKind::Viewer, None);
@@ -374,18 +343,17 @@ impl KitchenApp {
         self.dashboard_shown = now;
     }
 
-    /// Open (or, when it is already open and focused, re-trigger) a side panel.
+    /// Show a side panel (or, when it is already shown, re-trigger it or go
+    /// back to the terminal).
     fn open_side(&mut self, kind: SideKind, cmd_if_focused: Option<PanelCmd>) {
         if self.side() == Some(kind) && self.focus == Focus::Side {
-            if let Some(cmd) = cmd_if_focused {
-                self.side_command(cmd);
-            } else {
-                self.set_side(None);
-                self.focus = Focus::Terminal;
+            match cmd_if_focused {
+                Some(cmd) => self.side_command(cmd),
+                None => self.focus = Focus::Terminal,
             }
             return;
         }
-        self.set_side(Some(kind));
+        self.set_side(kind);
         self.focus = Focus::Side;
         if kind == SideKind::Plan {
             self.side_command(PanelCmd::Reload);
@@ -411,29 +379,10 @@ impl KitchenApp {
         self.selected_tab_id().and_then(|id| self.sides.get(&id).copied())
     }
 
-    /// Open `kind` on the selected tab, or close its panel (`None`, which
-    /// also brings back a hidden terminal).
-    fn set_side(&mut self, kind: Option<SideKind>) {
-        let Some(id) = self.selected_tab_id() else { return };
-        match kind {
-            Some(k) => {
-                self.sides.insert(id, k);
-            }
-            None => {
-                self.sides.remove(&id);
-                self.terminal_hidden.remove(&id);
-            }
-        }
-    }
-
-    /// The selected tab shows only its side panel (⌘. in the panel).
-    fn terminal_is_hidden(&self) -> bool {
-        self.side().is_some() && self.selected_tab_id().is_some_and(|id| self.terminal_hidden.contains(&id))
-    }
-
-    fn show_terminal(&mut self) {
+    /// Make `kind` the selected tab's side panel.
+    fn set_side(&mut self, kind: SideKind) {
         if let Some(id) = self.selected_tab_id() {
-            self.terminal_hidden.remove(&id);
+            self.sides.insert(id, kind);
         }
     }
 
@@ -522,7 +471,7 @@ impl KitchenApp {
                     }
                     Some(PaletteItem::Diagnostics) => {
                         if let Some(tab) = self.selected_tab_id() {
-                            self.set_side(Some(SideKind::Viewer));
+                            self.set_side(SideKind::Viewer);
                             self.focus = Focus::Side;
                             self.panel_command_for(&tab, SideKind::Viewer, PanelCmd::Diagnostics);
                         }
@@ -745,11 +694,10 @@ impl KitchenApp {
                     (SideKind::Plan, "Plan ⌘⇧I", Action::OpenPlan),
                     (SideKind::Viewer, "Files ⌘.", Action::ToggleFiles),
                 ] {
-                    let on = self.side() == Some(kind);
+                    let on = self.focus == Focus::Side && self.side() == Some(kind);
                     let text = RichText::new(label).font(theme::ui_font(11.0)).color(if on { theme::ACCENT } else { theme::MUTED });
                     if ui.add(egui::Button::new(text).frame(false)).clicked_by(egui::PointerButton::Primary) {
                         if on {
-                            self.set_side(None);
                             self.focus = Focus::Terminal;
                         } else {
                             self.run_action(action);
@@ -781,9 +729,9 @@ impl KitchenApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(match (self.focus, self.side()) {
-                        (Focus::Side, Some(SideKind::Viewer)) => "⌘⇧H/L files ↔ code · ⌘⇧J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘. terminal · ⌘D diff · ⌘O outline · ⌥H/L pane",
-                        (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘H/L tab · ⌘J/K workspace",
-                        _ => "⌘H/L or ⌘1-9 tab · ⌘T new · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
+                        (Focus::Side, Some(SideKind::Viewer)) => "⌘⇧H/L files ↔ code · ⌘⇧J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘. terminal · ⌘D diff · ⌘O outline",
+                        (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌘. viewer · ⌘H/L tab · ⌘J/K workspace",
+                        _ => "⌘H/L or ⌘1-9 tab · ⌘T new · ⌘R rename · ⌘W close · ⌘. viewer · ⌘J/K workspace",
                     })
                         .size(10.5)
                         .color(theme::DIM),
@@ -884,7 +832,6 @@ impl KitchenApp {
         self.viewers.retain(|id, _| live.contains(id));
         self.plans.retain(|id, _| live.contains(id));
         self.sides.retain(|id, _| live.contains(id));
-        self.terminal_hidden.retain(|id| live.contains(id));
     }
 }
 
@@ -914,7 +861,7 @@ impl eframe::App for KitchenApp {
         } else {
             let (reg, chords) = self.plugin_chords();
             for action in keymap::collect(&ctx, &chords) {
-                // Chords belong to the focused pane; out-of-scope ones are swallowed.
+                // Chords belong to what is on screen; out-of-scope ones are swallowed.
                 let side_focused = self.focus == Focus::Side && self.side().is_some();
                 if !action.allowed(side_focused, self.viewer_focused()) {
                     continue;
@@ -938,10 +885,6 @@ impl eframe::App for KitchenApp {
         // hand the keyboard back to its terminal.
         if self.focus == Focus::Side && self.side().is_none() {
             self.focus = Focus::Terminal;
-        }
-        // A hidden terminal never has the keyboard (e.g. after a dialog).
-        if self.focus == Focus::Terminal && self.terminal_is_hidden() {
-            self.focus = Focus::Side;
         }
 
         let ws = self.engine.selected_workspace();
@@ -972,30 +915,14 @@ impl eframe::App for KitchenApp {
         }
         let creating = ws.as_ref().and_then(|w| w.pending.iter().rev().find(|p| p.focus).cloned());
         let dashboard = ws.as_ref().is_some_and(|w| self.dashboard.contains(&w.row.id));
-        // Terminal hidden: the side panel takes its place.
-        let side_only = self.terminal_is_hidden() && creating.is_none() && !dashboard;
-        let mut side_rect = None;
-        if self.side().is_some() && !side_only {
-            // The viewer and plan need a workspace.
-            if let Some(ws) = &ws {
-                let width = ui.available_width();
-                let shown = egui::Panel::right("side")
-                    .resizable(true)
-                    .default_size(width * 0.5)
-                    .size_range(280.0..=width - 200.0)
-                    .frame(egui::Frame::NONE.fill(theme::BG).stroke(egui::Stroke::new(1.0, theme::BORDER)))
-                    .show(ui, |ui| self.side_area(ui, ws, tab.as_ref()));
-                side_rect = Some(shown.response.rect);
-            }
-        }
-        let central = egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {
-            (Some(ws), _) if creating.is_some() => {
+        let side_shown = self.focus == Focus::Side && creating.is_none() && !dashboard;
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {            (Some(ws), _) if creating.is_some() => {
                 let p = creating.as_ref().unwrap();
                 centered_note(ui, &format!("creating tab “{}” on {}…\nfetching origin · preparing worktree · starting tmux", p.title, ws.row.host), theme::DIM);
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
             (Some(ws), _) if dashboard => crate::dashboard_view::ui(ui, &self.engine, ws),
-            (Some(ws), tab) if side_only => self.side_area(ui, ws, tab.as_ref()),
+            (Some(ws), tab) if side_shown => self.side_area(ui, ws, tab.as_ref()),
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();
@@ -1003,16 +930,6 @@ impl eframe::App for KitchenApp {
             }
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });
-        if side_only {
-            side_rect = Some(central.response.rect);
-        }
-        if self.dialog.is_none() {
-            let focused = match (self.focus, side_rect) {
-                (Focus::Side, Some(r)) => r,
-                _ => central.response.rect,
-            };
-            paint_focus_glow(&ctx, focused);
-        }
         self.palette_ui(&ctx);
         self.save_screenshots(&ctx);
         if profiling() {
@@ -1028,20 +945,6 @@ impl eframe::App for KitchenApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG.to_normalized_gamma_f32()
     }
-}
-
-/// A bright violet glow just inside the focused pane: a crisp 2px edge
-/// with a soft falloff inward, drawn above the pane's content.
-fn paint_focus_glow(ctx: &egui::Context, rect: egui::Rect) {
-    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("focus-glow")));
-    let rect = rect.shrink(1.0);
-    const WIDTH: usize = 16;
-    for i in 0..WIDTH {
-        let alpha = (170.0 * (1.0 - i as f32 / WIDTH as f32).powi(2)) as u8;
-        let c = Color32::from_rgba_unmultiplied(theme::FOCUS.r(), theme::FOCUS.g(), theme::FOCUS.b(), alpha);
-        painter.rect_stroke(rect.shrink(2.0 + i as f32), 6.0, egui::Stroke::new(1.0, c), egui::StrokeKind::Inside);
-    }
-    painter.rect_stroke(rect, 6.0, egui::Stroke::new(3.0, theme::FOCUS), egui::StrokeKind::Inside);
 }
 
 fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
@@ -1106,8 +1009,8 @@ mod tests {
             step(&mut app, vec![]);
         }
         assert_eq!(app.focus, Focus::Terminal);
-        // ⌥L: the viewer; wait for the file list; ⌘⇧H: into the list.
-        step(&mut app, key(Key::L, Modifiers::ALT));
+        // ⌘.: the viewer; wait for the file list; ⌘⇧H: into the list.
+        step(&mut app, key(Key::Period, Modifiers::COMMAND));
         assert_eq!(app.focus, Focus::Side);
         for _ in 0..200 {
             step(&mut app, vec![]);
@@ -1147,10 +1050,11 @@ mod tests {
         };
         engine.select_tab_index(1);
         step(&mut app, vec![]);
-        // ⌥L opens the viewer on t1 only.
-        step(&mut app, key(Key::L, Modifiers::ALT));
+        // ⌘. swaps t1's terminal for the viewer.
+        step(&mut app, key(Key::Period, Modifiers::COMMAND));
         assert_eq!(app.sides.get("t1"), Some(&SideKind::Viewer));
         assert_eq!(app.focus, Focus::Side);
+        // t2 has no viewer: it shows its terminal.
         engine.select_tab_index(2);
         step(&mut app, vec![]);
         assert_eq!(app.side(), None);
@@ -1159,40 +1063,25 @@ mod tests {
         engine.select_tab_index(1);
         step(&mut app, vec![]);
         assert_eq!(app.side(), Some(SideKind::Viewer));
-        // Tab keys work from the focused viewer too: ⌘L to t2, ⌘1 back.
-        step(&mut app, key(Key::L, Modifiers::ALT));
+        assert_eq!(app.focus, Focus::Terminal);
+        // Tab keys work from the viewer too: ⌘L to t2, ⌘1 back.
+        step(&mut app, key(Key::Period, Modifiers::COMMAND));
+        assert_eq!(app.focus, Focus::Side);
         step(&mut app, key(Key::L, Modifiers::COMMAND));
         assert_eq!(app.selected_tab_id().as_deref(), Some("t2"));
         step(&mut app, key(Key::Num1, Modifiers::COMMAND));
         assert_eq!(app.selected_tab_id().as_deref(), Some("t1"));
-        // ⌘. in the focused viewer hides t1's terminal; the keyboard stays there.
-        step(&mut app, key(Key::L, Modifiers::ALT));
+        // ⌘. back and forth: terminal, viewer, terminal; the viewer stays open.
         step(&mut app, key(Key::Period, Modifiers::COMMAND));
-        assert!(app.terminal_is_hidden());
-        assert_eq!(app.focus, Focus::Side);
-        engine.select_tab_index(2);
-        step(&mut app, vec![]);
-        assert!(!app.terminal_is_hidden());
-        assert_eq!(app.focus, Focus::Terminal);
-        // Back on t1 the hidden terminal can't hold focus; ⌥H shows it again.
-        engine.select_tab_index(1);
-        step(&mut app, vec![]);
-        assert!(app.terminal_is_hidden());
-        assert_eq!(app.focus, Focus::Side);
-        step(&mut app, key(Key::H, Modifiers::ALT));
-        assert!(!app.terminal_is_hidden());
-        assert_eq!(app.focus, Focus::Terminal);
-        assert_eq!(app.side(), Some(SideKind::Viewer));
-        // ⌘. twice in the viewer: hide, then show the terminal again.
-        step(&mut app, key(Key::L, Modifiers::ALT));
-        step(&mut app, key(Key::Period, Modifiers::COMMAND));
-        assert!(app.terminal_is_hidden());
-        step(&mut app, key(Key::Period, Modifiers::COMMAND));
-        assert!(!app.terminal_is_hidden());
         assert_eq!((app.focus, app.side()), (Focus::Side, Some(SideKind::Viewer)));
-        // From the terminal, ⌘. still closes the viewer.
-        step(&mut app, key(Key::H, Modifiers::ALT));
         step(&mut app, key(Key::Period, Modifiers::COMMAND));
-        assert_eq!((app.focus, app.side()), (Focus::Terminal, None));
+        assert_eq!((app.focus, app.side()), (Focus::Terminal, Some(SideKind::Viewer)));
+        // From the plan, ⌘. goes to the terminal, and then to the viewer.
+        step(&mut app, key(Key::I, Modifiers::COMMAND | Modifiers::SHIFT));
+        assert_eq!((app.focus, app.side()), (Focus::Side, Some(SideKind::Plan)));
+        step(&mut app, key(Key::Period, Modifiers::COMMAND));
+        assert_eq!(app.focus, Focus::Terminal);
+        step(&mut app, key(Key::Period, Modifiers::COMMAND));
+        assert_eq!((app.focus, app.side()), (Focus::Side, Some(SideKind::Viewer)));
     }
 }

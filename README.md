@@ -66,10 +66,11 @@ the next workspace setup.
 
 ## Keybindings
 
-Every app shortcut is ⌘+key, and acts on the focused pane: tab keys (⌘T
-⌘W) only when the terminal is focused, panel keys (⌘M ⌘O
-⌘Enter) only in a focused side panel; the rest are global (⌘D: diff in a
-focused side panel, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
+A tab shows either its terminal or its side panel (the file viewer or the
+plan) on the whole screen; ⌘. switches between the terminal and the viewer.
+Every app shortcut is ⌘+key, and acts on what is shown: tab keys (⌘T ⌘W)
+only in the terminal, panel keys (⌘M ⌘O ⌘Enter) only in the viewer or plan;
+the rest are global (⌘D: diff in the viewer or plan, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
 keys (`gd` definition, `gr` references, `Ctrl-o` back, `]d` next diagnostic, …).
 `gd`/`gr` ask a plugin's language server when there is one (Python: ty) and
 fall back to text search; a slow one (over 0.4s) shows the text matches until it answers.
@@ -80,24 +81,22 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘J / ⌘K | next / previous workspace |
 | ⌘1 … ⌘9 | go to tab N of the current workspace |
 | ⌘H / ⌘L | previous / next tab |
-| ⌘⇧J / ⌘⇧K | in a focused viewer: next / previous changed file |
-| ⌘⇧H / ⌘⇧L | in a focused viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
+| ⌘⇧J / ⌘⇧K | in the viewer: next / previous changed file |
+| ⌘⇧H / ⌘⇧L | in the viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
 | ⌘T | new tab — own worktree + branch; type a name, or paste a PR link for the PR's branch |
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |
-| ⌘P | fuzzy file picker (in a focused viewer) |
+| ⌘P | fuzzy file picker (in the viewer) |
 | ⌘B | show / hide the viewer's file list |
 | ⌘⇧I | plan reviewer |
 | ⌘⇧R | rename the current workspace |
 | ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins) |
-| ⌥H / ⌥L | focus the terminal pane (left) / side panel (right) |
-| ⌘` | switch focus terminal ↔ side panel |
 | ⌘M | comment on the cursor line / selection (viewer, PR tab: posted to the PR on GitHub; on a commented line: a reply) |
 | ⌘Enter | submit comment (plan: send comments to agent) |
-| ⌘D | workspace dashboard; in a focused side panel: toggle diff / plain file |
+| ⌘D | workspace dashboard; in the viewer or plan: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |
-| ⌘. | open the file viewer; close the side panel if one is open; in a focused viewer (or plan): hide / show the terminal, so the panel fills the tab (⌥H and ⌘` also bring it back) |
+| ⌘. | switch the whole tab between the terminal and the file viewer (from the plan: back to the terminal) |
 | ⌘C / ⌘V | copy / paste |
 
 ## Layout
