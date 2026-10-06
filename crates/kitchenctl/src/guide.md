@@ -10,25 +10,23 @@ socket is a relay the app keeps open over ssh, so the same commands work there.
 ```bash
 kitchenctl identify            # my workspace, tab, worktree, branch, plan file
 kitchenctl --json identify     # same, as JSON
-echo "$KITCHEN_TAB_KIND"       # edit | readonly
 ```
 
 Environment in every kitchen tab: `KITCHEN_WORKSPACE_ID`, `KITCHEN_TAB_ID`,
-`KITCHEN_TAB_KIND`, `KITCHEN_PLAN_FILE` (edit tabs), `KITCHEN_READONLY=1`
-(read-only tabs). Commands default to *your* workspace and tab.
+`KITCHEN_PLAN_FILE`, `KITCHEN_DIFF_BASE`. Commands default to *your*
+workspace and tab.
 
 ## Model
 
 - **Workspace** — one repo on this mac or on a devbox (sidebar).
-- **Edit tab** — its own git worktree `<repo>-<slug>` on branch
-  `william/<slug>`, cut from freshly fetched `origin/<default>`. One PR per tab.
-- **Read-only tab** — the shared read-only worktree `<repo>-kitchen-readonly`,
-  synced to the latest `origin/<default>`, or (opened from a PR link) the PR
-  head in `<repo>-kitchen-ro-pr-<N>`. Its folders are locked (no file can be
-  created, deleted or renamed). Use it for code understanding and review
-  only: never edit its files, and never try to make it writable.
-- Every tab has `$KITCHEN_DIFF_BASE`: the tab's changes (an edit tab's work,
-  or a PR's diff) are `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`.
+- **Tab** — its own git worktree `<repo>-<slug>`, on a new branch
+  `william/<slug>` cut from freshly fetched `origin/<default>`, or on an
+  existing branch. One PR per tab.
+- **PR tab** — opened from a PR link: the PR's branch in
+  `<repo>-kitchen-pr-<N>` (the PR head, detached, for forks and merged PRs).
+  Opening the link again, or `git pull`, brings in new pushes.
+- Every tab has `$KITCHEN_DIFF_BASE`: the tab's changes (your work, or a
+  PR's diff) are `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`.
 - William's review comments on a PR (⌘M in the viewer) are posted to GitHub
   as PR review comments. To address them, read them with
   `gh api repos/<owner>/<repo>/pulls/<N>/comments --paginate` (`path`,
@@ -39,10 +37,9 @@ Environment in every kitchen tab: `KITCHEN_WORKSPACE_ID`, `KITCHEN_TAB_ID`,
 
 ```bash
 kitchenctl workspace list
-kitchenctl tab new --edit --task "AI-123: add retries to the judge client"
-kitchenctl tab new --edit --branch william/x  # continue an existing branch
-kitchenctl tab new --readonly                # latest main, read-only
-kitchenctl tab open https://github.com/ppl-ai/air/pull/14211   # review a PR
+kitchenctl tab new --task "AI-123: add retries to the judge client"
+kitchenctl tab new --branch william/x        # continue an existing branch
+kitchenctl tab open https://github.com/ppl-ai/air/pull/14211   # a PR's branch; again to update it
 kitchenctl tab send --tab 2 --enter "make test"
 kitchenctl tab read-screen --tab 2 --scrollback 200
 kitchenctl tab send-key --tab 2 C-c
@@ -51,7 +48,7 @@ kitchenctl notify --title "tests green" --body "PR ready for review"
 kitchenctl worktree list
 ```
 
-## Planning phase (edit tabs)
+## Planning phase
 
 Every PR starts with a plan. When you were started with a task:
 

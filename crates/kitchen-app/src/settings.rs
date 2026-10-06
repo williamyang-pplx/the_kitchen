@@ -5,14 +5,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
-    /// Prefix for branches created by edit tabs.
+    /// Prefix for branches created by new tabs.
     pub branch_prefix: String,
-    /// Agent started in a new edit tab (the planning prompt is appended).
+    /// Agent started in a new tab (the planning prompt is appended).
     pub edit_agent_command: String,
-    /// Agent started in a new read-only tab. Skips permission prompts (so it can
-    /// write scratch scripts to /tmp through Bash) but has no edit tools.
-    pub readonly_agent_command: String,
-    pub autostart_readonly_agent: bool,
     /// Local dotfiles checkout; skills are symlinked from here.
     pub dotfiles_local: String,
     pub dotfiles_remote_url: String,
@@ -35,8 +31,6 @@ impl Default for Settings {
         Self {
             branch_prefix: "william/".into(),
             edit_agent_command: "claude".into(),
-            readonly_agent_command: "claude --dangerously-skip-permissions --disallowedTools Edit,Write,NotebookEdit".into(),
-            autostart_readonly_agent: true,
             dotfiles_local: format!("{home}/Documents/dotfiles"),
             dotfiles_remote_url: "https://github.com/williamyang-pplx/dotfiles".into(),
             dotfiles_remote_dir: "~/.dotfiles".into(),

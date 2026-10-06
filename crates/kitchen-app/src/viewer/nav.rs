@@ -511,7 +511,7 @@ mod tests {
             crate::theme::install(&ctx);
             let db = kitchen_core::db::Db::open_in_memory().unwrap();
             let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-            let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+            let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
             db.insert_workspace(&ws).unwrap();
             db.insert_tab(&tab).unwrap();
             let engine = crate::engine::Engine::new(ctx.clone(), db).unwrap();

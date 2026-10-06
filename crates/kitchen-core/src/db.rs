@@ -111,7 +111,6 @@ pub struct WorkspaceRow {
 pub struct TabRow {
     pub id: String,
     pub workspace_id: String,
-    pub kind: String,
     pub title: String,
     pub worktree: String,
     pub branch: Option<String>,
@@ -163,14 +162,13 @@ fn tab_from(r: &Row) -> rusqlite::Result<TabRow> {
     Ok(TabRow {
         id: r.get(0)?,
         workspace_id: r.get(1)?,
-        kind: r.get(2)?,
-        title: r.get(3)?,
-        worktree: r.get(4)?,
-        branch: r.get(5)?,
-        tmux_session: r.get(6)?,
-        plan_file: r.get(7)?,
-        position: r.get(8)?,
-        diff_base: r.get(9)?,
+        title: r.get(2)?,
+        worktree: r.get(3)?,
+        branch: r.get(4)?,
+        tmux_session: r.get(5)?,
+        plan_file: r.get(6)?,
+        position: r.get(7)?,
+        diff_base: r.get(8)?,
     })
 }
 
@@ -188,7 +186,7 @@ fn plan_comment_from(r: &Row) -> rusqlite::Result<PlanComment> {
 }
 
 const WS_COLS: &str = "id, name, host, repo_path, github_slug, default_branch, position, pinned";
-const TAB_COLS: &str = "id, workspace_id, kind, title, worktree, branch, tmux_session, plan_file, position, diff_base";
+const TAB_COLS: &str = "id, workspace_id, title, worktree, branch, tmux_session, plan_file, position, diff_base";
 const PC_COLS: &str = "id, tab_id, line, end_line, quote, body, state, created_at";
 
 /// Columns added after a table first shipped; `CREATE TABLE IF NOT EXISTS`
@@ -279,11 +277,10 @@ impl Db {
     pub fn insert_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, plan_file, position, diff_base, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, 'edit', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 t.id,
                 t.workspace_id,
-                t.kind,
                 t.title,
                 t.worktree,
                 t.branch,
@@ -466,7 +463,6 @@ mod tests {
         let tab = TabRow {
             id: "t1".into(),
             workspace_id: "a".into(),
-            kind: "edit".into(),
             title: "x".into(),
             worktree: "/r-x".into(),
             branch: Some("william/x".into()),
@@ -522,7 +518,6 @@ mod tests {
         db.insert_tab(&TabRow {
             id: "t".into(),
             workspace_id: "a".into(),
-            kind: "edit".into(),
             title: "t".into(),
             worktree: "/w".into(),
             branch: None,

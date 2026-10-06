@@ -1,10 +1,12 @@
--- github: open a PR from its link in a read-only tab, and review it.
+-- github: open a PR from its link in a tab on the PR's branch, and review it.
 --
--- A PR is its repo + number. The tab checks out the PR head (fetched from
--- origin's refs/pull/N/head) in its own worktree, and the viewer diffs it
--- against the PR's base branch, like GitHub's "Files changed". gh (on the
--- mac) supplies the title and base branch; without it the workspace's
--- default branch is the base.
+-- A PR is its repo + number. The tab checks out the PR's branch in its own
+-- worktree, <repo>-kitchen-pr-<N>, and the viewer diffs it against the PR's
+-- base branch, like GitHub's "Files changed". Opening the link again (or
+-- `git pull`) brings in new pushes. gh (on the mac) supplies the branch,
+-- title and base; when the branch can't be used (gh failed, a fork, a merged
+-- PR) the tab checks out the PR head (origin's refs/pull/N/head) detached,
+-- diffed against the workspace's default branch if gh failed.
 --
 -- Review comments live on GitHub: the viewer shows the PR's comment threads
 -- under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a line
@@ -47,30 +49,39 @@ function M.prefetch(ws, n)
 end
 
 -- The tab for PR `n` of `ws`, given gh's answer (`nil` when gh failed).
--- `prefetched`: M.prefetch already ran, so an open PR on the default branch
--- needs no fetch at all.
+-- `prefetched`: M.prefetch already ran, so the PR head and the default
+-- branch need no fetch.
 function M.spec(ws, n, info, prefetched)
-  local base = (info and info.baseRefName) or ws.default_branch or "main"
-  local head_ref = "refs/kitchen/pr/" .. n
-  local fetch = { "+refs/pull/" .. n .. "/head:" .. head_ref }
-  local diff_base
+  local dflt = ws.default_branch or "main"
+  local base = (info and info.baseRefName) or dflt
+  local spec = { workspace = ws.id, name = "kitchen-pr-" .. n, title = "PR #" .. n }
+  if info and info.title and info.title ~= "" then
+    spec.title = "#" .. n .. " " .. info.title
+  end
+  local fetch = {}
+  if info and info.state == "OPEN" and info.headRefName and not info.isCrossRepository then
+    spec.branch = info.headRefName
+    table.insert(fetch, "+refs/heads/" .. info.headRefName .. ":refs/remotes/origin/" .. info.headRefName)
+  else
+    spec.rev = "refs/kitchen/pr/" .. n
+    if not prefetched then
+      table.insert(fetch, "+refs/pull/" .. n .. "/head:" .. spec.rev)
+    end
+  end
   if info and info.state == "MERGED" and info.mergeCommit and info.mergeCommit.oid then
     -- The base branch has moved past the PR (and may be gone): diff against
     -- the base as it was just before the merge.
     table.insert(fetch, info.mergeCommit.oid)
-    diff_base = info.mergeCommit.oid .. "^1"
+    spec.diff_base = info.mergeCommit.oid .. "^1"
   else
-    table.insert(fetch, "+refs/heads/" .. base .. ":refs/remotes/origin/" .. base)
-    diff_base = "origin/" .. base
+    if not (prefetched and base == dflt) then
+      table.insert(fetch, "+refs/heads/" .. base .. ":refs/remotes/origin/" .. base)
+    end
+    spec.diff_base = "origin/" .. base
   end
-  local title = "PR #" .. n
-  if info and info.title and info.title ~= "" then
-    title = "#" .. n .. " " .. info.title
-  end
-  if prefetched and diff_base == "origin/" .. (ws.default_branch or "main") then
-    fetch = nil -- (nil, not {}: an empty table would reach tab_open as an object)
-  end
-  return { workspace = ws.id, name = "pr-" .. n, rev = head_ref, fetch = fetch, diff_base = diff_base, title = title }
+  -- (nil, not {}: an empty table would reach tab_open as an object)
+  spec.fetch = #fetch > 0 and fetch or nil
+  return spec
 end
 
 kitchen.on("open", function(ev)
@@ -97,7 +108,7 @@ kitchen.on("open", function(ev)
     end
   end
   local sh = "export PATH=" .. (kitchen.config.path or "") .. ':"$PATH"; gh pr view ' .. n .. " -R " .. q(slug)
-    .. " --json title,baseRefName,state,mergeCommit"
+    .. " --json title,baseRefName,state,mergeCommit,headRefName,isCrossRepository"
   kitchen.run({ sh = sh, host = "local", timeout = 20 }, function(res)
     if res.code == 0 then
       local ok, v = pcall(kitchen.json.decode, res.stdout)
@@ -141,9 +152,10 @@ local function why(res)
   return (text:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", ""))
 end
 
--- The PR a worktree belongs to: tabs opened from PR links are named pr-<N>.
+-- The PR a worktree belongs to: tabs opened from PR links are in
+-- <repo>-kitchen-pr-<N> (tab slugs never start with "kitchen").
 function M.pr_number(worktree)
-  local n = worktree:match("%-kitchen%-ro%-pr%-(%d+)$")
+  local n = worktree:match("%-kitchen%-pr%-(%d+)$")
   return n and tonumber(n)
 end
 

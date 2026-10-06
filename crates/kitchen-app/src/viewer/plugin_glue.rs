@@ -130,11 +130,11 @@ impl Viewer {
         });
     }
 
-    /// Edit tabs: every few seconds re-list the changes quietly (one small
-    /// round trip; the file list is only re-sent when they or HEAD moved).
+    /// Every few seconds re-list the changes quietly (one small round trip;
+    /// the file list is only re-sent when they or HEAD moved).
     pub(super) fn check_changes(&mut self) {
-        if !self.live || self.changes_pending || self.changes_at.elapsed() < STAT_EVERY {
-            if self.live && !self.changes_pending {
+        if self.changes_pending || self.changes_at.elapsed() < STAT_EVERY {
+            if !self.changes_pending {
                 self.engine.ctx.request_repaint_after(STAT_EVERY);
             }
             return;

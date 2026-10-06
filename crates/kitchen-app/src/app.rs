@@ -7,7 +7,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Key, Layout, Modifiers, RichText, Sense, Ui};
-use kitchen_proto::TabKind;
 
 use crate::engine::{Engine, Tab, UiCommand, Workspace};
 use crate::keymap::{self, Action};
@@ -254,18 +253,18 @@ impl KitchenApp {
                 self.hide_dashboard();
             }
             Action::Quit => self.quit_requested = true,
-            Action::NewEditTab => {
+            Action::NewTab => {
                 if let Some(ws) = &ws {
                     // Fetch and refresh the spares while the name is typed.
                     engine.refill_spare(&ws.row.id, true);
-                    self.dialog = Some(Dialog::new_edit_tab());
+                    self.dialog = Some(Dialog::new_tab());
                 } else {
                     engine.toast_err("create a workspace first (⌘N)");
                 }
             }
-            Action::NewReadonlyTab => {
+            Action::OpenLink => {
                 if ws.is_some() {
-                    self.dialog = Some(Dialog::new_readonly_tab());
+                    self.dialog = Some(Dialog::open_link());
                     self.focus = Focus::Terminal;
                 } else {
                     engine.toast_err("create a workspace first (⌘N)");
@@ -707,8 +706,6 @@ impl KitchenApp {
             let sel = ws.selected().map(|t| t.row.id.clone());
             for (i, tab) in ws.tabs.iter().enumerate() {
                 let is_sel = sel.as_deref() == Some(&tab.row.id);
-                // The tint says the kind: green = edit (read-write), blue = read-only.
-                let kind_color = if tab.kind() == TabKind::Edit { theme::GREEN } else { theme::ACCENT };
                 let title: String = tab.row.title.chars().take(28).collect();
                 let mut job = egui::text::LayoutJob::default();
                 let fmt = |c: Color32, size: f32| egui::TextFormat { font_id: theme::ui_font(size), color: c, valign: Align::Center, ..Default::default() };
@@ -718,7 +715,7 @@ impl KitchenApp {
                     job.append("  ●", 0.0, fmt(theme::YELLOW, 10.5));
                 }
                 let btn = egui::Button::new(job)
-                    .fill(kind_color.gamma_multiply(if is_sel { 0.35 } else { 0.12 }))
+                    .fill(theme::GREEN.gamma_multiply(if is_sel { 0.35 } else { 0.12 }))
                     .corner_radius(5.0)
                     .min_size(egui::vec2(0.0, 24.0));
                 let resp = ui.add(btn).on_hover_text(format!(
@@ -736,17 +733,16 @@ impl KitchenApp {
                 }
             }
             for p in &ws.pending {
-                let color = if p.kind == TabKind::Edit { theme::GREEN } else { theme::ACCENT };
-                let label = RichText::new(format!("⋯ {}", p.title.chars().take(28).collect::<String>())).font(theme::ui_font(12.5)).color(color).italics();
+                let label = RichText::new(format!("⋯ {}", p.title.chars().take(28).collect::<String>())).font(theme::ui_font(12.5)).color(theme::GREEN).italics();
                 ui.add(egui::Button::new(label).fill(if p.focus { theme::SELECTED } else { Color32::TRANSPARENT }).corner_radius(5.0).min_size(egui::vec2(0.0, 24.0)))
                     .on_hover_text("fetching origin and preparing the worktree…");
             }
             ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new("＋ edit ⌘E").font(theme::ui_font(11.0)).color(theme::GREEN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
-                self.run_action(Action::NewEditTab);
+            if ui.add(egui::Button::new(RichText::new("＋ tab ⌘E").font(theme::ui_font(11.0)).color(theme::GREEN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
+                self.run_action(Action::NewTab);
             }
-            if ui.add(egui::Button::new(RichText::new("＋ read-only ⌘I").font(theme::ui_font(11.0)).color(theme::ACCENT)).frame(false)).clicked_by(egui::PointerButton::Primary) {
-                self.run_action(Action::NewReadonlyTab);
+            if ui.add(egui::Button::new(RichText::new("＋ PR ⌘I").font(theme::ui_font(11.0)).color(theme::ACCENT)).frame(false)).clicked_by(egui::PointerButton::Primary) {
+                self.run_action(Action::OpenLink);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
@@ -798,7 +794,7 @@ impl KitchenApp {
                     RichText::new(match (self.focus, self.side()) {
                         (Focus::Side, Some(SideKind::Viewer)) => "⌘⇧H/L files ↔ code · ⌘⇧J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘. terminal · ⌘D diff · ⌘O outline · ⌥H/L pane",
                         (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘H/L tab · ⌘J/K workspace",
-                        _ => "⌘H/L or ⌘1-9 tab · ⌘E edit · ⌘I read-only · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
+                        _ => "⌘H/L or ⌘1-9 tab · ⌘E new · ⌘I PR · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
                     })
                         .size(10.5)
                         .color(theme::DIM),
@@ -1006,8 +1002,7 @@ impl eframe::App for KitchenApp {
         let central = egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {
             (Some(ws), _) if creating.is_some() => {
                 let p = creating.as_ref().unwrap();
-                let what = if p.kind == TabKind::Edit { "edit tab" } else { "read-only tab" };
-                centered_note(ui, &format!("creating {what} “{}” on {}…\nfetching origin · preparing worktree · starting tmux", p.title, ws.row.host), theme::DIM);
+                centered_note(ui, &format!("creating tab “{}” on {}…\nfetching origin · preparing worktree · starting tmux", p.title, ws.row.host), theme::DIM);
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
             (Some(ws), _) if dashboard => crate::dashboard_view::ui(ui, &self.engine, ws),
@@ -1015,7 +1010,7 @@ impl eframe::App for KitchenApp {
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();
-                centered_note(ui, &format!("{}\n\n⌘E  new edit tab (own worktree + branch)\n⌘I  new read-only tab (latest {})\n{status}", ws.row.name, ws.row.default_branch.as_deref().unwrap_or("main")), theme::DIM)
+                centered_note(ui, &format!("{}\n\n⌘E  new tab (own worktree + branch)\n⌘I  open a PR (its branch in a tab)\n{status}", ws.row.name), theme::DIM)
             }
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });
@@ -1115,7 +1110,7 @@ mod tests {
         theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
         db.insert_workspace(&ws).unwrap();
         db.insert_tab(&tab).unwrap();
         let engine = Engine::new(ctx.clone(), db).unwrap();
@@ -1169,7 +1164,7 @@ mod tests {
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
         db.insert_workspace(&ws).unwrap();
         for (i, id) in ["t1", "t2"].into_iter().enumerate() {
-            let tab = kitchen_core::db::TabRow { id: id.into(), workspace_id: "w".into(), kind: "readonly".into(), title: id.into(), worktree: d.clone(), branch: None, tmux_session: id.into(), plan_file: None, position: i as i64, diff_base: None };
+            let tab = kitchen_core::db::TabRow { id: id.into(), workspace_id: "w".into(), title: id.into(), worktree: d.clone(), branch: None, tmux_session: id.into(), plan_file: None, position: i as i64, diff_base: None };
             db.insert_tab(&tab).unwrap();
         }
         let engine = Engine::new(ctx.clone(), db).unwrap();

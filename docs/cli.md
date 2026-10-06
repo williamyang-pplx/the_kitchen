@@ -51,16 +51,15 @@ app is not reachable.
 | `workspace close W` | `workspace.close` | ends tmux sessions; repo + worktrees stay |
 | `workspace bootstrap [-w W]` | `workspace.bootstrap` | pull dotfiles, relink skills, install kitchenctl, start relay |
 | `tab list [-w W]` | `tab.list` | |
-| `tab open TEXT` | `tab.open` | ⌘I: plugins open the text (github: a PR link → read-only tab at the PR head, diffed against its base) |
-| `tab new [--edit\|--readonly] [--task T\|--task-file F] [--branch B] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | edit: own worktree + branch off fresh origin; `--task` starts `/low-level-plan`. readonly: shared read-only worktree synced to origin |
+| `tab open TEXT` | `tab.open` | ⌘I: plugins open the text (github: a PR link → tab on the PR's branch, diffed against its base; again → updated) |
+| `tab new [--task T\|--task-file F] [--branch B] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | own worktree + new branch off fresh origin, or `--branch` (fetched; a tab on it is reused); `--task` starts `/low-level-plan` |
 | `tab select T [-w W]` | `tab.select` | ⌘1…⌘9 |
 | `tab rename TITLE [-t T]` | `tab.rename` | |
 | `tab close [-t T]` | `tab.close` | ends the tmux session; worktree stays |
 | `tab send TEXT [--enter] [-t T]` | `tab.send` | `-` reads stdin; multi-line text is pasted as one bracketed paste |
 | `tab send-key KEY… [-t T]` | `tab.send_key` | tmux key names: `Enter`, `Escape`, `C-c`, `Up` |
 | `tab read-screen [--scrollback N] [-t T]` | `tab.read_screen` | |
-| `worktree list [--status] [-w W]` | `worktree.list` | role (main/edit/readonly), branch, owning tab, dirty with `--status` |
-| `worktree sync-readonly [-w W]` | `worktree.sync_readonly` | fetch + move the read-only worktree to `origin/<default>` |
+| `worktree list [--status] [-w W]` | `worktree.list` | role (main/edit/spare), branch, owning tab, dirty with `--status` |
 | `worktree remove PATH [--force] [-w W]` | `worktree.remove` | refuses the main checkout, worktrees an open tab uses, and dirty ones without `--force` |
 | `plugin timers` | `plugin.timers` | plugin timers (`kitchen.every`): interval, runs, last fired, next due, last error and stats |
 | `viewer open [PATH] [--line N] [--diff] [-t T]` | `viewer.open` | |

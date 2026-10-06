@@ -33,7 +33,7 @@ end
 
 -- Worktree counts from `kitchenctl --json worktree list`.
 function M.worktree_counts(list)
-  local c = { total = 0, edit = 0, edit_tabs = 0, review = 0, readonly = 0, spare = 0 }
+  local c = { total = 0, edit = 0, edit_tabs = 0, spare = 0 }
   for _, w in ipairs(list) do
     c.total = c.total + 1
     if w.role == "edit" then
@@ -41,10 +41,6 @@ function M.worktree_counts(list)
       if w.tab then
         c.edit_tabs = c.edit_tabs + 1
       end
-    elseif w.role == "readonly" and w.path:match("%-kitchen%-ro%-pr%-%d+$") then
-      c.review = c.review + 1
-    elseif w.role == "readonly" then
-      c.readonly = c.readonly + 1
     elseif w.role == "spare" then
       c.spare = c.spare + 1
     end
@@ -119,9 +115,7 @@ function M.sections(counts, mem, disk, paths, top, measured_at)
       title = "Worktrees",
       note = counts.total .. " total",
       rows = {
-        { label = "edit", value = edit },
-        { label = "PR review", value = tostring(counts.review) },
-        { label = "read-only", value = tostring(counts.readonly) },
+        { label = "checkouts", value = edit },
         { label = "spare", value = tostring(counts.spare) },
       },
     })

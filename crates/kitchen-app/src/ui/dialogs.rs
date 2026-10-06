@@ -1,5 +1,5 @@
-//! Modal dialogs: new workspace (⌘N), new edit tab (⌘E), new read-only tab
-//! (⌘I), rename tab (⌘R) / workspace (⌘⇧R), close confirmations.
+//! Modal dialogs: new workspace (⌘N), new tab (⌘E), open a link (⌘I),
+//! rename tab (⌘R) / workspace (⌘⇧R), close confirmations.
 //! Enter submits, Esc cancels, Tab moves between fields.
 
 use std::collections::HashMap;
@@ -20,8 +20,8 @@ pub enum DialogOutcome {
 
 pub enum Dialog {
     NewWorkspace(NewWorkspace),
-    NewEditTab(NewEditTab),
-    NewReadonlyTab(NewReadonlyTab),
+    NewTab(NewTabDialog),
+    OpenLink(OpenLink),
     ConfirmCloseTab { id: String, title: String },
     ConfirmCloseWorkspace { id: String, name: String },
     Rename(Rename),
@@ -51,14 +51,14 @@ pub struct Rename {
     first_frame: bool,
 }
 
-/// ⌘I: empty = latest main; anything else (a PR link) goes to the plugins.
-pub struct NewReadonlyTab {
+/// ⌘I: text (a PR link) for the plugins to open.
+pub struct OpenLink {
     text: String,
     first_frame: bool,
 }
 
 /// ⌘E: just a name, for the tab title and the worktree/branch slug.
-pub struct NewEditTab {
+pub struct NewTabDialog {
     name: String,
     first_frame: bool,
 }
@@ -77,15 +77,15 @@ impl Dialog {
         })
     }
 
-    pub fn new_edit_tab() -> Dialog {
-        Dialog::NewEditTab(NewEditTab { name: String::new(), first_frame: true })
+    pub fn new_tab() -> Dialog {
+        Dialog::NewTab(NewTabDialog { name: String::new(), first_frame: true })
     }
 
-    pub fn new_readonly_tab() -> Dialog {
+    pub fn open_link() -> Dialog {
         // A link just copied from the browser is the likely input.
         let clip = std::process::Command::new("pbpaste").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         let text = clip.filter(|c| c.starts_with("https://") && !c.contains(char::is_whitespace)).unwrap_or_default();
-        Dialog::NewReadonlyTab(NewReadonlyTab { text, first_frame: true })
+        Dialog::OpenLink(OpenLink { text, first_frame: true })
     }
 
     pub fn confirm_close(tab: &Tab) -> Dialog {
@@ -114,8 +114,8 @@ impl Dialog {
             ui.set_width(520.0);
             outcome = match self {
                 Dialog::NewWorkspace(d) => d.ui(ui, engine),
-                Dialog::NewEditTab(d) => d.ui(ui, engine),
-                Dialog::NewReadonlyTab(d) => d.ui(ui, engine),
+                Dialog::NewTab(d) => d.ui(ui, engine),
+                Dialog::OpenLink(d) => d.ui(ui, engine),
                 Dialog::Rename(d) => d.ui(ui, engine),
                 Dialog::ConfirmCloseTab { id, title } => confirm(
                     ui,
@@ -324,13 +324,13 @@ impl Rename {
     }
 }
 
-impl NewReadonlyTab {
+impl OpenLink {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
-        ui.heading("New read-only tab");
-        ui.label(RichText::new("Paste a PR link to review it, or leave empty for the latest main.").color(theme::DIM).size(12.0));
+        ui.heading("Open a link");
+        ui.label(RichText::new("Paste a PR link: its branch opens in a tab of its own.").color(theme::DIM).size(12.0));
         ui.add_space(8.0);
         let field = ui.add(
-            egui::TextEdit::singleline(&mut self.text).hint_text("https://github.com/ppl-ai/air/pull/14211  (optional)").desired_width(500.0),
+            egui::TextEdit::singleline(&mut self.text).hint_text("https://github.com/ppl-ai/air/pull/14211").desired_width(500.0),
         );
         if self.first_frame {
             field.request_focus();
@@ -344,17 +344,9 @@ impl NewReadonlyTab {
         let submit = ui.input(|i| i.key_pressed(Key::Enter));
         let mut out = DialogOutcome::Open;
         ui.horizontal(|ui| {
-            let label = if self.text.trim().is_empty() { "Open latest main  ⏎" } else { "Open  ⏎" };
-            if ui.button(label).clicked() || submit {
-                let text = self.text.trim().to_string();
-                if text.is_empty() {
-                    if let Some(ws) = engine.selected_workspace() {
-                        let id = ws.row.id.clone();
-                        engine.spawn("read-only tab", move |e| e.create_tab(&id, NewTab { kind: Some("readonly".into()), ..Default::default() }).map(|_| ()));
-                    }
-                } else {
-                    engine.spawn("open", move |e| e.open_text(&text));
-                }
+            let text = self.text.trim().to_string();
+            if (ui.button("Open  ⏎").clicked() || submit) && !text.is_empty() {
+                engine.spawn("open", move |e| e.open_text(&text));
                 out = DialogOutcome::Done;
             }
             if ui.button("Cancel  esc").clicked() {
@@ -365,9 +357,9 @@ impl NewReadonlyTab {
     }
 }
 
-impl NewEditTab {
+impl NewTabDialog {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
-        ui.heading("New edit tab");
+        ui.heading("New tab");
         ui.label(RichText::new("Gets its own worktree + branch off the latest origin, with Claude running in it.").color(theme::DIM).size(12.0));
         ui.add_space(8.0);
         let field = ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("tab / worktree name").desired_width(500.0));
@@ -381,10 +373,10 @@ impl NewEditTab {
         ui.horizontal(|ui| {
             if ui.button("Create  ⏎").clicked() || submit {
                 let title = Some(self.name.trim().to_string()).filter(|t| !t.is_empty());
-                let opts = NewTab { kind: Some("edit".into()), title, ..Default::default() };
+                let opts = NewTab { title, ..Default::default() };
                 if let Some(ws) = engine.selected_workspace() {
                     let id = ws.row.id.clone();
-                    engine.spawn("new edit tab", move |e| e.create_tab(&id, opts).map(|_| ()));
+                    engine.spawn("new tab", move |e| e.create_tab(&id, opts).map(|_| ()));
                 }
                 out = DialogOutcome::Done;
             }
@@ -416,7 +408,7 @@ mod tests {
         std::thread::spawn(move || {
             let ctx = egui::Context::default();
             let engine = Engine::new(ctx.clone(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
-            let mut dialog = Dialog::new_edit_tab();
+            let mut dialog = Dialog::new_tab();
             let mut step = |events: Vec<egui::Event>| {
                 let mut outcome = DialogOutcome::Closed;
                 let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| outcome = dialog.show(ui.ctx(), &engine));
@@ -428,7 +420,7 @@ mod tests {
             let enter = egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
             tx.send(matches!(step(vec![enter]), DialogOutcome::Done)).unwrap();
         });
-        let done = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("Enter in the edit tab dialog deadlocked");
+        let done = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("Enter in the new tab dialog deadlocked");
         assert!(done, "Enter in the name field should submit");
     }
 }

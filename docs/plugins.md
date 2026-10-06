@@ -55,9 +55,11 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 6)
+## API (level 7)
 
-Level 6 added `kitchen.every`, `kitchen.dashboard` and the `dashboard` event
+Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
+read-only tabs any more, so tabs have no `kind` and `worktree.list` no
+"readonly" role. Level 6 added `kitchen.every`, `kitchen.dashboard` and the `dashboard` event
 (see "Timers" and "Dashboard"). Level 5 added `kitchen.link` (see "Links"). Level 4 added `kitchen.comments`, the `comment` event and
 `kitchen.workspaces()` (see "Comments"). Level 3 added `kitchen.tab_open` and the `open` event (see "Tabs"). Level 2 added `kitchen.spawn`, `kitchen.provide`, `kitchen.json.null`,
 `kitchen.lsp`, and `ctx.viewer.file` / `word`; `ctx.viewer.col` became a raw
@@ -228,23 +230,22 @@ kitchen.on("open", function(ev)   -- ev = { text, workspaces = { {id, name, host
   -- github_slug, default_branch, selected, tabs}, … } }
   kitchen.tab_open {
     workspace = ws.id,
-    rev = "refs/kitchen/pr/12",                           -- what to check out (any rev)
-    fetch = { "+refs/pull/12/head:refs/kitchen/pr/12" },  -- fetched from origin first
+    branch = "al/fix",          -- what to check out: a branch, or `rev` (any rev, detached)
+    fetch = { "+refs/heads/al/fix:refs/remotes/origin/al/fix" },  -- fetched from origin first
     diff_base = "origin/main",  -- the viewer diffs against merge-base(HEAD, this)
-    name = "pr-12",             -- worktree <repo>-kitchen-ro-pr-12; reopening reuses the tab
+    name = "kitchen-pr-12",     -- worktree <repo>-kitchen-pr-12; reopening reuses the tab
     title = "#12 Fix it",
   }
 end)
 ```
 
-⌘I (and `kitchenctl tab open TEXT`) opens a read-only tab on the latest
-default branch when the text is empty; otherwise every plugin's `open`
-handler gets the text, and the one that recognises it calls
-`kitchen.tab_open` (the rest return). Fetch and checkout run in one round
-trip on the workspace's host (a new worktree takes over a spare); the
-worktree is read-only (its folders are locked). Opening the same
-`name` again re-fetches, moves the worktree only if the rev moved, and
-reloads the viewer. Every tab's shell gets `KITCHEN_DIFF_BASE`. See
+⌘I (and `kitchenctl tab open TEXT`) hands the text to every plugin's
+`open` handler, and the one that recognises it calls `kitchen.tab_open`
+(the rest return). Fetch and checkout run in one round trip on the
+workspace's host (a new worktree takes over a spare). Opening the same
+`name` (or branch) again re-fetches, moves the worktree forward (a
+fast-forward; git refuses to overwrite local changes), and reloads the
+viewer. Every tab's shell gets `KITCHEN_DIFF_BASE`. See
 `plugins/github/init.lua` (PR links).
 
 ### Comments

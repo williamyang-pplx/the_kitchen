@@ -1,7 +1,7 @@
 name = "prune-worktrees"
 version = "0.1.0"
 description = "Every so often, remove clean worktrees whose PR is merged or closed (no open tab, no unpushed commits)"
-api = 6
+api = 7
 
 [config]
 # Minutes between passes; the first pass runs about a minute after the kitchen starts.

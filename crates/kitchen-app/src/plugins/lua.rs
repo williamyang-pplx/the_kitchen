@@ -670,7 +670,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
         })?,
     )?;
 
-    // Tabs: a read-only tab at any git rev (see docs/plugins.md).
+    // Tabs: a tab on a branch or at a git rev (see docs/plugins.md).
     let c = cx.clone();
     k.set(
         "tab_open",
@@ -678,7 +678,8 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
             #[derive(serde::Deserialize)]
             struct Spec {
                 workspace: String,
-                rev: String,
+                branch: Option<String>,
+                rev: Option<String>,
                 name: Option<String>,
                 #[serde(default)]
                 fetch: Vec<String>,
@@ -687,11 +688,14 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                 focus: Option<bool>,
             }
             let s: Spec = serde_json::from_value(to_json(lua, Value::Table(spec))?)
-                .map_err(|e| mlua::Error::runtime(format!("kitchen.tab_open: {e} (needs workspace, rev)")))?;
+                .map_err(|e| mlua::Error::runtime(format!("kitchen.tab_open: {e} (needs workspace, and branch or rev)")))?;
+            if s.branch.is_none() && s.rev.is_none() {
+                return Err(mlua::Error::runtime("kitchen.tab_open needs a branch or a rev"));
+            }
             let Some(e) = c.host.engine() else { return Ok(()) };
             let opts = crate::engine::NewTab {
-                kind: Some("readonly".into()),
-                rev: Some(s.rev),
+                branch: s.branch,
+                rev: s.rev,
                 name: s.name,
                 fetch: s.fetch,
                 diff_base: s.diff_base,

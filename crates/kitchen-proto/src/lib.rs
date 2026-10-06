@@ -17,8 +17,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const ENV_SOCKET: &str = "KITCHEN_SOCKET_PATH";
 pub const ENV_WORKSPACE: &str = "KITCHEN_WORKSPACE_ID";
 pub const ENV_TAB: &str = "KITCHEN_TAB_ID";
-pub const ENV_TAB_KIND: &str = "KITCHEN_TAB_KIND";
-pub const ENV_READONLY: &str = "KITCHEN_READONLY";
 pub const ENV_PLAN_FILE: &str = "KITCHEN_PLAN_FILE";
 /// Rev the tab's changes are measured against (diff with `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`).
 pub const ENV_DIFF_BASE: &str = "KITCHEN_DIFF_BASE";
@@ -114,35 +112,11 @@ pub struct WorkspaceInfo {
     pub tabs: Vec<TabInfo>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum TabKind {
-    Edit,
-    Readonly,
-}
-
-impl TabKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TabKind::Edit => "edit",
-            TabKind::Readonly => "readonly",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "edit" | "e" | "rw" => Some(TabKind::Edit),
-            "readonly" | "read-only" | "ro" | "r" => Some(TabKind::Readonly),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TabInfo {
     pub id: String,
     /// 1-based position in the workspace; Cmd+<index> focuses it.
     pub index: usize,
-    pub kind: TabKind,
     pub title: String,
     pub worktree: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

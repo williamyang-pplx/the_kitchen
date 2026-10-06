@@ -1,14 +1,14 @@
 -- prune-worktrees: every interval_minutes, remove the worktrees of PRs that
 -- are done.
 --
--- Two kinds go: edit worktrees whose branch's PRs are all merged/closed, and
--- PR review worktrees (<repo>-kitchen-ro-pr-<N>, opened by the github plugin)
--- whose PR #N is merged/closed. Neither may have an open tab.
+-- Two kinds go: worktrees on a branch whose PRs are all merged/closed, and
+-- detached PR worktrees (<repo>-kitchen-pr-<N>, opened by the github plugin
+-- when the PR's branch wasn't usable) whose PR #N is merged/closed. Neither
+-- may have an open tab.
 --
 -- Per workspace (on its own host): `kitchenctl worktree list` says which
--- worktrees are edit / review worktrees with no tab; gh (on the mac) says
--- whether their PRs are done and which commit GitHub has. An edit worktree
--- goes only when its HEAD is that commit. `kitchenctl worktree remove` (never
+-- worktrees have no tab; gh (on the mac) says whether their PRs are done and
+-- which commit GitHub has. A worktree goes only when its HEAD is that commit. `kitchenctl worktree remove` (never
 -- --force) re-checks the tab and refuses dirty worktrees at removal time.
 -- Anything doubtful is kept and logged.
 
@@ -38,11 +38,11 @@ function M.candidates(list, tabs)
   end
   local out = {}
   for _, wt in ipairs(list) do
-    if wt.tab == nil and not names[basename(wt.path)] then
-      local n = wt.path:match("%-kitchen%-ro%-pr%-(%d+)$")
-      if wt.role == "edit" and wt.branch and not branches[wt.branch] then
+    if wt.role == "edit" and wt.tab == nil and not names[basename(wt.path)] then
+      local n = wt.path:match("%-kitchen%-pr%-(%d+)$")
+      if wt.branch and not branches[wt.branch] then
         table.insert(out, { kind = "edit", path = wt.path, branch = wt.branch, head = wt.head })
-      elseif wt.role == "readonly" and n then
+      elseif not wt.branch and n then
         table.insert(out, { kind = "pr", path = wt.path, number = tonumber(n), head = wt.head })
       end
     end
@@ -67,14 +67,11 @@ function M.verdict(wt, prs)
     end
   end
   local done = "PR #" .. newest.number .. " " .. newest.state:lower()
-  if wt.kind == "pr" then
-    -- A detached read-only checkout of the PR head: no branch, no local work.
-    return { action = "remove", why = done, pr = newest, delete_branch = false }
-  end
   if not newest.headRefOid or wt.head ~= newest.headRefOid then
     return { action = "keep", why = "local commits not on PR #" .. newest.number, pr = newest }
   end
-  return { action = "remove", why = done, pr = newest, delete_branch = newest.state == "MERGED" }
+  -- (a detached PR worktree has no branch to delete)
+  return { action = "remove", why = done, pr = newest, delete_branch = wt.kind == "edit" and newest.state == "MERGED" }
 end
 
 -- Shell line that deletes `branch` only while its tip is still `oid` (the
@@ -102,7 +99,7 @@ end
 local function prs_for(slug, wt)
   local cmd
   if wt.kind == "pr" then
-    cmd = "gh pr view " .. wt.number .. " -R " .. q(slug) .. " --json number,state,url"
+    cmd = "gh pr view " .. wt.number .. " -R " .. q(slug) .. " --json number,state,url,headRefOid"
   else
     cmd = "gh pr list -R " .. q(slug) .. " --head " .. q(wt.branch) .. " --state all --json number,state,url,headRefOid --limit 10"
   end
@@ -139,7 +136,7 @@ local function prune_workspace(ws)
   for _, wt in ipairs(M.candidates(list, ws.tabs)) do
     local prs, err = prs_for(ws.github_slug, wt)
     local v = prs and M.verdict(wt, prs) or { action = "keep", why = err }
-    if v.action == "remove" and wt.kind == "edit" then
+    if v.action == "remove" then
       -- worktree.remove doesn't re-check HEAD: a commit made since the list must not be lost.
       local head = kitchen.run_sync({ host = ws.host, cmd = { "git", "-C", wt.path, "rev-parse", "HEAD" } })
       if head.code ~= 0 or head.stdout:gsub("%s+", "") ~= wt.head then

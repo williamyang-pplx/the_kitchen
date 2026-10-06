@@ -33,7 +33,6 @@ pub struct PlanView {
     tab_id: String,
     host: Host,
     worktree: String,
-    is_edit: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     path: Option<String>,
@@ -59,7 +58,6 @@ impl PlanView {
             tab_id: tab.row.id.clone(),
             host: ws.host(),
             worktree: tab.row.worktree.clone(),
-            is_edit: tab.row.plan_file.is_some(),
             tx,
             rx,
             path: None,
@@ -220,10 +218,8 @@ impl PlanView {
 
     pub fn ui(&mut self, ui: &mut Ui, cx: &mut PanelCtx) {
         self.receive();
-        if self.is_edit {
-            self.poll_file(false);
-            ui.ctx().request_repaint_after(POLL);
-        }
+        self.poll_file(false);
+        ui.ctx().request_repaint_after(POLL);
         if ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(ui.max_rect()) {
             cx.clicked = true;
         }
@@ -246,9 +242,7 @@ impl PlanView {
         let footer = egui::Rect::from_min_max(egui::pos2(full.min.x, full.max.y - footer_h), full.max);
         let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
 
-        let empty = if !self.is_edit {
-            Some("read-only tabs have no plan — plans belong to edit tabs (⌘E)".to_string())
-        } else if !self.loaded_once {
+        let empty = if !self.loaded_once {
             Some("loading plan…".into())
         } else if self.text.is_none() {
             Some(format!(

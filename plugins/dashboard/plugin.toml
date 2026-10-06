@@ -1,7 +1,7 @@
 name = "dashboard"
 version = "0.1.0"
 description = "Worktrees, disk and RAM of each workspace's host, on its dashboard (⌘D)"
-api = 6
+api = 7
 
 [config]
 # Seconds between refreshes of worktrees and RAM, for the dashboard on screen.

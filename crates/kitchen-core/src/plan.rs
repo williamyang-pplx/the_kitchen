@@ -1,4 +1,4 @@
-//! The planning phase of an edit tab.
+//! The planning phase of a tab.
 //!
 //! Before implementing, the tab's agent runs the `low-level-plan` skill and
 //! writes the plan to a markdown file in the worktree. William comments on
@@ -22,18 +22,6 @@ pub fn plans_dir_for(worktree: &str) -> String {
     format!("{}/{KITCHEN_DIR}/plans", worktree.trim_end_matches('/'))
 }
 
-/// Make `.kitchen/` invisible to git for every worktree of the repo.
-pub fn ensure_excluded(host: &Host, worktree: &str) -> anyhow::Result<()> {
-    let script = format!(
-        "f=\"$(git -C {w} rev-parse --git-common-dir)/info/exclude\"; \
-         case \"$f\" in /*) ;; *) f={w}/\"$f\";; esac; \
-         mkdir -p \"$(dirname \"$f\")\"; \
-         grep -qxF '{KITCHEN_DIR}/' \"$f\" 2>/dev/null || echo '{KITCHEN_DIR}/' >> \"$f\"",
-        w = crate::util::shell_quote(worktree)
-    );
-    host.sh_ok(&script, None).map(|_| ())
-}
-
 /// The plan document to show: `.kitchen/plan.md` or the newest plan-mode
 /// file under `.kitchen/plans/`, whichever changed last.
 pub fn current_plan_path(host: &Host, worktree: &str) -> Option<String> {
@@ -47,7 +35,7 @@ pub fn current_plan_path(host: &Host, worktree: &str) -> Option<String> {
     (!p.is_empty()).then(|| p.to_string())
 }
 
-/// Instructions typed into a fresh edit tab's agent to start planning.
+/// Instructions typed into a fresh tab's agent to start planning.
 pub fn planning_prompt(task: &str, plan_file: &str) -> String {
     format!(
         "/low-level-plan {task}\n\n\
@@ -140,14 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn exclude_and_discover() {
+    fn discover() {
         let tmp = tempfile::tempdir().unwrap();
         let w = tmp.path().display().to_string();
         std::process::Command::new("git").args(["init", "-q", &w]).status().unwrap();
-        ensure_excluded(&Host::Local, &w).unwrap();
-        ensure_excluded(&Host::Local, &w).unwrap();
-        let excl = std::fs::read_to_string(format!("{w}/.git/info/exclude")).unwrap();
-        assert_eq!(excl.matches(".kitchen/").count(), 1);
         assert_eq!(current_plan_path(&Host::Local, &w), None);
         Host::Local.write_file(&plan_file_for(&w), "# p").unwrap();
         assert_eq!(current_plan_path(&Host::Local, &w), Some(plan_file_for(&w)));

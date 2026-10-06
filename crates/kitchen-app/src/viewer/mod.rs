@@ -1,4 +1,4 @@
-//! The file viewer (one per tab). With changes (a PR tab, an edit tab the
+//! The file viewer (one per tab). With changes (a PR tab, a tab the
 //! agent worked in) it opens on the first changed file's diff, next to a
 //! tree of just the changed files; without, on a folder view at a default
 //! folder such as `aster/`. Plain / diff / outline modes, vim
@@ -176,9 +176,6 @@ pub struct Viewer {
     reloading: HashSet<String>,
     stat_at: std::time::Instant,
     stat_pending: bool,
-    /// Edit tab: the agent changes the worktree, so the changes are re-listed
-    /// every few seconds (and untracked files count).
-    live: bool,
     changes_at: std::time::Instant,
     changes_pending: bool,
     overlay: Option<plugin_glue::OverlayCache>,
@@ -246,7 +243,6 @@ impl Viewer {
             status: None,
             reloading: HashSet::new(),
             stat_at: std::time::Instant::now(),
-            live: tab.kind() == kitchen_proto::TabKind::Edit,
             changes_at: std::time::Instant::now(),
             changes_pending: false,
             stat_pending: false,
@@ -277,10 +273,10 @@ impl Viewer {
         // A quiet re-list that finds the same index and changes sends no file
         // list, unless the last one failed (then it is what recovers).
         let known = (quiet && matches!(self.files_state, Some(Ok(())))).then(|| (self.all_index.clone(), self.changed.clone()));
-        let (host, wt, base_ref, untracked, tx, ctx) =
-            (self.host.clone(), self.worktree.clone(), self.base_ref.clone(), self.live, self.tx.clone(), self.engine.ctx.clone());
+        let (host, wt, base_ref, tx, ctx) =
+            (self.host.clone(), self.worktree.clone(), self.base_ref.clone(), self.tx.clone(), self.engine.ctx.clone());
         std::thread::spawn(move || {
-            let mut listing = match Repo::new(&host, &wt).listing(&wt, &base_ref, untracked) {
+            let mut listing = match Repo::new(&host, &wt).listing(&wt, &base_ref) {
                 Ok(l) => l,
                 Err(e) => {
                     let _ = tx.send(Msg::FilesFailed(format!("{e:#}")));
@@ -1476,7 +1472,7 @@ fn parent_dir(path: &str) -> &str {
 
 /// Rows of folder `dir`: `../`, subfolders, then files (both sorted).
 /// Tracked files of `worktree` while its index checksum is `index`, shared
-/// by every viewer on it (the read-only tabs of a repo share one worktree).
+/// by every viewer on it.
 fn tracked_files(host: &Host, worktree: &str, index: &str) -> anyhow::Result<Arc<Vec<String>>> {
     type Trees = Mutex<Vec<((Host, String, String), Arc<Vec<String>>)>>;
     static TREES: OnceLock<Trees> = OnceLock::new();
@@ -1498,7 +1494,7 @@ fn tracked_files(host: &Host, worktree: &str, index: &str) -> anyhow::Result<Arc
 
 /// `tracked` without deleted (and renamed-away) paths, plus every other
 /// changed path (new, untracked), sorted. `tracked` itself when that changes
-/// nothing (read-only tabs), so viewers share one list.
+/// nothing, so viewers share one list.
 fn merge_all(tracked: &Arc<Vec<String>>, changed: &[ChangedFile]) -> Arc<Vec<String>> {
     fn gone(c: &ChangedFile) -> impl Iterator<Item = &str> {
         c.old_path.as_deref().into_iter().chain((c.status == 'D').then_some(c.path.as_str()))
@@ -1631,7 +1627,7 @@ mod tests {
         assert!(Arc::ptr_eq(&merge_all(&tracked, &[cf("gone.rs", 'D', None)]), &tracked));
     }
 
-    /// An edit tab lists once on open, re-lists only the changes while the
+    /// A tab lists once on open, re-lists only the changes while the
     /// worktree is unchanged, and folds new files into the file list.
     #[test]
     fn live_changes_single_listing() {
@@ -1644,7 +1640,7 @@ mod tests {
         crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "edit".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
         db.insert_workspace(&ws).unwrap();
         db.insert_tab(&tab).unwrap();
         let engine = Engine::new(ctx.clone(), db).unwrap();
@@ -1719,7 +1715,7 @@ mod tests {
         crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
         db.insert_workspace(&ws).unwrap();
         db.insert_tab(&tab).unwrap();
         let engine = Engine::new(ctx.clone(), db).unwrap();
@@ -1783,7 +1779,7 @@ mod tests {
         crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
         db.insert_workspace(&ws).unwrap();
         db.insert_tab(&tab).unwrap();
         let engine = Engine::new(ctx.clone(), db).unwrap();
@@ -1876,7 +1872,7 @@ end)"#,
         crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
         db.insert_workspace(&ws).unwrap();
         db.insert_tab(&tab).unwrap();
         let engine = Engine::new(ctx.clone(), db).unwrap();
@@ -1936,7 +1932,7 @@ end)"#,
         crate::theme::install(&ctx);
         let db = kitchen_core::db::Db::open_in_memory().unwrap();
         let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host, repo_path: wt.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), kind: "readonly".into(), title: "t".into(), worktree: wt, branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
+        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: wt, branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
         db.insert_workspace(&ws).unwrap();
         db.insert_tab(&tab).unwrap();
         let engine = Engine::new(ctx.clone(), db).unwrap();

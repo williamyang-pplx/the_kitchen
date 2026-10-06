@@ -193,7 +193,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({
                 "caller": {
                     "workspace": ws.as_ref().map(|w| json!({"id": w.row.id, "name": w.row.name, "host": w.row.host, "repo_path": w.row.repo_path})),
-                    "tab": tab.as_ref().map(|t| json!({"id": t.row.id, "kind": t.row.kind, "title": t.row.title, "worktree": t.row.worktree, "branch": t.row.branch, "plan_file": t.row.plan_file, "diff_base": t.row.diff_base})),
+                    "tab": tab.as_ref().map(|t| json!({"id": t.row.id, "title": t.row.title, "worktree": t.row.worktree, "branch": t.row.branch, "plan_file": t.row.plan_file, "diff_base": t.row.diff_base})),
                 },
                 "focused": {
                     "workspace": selected.as_ref().map(|w| w.row.id.clone()),
@@ -283,7 +283,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             let a: P = p(params)?;
             let ws = engine.resolve_workspace(a.workspace.as_deref(), caller)?;
             let row = engine.create_tab(&ws, a.opts)?;
-            Ok(json!({"id": row.id, "workspace": ws, "kind": row.kind, "title": row.title, "worktree": row.worktree,
+            Ok(json!({"id": row.id, "workspace": ws, "title": row.title, "worktree": row.worktree,
                       "branch": row.branch, "tmux_session": row.tmux_session, "plan_file": row.plan_file}))
         }
         "tab.select" => {
@@ -465,7 +465,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({"events": n}))
         }
 
-        "worktree.list" | "worktree.sync_readonly" | "worktree.remove" => worktree(engine, method, params, caller),
+        "worktree.list" | "worktree.remove" => worktree(engine, method, params, caller),
 
         _ => Err(anyhow!("unknown method {method:?}; see `kitchenctl --help`")),
     }
@@ -473,7 +473,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
 
 /// `worktree.*`: inspect and tidy the repo's worktrees.
 fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) -> Result<Value> {
-    use kitchen_core::git::{READONLY_SUFFIX, Repo};
+    use kitchen_core::git::Repo;
 
     #[derive(Deserialize, Default)]
     #[serde(default)]
@@ -502,8 +502,6 @@ fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) 
                     // git lists the main checkout first.
                     let role = if i == 0 {
                         "main"
-                    } else if w.path.ends_with(READONLY_SUFFIX) || w.path.contains("-kitchen-ro-") {
-                        "readonly"
                     } else if spares.contains(&w.path) {
                         "spare"
                     } else {
@@ -514,17 +512,6 @@ fn worktree(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller) 
                 })
                 .collect();
             Ok(Value::Array(out))
-        }
-        "worktree.sync_readonly" => {
-            repo.fetch().context("git fetch origin")?;
-            let base = match &ws.row.default_branch {
-                Some(b) => b.clone(),
-                None => repo.default_branch()?,
-            };
-            let _held = engine.hold_readonly(&ws)?;
-            let wt = repo.sync_readonly_worktree(&repo.readonly_path(), &format!("origin/{base}"))?;
-            engine.refill_spare(&ws_id, false);
-            Ok(json!({"path": wt.path, "head": wt.head}))
         }
         "worktree.remove" => {
             let given = host.expand_home(&a.path.context("path is required")?)?;

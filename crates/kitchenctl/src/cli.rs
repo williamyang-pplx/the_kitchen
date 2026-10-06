@@ -55,7 +55,7 @@ pub enum Command {
     /// Workspaces: one repo on this mac or on a devbox.
     #[command(subcommand)]
     Workspace(WorkspaceCmd),
-    /// Terminal tabs (edit tabs own a worktree; read-only tabs share one).
+    /// Terminal tabs, each in its own worktree.
     #[command(subcommand)]
     Tab(TabCmd),
     /// Git worktrees of a workspace's repo.
@@ -64,7 +64,7 @@ pub enum Command {
     /// The file viewer panel.
     #[command(subcommand)]
     Viewer(ViewerCmd),
-    /// The planning phase of an edit tab.
+    /// The planning phase of a tab.
     #[command(subcommand)]
     Plan(PlanCmd),
     /// Plugins: Lua in ~/.kitchen/plugins/<name>/ (see docs/plugins.md).
@@ -172,8 +172,8 @@ pub enum WorkspaceCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum TabCmd {
-    /// Open something in a read-only tab: plugins handle the text (the github
-    /// plugin opens PR links in the workspace for that repo).
+    /// Open something in a tab: plugins handle the text (the github plugin
+    /// opens a PR link on the PR's branch, in the workspace for that repo).
     #[command(after_help = "Example:\n  kitchenctl tab open https://github.com/ppl-ai/air/pull/14211")]
     Open { text: String },
     /// List tabs of a workspace.
@@ -182,24 +182,18 @@ pub enum TabCmd {
         #[command(flatten)]
         target: WsTarget,
     },
-    /// Open a tab. Edit tabs get their own worktree and branch off the latest
-    /// origin; with --task the agent starts planning (/low-level-plan).
-    #[command(after_help = "Examples:\n  kitchenctl tab new --edit --task \"AI-9586: retry judge calls\"\n  \
-        kitchenctl tab new --edit --branch william/old-work\n  kitchenctl tab new --readonly --no-agent")]
+    /// Open a tab in its own worktree, on a new branch off the latest origin
+    /// or on --branch; with --task the agent starts planning (/low-level-plan).
+    #[command(after_help = "Examples:\n  kitchenctl tab new --task \"AI-9586: retry judge calls\"\n  \
+        kitchenctl tab new --branch william/old-work\n  kitchenctl tab new --no-agent")]
     New {
-        /// Read/write tab with its own worktree (default).
-        #[arg(long, conflicts_with = "readonly")]
-        edit: bool,
-        /// Read-only tab on the up-to-date read-only worktree.
-        #[arg(long)]
-        readonly: bool,
-        /// Task/ticket text; edit tabs start the planning phase with it.
+        /// Task/ticket text; the agent starts the planning phase with it.
         #[arg(long)]
         task: Option<String>,
         /// Read the task text from a file (`-` for stdin).
         #[arg(long, conflicts_with = "task", value_name = "FILE")]
         task_file: Option<String>,
-        /// Existing branch to check out (edit tabs).
+        /// Existing branch to check out (fetched first; a tab already on it is reused).
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
@@ -332,12 +326,6 @@ pub enum WorktreeCmd {
         /// Also report uncommitted changes (runs `git status` in each worktree).
         #[arg(long)]
         status: bool,
-        #[command(flatten)]
-        target: WsTarget,
-    },
-    /// Fetch origin and move the shared read-only worktree to the latest default branch.
-    #[command(name = "sync-readonly")]
-    SyncReadonly {
         #[command(flatten)]
         target: WsTarget,
     },
@@ -496,7 +484,7 @@ impl Cli {
             Command::Tab(c) => match c {
                 TabCmd::Open { text } => api("tab.open", json!({"text": text})),
                 TabCmd::List { target } => api("tab.list", ws(target)),
-                TabCmd::New { edit: _, readonly, task, task_file, branch, title, command, no_agent, no_focus, target } => {
+                TabCmd::New { task, task_file, branch, title, command, no_agent, no_focus, target } => {
                     let task = match task_file {
                         Some(f) => Some(read_text(f, stdin)?),
                         None => task.clone(),
@@ -506,7 +494,6 @@ impl Cli {
                         merge(
                             ws(target),
                             json!({
-                                "kind": if *readonly { "readonly" } else { "edit" },
                                 "task": task, "branch": branch, "title": title, "command": command,
                                 "no_agent": no_agent, "focus": !no_focus,
                             }),
@@ -527,7 +514,6 @@ impl Cli {
             },
             Command::Worktree(c) => match c {
                 WorktreeCmd::List { status, target } => api("worktree.list", merge(ws(target), json!({"status": status}))),
-                WorktreeCmd::SyncReadonly { target } => api("worktree.sync_readonly", ws(target)),
                 WorktreeCmd::Remove { path, force, target } => {
                     api("worktree.remove", merge(ws(target), json!({"path": path, "force": force})))
                 }
@@ -603,16 +589,15 @@ mod tests {
     }
 
     #[test]
-    fn tab_new_edit_with_task() {
+    fn tab_new_with_task() {
         let (m, p) = api_call(&["tab", "new", "--task", "AI-1: x", "--branch", "b", "-w", "2"]);
         assert_eq!(m, "tab.create");
-        assert_eq!(p, json!({"workspace": "2", "kind": "edit", "task": "AI-1: x", "branch": "b", "no_agent": false, "focus": true}));
+        assert_eq!(p, json!({"workspace": "2", "task": "AI-1: x", "branch": "b", "no_agent": false, "focus": true}));
     }
 
     #[test]
-    fn tab_new_readonly_no_focus() {
-        let (_, p) = api_call(&["tab", "new", "--readonly", "--no-agent", "--no-focus"]);
-        assert_eq!(p["kind"], "readonly");
+    fn tab_new_no_agent_no_focus() {
+        let (_, p) = api_call(&["tab", "new", "--no-agent", "--no-focus"]);
         assert_eq!(p["focus"], false);
         assert_eq!(p["no_agent"], true);
     }

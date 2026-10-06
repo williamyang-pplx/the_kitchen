@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Most items kept per set.
 pub const MAX_ITEMS: usize = 10_000;
 
-/// A file as the viewer holds it. Edit tabs have their own worktrees, so the
+/// A file as the viewer holds it. Tabs have their own worktrees, so the
 /// worktree is part of the identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileKey {

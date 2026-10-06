@@ -10,11 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::host::Host;
 use crate::util::shell_quote;
 
-/// Directory name of the shared read-only worktree, next to the repo.
-pub const READONLY_SUFFIX: &str = "kitchen-readonly";
-
 /// A spare detached worktree kept checked out next to the repo, so a new
-/// edit tab can take it over instead of paying for a full checkout.
+/// tab can take it over instead of paying for a full checkout.
 pub const SPARE_SUFFIX: &str = "kitchen-spare";
 
 /// Spare worktrees kept per repo (each is a full checkout).
@@ -38,6 +35,15 @@ pub struct Worktree {
     pub head: String,
     pub branch: Option<String>,
     pub detached: bool,
+}
+
+/// What [`Repo::checkout_worktree`] puts in a worktree.
+#[derive(Debug, Clone, Copy)]
+pub enum Checkout<'a> {
+    /// A branch: the local one, else a new one tracking `origin/<branch>`.
+    Branch(&'a str),
+    /// A detached HEAD at a rev (a PR whose branch isn't on origin).
+    Detached(&'a str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,10 +92,6 @@ impl<'a> Repo<'a> {
         format!("{}/{}-{}", self.parent_dir(), self.repo_name(), slug)
     }
 
-    pub fn readonly_path(&self) -> String {
-        self.sibling_path(READONLY_SUFFIX)
-    }
-
     pub fn is_repo(&self) -> bool {
         self.git(&["rev-parse", "--git-dir"]).is_ok()
     }
@@ -126,18 +128,6 @@ impl<'a> Repo<'a> {
         Ok(parse_worktree_porcelain(&self.git(&["worktree", "list", "--porcelain"])?))
     }
 
-    pub fn worktree_for_branch(&self, branch: &str) -> Result<Option<Worktree>> {
-        Ok(self.worktrees()?.into_iter().find(|w| w.branch.as_deref() == Some(branch)))
-    }
-
-    pub fn local_branch_exists(&self, branch: &str) -> bool {
-        self.git(&["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok()
-    }
-
-    fn remote_branch_exists(&self, branch: &str) -> bool {
-        self.git(&["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")]).is_ok()
-    }
-
     /// New branch off the freshly fetched default branch, in its own worktree.
     pub fn add_worktree_new_branch(&self, branch: &str, path: &str, base: &str) -> Result<Worktree> {
         let start = format!("origin/{base}");
@@ -145,71 +135,74 @@ impl<'a> Repo<'a> {
         self.describe(path)
     }
 
-    /// Check out an existing branch (e.g. a PR head) in a worktree, reusing
-    /// the worktree that already has it checked out.
-    pub fn add_worktree_existing_branch(&self, branch: &str, path: &str) -> Result<Worktree> {
-        if let Some(wt) = self.worktree_for_branch(branch)? {
-            return Ok(wt);
-        }
-        if !self.remote_branch_exists(branch) {
-            let _ = self.git(&["fetch", "--quiet", "origin", &format!("{branch}:refs/remotes/origin/{branch}")]);
-        }
-        if self.local_branch_exists(branch) {
-            self.git(&["worktree", "add", path, branch])?;
-        } else if self.remote_branch_exists(branch) {
-            let upstream = format!("origin/{branch}");
-            self.git(&["worktree", "add", "--track", "-b", branch, path, &upstream])?;
-        } else {
-            bail!("branch {branch} exists neither locally nor on origin");
-        }
-        self.describe(path)
-    }
-
-    /// Detached, read-only worktree at `rev`, re-used and moved when it
-    /// exists. `fetch` refspecs (`+src:dst`) are fetched from origin first.
-    /// One round trip to the host; a worktree already at `rev` is left alone,
-    /// and a missing one takes over a spare (a checkout of a big repo from
-    /// scratch takes seconds).
+    /// Worktree with `to` checked out, after fetching `fetch` refspecs
+    /// (`+src:dst`) from origin; one round trip, `.kitchen/` git-excluded.
+    /// A branch already checked out somewhere is used where it is, else the
+    /// worktree goes at `path`, taking over a spare when there is one (a
+    /// checkout of a big repo from scratch takes seconds).
     ///
-    /// Only directories are locked: no file can be created, deleted or
-    /// renamed (that includes `sed -i` and editors' atomic saves). Files keep
-    /// their mode, because chmod bumps a file's ctime and git then re-hashes
-    /// it on the next checkout or status (2.3 GB for agi: ~7 s).
-    pub fn sync_readonly_worktree(&self, path: &str, rev: &str) -> Result<Worktree> {
-        Ok(self.sync_readonly_worktree_fetching(path, rev, &[])?.0)
-    }
-
-    /// [`Self::sync_readonly_worktree`] after fetching `fetch`; also says
-    /// whether HEAD moved (a new worktree counts as moved).
-    pub fn sync_readonly_worktree_fetching(&self, path: &str, rev: &str, fetch: &[String]) -> Result<(Worktree, bool)> {
-        let (r, p, rv) = (shell_quote(self.path), shell_quote(path), shell_quote(&format!("{rev}^{{commit}}")));
+    /// An existing worktree is moved forward, never reset: a branch is
+    /// fast-forwarded to its upstream, and a detached worktree is checked out
+    /// at the rev or switched onto the branch. git refuses whatever would
+    /// overwrite local changes. Also says whether HEAD moved (a new worktree
+    /// counts as moved).
+    pub fn checkout_worktree(&self, path: &str, to: Checkout, fetch: &[String]) -> Result<(Worktree, bool)> {
+        let r = shell_quote(self.path);
         let fetch = if fetch.is_empty() { String::new() } else { format!("{} || exit 11\n", fetch_cmd(&r, fetch)) };
-        let script = format!(
-            r#"{fetch}moved=1
-git -C {r} rev-parse --verify --quiet {rv} >/dev/null || {{ echo "unknown revision {rev}" >&2; exit 14; }}
-unlock() {{ find {p} -path {p}/.git -prune -o -type d ! -perm -200 -exec chmod u+w {{}} + 2>/dev/null; true; }}
-lock() {{ find {p} -path {p}/.git -prune -o -type d -perm -200 -exec chmod a-w {{}} + 2>/dev/null; true; }}
-{take_spare}
-if [ -e {p} ] && [ "$(git -C {p} rev-parse HEAD 2>/dev/null)" = "$(git -C {r} rev-parse --verify --quiet {rv})" ] && git -C {p} diff --quiet 2>/dev/null; then
-  moved=0
-elif [ -e {p} ]; then
-  # (also at `rev` already, but with files edited in place: put them back)
-  git -C {p} rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "{path} exists but is not a git worktree" >&2; exit 12; }}
-  unlock
-  git -C {p} checkout --quiet --detach --force {rv} && git -C {p} clean -fdq; rc=$?
-  lock
-  [ $rc = 0 ] || exit $rc
-elif take_spare {p}; then
-  git -C {p} checkout --quiet --detach --force {rv} && git -C {p} clean -fdq || {{ give_back {p}; exit 13; }}
-  lock
+        let checkout = match to {
+            Checkout::Branch(branch) => format!(
+                r#"b={b}
+W=$(git -C {r} worktree list --porcelain | awk -v ref="branch refs/heads/$b" '/^worktree /{{w=substr($0,10)}} $0==ref{{print w; exit}}')
+[ -n "$W" ] && P=$W
+if git -C {r} rev-parse --verify --quiet "refs/heads/$b" >/dev/null; then local=1
+elif git -C {r} rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null; then local=
+else echo "branch $b exists neither locally nor on origin" >&2; exit 14; fi
+co() {{ if [ -n "$local" ]; then git -C "$1" checkout --quiet "$b"; else git -C "$1" checkout --quiet --track -b "$b" "origin/$b"; fi; }}
+before=$(git -C "$P" rev-parse HEAD 2>/dev/null)
+if [ -e "$P" ]; then
+  git -C "$P" rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "$P exists but is not a git worktree" >&2; exit 12; }}
+  cur=$(git -C "$P" symbolic-ref --quiet --short HEAD)
+  if [ "$cur" = "$b" ]; then
+    if git -C "$P" rev-parse --verify --quiet '@{{u}}' >/dev/null; then git -C "$P" merge --quiet --ff-only '@{{u}}' || exit 13; fi
+  elif [ -z "$cur" ]; then
+    co "$P" || exit 13
+  else
+    echo "$P is on branch $cur, not $b" >&2; exit 12
+  fi
+elif take_spare "$P"; then
+  co "$P" || {{ give_back "$P"; exit 13; }}
+elif [ -n "$local" ]; then
+  git -C {r} worktree add --quiet "$P" "$b" || exit 13
 else
-  git -C {r} worktree add --quiet --detach {p} {rv} || exit 13
-  lock
-fi
-echo "KT_MOVED=$moved"
+  git -C {r} worktree add --quiet --track -b "$b" "$P" "origin/$b" || exit 13
+fi"#,
+                b = shell_quote(branch),
+            ),
+            Checkout::Detached(rev) => format!(
+                r#"git -C {r} rev-parse --verify --quiet {rv} >/dev/null || {{ echo "unknown revision {rev}" >&2; exit 14; }}
+before=$(git -C "$P" rev-parse HEAD 2>/dev/null)
+if [ -e "$P" ]; then
+  git -C "$P" rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "$P exists but is not a git worktree" >&2; exit 12; }}
+  git -C "$P" checkout --quiet --detach {rv} || exit 13
+elif take_spare "$P"; then
+  git -C "$P" checkout --quiet --detach {rv} || {{ give_back "$P"; exit 13; }}
+else
+  git -C {r} worktree add --quiet --detach "$P" {rv} || exit 13
+fi"#,
+                rv = shell_quote(&format!("{rev}^{{commit}}")),
+            ),
+        };
+        let script = format!(
+            r#"{fetch}P={p}
+{take_spare}
+{checkout}
+{exclude}
+[ "$before" = "$(git -C "$P" rev-parse HEAD)" ] && echo KT_MOVED=0 || echo KT_MOVED=1
 {report}"#,
+            p = shell_quote(path),
             take_spare = take_spare_snippet(&r, &self.spare_paths()),
-            report = report_snippet(&p),
+            exclude = exclude_snippet("\"$P\""),
+            report = report_snippet("\"$P\""),
         );
         let out = self.host.sh_ok(&script, None)?;
         Ok((parse_report(&out)?, out.lines().any(|l| l == "KT_MOVED=1")))
@@ -220,7 +213,7 @@ echo "KT_MOVED=$moved"
     /// fresh), checked out in the sibling worktree `<repo>-<slug>`, with
     /// `.kitchen/` git-excluded. One round trip to the host, no network.
     pub fn create_edit_worktree(&self, base: &str, prefix: &str, slug: &str) -> Result<Worktree> {
-        // `<repo>-kitchen-*` names belong to the kitchen (spares, read-only trees).
+        // `<repo>-kitchen-*` names belong to the kitchen (spares, PR tabs).
         let slug = if slug.starts_with("kitchen") { format!("tab-{slug}") } else { slug.to_string() };
         let (r, b, pf, sl) = (shell_quote(self.path), shell_quote(base), shell_quote(prefix), shell_quote(&slug));
         let parent = shell_quote(self.parent_dir());
@@ -319,17 +312,6 @@ exit ${{err:-0}}"#,
         Ok(())
     }
 
-    /// Toggle write permission on every file and directory under `path`,
-    /// leaving the worktree's `.git` link file alone.
-    pub fn set_writable(&self, path: &str, writable: bool) -> Result<()> {
-        let mode = if writable { "u+w" } else { "a-w" };
-        let script = format!(
-            "find {p} -path {p}/.git -prune -o -exec chmod {mode} {{}} + 2>/dev/null; true",
-            p = crate::util::shell_quote(path)
-        );
-        self.host.sh_ok(&script, None).map(|_| ())
-    }
-
     /// Once per workspace setup: turn on git's untracked-file cache unless the
     /// repo configures it (big repos: `git status` stops walking every
     /// directory), and run the cheap maintenance tasks, niced. No repacking:
@@ -355,7 +337,6 @@ true"#
     }
 
     pub fn remove_worktree(&self, path: &str, force: bool) -> Result<()> {
-        let _ = self.set_writable(path, true);
         let mut args = vec!["worktree", "remove"];
         if force {
             args.push("--force");
@@ -384,11 +365,9 @@ true"#
     /// Everything the file viewer needs but the tracked-file list, in one
     /// round trip: HEAD, a checksum of the index's file list (~60 ms on agi),
     /// the merge base of HEAD and `base_ref`, and the files
-    /// changed since it. `untracked` adds untracked files (as added); read-only
-    /// worktrees are cleaned and locked, so they skip that scan (~0.5 s on agi).
-    pub fn listing(&self, dir: &str, base_ref: &str, untracked: bool) -> Result<Listing> {
+    /// changed since it, untracked files included (as added).
+    pub fn listing(&self, dir: &str, base_ref: &str) -> Result<Listing> {
         let (d, b) = (shell_quote(dir), shell_quote(base_ref));
-        let others = if untracked { "git ls-files --others --exclude-standard -z" } else { "true" };
         let script = format!(
             "cd {d} || exit 3\n\
              git rev-parse HEAD | tr -d '\\n'; printf '\\036'\n\
@@ -397,7 +376,7 @@ true"#
              printf '%s' \"$base\"; printf '\\036'\n\
              git diff -M --name-status -z \"$base\"; printf '\\036'\n\
              git diff -M --numstat -z \"$base\"; printf '\\036'\n\
-             {others}\n"
+             git ls-files --others --exclude-standard -z\n"
         );
         let out = self.host.sh_ok(&script, None).with_context(|| format!("list files in {dir}"))?;
         parse_listing(&out)
@@ -680,21 +659,19 @@ mod tests {
         );
         let dir = root.join("repo").display().to_string();
         let repo = Repo::new(&Host::Local, &dir);
-        let l = repo.listing(&dir, "origin/main", true).unwrap();
+        let l = repo.listing(&dir, "origin/main").unwrap();
         assert_eq!(l.head.len(), 40, "{:?}", l.head);
         assert_eq!(l.base, l.head, "nothing committed: the merge base is HEAD");
         assert!(!l.index.is_empty());
         sh(root.join("repo").as_path(), "git add 'aster/sp ace.rs'");
-        let staged = repo.listing(&dir, "origin/main", true).unwrap();
+        let staged = repo.listing(&dir, "origin/main").unwrap();
         assert_ne!(staged.index, l.index, "staging a file changes the index checksum");
         assert_eq!(staged.head, l.head);
         sh(root.join("repo").as_path(), "git rm -q --cached 'aster/sp ace.rs'");
-        assert_eq!(repo.listing(&dir, "origin/main", true).unwrap().index, l.index);
+        assert_eq!(repo.listing(&dir, "origin/main").unwrap().index, l.index);
         let changed: Vec<&str> = l.changed.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(changed, vec!["aster/src/a.rs", "aster/sp ace.rs"]);
         assert_eq!(l.changed[0].added, 1);
-        let l = repo.listing(&dir, "origin/main", false).unwrap();
-        assert_eq!(l.changed.len(), 1, "untracked files skipped: {:?}", l.changed);
         assert_eq!(repo.tracked_files(&dir).unwrap(), vec!["aster/src/a.rs", "aster/ünï cødé.md", "top.md"]);
         for (suffix, want) in [
             ("a.rs", vec!["aster/src/a.rs"]),
@@ -743,46 +720,10 @@ mod tests {
         let wt = repo.add_worktree_new_branch("william/feature", &edit, "main").unwrap();
         assert_eq!(wt.branch.as_deref(), Some("william/feature"));
 
-        // Read-only: directories are locked (nothing can be added, removed or
-        // renamed), files keep their ctime so git never re-hashes the tree.
-        use std::os::unix::fs::MetadataExt;
-        let ro = repo.readonly_path();
-        let ctime = |f: &str| std::fs::metadata(format!("{ro}/{f}")).map(|m| (m.ctime(), m.ctime_nsec())).unwrap();
-        repo.sync_readonly_worktree(&ro, "origin/main").unwrap();
-        assert!(std::fs::write(format!("{ro}/new.txt"), "x").is_err(), "read-only worktree must reject new files");
-        assert!(std::fs::remove_file(format!("{ro}/a.txt")).is_err(), "and deletions");
-        let a_created = ctime("a.txt");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        // Advance origin and resync: the read-only tree follows.
         sh(root, "cd origin && echo three > c.txt && git add . && git commit -qm more");
         repo.fetch().unwrap();
-        repo.sync_readonly_worktree(&ro, "origin/main").unwrap();
-        assert!(exists(&format!("{ro}/c.txt")));
-        assert_eq!(ctime("a.txt"), a_created, "unchanged file was chmod-ed");
-        // Resyncing still replaces changed files, adds new folders locked, and drops strays.
-        sh(root, "cd origin && mkdir d && echo four > d/e.txt && echo changed > c.txt && git add . && git commit -qm again");
-        sh(std::path::Path::new(&ro), "chmod u+w . && touch stray && chmod a-w .");
-        repo.fetch().unwrap();
-        repo.sync_readonly_worktree(&ro, "origin/main").unwrap();
-        assert_eq!(ctime("a.txt"), a_created);
-        assert_eq!(std::fs::read_to_string(format!("{ro}/c.txt")).unwrap(), "changed\n");
-        assert!(std::fs::write(format!("{ro}/d/new.txt"), "x").is_err(), "new folders are locked too");
-        assert!(!exists(&format!("{ro}/stray")));
-        assert!(repo.sync_readonly_worktree(&ro, "origin/nope").unwrap_err().to_string().contains("exit 14"));
-        // Folders-only lock: an in-place edit is possible, and the next sync
-        // at the same commit puts the file back.
-        std::fs::OpenOptions::new().append(true).open(format!("{ro}/a.txt")).map(|mut f| std::io::Write::write_all(&mut f, b"edit")).unwrap().unwrap();
-        let (_, moved) = repo.sync_readonly_worktree_fetching(&ro, "origin/main", &[]).unwrap();
-        assert!(moved, "restoring edited files counts as moved");
-        assert_eq!(std::fs::read_to_string(format!("{ro}/a.txt")).unwrap(), "one\n");
 
-        // Re-opening an existing branch reuses its worktree.
-        let again = repo.add_worktree_existing_branch("william/feature", "/nonexistent").unwrap();
-        assert!(again.path.ends_with("/repo-feature"), "{}", again.path);
-        repo.remove_worktree(&ro, true).unwrap();
-        assert!(!exists(&ro));
-
-        // Spares: two, detached at origin/main. Edit tabs take them in turn
+        // Spares: two, detached at origin/main. New tabs take them in turn
         // (slug collisions get -2, .kitchen/ excluded), then check out fresh.
         repo.ensure_spare_worktree("main", false).unwrap();
         let spares = repo.spare_paths();
@@ -843,7 +784,7 @@ mod tests {
         repo.ensure_spare_worktree("main", false).unwrap();
         assert!(spares.iter().all(|s| exists(&format!("{s}/.git"))), "deleted spare re-created");
 
-        // New edit tabs never fetch: a commit on origin reaches them once a
+        // New tabs never fetch: a commit on origin reaches them once a
         // spare refresh fetches it, which brings both spares along.
         sh(root, "cd origin && echo six > s.txt && git add . && git commit -qm six");
         let h = repo.create_edit_worktree("main", "william/", "nofetch").unwrap();
@@ -857,31 +798,80 @@ mod tests {
         repo.ensure_spare_worktree("main", true).unwrap();
         assert!(spares.iter().all(|s| exists(&format!("{s}/v.txt")) && !exists(&format!("{s}/e.txt"))), "fetch failure tolerated");
         sh(root, &format!("git -C repo remote set-url origin {}", shell_quote(&root.join("origin").display().to_string())));
+    }
 
-        // Read-only sync with a fetch in the same round trip.
-        let (ro2, _) = repo.sync_readonly_worktree_fetching(&repo.readonly_path(), "origin/main", &[branch_refspec("main")]).unwrap();
-        assert!(ro2.detached);
+    /// Existing branches and PR heads, fetched and checked out in one trip,
+    /// then moved forward (never reset) when opened again.
+    #[test]
+    fn checkout_worktree_branch_and_detached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sh(
+            root,
+            "git init -q -b main origin && cd origin && git config user.email t@t && git config user.name t \
+             && echo one > a.txt && git add . && git commit -qm init \
+             && git checkout -qb pr && echo pr > p.txt && git add . && git commit -qm pr \
+             && git update-ref refs/pull/7/head HEAD && git checkout -q main \
+             && cd .. && git clone -q origin repo && git -C repo config user.email t@t && git -C repo config user.name t",
+        );
+        let host = Host::Local;
+        let repo_path = root.join("repo").display().to_string();
+        let repo = Repo::new(&host, &repo_path);
+        let read = |p: &str| std::fs::read_to_string(p).unwrap();
 
-        // A PR-style ref (refs/pull/N/head on the remote) fetched and checked
-        // out in one trip, in a spare when there is one; re-syncing at the
-        // same commit does nothing.
+        // A branch only on origin: fetched, takes over a spare, writable.
         repo.ensure_spare_worktree("main", false).unwrap();
-        sh(root, "cd origin && git checkout -qb pr && echo pr > p.txt && git add . && git commit -qm pr \
-                  && git update-ref refs/pull/7/head HEAD && git checkout -q main");
-        let pr_path = repo.sibling_path("kitchen-ro-pr-7");
-        let specs = ["+refs/pull/7/head:refs/kitchen/pr/7".to_string(), branch_refspec("main")];
-        let (wt, moved) = repo.sync_readonly_worktree_fetching(&pr_path, "refs/kitchen/pr/7", &specs).unwrap();
-        assert!(moved && exists(&format!("{}/p.txt", wt.path)));
-        assert!(wt.detached);
-        assert!(!exists(&spares[0]), "the PR worktree took over a spare");
-        assert!(std::fs::write(format!("{pr_path}/new.txt"), "x").is_err(), "and is locked");
-        let (_, moved) = repo.sync_readonly_worktree_fetching(&pr_path, "refs/kitchen/pr/7", &specs).unwrap();
-        assert!(!moved, "same head: no checkout");
-        sh(root, "cd origin && git checkout -q pr && echo more >> p.txt && git commit -qam more \
-                  && git update-ref refs/pull/7/head HEAD && git checkout -q main");
-        let (_, moved) = repo.sync_readonly_worktree_fetching(&pr_path, "refs/kitchen/pr/7", &specs).unwrap();
-        assert!(moved, "new push moves the worktree");
-        assert_eq!(std::fs::read_to_string(format!("{pr_path}/p.txt")).unwrap(), "pr\nmore\n");
+        let spares = repo.spare_paths();
+        let path = repo.sibling_path("kitchen-pr-7");
+        let fetch = [branch_refspec("pr")];
+        let (wt, moved) = repo.checkout_worktree(&path, Checkout::Branch("pr"), &fetch).unwrap();
+        assert!(moved && wt.branch.as_deref() == Some("pr") && exists(&format!("{path}/p.txt")));
+        assert!(!exists(&spares[0]), "took over a spare");
+        std::fs::write(format!("{path}/a.txt"), "local edit\n").unwrap();
+        let excl = read(&format!("{repo_path}/.git/info/exclude"));
+        assert_eq!(excl.matches(".kitchen/").count(), 1);
+
+        // Same head: nothing moves. A new push fast-forwards, keeping local edits.
+        let (_, moved) = repo.checkout_worktree(&path, Checkout::Branch("pr"), &fetch).unwrap();
+        assert!(!moved);
+        sh(root, "cd origin && git checkout -q pr && echo more >> p.txt && git commit -qam more && git checkout -q main");
+        let (_, moved) = repo.checkout_worktree(&path, Checkout::Branch("pr"), &fetch).unwrap();
+        assert!(moved);
+        assert_eq!(read(&format!("{path}/p.txt")), "pr\nmore\n");
+        assert_eq!(read(&format!("{path}/a.txt")), "local edit\n", "local edits survive");
+
+        // Reused where it is checked out, whatever path is asked for.
+        let (again, _) = repo.checkout_worktree("/nonexistent", Checkout::Branch("pr"), &[]).unwrap();
+        assert!(again.path.ends_with("/repo-kitchen-pr-7"), "{}", again.path);
+
+        // Diverged: the fast-forward fails and the tree is left alone.
+        sh(std::path::Path::new(&path), "git commit -qam mine");
+        sh(root, "cd origin && git checkout -q pr && echo other >> p.txt && git commit -qam other && git checkout -q main");
+        assert!(repo.checkout_worktree(&path, Checkout::Branch("pr"), &fetch).unwrap_err().to_string().contains("exit 13"));
+        assert_eq!(read(&format!("{path}/p.txt")), "pr\nmore\n");
+
+        // Detached at a PR ref; a conflicting local edit stops a re-checkout.
+        let det = repo.sibling_path("kitchen-pr-8");
+        let specs = ["+refs/pull/7/head:refs/kitchen/pr/7".to_string()];
+        let (wt, moved) = repo.checkout_worktree(&det, Checkout::Detached("refs/kitchen/pr/7"), &specs).unwrap();
+        assert!(moved && wt.detached && exists(&format!("{det}/p.txt")));
+        std::fs::write(format!("{det}/p.txt"), "edited\n").unwrap();
+        sh(root, "cd origin && git checkout -q pr && git update-ref refs/pull/7/head HEAD && git checkout -q main");
+        assert!(repo.checkout_worktree(&det, Checkout::Detached("refs/kitchen/pr/7"), &specs).unwrap_err().to_string().contains("exit 13"));
+        assert_eq!(read(&format!("{det}/p.txt")), "edited\n");
+
+        // A detached worktree asked for a branch is switched onto it.
+        sh(std::path::Path::new(&det), "git checkout -q -- p.txt");
+        sh(root, "cd origin && git branch -q other main");
+        let (wt, _) = repo.checkout_worktree(&det, Checkout::Branch("other"), &[branch_refspec("other")]).unwrap();
+        assert_eq!(wt.branch.as_deref(), Some("other"));
+
+        // On another branch, or no such branch: refused.
+        sh(root, "cd origin && git branch -q third main");
+        let e = repo.checkout_worktree(&det, Checkout::Branch("third"), &[branch_refspec("third")]).unwrap_err();
+        assert!(e.to_string().contains("exit 12"), "{e:#}");
+        let e = repo.checkout_worktree(&det, Checkout::Branch("nope"), &[]).unwrap_err();
+        assert!(e.to_string().contains("exit 14"), "{e:#}");
     }
 
     #[test]

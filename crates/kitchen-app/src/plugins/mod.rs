@@ -31,7 +31,7 @@ use keys::Chord;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 6;
+pub const API_LEVEL: u32 = 7;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (text typed into ⌘I), `comment` (a viewer comment to post),
 /// `dashboard` (a workspace's dashboard was shown or hidden).
@@ -929,30 +929,36 @@ mod tests {
         let spec: mlua::Function = m.get("spec").unwrap();
         let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
         let ws = lua.to_value(&serde_json::json!({"id": "w1", "default_branch": "main"})).unwrap();
-        let open = lua.to_value(&serde_json::json!({"title": "Fix it", "baseRefName": "dev", "state": "OPEN"})).unwrap();
+        // An open PR from this repo: its branch, fetched with the base.
+        let open = lua.to_value(&serde_json::json!({"title": "Fix it", "baseRefName": "dev", "state": "OPEN", "headRefName": "al/fix"})).unwrap();
         let s = to_json(spec.call((ws.clone(), 12, open)).unwrap());
         assert_eq!(s["title"], "#12 Fix it");
-        assert_eq!(s["rev"], "refs/kitchen/pr/12");
+        assert_eq!((s["name"].as_str(), s["branch"].as_str(), s.get("rev")), (Some("kitchen-pr-12"), Some("al/fix"), None));
         assert_eq!(s["diff_base"], "origin/dev");
+        assert_eq!(s["fetch"], serde_json::json!(["+refs/heads/al/fix:refs/remotes/origin/al/fix", "+refs/heads/dev:refs/remotes/origin/dev"]));
+        // A fork, a merged PR, no gh: the PR head, detached.
+        let fork = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "dev", "state": "OPEN", "headRefName": "main", "isCrossRepository": true})).unwrap();
+        let s = to_json(spec.call((ws.clone(), 12, fork)).unwrap());
+        assert_eq!((s.get("branch"), s["rev"].as_str()), (None, Some("refs/kitchen/pr/12")));
         assert_eq!(s["fetch"], serde_json::json!(["+refs/pull/12/head:refs/kitchen/pr/12", "+refs/heads/dev:refs/remotes/origin/dev"]));
-        let merged = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "dev", "state": "MERGED", "mergeCommit": {"oid": "abc"}})).unwrap();
-        assert_eq!(to_json(spec.call((ws.clone(), 12, merged)).unwrap())["diff_base"], "abc^1");
+        let merged = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "dev", "state": "MERGED", "headRefName": "al/fix", "mergeCommit": {"oid": "abc"}})).unwrap();
+        let s = to_json(spec.call((ws.clone(), 12, merged)).unwrap());
+        assert_eq!((s["rev"].as_str(), s["diff_base"].as_str()), (Some("refs/kitchen/pr/12"), Some("abc^1")));
         let no_gh = to_json(spec.call((ws.clone(), 12, mlua::Value::Nil)).unwrap());
-        assert_eq!((no_gh["title"].as_str(), no_gh["diff_base"].as_str()), (Some("PR #12"), Some("origin/main")));
-        // After the prefetch (PR head + default branch), an open PR on the
-        // default branch fetches nothing; other bases still fetch theirs.
-        let on_main = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "main", "state": "OPEN"})).unwrap();
-        assert!(to_json(spec.call((ws.clone(), 12, on_main.clone(), true)).unwrap()).get("fetch").is_none());
-        assert!(to_json(spec.call((ws.clone(), 12, on_main, false)).unwrap())["fetch"].is_array());
-        let on_dev = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "dev", "state": "OPEN"})).unwrap();
-        assert!(to_json(spec.call((ws.clone(), 12, on_dev, true)).unwrap())["fetch"].is_array());
+        assert_eq!((no_gh["title"].as_str(), no_gh["rev"].as_str(), no_gh["diff_base"].as_str()), (Some("PR #12"), Some("refs/kitchen/pr/12"), Some("origin/main")));
+        // After the prefetch (PR head + default branch), a detached PR on the
+        // default branch fetches nothing; a branch or another base still fetch.
+        assert!(to_json(spec.call((ws.clone(), 12, mlua::Value::Nil, true)).unwrap()).get("fetch").is_none());
+        let on_main = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "main", "state": "OPEN", "headRefName": "al/fix"})).unwrap();
+        assert_eq!(to_json(spec.call((ws.clone(), 12, on_main, true)).unwrap())["fetch"], serde_json::json!(["+refs/heads/al/fix:refs/remotes/origin/al/fix"]));
         let prefetch: Vec<String> = lua.from_value(m.get::<mlua::Function>("prefetch").unwrap().call((ws, 12)).unwrap()).unwrap();
         assert_eq!(prefetch, ["+refs/pull/12/head:refs/kitchen/pr/12", "+refs/heads/main:refs/remotes/origin/main"]);
 
         // Review comments: threads from gh's list, items for the viewer, post arguments.
         let pr_number: mlua::Function = m.get("pr_number").unwrap();
-        assert_eq!(pr_number.call::<Option<u64>>("/r/air-kitchen-ro-pr-14211").unwrap(), Some(14211));
-        assert_eq!(pr_number.call::<Option<u64>>("/r/air-kitchen-ro-main").unwrap(), None);
+        assert_eq!(pr_number.call::<Option<u64>>("/r/air-kitchen-pr-14211").unwrap(), Some(14211));
+        assert_eq!(pr_number.call::<Option<u64>>("/r/air-fix-pr-5").unwrap(), None, "a tab's own slug");
+        assert_eq!(pr_number.call::<Option<u64>>("/r/air-kitchen-ro-pr-3").unwrap(), None, "pre-merge read-only tree");
         let list = lua
             .to_value(&serde_json::json!([
                 { "id": 2, "in_reply_to_id": 1, "path": "a.py", "user": "bo", "body": "agreed", "created_at": "2026-10-02T00:00:00Z" },
@@ -996,26 +1002,28 @@ mod tests {
 
         let list = val(serde_json::json!([
             { "path": "/r/air", "branch": "main", "head": "a", "role": "main" },
-            { "path": "/r/air-kitchen-readonly", "head": "b", "role": "readonly" },
+            { "path": "/r/air-kitchen-ro-pr-11", "head": "b", "role": "edit" },
             { "path": "/r/air-kitchen-spare", "head": "c", "role": "spare" },
             { "path": "/r/air-tabbed", "branch": "william/tabbed", "head": "d", "role": "edit", "tab": "t1" },
             { "path": "/r/air-detached", "head": "e", "role": "edit" },
             { "path": "/r/air-good", "branch": "william/good", "head": "f", "role": "edit" },
             { "path": "/r/air-moved", "branch": "william/open-elsewhere", "head": "g", "role": "edit" },
-            { "path": "/r/air-kitchen-ro-pr-12", "head": "h", "role": "readonly" },
-            { "path": "/r/air-kitchen-ro-pr-13", "head": "i", "role": "readonly" },
+            { "path": "/r/air-kitchen-pr-12", "head": "h", "role": "edit" },
+            { "path": "/r/air-kitchen-pr-13", "head": "i", "role": "edit" },
+            { "path": "/r/air-kitchen-pr-14", "branch": "al/fix", "head": "j", "role": "edit" },
         ]));
         // Tabs whose worktree path git spells differently: matched by branch / name.
         let tabs = val(serde_json::json!([
             { "worktree": "/private/r/air-other", "branch": "william/open-elsewhere" },
-            { "worktree": "/private/r/air-kitchen-ro-pr-13" },
+            { "worktree": "/private/r/air-kitchen-pr-13" },
         ]));
         let got = to_json(m.get::<mlua::Function>("candidates").unwrap().call((list, tabs)).unwrap());
         assert_eq!(
             got,
             serde_json::json!([
                 { "kind": "edit", "path": "/r/air-good", "branch": "william/good", "head": "f" },
-                { "kind": "pr", "path": "/r/air-kitchen-ro-pr-12", "number": 12, "head": "h" },
+                { "kind": "pr", "path": "/r/air-kitchen-pr-12", "number": 12, "head": "h" },
+                { "kind": "edit", "path": "/r/air-kitchen-pr-14", "branch": "al/fix", "head": "j" },
             ])
         );
 
@@ -1034,8 +1042,10 @@ mod tests {
         let v = judge(edit("abc"), serde_json::json!([pr(1, "CLOSED", "old"), pr(4, "MERGED", "abc")]));
         assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool(), v["pr"]["number"].as_u64()), (Some("remove"), Some(true), Some(4)));
         let review = || val(serde_json::json!({ "kind": "pr", "number": 12, "head": "zzz" }));
-        let v = judge(review(), serde_json::json!([{ "number": 12, "state": "MERGED" }]));
+        let v = judge(review(), serde_json::json!([pr(12, "MERGED", "zzz")]));
         assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some(false)));
+        let v = judge(review(), serde_json::json!([pr(12, "MERGED", "abc")]));
+        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("local commits not on PR #12")));
         let v = judge(review(), serde_json::json!([{ "number": 12, "state": "OPEN" }]));
         assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("PR #12 open")));
 
@@ -1066,20 +1076,19 @@ mod tests {
                 { "path": "/r/a", "role": "main" },
                 { "path": "/r/a-x", "role": "edit", "tab": "t1" },
                 { "path": "/r/a-y", "role": "edit" },
-                { "path": "/r/a-kitchen-ro-pr-12", "role": "readonly" },
-                { "path": "/r/a-kitchen-readonly", "role": "readonly" },
+                { "path": "/r/a-kitchen-pr-12", "role": "edit" },
                 { "path": "/r/a-kitchen-spare", "role": "spare" },
             ]))
             .unwrap();
         let counts = m.get::<mlua::Function>("worktree_counts").unwrap().call::<mlua::Value>(list).unwrap();
-        assert_eq!(to_json(counts.clone()), serde_json::json!({"total": 6, "edit": 2, "edit_tabs": 1, "review": 1, "readonly": 1, "spare": 1}));
+        assert_eq!(to_json(counts.clone()), serde_json::json!({"total": 5, "edit": 3, "edit_tabs": 1, "spare": 1}));
 
         let parsed: mlua::Value = parse.call(text).unwrap();
         let paths = lua.to_value(&serde_json::json!(["/home/dev/air-worktrees/ast-1"])).unwrap();
         let sections = to_json(m.get::<mlua::Function>("sections").unwrap().call((counts, parsed.clone(), parsed, paths, 1, 0)).unwrap());
         let titles: Vec<&str> = sections.as_array().unwrap().iter().map(|s| s["title"].as_str().unwrap()).collect();
         assert_eq!(titles, ["Worktrees", "Disk", "RAM"]);
-        assert_eq!(sections[0]["rows"][0], serde_json::json!({"label": "edit", "value": "2 (1 with tabs)"}));
+        assert_eq!(sections[0]["rows"][0], serde_json::json!({"label": "checkouts", "value": "3 (1 with tabs)"}));
         let disk = &sections[1]["rows"];
         assert_eq!((disk[0]["value"].as_str(), disk.as_array().unwrap().len()), (Some("381.5G / 953.7G"), 2), "the volume, then `top` = 1 folder");
         assert_eq!((disk[1]["label"].as_str(), disk[1]["mark"].as_bool()), (Some("agi"), Some(false)));

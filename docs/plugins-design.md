@@ -78,7 +78,7 @@ UI thread ── Event/Invoke ──▶ plugin inbox (mpsc) ─▶ plugin thread
 
 ## 3. Files, versions, units
 
-* **File identity** *(review)*: `{host, worktree, path}` — edit tabs have their
+* **File identity** *(review)*: `{host, worktree, path}` — tabs have their
   own worktrees, so `(workspace, path)` is ambiguous. `abs = worktree/path`.
 * **Version** *(review)*: a content hash (`blake3`, 16 hex) of the text the
   viewer holds. External tools can compute it from disk. A decoration set
@@ -177,10 +177,9 @@ about LSP:
 ## Level 3 (2026-10-04): opening tabs
 
 * `kitchen.tab_open{workspace, rev, fetch, diff_base, name, title}` — a
-  read-only tab at any rev, in worktree `<repo>-kitchen-ro-<name>`. The core
-  has one read-only path: the latest-main tab is the default spec. Fetch +
-  checkout are one host round trip, skipped when HEAD is already at `rev`;
-  a second open of the same name reuses (and re-syncs) the tab.
+  tab at any rev, in worktree `<repo>-<name>` (level 7 added `branch`, and
+  dropped read-only tabs). Fetch + checkout are one host round trip; a
+  second open of the same name reuses (and moves forward) the tab.
 * `diff_base` is a tab column (NULL = `origin/<default>`), used by the viewer
   and exported as `KITCHEN_DIFF_BASE`, so it survives session re-creation.
 * `kitchen.on("open", ev)` — free text from ⌘I / `tab.open` goes to every

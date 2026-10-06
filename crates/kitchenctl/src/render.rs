@@ -17,10 +17,9 @@ fn opt(v: &Value, prefix: &str) -> String {
 fn tabs(out: &mut String, tabs: &Value, indent: &str) {
     for t in tabs.as_array().into_iter().flatten() {
         let mark = if t["selected"].as_bool() == Some(true) { "*" } else { " " };
-        let kind = if t["kind"] == "readonly" { "RO" } else { "RW" };
         let unread = if t["unread"].as_bool() == Some(true) { " ●" } else { "" };
         out.push_str(&format!(
-            "{indent}{mark} tab:{} [{kind}] {}{unread}  (id {}{})\n{indent}    {}\n",
+            "{indent}{mark} tab:{} {}{unread}  (id {}{})\n{indent}    {}\n",
             s(&t["index"]),
             s(&t["title"]),
             s(&t["id"]),
@@ -45,9 +44,8 @@ pub fn render(method: &str, v: &Value) -> String {
             }
             if !tab.is_null() {
                 out.push_str(&format!(
-                    "tab:       {} [{}] (id {})\nworktree:  {}\n{}{}{}",
+                    "tab:       {} (id {})\nworktree:  {}\n{}{}{}",
                     s(&tab["title"]),
-                    s(&tab["kind"]),
                     s(&tab["id"]),
                     s(&tab["worktree"]),
                     opt(&tab["branch"], "branch:    ") + if tab["branch"].is_null() { "" } else { "\n" },
@@ -85,8 +83,7 @@ pub fn render(method: &str, v: &Value) -> String {
             }
         }
         "tab.create" => out.push_str(&format!(
-            "opened {} tab {} (id {})\nworktree: {}\n{}",
-            s(&v["kind"]),
+            "opened tab {} (id {})\nworktree: {}\n{}",
             s(&v["title"]),
             s(&v["id"]),
             s(&v["worktree"]),
@@ -203,10 +200,10 @@ mod tests {
     #[test]
     fn workspace_list() {
         let v = json!([{"id":"a1","index":1,"name":"air","host":"local","repo_path":"/r","selected":true,
-            "tabs":[{"id":"t1","index":1,"kind":"edit","title":"Fix","worktree":"/r-fix","branch":"william/fix","selected":true,"unread":true}]}]);
+            "tabs":[{"id":"t1","index":1,"title":"Fix","worktree":"/r-fix","branch":"william/fix","selected":true,"unread":true}]}]);
         let out = render("workspace.list", &v);
         assert!(out.contains("* workspace:1 air  [local] /r"));
-        assert!(out.contains("* tab:1 [RW] Fix ●  (id t1, branch william/fix)"));
+        assert!(out.contains("* tab:1 Fix ●  (id t1, branch william/fix)"));
     }
 
     #[test]

@@ -8,18 +8,15 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   latest dotfiles from `github.com/williamyang-pplx/dotfiles`, links skills
   from it, and installs `kitchenctl`. Drag workspaces to reorder them;
   right-click → Pin to top keeps one above the rest.
-- **Edit tabs**: one PR each, in a fresh worktree + branch cut from
+- **Tabs**: one PR each, in a fresh worktree + branch cut from
   `origin/<default>` as last fetched (a background fetch every 5 minutes and
   when ⌘E opens, so ⌘E never waits on the network). Given a task, the agent starts with `/low-level-plan` and
-  writes a plan you comment on inline (⌘⇧I).
-- **Read-only tabs**: code review and understanding, on a shared read-only
-  worktree kept at the latest `origin/<default>`. ⌘I asks for a PR link
+  writes a plan you comment on inline (⌘⇧I). ⌘I asks for a PR link
   (`https://github.com/<org>/<repo>/pull/<n>`, any suffix): the `github`
-  plugin opens that PR's head read-only in its own worktree, and the viewer
-  shows its diff against the PR's base (as on GitHub). Re-opening the link
-  picks up new pushes. Empty = latest main. Read-only worktrees have their
-  folders locked (no file can be added, removed or renamed).
-- File viewer. With changes (a PR tab, or an edit tab after the agent's
+  plugin opens that PR's branch in its own worktree, and the viewer shows its
+  diff against the PR's base (as on GitHub). Re-opening the link (or `git
+  pull`) picks up new pushes.
+- File viewer. With changes (a PR tab, or a tab after the agent's
   edits, followed live) ⌘. opens straight on the first changed file's diff,
   next to a tree of just the changed files: j/k in the tree, or ⌘⇧J/⌘⇧K and
   `]c`/`[c` in the code, step through them; `a` in the list switches to the
@@ -85,8 +82,8 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘H / ⌘L | previous / next tab |
 | ⌘⇧J / ⌘⇧K | in a focused viewer: next / previous changed file |
 | ⌘⇧H / ⌘⇧L | in a focused viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
-| ⌘E | new edit (read/write) tab — own worktree |
-| ⌘I | new read-only tab: paste a PR link, or empty for latest main |
+| ⌘E | new tab — own worktree + branch |
+| ⌘I | open a PR link — its branch in a tab |
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |
