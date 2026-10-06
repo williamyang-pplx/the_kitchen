@@ -1078,6 +1078,7 @@ fn _assert_modifiers(_: Modifiers) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{self, TestRepo};
 
     fn key(key: Key, modifiers: Modifiers) -> Vec<egui::Event> {
         vec![
@@ -1090,19 +1091,8 @@ mod tests {
     /// keyboard in the viewer; it must never land in the terminal.
     #[test]
     fn enter_in_file_list_keeps_viewer_focus() {
-        let tmp = std::env::temp_dir().join(format!("kt-focus-{}", kitchen_core::util::new_id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let d = tmp.display().to_string();
-        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
-        run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p .agents/skills aster/x && echo 1 > .agents/skills/a.md && echo 2 > aster/x/b.py && echo 3 > README.md && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let db = kitchen_core::db::Db::open_in_memory().unwrap();
-        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
-        db.insert_workspace(&ws).unwrap();
-        db.insert_tab(&tab).unwrap();
-        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let repo = TestRepo::new("mkdir -p .agents/skills aster/x && echo 1 > .agents/skills/a.md && echo 2 > aster/x/b.py && echo 3 > README.md");
+        let (ctx, engine) = test_util::engine("local", &repo.path(), &["t"]);
         let mut app = KitchenApp::new(engine.clone());
         let term = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), "cat >/dev/null".into()], None, HashMap::new()).unwrap();
         app.slots.insert("t".into(), TermSlot::Live(term));
@@ -1136,27 +1126,14 @@ mod tests {
             step(&mut app, vec![egui::Event::Text("g".into())]);
             step(&mut app, vec![egui::Event::Text("g".into())]);
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The side panel belongs to the tab it was opened on: other tabs keep
     /// theirs closed, and switching to one hands the keyboard back.
     #[test]
     fn side_panel_is_per_tab() {
-        let tmp = std::env::temp_dir().join(format!("kt-sides-{}", kitchen_core::util::new_id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let d = tmp.display().to_string();
-        assert!(std::process::Command::new("sh").arg("-c").arg("git init -q -b main && git config user.email t@t && git config user.name t && echo 1 > a && git add . && git commit -qm i").current_dir(&d).status().unwrap().success());
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let db = kitchen_core::db::Db::open_in_memory().unwrap();
-        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        db.insert_workspace(&ws).unwrap();
-        for (i, id) in ["t1", "t2"].into_iter().enumerate() {
-            let tab = kitchen_core::db::TabRow { id: id.into(), workspace_id: "w".into(), title: id.into(), worktree: d.clone(), branch: None, tmux_session: id.into(), plan_file: None, position: i as i64, diff_base: None };
-            db.insert_tab(&tab).unwrap();
-        }
-        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let repo = TestRepo::new("echo 1 > a");
+        let (ctx, engine) = test_util::engine("local", &repo.path(), &["t1", "t2"]);
         let mut app = KitchenApp::new(engine.clone());
         for id in ["t1", "t2"] {
             let term = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), "cat >/dev/null".into()], None, HashMap::new()).unwrap();
@@ -1217,6 +1194,5 @@ mod tests {
         step(&mut app, key(Key::H, Modifiers::ALT));
         step(&mut app, key(Key::Period, Modifiers::COMMAND));
         assert_eq!((app.focus, app.side()), (Focus::Terminal, None));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

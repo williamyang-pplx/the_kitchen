@@ -13,6 +13,8 @@ mod plugins;
 mod relay;
 mod settings;
 mod terminal;
+#[cfg(test)]
+mod test_util;
 mod theme;
 mod ui;
 mod viewer;

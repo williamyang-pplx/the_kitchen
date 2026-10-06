@@ -115,11 +115,17 @@ pub struct TabRow {
     pub worktree: String,
     pub branch: Option<String>,
     pub tmux_session: String,
-    pub plan_file: Option<String>,
     pub position: i64,
     /// What the viewer diffs against (any rev); `None` = `origin/<default>`.
     #[serde(default)]
     pub diff_base: Option<String>,
+}
+
+impl TabRow {
+    /// Where the tab's agent keeps its plan.
+    pub fn plan_file(&self) -> String {
+        crate::plan::plan_file_for(&self.worktree)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -166,9 +172,8 @@ fn tab_from(r: &Row) -> rusqlite::Result<TabRow> {
         worktree: r.get(3)?,
         branch: r.get(4)?,
         tmux_session: r.get(5)?,
-        plan_file: r.get(6)?,
-        position: r.get(7)?,
-        diff_base: r.get(8)?,
+        position: r.get(6)?,
+        diff_base: r.get(7)?,
     })
 }
 
@@ -186,7 +191,7 @@ fn plan_comment_from(r: &Row) -> rusqlite::Result<PlanComment> {
 }
 
 const WS_COLS: &str = "id, name, host, repo_path, github_slug, default_branch, position, pinned";
-const TAB_COLS: &str = "id, workspace_id, title, worktree, branch, tmux_session, plan_file, position, diff_base";
+const TAB_COLS: &str = "id, workspace_id, title, worktree, branch, tmux_session, position, diff_base";
 const PC_COLS: &str = "id, tab_id, line, end_line, quote, body, state, created_at";
 
 /// Columns added after a table first shipped; `CREATE TABLE IF NOT EXISTS`
@@ -276,8 +281,8 @@ impl Db {
 
     pub fn insert_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, plan_file, position, diff_base, created_at)
-             VALUES (?1, ?2, 'edit', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, position, diff_base, created_at)
+             VALUES (?1, ?2, 'edit', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 t.id,
                 t.workspace_id,
@@ -285,7 +290,6 @@ impl Db {
                 t.worktree,
                 t.branch,
                 t.tmux_session,
-                t.plan_file,
                 t.position,
                 t.diff_base,
                 now()
@@ -296,8 +300,8 @@ impl Db {
 
     pub fn update_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
-            "UPDATE tabs SET title = ?2, worktree = ?3, branch = ?4, plan_file = ?5, position = ?6, diff_base = ?7 WHERE id = ?1",
-            params![t.id, t.title, t.worktree, t.branch, t.plan_file, t.position, t.diff_base],
+            "UPDATE tabs SET title = ?2, worktree = ?3, branch = ?4, position = ?5, diff_base = ?6 WHERE id = ?1",
+            params![t.id, t.title, t.worktree, t.branch, t.position, t.diff_base],
         )?;
         Ok(())
     }
@@ -462,7 +466,6 @@ mod tests {
             worktree: "/r-x".into(),
             branch: Some("william/x".into()),
             tmux_session: "kt_a_t1".into(),
-            plan_file: None,
             position: 1,
             diff_base: Some("origin/main".into()),
         };
@@ -517,7 +520,6 @@ mod tests {
             worktree: "/w".into(),
             branch: None,
             tmux_session: "s".into(),
-            plan_file: None,
             position: 1,
             diff_base: None,
         })

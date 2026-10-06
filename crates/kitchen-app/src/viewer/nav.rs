@@ -490,67 +490,13 @@ mod tests {
         assert_eq!(locs[1].text.as_deref(), Some("é = foo:bar"));
     }
 
-    /// A viewer on a fresh git repo holding `files`, driven frame by frame.
-    struct Harness {
-        ctx: egui::Context,
-        engine: std::sync::Arc<crate::engine::Engine>,
-        dir: std::path::PathBuf,
-    }
+    use crate::test_util::{Harness, TestRepo};
 
-    impl Harness {
-        fn new(files: &[(&str, &str)]) -> (Harness, Viewer) {
-            let dir = std::env::temp_dir().join(format!("kt-nav-{}", kitchen_core::util::new_id()));
-            for (path, text) in files {
-                let p = dir.join(path);
-                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-                std::fs::write(p, text).unwrap();
-            }
-            let d = dir.display().to_string();
-            git(&d, "git init -q -b main && git config user.email t@t && git config user.name t && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
-            let ctx = egui::Context::default();
-            crate::theme::install(&ctx);
-            let db = kitchen_core::db::Db::open_in_memory().unwrap();
-            let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-            let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
-            db.insert_workspace(&ws).unwrap();
-            db.insert_tab(&tab).unwrap();
-            let engine = crate::engine::Engine::new(ctx.clone(), db).unwrap();
-            let w = engine.workspaces()[0].clone();
-            let v = Viewer::new(&engine, &w, &w.tabs[0]);
-            (Harness { ctx, engine, dir }, v)
-        }
-
-        fn frame_with(&self, v: &mut Viewer, events: Vec<egui::Event>) {
-            use crate::panels::PanelCtx;
-            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), events, ..Default::default() };
-            let mut out = self.ctx.run_ui(input, |ui| {
-                let mut cx = PanelCtx { engine: &self.engine, focused: true, clicked: false };
-                v.ui(ui, &mut cx);
-            });
-            out.textures_delta.clear();
-        }
-
-        fn settle(&self, v: &mut Viewer, done: &dyn Fn(&Viewer) -> bool) {
-            for _ in 0..300 {
-                self.frame_with(v, Vec::new());
-                if done(v) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            panic!("viewer never settled");
-        }
-
-        fn key(&self, v: &mut Viewer, key: egui::Key) {
-            let ev = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
-            self.frame_with(v, vec![ev]);
-        }
-    }
-
-    impl Drop for Harness {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
+    /// A viewer on a fresh git repo holding `files`.
+    fn harness(files: &[(&str, &str)]) -> (Harness, Viewer) {
+        let h = Harness::new(TestRepo::with_files(files));
+        let v = h.viewer();
+        (h, v)
     }
 
     fn git(dir: &str, sh: &str) {
@@ -563,7 +509,7 @@ mod tests {
     fn provider_answers_drive_the_viewer() {
         let lines: Vec<String> = (1..=300).map(|i| if i == 123 { "\tself._loader = Loader()".to_string() } else { format!("x{i} = {i}") }).collect();
         let m = lines.join("\n") + "\n";
-        let (h, mut v) = Harness::new(&[("m.py", &m), ("n.py", "a = 1\nb = 2\nuse_loader = _loader\n")]);
+        let (h, mut v) = harness(&[("m.py", &m), ("n.py", "a = 1\nb = 2\nuse_loader = _loader\n")]);
         v.open("m.py", Some(216), false);
         h.settle(&mut v, &|v| v.files.contains_key("m.py") && v.current_source_line() == Some(216));
 
@@ -599,7 +545,7 @@ mod tests {
     /// results show until the provider answers (or the user acts on them).
     #[test]
     fn slow_provider_races_text_search() {
-        let (h, mut v) = Harness::new(&[
+        let (h, mut v) = harness(&[
             ("use.py", "from a import foo, bar\nfoo()\nbar()\nnone_here()\n"),
             ("a.py", "def foo():\n    pass\n\n\ndef bar():\n    pass\n"),
             ("b.py", "class foo:\n    pass\n"),

@@ -87,9 +87,7 @@ fn tab_env(ws: &WorkspaceRow, tab: &TabRow, host: &Host) -> Vec<(String, String)
         (kitchen_proto::ENV_DIFF_BASE.to_string(), diff_base_of(ws, tab)),
     ];
     env.extend(local_socket_env(host));
-    if let Some(p) = &tab.plan_file {
-        env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), p.clone()));
-    }
+    env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), tab.plan_file()));
     env
 }
 
@@ -753,7 +751,6 @@ impl Engine {
                 }
             };
             let title = opts.title.clone().unwrap_or(title);
-            let plan_file = Some(plan::plan_file_for(&wt.path));
 
             let session = tmux::session_name(ws_id, &tab_id);
             let row = TabRow {
@@ -763,7 +760,6 @@ impl Engine {
                 worktree: wt.path,
                 branch: wt.branch,
                 tmux_session: session,
-                plan_file,
                 position: ws.tabs.iter().map(|t| t.row.position).max().unwrap_or(0) + 1,
                 diff_base: opts.diff_base.clone(),
             };
@@ -1046,8 +1042,7 @@ impl Engine {
         if open.is_empty() {
             bail!("no open plan comments to send");
         }
-        let plan_file = tab.row.plan_file.clone().unwrap_or_default();
-        let msg = plan::feedback_message(&plan_file, &open);
+        let msg = plan::feedback_message(&tab.row.plan_file(), &open);
         self.send_text(tab_id, &msg, true)?;
         let db = self.db();
         for c in &open {
@@ -1146,7 +1141,7 @@ fn tab_infos(w: &Workspace) -> Vec<TabInfo> {
             branch: t.row.branch.clone(),
             tmux_session: t.row.tmux_session.clone(),
             selected: sel.as_deref() == Some(&t.row.id),
-            plan_file: t.row.plan_file.clone(),
+            plan_file: t.row.plan_file(),
             diff_base: t.row.diff_base.clone(),
             unread: t.unread,
         })

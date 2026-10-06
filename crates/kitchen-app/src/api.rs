@@ -191,7 +191,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({
                 "caller": {
                     "workspace": ws.as_ref().map(|w| json!({"id": w.row.id, "name": w.row.name, "host": w.row.host, "repo_path": w.row.repo_path})),
-                    "tab": tab.as_ref().map(|t| json!({"id": t.row.id, "title": t.row.title, "worktree": t.row.worktree, "branch": t.row.branch, "plan_file": t.row.plan_file, "diff_base": t.row.diff_base})),
+                    "tab": tab.as_ref().map(|t| json!({"id": t.row.id, "title": t.row.title, "worktree": t.row.worktree, "branch": t.row.branch, "plan_file": t.row.plan_file(), "diff_base": t.row.diff_base})),
                 },
                 "focused": {
                     "workspace": selected.as_ref().map(|w| w.row.id.clone()),
@@ -282,7 +282,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             let ws = engine.resolve_workspace(a.workspace.as_deref(), caller)?;
             let row = engine.create_tab(&ws, a.opts)?;
             Ok(json!({"id": row.id, "workspace": ws, "title": row.title, "worktree": row.worktree,
-                      "branch": row.branch, "tmux_session": row.tmux_session, "plan_file": row.plan_file}))
+                      "branch": row.branch, "tmux_session": row.tmux_session, "plan_file": row.plan_file()}))
         }
         "tab.select" => {
             let t: Target = p(params)?;
@@ -367,7 +367,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             let t: Target = p(params)?;
             let id = engine.resolve_tab(t.tab.as_deref(), t.workspace.as_deref(), caller)?;
             let (_, tab) = engine.find_tab(&id).context("no such tab")?;
-            Ok(json!({"tab": id, "plan_file": tab.row.plan_file}))
+            Ok(json!({"tab": id, "plan_file": tab.row.plan_file()}))
         }
         "plan.open" => {
             let t: Target = p(params)?;

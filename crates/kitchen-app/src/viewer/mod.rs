@@ -1606,6 +1606,7 @@ fn kind_color(kind: &str) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{Harness, TestRepo};
 
     fn paths(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1631,37 +1632,11 @@ mod tests {
     /// worktree is unchanged, and folds new files into the file list.
     #[test]
     fn live_changes_single_listing() {
-        let tmp = std::env::temp_dir().join(format!("kt-live-{}", kitchen_core::util::new_id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let d = tmp.display().to_string();
-        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
-        run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir aster && echo a > aster/a.rs && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
-        let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
-        let db = kitchen_core::db::Db::open_in_memory().unwrap();
-        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
-        db.insert_workspace(&ws).unwrap();
-        db.insert_tab(&tab).unwrap();
-        let engine = Engine::new(ctx.clone(), db).unwrap();
-        let w = engine.workspaces()[0].clone();
-        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
-        let frame = |v: &mut Viewer| {
-            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
-                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
-                v.ui(ui, &mut cx);
-            });
-            out.textures_delta.clear();
-        };
+        let h = Harness::new(TestRepo::new("mkdir aster && echo a > aster/a.rs"));
+        let mut v = h.viewer();
         let settle = |v: &mut Viewer| {
-            for _ in 0..200 {
-                frame(v);
-                if v.files_state.is_some() && !v.changes_pending {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            frame(v);
+            h.settle(v, &|v| v.files_state.is_some() && !v.changes_pending);
+            h.frame(v);
         };
         settle(&mut v);
         assert!(v.browsing && v.dir == "aster", "no changes: opens on the default folder");
@@ -1669,26 +1644,19 @@ mod tests {
         let first = v.all.clone();
         // Nothing changed: the quiet re-list keeps the very same file list.
         v.changes_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
-        frame(&mut v);
+        h.frame(&mut v);
         assert!(v.changes_pending, "a quiet re-list started");
         settle(&mut v);
         assert!(Arc::ptr_eq(&first, &v.all), "unchanged worktree: no new file list");
         // An agent adds a file: it shows up as changed and in the folder.
-        run("echo b > aster/b.rs");
+        h.repo.sh("echo b > aster/b.rs");
         v.changes_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
-        frame(&mut v);
+        h.frame(&mut v);
         settle(&mut v);
-        for _ in 0..100 {
-            if v.all.iter().any(|p| p == "aster/b.rs") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            frame(&mut v);
-        }
+        h.settle(&mut v, &|v| v.all.iter().any(|p| p == "aster/b.rs"));
         assert!(v.changed.iter().any(|c| c.path == "aster/b.rs" && c.status == 'A'));
         assert_eq!(*v.all, paths(&["aster/a.rs", "aster/b.rs"]));
         assert!(v.entries.iter().any(|e| e.path == "aster/b.rs"), "folder view rebuilt");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1706,104 +1674,45 @@ mod tests {
 
     #[test]
     fn file_list_keyboard() {
-        let tmp = std::env::temp_dir().join(format!("kt-list-{}", kitchen_core::util::new_id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let d = tmp.display().to_string();
-        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
-        run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p aster/a aster/b && echo 1 > aster/a/x.py && echo 2 > aster/b/y.py && echo 3 > aster/top.py && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
-        let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
-        let db = kitchen_core::db::Db::open_in_memory().unwrap();
-        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
-        db.insert_workspace(&ws).unwrap();
-        db.insert_tab(&tab).unwrap();
-        let engine = Engine::new(ctx.clone(), db).unwrap();
-        let w = engine.workspaces()[0].clone();
-        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
-        let frame = |v: &mut Viewer, text: &str| {
-            let events = if text == "\n" {
-                vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]
-            } else if text.is_empty() {
-                vec![]
-            } else {
-                vec![egui::Event::Text(text.into())]
-            };
-            let mut out = ctx.run_ui(egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
-                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
-                v.ui(ui, &mut cx);
-            });
-            out.textures_delta.clear();
-        };
-        for _ in 0..100 {
-            frame(&mut v, "");
-            if v.files_state.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        frame(&mut v, "");
+        let h = Harness::new(TestRepo::new("mkdir -p aster/a aster/b && echo 1 > aster/a/x.py && echo 2 > aster/b/y.py && echo 3 > aster/top.py"));
+        let mut v = h.viewer();
+        h.settle(&mut v, &|v| v.files_state.is_some());
+        h.frame(&mut v);
         assert_eq!(v.dir, "aster", "no changes: default folder");
-        v.command(PanelCmd::FocusList, &engine);
-        frame(&mut v, "");
+        v.command(PanelCmd::FocusList, &h.engine);
+        h.frame(&mut v);
         // Rows: ../ a/ b/ top.py — the cursor starts on a/.
         assert_eq!(v.list_cursor, 1);
-        frame(&mut v, "\n");
+        h.key(&mut v, egui::Key::Enter);
         assert_eq!(v.dir, "aster/a");
-        frame(&mut v, "\n"); // x.py
+        h.key(&mut v, egui::Key::Enter); // x.py
         assert_eq!(v.current.as_deref(), Some("aster/a/x.py"));
         assert!(v.list_focus, "opening a file keeps the list focused");
-        frame(&mut v, "h");
+        h.text(&mut v, "h");
         assert_eq!(v.dir, "aster");
         assert_eq!(v.list_entries()[v.list_cursor].path, "aster/a", "cursor back on the folder we left");
-        frame(&mut v, "j");
-        frame(&mut v, "j");
-        frame(&mut v, "l");
+        h.text(&mut v, "j");
+        h.text(&mut v, "j");
+        h.text(&mut v, "l");
         assert_eq!(v.current.as_deref(), Some("aster/top.py"));
-        v.command(PanelCmd::FocusCode, &engine);
+        v.command(PanelCmd::FocusCode, &h.engine);
         assert!(!v.list_focus);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A tab with changes opens on the first changed file's diff; the tree
     /// list, ⌘⇧J/⌘⇧K, `[c` and ⌘B step through them without browsing folders.
     #[test]
     fn changed_files_flow() {
-        let tmp = std::env::temp_dir().join(format!("kt-changes-{}", kitchen_core::util::new_id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let d = tmp.display().to_string();
-        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
-        run("git init -q -b main && git config user.email t@t && git config user.name t && mkdir -p src/deep/er && printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n' > src/a.rs && echo gone > old.txt && echo z > z.md && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
-        run("printf '1\\nX\\n3\\n4\\n5\\n6\\nY\\n8\\n' > src/a.rs && echo new > src/deep/er/b.rs && git rm -q old.txt && git add . && git commit -qm change");
-        let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
-        let db = kitchen_core::db::Db::open_in_memory().unwrap();
-        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
-        db.insert_workspace(&ws).unwrap();
-        db.insert_tab(&tab).unwrap();
-        let engine = Engine::new(ctx.clone(), db).unwrap();
-        let w = engine.workspaces()[0].clone();
-        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
-        let frame = |v: &mut Viewer, text: &str| {
-            let events = if text.is_empty() { vec![] } else { vec![egui::Event::Text(text.into())] };
-            let mut out = ctx.run_ui(egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
-                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
-                v.ui(ui, &mut cx);
-            });
-            out.textures_delta.clear();
-        };
+        let h = Harness::new(TestRepo::new("mkdir -p src/deep/er && printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n' > src/a.rs && echo gone > old.txt && echo z > z.md"));
+        h.repo.sh("printf '1\\nX\\n3\\n4\\n5\\n6\\nY\\n8\\n' > src/a.rs && echo new > src/deep/er/b.rs && git rm -q old.txt && git add . && git commit -qm change");
+        let mut v = h.viewer();
         // Settle: list, file and base reads run on threads.
         let settle = |v: &mut Viewer| {
-            for _ in 0..100 {
-                frame(v, "");
+            h.settle(v, &|v| {
                 let p = v.current.clone().unwrap_or_default();
-                if v.files_state.is_some() && v.files.contains_key(&p) && v.bases.contains_key(&p) && v.hunk_goto.is_none() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            frame(v, "");
+                v.files_state.is_some() && v.files.contains_key(&p) && v.bases.contains_key(&p) && v.hunk_goto.is_none()
+            });
+            h.frame(v);
         };
         settle(&mut v);
         let order: Vec<&str> = v.changed.iter().map(|c| c.path.as_str()).collect();
@@ -1812,37 +1721,36 @@ mod tests {
         assert_eq!(v.current.as_deref(), Some("src/deep/er/b.rs"), "opens on the first changed file");
         assert!(v.doc.hunk_starts().contains(&v.vim.line), "cursor on its first change");
         // ⌘⇧J: next changed file, cursor on its first change (line 2 of a.rs).
-        v.command(PanelCmd::NextFile, &engine);
+        v.command(PanelCmd::NextFile, &h.engine);
         settle(&mut v);
         assert_eq!(v.current.as_deref(), Some("src/a.rs"));
         assert_eq!(v.current_source_line(), Some(2));
         // The deleted file shows as removed lines.
-        v.command(PanelCmd::NextFile, &engine);
+        v.command(PanelCmd::NextFile, &h.engine);
         settle(&mut v);
         assert_eq!(v.current.as_deref(), Some("old.txt"));
         assert_eq!(v.doc.changed_count(), (0, 1));
         // `[c` at the first change: the previous file's last change.
-        frame(&mut v, "[");
-        frame(&mut v, "c");
+        h.text(&mut v, "[");
+        h.text(&mut v, "c");
         settle(&mut v);
         assert_eq!(v.current.as_deref(), Some("src/a.rs"));
         assert_eq!(v.current_source_line(), Some(7));
         // The tree list: j/k open files straight away; `a` toggles the folder list.
-        v.command(PanelCmd::FocusList, &engine);
-        frame(&mut v, "k");
+        v.command(PanelCmd::FocusList, &h.engine);
+        h.text(&mut v, "k");
         assert_eq!(v.current.as_deref(), Some("src/deep/er/b.rs"));
-        frame(&mut v, "G");
+        h.text(&mut v, "G");
         assert_eq!(v.current.as_deref(), Some("old.txt"));
-        frame(&mut v, "a");
+        h.text(&mut v, "a");
         assert!(!v.tree_mode());
-        frame(&mut v, "a");
+        h.text(&mut v, "a");
         assert!(v.tree_mode());
         // ⌘B hides and shows the list.
-        v.command(PanelCmd::ToggleFiles, &engine);
+        v.command(PanelCmd::ToggleFiles, &h.engine);
         assert!(!v.show_files && !v.list_focus);
-        v.command(PanelCmd::ToggleFiles, &engine);
+        v.command(PanelCmd::ToggleFiles, &h.engine);
         assert!(v.show_files);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// ⌘M … ⌘Enter hands the comment to the `comment` listener with its
@@ -1850,10 +1758,8 @@ mod tests {
     /// such a row replies.
     #[test]
     fn comments_go_to_plugins_and_come_back() {
-        let tmp = std::env::temp_dir().join(format!("kt-comments-{}", kitchen_core::util::new_id()));
-        let wt = tmp.join("wt");
-        let plug = tmp.join("plugins/notes");
-        std::fs::create_dir_all(&wt).unwrap();
+        let plugins = std::env::temp_dir().join(format!("kt-plugins-{}", kitchen_core::util::new_id()));
+        let plug = plugins.join("notes");
         std::fs::create_dir_all(&plug).unwrap();
         std::fs::write(plug.join("plugin.toml"), "name = \"notes\"\napi = 4\n").unwrap();
         std::fs::write(
@@ -1864,62 +1770,34 @@ mod tests {
 end)"#,
         )
         .unwrap();
-        let d = wt.display().to_string();
-        let run = |sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(&d).status().unwrap().success());
-        run("git init -q -b main && git config user.email t@t && git config user.name t && printf 'a\\nb\\nc\\n' > a.py && git add . && git commit -qm i && git update-ref refs/remotes/origin/main HEAD");
-        run("printf 'a\\nB\\nc\\n' > a.py && git commit -qam change");
-        let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
-        let db = kitchen_core::db::Db::open_in_memory().unwrap();
-        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host: "local".into(), repo_path: d.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: d.clone(), branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
-        db.insert_workspace(&ws).unwrap();
-        db.insert_tab(&tab).unwrap();
-        let engine = Engine::new(ctx.clone(), db).unwrap();
-        engine.set_plugins(crate::plugins::PluginHost::start(&engine, vec![tmp.join("plugins")]));
-        let w = engine.workspaces()[0].clone();
-        let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
-        let frame = |v: &mut Viewer, text: &str| {
-            let events = if text.is_empty() { vec![] } else { vec![egui::Event::Text(text.into())] };
-            let mut out = ctx.run_ui(egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
-                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
-                v.ui(ui, &mut cx);
-            });
-            out.textures_delta.clear();
-        };
-        let settle = |v: &mut Viewer, done: &dyn Fn(&Viewer) -> bool| {
-            for _ in 0..300 {
-                frame(v, "");
-                if done(v) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            panic!("viewer never settled");
-        };
-        settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none() && !engine.plugins().unwrap().listeners("comment").is_empty());
+        let h = Harness::new(TestRepo::new("printf 'a\\nb\\nc\\n' > a.py"));
+        h.repo.sh("printf 'a\\nB\\nc\\n' > a.py && git commit -qam change");
+        let engine = &h.engine;
+        engine.set_plugins(crate::plugins::PluginHost::start(engine, vec![plugins.clone()]));
+        let mut v = h.viewer();
+        h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none() && !engine.plugins().unwrap().listeners("comment").is_empty());
         // The first change starts with the removed `b`: a base-side line.
         assert_eq!(v.doc.lines[v.vim.line].text, "b");
-        v.command(PanelCmd::Comment, &engine);
+        v.command(PanelCmd::Comment, engine);
         assert!(v.editor.is_some());
-        frame(&mut v, "");
-        frame(&mut v, "why?");
-        v.command(PanelCmd::Submit, &engine);
-        frame(&mut v, "");
+        h.frame(&mut v);
+        h.text(&mut v, "why?");
+        v.command(PanelCmd::Submit, engine);
+        h.frame(&mut v);
         assert!(v.editor.is_none(), "submitted");
-        settle(&mut v, &|v| !v.comment_blocks().is_empty());
+        h.settle(&mut v, &|v| !v.comment_blocks().is_empty());
         let (block, id) = v.comment_blocks().remove(0);
         assert_eq!((block.after, id.as_deref()), (Some(v.vim.line), Some("c1")));
         assert_eq!(block.body, "why?|old:2|nil|-");
         // ⌘M on the commented row replies to it.
-        v.command(PanelCmd::Comment, &engine);
+        v.command(PanelCmd::Comment, engine);
         assert!(v.editor.as_ref().unwrap().label.starts_with("Reply to @me"));
-        frame(&mut v, "");
-        frame(&mut v, "ok");
-        v.command(PanelCmd::Submit, &engine);
-        frame(&mut v, "");
-        settle(&mut v, &|v| v.comment_blocks().first().is_some_and(|(b, _)| b.body.ends_with("|c1")));
-        let _ = std::fs::remove_dir_all(&tmp);
+        h.frame(&mut v);
+        h.text(&mut v, "ok");
+        v.command(PanelCmd::Submit, engine);
+        h.frame(&mut v);
+        h.settle(&mut v, &|v| v.comment_blocks().first().is_some_and(|(b, _)| b.body.ends_with("|c1")));
+        let _ = std::fs::remove_dir_all(&plugins);
     }
 
     /// Drives a real viewer against `KT_VIEWER_HOST`:`KT_VIEWER_WT` (e.g. a devbox worktree).
@@ -1928,14 +1806,7 @@ end)"#,
     fn live_picker() {
         let host = std::env::var("KT_VIEWER_HOST").unwrap_or_else(|_| "local".into());
         let wt = std::env::var("KT_VIEWER_WT").expect("KT_VIEWER_WT");
-        let ctx = egui::Context::default();
-        crate::theme::install(&ctx);
-        let db = kitchen_core::db::Db::open_in_memory().unwrap();
-        let ws = kitchen_core::db::WorkspaceRow { id: "w".into(), name: "w".into(), host, repo_path: wt.clone(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
-        let tab = kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: wt, branch: None, tmux_session: "x".into(), plan_file: None, position: 0, diff_base: None };
-        db.insert_workspace(&ws).unwrap();
-        db.insert_tab(&tab).unwrap();
-        let engine = Engine::new(ctx.clone(), db).unwrap();
+        let (ctx, engine) = crate::test_util::engine(&host, &wt, &["t"]);
         let w = engine.workspaces()[0].clone();
         let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
         let frame = |v: &mut Viewer, events: Vec<egui::Event>| {

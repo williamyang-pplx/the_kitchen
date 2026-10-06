@@ -131,8 +131,8 @@ pub struct TabInfo {
     pub branch: Option<String>,
     pub tmux_session: String,
     pub selected: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_file: Option<String>,
+    #[serde(default)]
+    pub plan_file: String,
     /// Rev the viewer diffs against (`origin/<default>` when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_base: Option<String>,
