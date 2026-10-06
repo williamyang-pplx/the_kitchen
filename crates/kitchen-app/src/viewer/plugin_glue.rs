@@ -284,7 +284,7 @@ impl Viewer {
         }
         let who = self.engine.plugins().map(|p| p.listeners("comment")).unwrap_or_default();
         if who.is_empty() {
-            self.status = Some(("no plugin takes comments (the github plugin does, in PR tabs opened with ⌘I)".into(), false));
+            self.status = Some(("no plugin takes comments (the github plugin does, in PR tabs opened from a PR link with ⌘E)".into(), false));
             return;
         }
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));

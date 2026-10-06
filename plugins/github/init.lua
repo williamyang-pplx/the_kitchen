@@ -307,7 +307,7 @@ end)
 kitchen.on("comment", function(ev)
   local pr = pr_for(ev.file.worktree)
   if not pr then
-    kitchen.notify("comments are posted to GitHub PRs — open the PR from its link (⌘I) to comment on it", "warn")
+    kitchen.notify("comments are posted to GitHub PRs — open the PR from its link (⌘E) to comment on it", "warn")
     return
   end
   pr.files[ev.path] = ev.file

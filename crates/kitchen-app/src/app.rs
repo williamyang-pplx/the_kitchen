@@ -262,14 +262,6 @@ impl KitchenApp {
                     engine.toast_err("create a workspace first (⌘N)");
                 }
             }
-            Action::OpenLink => {
-                if ws.is_some() {
-                    self.dialog = Some(Dialog::open_link());
-                    self.focus = Focus::Terminal;
-                } else {
-                    engine.toast_err("create a workspace first (⌘N)");
-                }
-            }
             Action::RenameTab => {
                 if let Some(t) = tab {
                     self.dialog = Some(Dialog::rename_tab(&t));
@@ -741,9 +733,6 @@ impl KitchenApp {
             if ui.add(egui::Button::new(RichText::new("＋ tab ⌘E").font(theme::ui_font(11.0)).color(theme::GREEN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewTab);
             }
-            if ui.add(egui::Button::new(RichText::new("＋ PR ⌘I").font(theme::ui_font(11.0)).color(theme::ACCENT)).frame(false)).clicked_by(egui::PointerButton::Primary) {
-                self.run_action(Action::OpenLink);
-            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
                 // Rightmost: the dashboard (⌘D).
@@ -794,7 +783,7 @@ impl KitchenApp {
                     RichText::new(match (self.focus, self.side()) {
                         (Focus::Side, Some(SideKind::Viewer)) => "⌘⇧H/L files ↔ code · ⌘⇧J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘. terminal · ⌘D diff · ⌘O outline · ⌥H/L pane",
                         (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌥H/L pane · ⌘H/L tab · ⌘J/K workspace",
-                        _ => "⌘H/L or ⌘1-9 tab · ⌘E new · ⌘I PR · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
+                        _ => "⌘H/L or ⌘1-9 tab · ⌘E new · ⌘R rename · ⌘W close · ⌥H/L pane · ⌘J/K workspace",
                     })
                         .size(10.5)
                         .color(theme::DIM),
@@ -853,7 +842,7 @@ impl KitchenApp {
                 .entry(tab.row.id.clone())
                 .or_insert_with(|| crate::plan_view::PlanView::new(&self.engine, ws, tab))
                 .ui(ui, &mut cx),
-            (_, None) => centered_note(ui, "open a tab first (⌘E / ⌘I)", theme::DIM),
+            (_, None) => centered_note(ui, "open a tab first (⌘E)", theme::DIM),
         }
         if cx.clicked {
             self.focus = Focus::Side;
@@ -1010,7 +999,7 @@ impl eframe::App for KitchenApp {
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();
-                centered_note(ui, &format!("{}\n\n⌘E  new tab (own worktree + branch)\n⌘I  open a PR (its branch in a tab)\n{status}", ws.row.name), theme::DIM)
+                centered_note(ui, &format!("{}\n\n⌘E  new tab: a name, or a PR link (own worktree + branch)\n{status}", ws.row.name), theme::DIM)
             }
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });

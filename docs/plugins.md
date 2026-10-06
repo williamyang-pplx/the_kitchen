@@ -35,7 +35,7 @@ Run commands from **⌘⇧P** (command palette), their keys, or
 `~/.kitchen/logs/plugins/hello.log` (`kitchenctl plugin logs hello`).
 
 Examples in the repo's `plugins/`: `ruff` (Python lint), `python` (`gd`/`gr`
-via the ty language server), `github` (PR links in ⌘I, PR review comments),
+via the ty language server), `github` (PR links in ⌘E, PR review comments),
 `todo` (highlights), `hello` (commands, keys, jobs), `prune-worktrees` (a
 `kitchen.every` timer; removes edit and PR review worktrees of merged/closed
 PRs) and `dashboard` (worktrees, disk and RAM on the dashboard). `install.sh`
@@ -71,7 +71,7 @@ column. Plugins written for level 1 keep working.
 kitchen.on("file_opened", function(ev) end)   -- the viewer loaded a file
 kitchen.on("file_changed", function(ev) end)  -- …and it changed on disk since
 kitchen.on("startup", function() end)         -- after init.lua ran
-kitchen.on("open", function(ev) end)          -- text typed into ⌘I (see Tabs)
+kitchen.on("open", function(ev) end)          -- a link typed into ⌘E (see Tabs)
 kitchen.on("comment", function(ev) end)       -- ⌘M … ⌘Enter in the viewer (see Comments)
 kitchen.on("dashboard", function(ev) end)     -- a dashboard was shown / hidden (see Dashboard)
 ```
@@ -239,7 +239,8 @@ kitchen.on("open", function(ev)   -- ev = { text, workspaces = { {id, name, host
 end)
 ```
 
-⌘I (and `kitchenctl tab open TEXT`) hands the text to every plugin's
+A link typed into ⌘E (a URL or `owner/repo#N`; anything else names a new
+tab), and `kitchenctl tab open TEXT`, go to every plugin's
 `open` handler, and the one that recognises it calls `kitchen.tab_open`
 (the rest return). Fetch and checkout run in one round trip on the
 workspace's host (a new worktree takes over a spare). Opening the same

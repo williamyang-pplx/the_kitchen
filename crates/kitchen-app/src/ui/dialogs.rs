@@ -1,5 +1,4 @@
-//! Modal dialogs: new workspace (⌘N), new tab (⌘E), open a link (⌘I),
-//! rename tab (⌘R) / workspace (⌘⇧R), close confirmations.
+//! Modal dialogs: new workspace (⌘N), new tab (⌘E), rename tab (⌘R) / workspace (⌘⇧R), close confirmations.
 //! Enter submits, Esc cancels, Tab moves between fields.
 
 use std::collections::HashMap;
@@ -21,7 +20,6 @@ pub enum DialogOutcome {
 pub enum Dialog {
     NewWorkspace(NewWorkspace),
     NewTab(NewTabDialog),
-    OpenLink(OpenLink),
     ConfirmCloseTab { id: String, title: String },
     ConfirmCloseWorkspace { id: String, name: String },
     Rename(Rename),
@@ -51,15 +49,10 @@ pub struct Rename {
     first_frame: bool,
 }
 
-/// ⌘I: text (a PR link) for the plugins to open.
-pub struct OpenLink {
-    text: String,
-    first_frame: bool,
-}
-
-/// ⌘E: just a name, for the tab title and the worktree/branch slug.
+/// ⌘E: a name, for the tab title and the worktree/branch slug, or a link
+/// (a PR) for the plugins to open.
 pub struct NewTabDialog {
-    name: String,
+    text: String,
     first_frame: bool,
 }
 
@@ -78,14 +71,11 @@ impl Dialog {
     }
 
     pub fn new_tab() -> Dialog {
-        Dialog::NewTab(NewTabDialog { name: String::new(), first_frame: true })
-    }
-
-    pub fn open_link() -> Dialog {
-        // A link just copied from the browser is the likely input.
+        // A link just copied from the browser is the likely input (selected,
+        // so typing a name replaces it).
         let clip = std::process::Command::new("pbpaste").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         let text = clip.filter(|c| c.starts_with("https://") && !c.contains(char::is_whitespace)).unwrap_or_default();
-        Dialog::OpenLink(OpenLink { text, first_frame: true })
+        Dialog::NewTab(NewTabDialog { text, first_frame: true })
     }
 
     pub fn confirm_close(tab: &Tab) -> Dialog {
@@ -115,7 +105,6 @@ impl Dialog {
             outcome = match self {
                 Dialog::NewWorkspace(d) => d.ui(ui, engine),
                 Dialog::NewTab(d) => d.ui(ui, engine),
-                Dialog::OpenLink(d) => d.ui(ui, engine),
                 Dialog::Rename(d) => d.ui(ui, engine),
                 Dialog::ConfirmCloseTab { id, title } => confirm(
                     ui,
@@ -324,13 +313,17 @@ impl Rename {
     }
 }
 
-impl OpenLink {
+impl NewTabDialog {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
-        ui.heading("Open a link");
-        ui.label(RichText::new("Paste a PR link: its branch opens in a tab of its own.").color(theme::DIM).size(12.0));
+        ui.heading("New tab");
+        ui.label(
+            RichText::new("A name: its own worktree + branch off the latest origin. A PR link: the PR's branch. Claude runs in it.")
+                .color(theme::DIM)
+                .size(12.0),
+        );
         ui.add_space(8.0);
         let field = ui.add(
-            egui::TextEdit::singleline(&mut self.text).hint_text("https://github.com/ppl-ai/air/pull/14211").desired_width(500.0),
+            egui::TextEdit::singleline(&mut self.text).hint_text("tab name, or https://github.com/ppl-ai/air/pull/14211").desired_width(500.0),
         );
         if self.first_frame {
             field.request_focus();
@@ -344,37 +337,12 @@ impl OpenLink {
         let submit = ui.input(|i| i.key_pressed(Key::Enter));
         let mut out = DialogOutcome::Open;
         ui.horizontal(|ui| {
-            let text = self.text.trim().to_string();
-            if (ui.button("Open  ⏎").clicked() || submit) && !text.is_empty() {
-                engine.spawn("open", move |e| e.open_text(&text));
-                out = DialogOutcome::Done;
-            }
-            if ui.button("Cancel  esc").clicked() {
-                out = DialogOutcome::Closed;
-            }
-        });
-        out
-    }
-}
-
-impl NewTabDialog {
-    fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
-        ui.heading("New tab");
-        ui.label(RichText::new("Gets its own worktree + branch off the latest origin, with Claude running in it.").color(theme::DIM).size(12.0));
-        ui.add_space(8.0);
-        let field = ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("tab / worktree name").desired_width(500.0));
-        if self.first_frame {
-            field.request_focus();
-            self.first_frame = false;
-        }
-        ui.add_space(10.0);
-        let submit = ui.input(|i| i.key_pressed(Key::Enter));
-        let mut out = DialogOutcome::Open;
-        ui.horizontal(|ui| {
             if ui.button("Create  ⏎").clicked() || submit {
-                let title = Some(self.name.trim().to_string()).filter(|t| !t.is_empty());
-                let opts = NewTab { title, ..Default::default() };
-                if let Some(ws) = engine.selected_workspace() {
+                let text = self.text.trim().to_string();
+                if is_link(&text) {
+                    engine.spawn("open", move |e| e.open_text(&text));
+                } else if let Some(ws) = engine.selected_workspace() {
+                    let opts = NewTab { title: Some(text).filter(|t| !t.is_empty()), ..Default::default() };
                     let id = ws.row.id.clone();
                     engine.spawn("new tab", move |e| e.create_tab(&id, opts).map(|_| ()));
                 }
@@ -388,9 +356,25 @@ impl NewTabDialog {
     }
 }
 
+/// Text the plugins open (a URL, or `owner/repo#12`) rather than a tab name.
+fn is_link(text: &str) -> bool {
+    let short_ref = text.split_once('#').is_some_and(|(repo, n)| repo.matches('/').count() == 1 && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    !text.contains(char::is_whitespace) && (text.contains("://") || text.starts_with("github.com/") || short_ref)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_versus_names() {
+        for link in ["https://github.com/ppl-ai/air/pull/14211", "github.com/o/r/pull/7", "ppl-ai/air#9"] {
+            assert!(is_link(link), "{link}");
+        }
+        for name in ["", "fix retries", "AI-123: judge", "issue #12", "a/b#x"] {
+            assert!(!is_link(name), "{name}");
+        }
+    }
 
     #[test]
     fn ssh_config() {

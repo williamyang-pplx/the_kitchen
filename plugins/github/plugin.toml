@@ -1,6 +1,6 @@
 name = "github"
 version = "0.1.0"
-description = "Open GitHub PR links (⌘I / kitchenctl tab open) as tabs on the PR's branch showing its diff; ⌘M posts review comments to the PR and shows its threads"
+description = "Open GitHub PR links (⌘E / kitchenctl tab open) as tabs on the PR's branch showing its diff; ⌘M posts review comments to the PR and shows its threads"
 api = 7
 
 [config]

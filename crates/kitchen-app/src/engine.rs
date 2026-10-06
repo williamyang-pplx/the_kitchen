@@ -120,7 +120,7 @@ pub struct State {
     pub toasts: Vec<Toast>,
 }
 
-/// Options for a new tab (from ⌘E/⌘I, plugins or `kitchenctl tab new`).
+/// Options for a new tab (from ⌘E, plugins or `kitchenctl tab new`).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct NewTab {
@@ -855,7 +855,7 @@ impl Engine {
         }
     }
 
-    /// Text from ⌘I / `kitchenctl tab open` (a PR link, …): handed to the
+    /// A link from ⌘E / `kitchenctl tab open` (a PR link, …): handed to the
     /// plugins' `open` handlers, which open a tab with `kitchen.tab_open`.
     pub fn open_text(&self, text: &str) -> Result<()> {
         let ev = serde_json::json!({ "text": text.trim(), "workspaces": self.workspace_info() });

@@ -3,7 +3,7 @@
 //! viewer never see these chords.
 //!
 //! Chords act on the focused pane only (see [`Action::scope`]): tab keys
-//! (⌘E ⌘I ⌘W) work in the terminal, panel keys (⌘M ⌘O ⌘Enter) in a focused
+//! (⌘E ⌘W) work in the terminal, panel keys (⌘M ⌘O ⌘Enter) in a focused
 //! side panel, ⌘P and ⌘⇧H/J/K/L in a focused viewer; elsewhere they are
 //! swallowed. Tab and workspace switching (⌘H/L ⌘1-9 ⌘J/K) work everywhere. The rest is global; ⌘D toggles diff in a focused side panel
 //! and the workspace dashboard elsewhere, and ⌘. hides the other pane: the
@@ -17,8 +17,7 @@
 //! | ⌘H / ⌘L     | previous / next tab                           |
 //! | ⌘⇧H / ⌘⇧L   | focused viewer: file list ↔ code              |
 //! | ⌘⇧J / ⌘⇧K   | focused viewer: next / previous changed file  |
-//! | ⌘E          | new edit (read/write) tab — own worktree      |
-//! | ⌘I          | open a PR link (its branch in a tab)          |
+//! | ⌘E          | new tab: a name or a PR link — own worktree   |
 //! | ⌘-click     | open the path / URL under the pointer (terminal) |
 //! | ⌘R          | rename the current tab                        |
 //! | ⌘W          | close tab                                     |
@@ -48,7 +47,6 @@ pub enum Action {
     PrevTab,
     NextTab,
     NewTab,
-    OpenLink,
     CloseTab,
     FilePicker,
     /// Viewer: ⌘⇧H / ⌘⇧L move between its file list and code.
@@ -90,7 +88,7 @@ pub enum Scope {
 impl Action {
     pub fn scope(self) -> Scope {
         match self {
-            Action::NewTab | Action::OpenLink | Action::CloseTab => Scope::Terminal,
+            Action::NewTab | Action::CloseTab => Scope::Terminal,
             Action::Comment | Action::Submit | Action::ToggleOutline | Action::FilePicker | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile => Scope::Side,
             _ => Scope::Global,
         }
@@ -132,7 +130,6 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::J, Action::NextWorkspace),
     (Key::K, Action::PrevWorkspace),
     (Key::E, Action::NewTab),
-    (Key::I, Action::OpenLink),
     (Key::R, Action::RenameTab),
     (Key::W, Action::CloseTab),
     (Key::P, Action::FilePicker),
@@ -244,7 +241,6 @@ mod tests {
         assert!(!Action::FocusFileList.allowed(false, false));
         // Viewer focused: panel keys yes, tab create / close keys no.
         assert!(!Action::NewTab.allowed(true, true));
-        assert!(!Action::OpenLink.allowed(true, true));
         assert!(!Action::CloseTab.allowed(true, true));
         assert!(Action::ToggleOutline.allowed(true, true));
         // Viewer-only keys are swallowed in the plan.
@@ -322,7 +318,6 @@ mod tests {
         assert_eq!(press(Key::K, cmd_shift), vec![Action::PrevFile]);
         assert_eq!(press(Key::J, Modifiers::COMMAND), vec![Action::NextWorkspace]);
         assert_eq!(press(Key::L, Modifiers::COMMAND), vec![Action::NextTab]);
-        assert_eq!(press(Key::I, Modifiers::COMMAND), vec![Action::OpenLink]);
         assert_eq!(press(Key::R, Modifiers::COMMAND), vec![Action::RenameTab]);
         assert_eq!(press(Key::P, cmd_shift), vec![Action::Palette]);
         assert_eq!(press(Key::P, Modifiers::COMMAND), vec![Action::FilePicker]);
