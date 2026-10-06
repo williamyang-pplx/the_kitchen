@@ -157,6 +157,9 @@ W=$(git -C {r} worktree list --porcelain | awk -v ref="branch refs/heads/$b" '/^
 if git -C {r} rev-parse --verify --quiet "refs/heads/$b" >/dev/null; then local=1
 elif git -C {r} rev-parse --verify --quiet "refs/remotes/origin/$b" >/dev/null; then local=
 else echo "branch $b exists neither locally nor on origin" >&2; exit 14; fi
+# --track needs a fetch refspec covering origin/$b; single-branch clones only map main.
+[ -n "$local" ] || git -C {r} config --get-all remote.origin.fetch | grep -qxF -e '+refs/heads/*:refs/remotes/origin/*' -e "+refs/heads/$b:refs/remotes/origin/$b" \
+  || git -C {r} remote set-branches --add origin "$b" || exit 13
 co() {{ if [ -n "$local" ]; then git -C "$1" checkout --quiet "$b"; else git -C "$1" checkout --quiet --track -b "$b" "origin/$b"; fi; }}
 before=$(git -C "$P" rev-parse HEAD 2>/dev/null)
 if [ -e "$P" ]; then
@@ -854,6 +857,32 @@ mod tests {
         assert!(e.to_string().contains("exit 12"), "{e:#}");
         let e = repo.checkout_worktree(&det, Checkout::Branch("nope"), &[]).unwrap_err();
         assert!(e.to_string().contains("exit 14"), "{e:#}");
+    }
+
+    /// A single-branch clone (origin maps only main) can still open a
+    /// branch that is only on origin, tracking it.
+    #[test]
+    fn checkout_worktree_in_single_branch_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sh(
+            root,
+            "git init -q -b main origin && cd origin && git config user.email t@t && git config user.name t \
+             && echo one > a.txt && git add . && git commit -qm init \
+             && git checkout -qb pr && echo pr > p.txt && git add . && git commit -qm pr && git checkout -q main \
+             && cd .. && git clone -q --single-branch origin repo",
+        );
+        let repo_path = root.join("repo").display().to_string();
+        let repo = Repo::new(&Host::Local, &repo_path);
+        let path = repo.sibling_path("kitchen-pr-7");
+        let fetch = [branch_refspec("pr")];
+        let (wt, _) = repo.checkout_worktree(&path, Checkout::Branch("pr"), &fetch).unwrap();
+        assert_eq!(wt.branch.as_deref(), Some("pr"));
+        assert_eq!(repo.git(&["-C", &path, "rev-parse", "--abbrev-ref", "@{u}"]).unwrap().trim(), "origin/pr");
+        // Opening it again leaves origin's refspecs as they are.
+        repo.checkout_worktree(&path, Checkout::Branch("pr"), &fetch).unwrap();
+        let specs = repo.git(&["config", "--get-all", "remote.origin.fetch"]).unwrap();
+        assert_eq!(specs.lines().count(), 2, "{specs}");
     }
 
     #[test]
