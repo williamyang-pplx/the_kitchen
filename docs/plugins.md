@@ -55,9 +55,9 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 8)
+## API (level 7)
 
-Level 8 added `kitchen.set_diff_base` (see "Tabs"). Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
+Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
 "readonly" role. Level 6 added `kitchen.every`, `kitchen.dashboard` and the `dashboard` event
 (see "Timers" and "Dashboard"). Level 5 added `kitchen.link` (see "Links"). Level 4 added `kitchen.comments`, the `comment` event and
@@ -248,14 +248,6 @@ workspace's host (a new worktree takes over a spare). Opening the same
 fast-forward; git refuses to overwrite local changes), and reloads the
 viewer. Every tab's shell gets `KITCHEN_DIFF_BASE`. See
 `plugins/github/init.lua` (PR links).
-
-```lua
-kitchen.set_diff_base(ctx.tab, "origin/al/base")  -- nil: back to origin/<default>
-```
-
-changes what an open tab's viewer diffs against, and reloads it (the
-tab's shell keeps the `KITCHEN_DIFF_BASE` it started with). The rev must
-exist in the worktree: fetch it first.
 
 ### Comments
 

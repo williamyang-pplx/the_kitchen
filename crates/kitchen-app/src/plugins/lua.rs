@@ -707,14 +707,6 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
             Ok(())
         })?,
     )?;
-    let c = cx.clone();
-    k.set(
-        "set_diff_base",
-        lua.create_function(move |_, (tab, base): (String, Option<String>)| match c.host.engine() {
-            Some(e) => e.set_diff_base(&tab, base).map_err(|e| mlua::Error::runtime(format!("kitchen.set_diff_base: {e:#}"))),
-            None => Ok(()),
-        })?,
-    )?;
 
     // Logging: kitchen.log and print go to ~/.kitchen/logs/plugins/<name>.log.
     let c = cx.clone();
