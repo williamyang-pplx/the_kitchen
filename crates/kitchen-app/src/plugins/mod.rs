@@ -985,79 +985,121 @@ mod tests {
         assert_eq!(file_level[11], "body=**L12**: `x = 1`\n\nhm");
     }
 
-    /// prune-worktrees: which worktrees are candidates, what gh's answer means
-    /// for them, and the guarded branch delete.
+    fn prune_module(lua: &mlua::Lua) -> mlua::Table {
+        lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/prune-worktrees/init.lua");
+        lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap()
+    }
+
+    /// prune-worktrees: which worktrees are candidates, how a probe reads,
+    /// what the verdict is, and the guarded branch delete.
     #[test]
     fn prune_plugin_decides_what_to_remove() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
-        lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/prune-worktrees/init.lua");
-        let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
+        let m = prune_module(&lua);
         let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
         let val = |j: serde_json::Value| lua.to_value(&j).unwrap();
 
         let list = val(serde_json::json!([
             { "path": "/r/air", "branch": "main", "head": "a", "role": "main" },
-            { "path": "/r/air-kitchen-ro-pr-11", "head": "b", "role": "edit" },
-            { "path": "/r/air-kitchen-spare", "head": "c", "role": "spare" },
-            { "path": "/r/air-tabbed", "branch": "william/tabbed", "head": "d", "role": "edit", "tab": "t1" },
-            { "path": "/r/air-detached", "head": "e", "role": "edit" },
-            { "path": "/r/air-good", "branch": "william/good", "head": "f", "role": "edit" },
-            { "path": "/r/air-moved", "branch": "william/open-elsewhere", "head": "g", "role": "edit" },
-            { "path": "/r/air-kitchen-pr-12", "head": "h", "role": "edit" },
-            { "path": "/r/air-kitchen-pr-13", "head": "i", "role": "edit" },
-            { "path": "/r/air-kitchen-pr-14", "branch": "al/fix", "head": "j", "role": "edit" },
+            { "path": "/r/air-kitchen-spare", "head": "b", "role": "spare" },
+            { "path": "/r/air-tabbed", "branch": "william/tabbed", "head": "c", "role": "edit", "tab": "t1" },
+            { "path": "/r/air-moved", "branch": "william/open-elsewhere", "head": "d", "role": "edit" },
+            { "path": "/r/air-named", "head": "e", "role": "edit" },
+            { "path": "/r/air-shell", "branch": "william/shell", "head": "f", "role": "edit" },
+            { "path": "/r/air-tmp", "branch": "william/tmp", "head": "g", "role": "edit" },
+            { "path": "/r/air-good", "branch": "william/good", "head": "h", "role": "edit" },
+            { "path": "/r/air-detached", "head": "i", "role": "edit" },
+            { "path": "/r/air-plain", "branch": "william/plain", "head": "j", "role": "edit" },
         ]));
         // Tabs whose worktree path git spells differently: matched by branch / name.
         let tabs = val(serde_json::json!([
             { "worktree": "/private/r/air-other", "branch": "william/open-elsewhere" },
-            { "worktree": "/private/r/air-kitchen-pr-13" },
+            { "worktree": "/private/r/air-named" },
         ]));
-        let got = to_json(m.get::<mlua::Function>("candidates").unwrap().call((list, tabs)).unwrap());
+        // A pane deep in air-shell, one in air-tmp spelled /private, one in a
+        // sibling whose name merely starts with air-good.
+        let panes = val(serde_json::json!(["/r/air-shell/src/lib", "/private/r/air-tmp", "/r/air-good2"]));
+        let got = to_json(m.get::<mlua::Function>("candidates").unwrap().call((list, tabs, panes)).unwrap());
         assert_eq!(
             got,
             serde_json::json!([
-                { "kind": "edit", "path": "/r/air-good", "branch": "william/good", "head": "f" },
-                { "kind": "pr", "path": "/r/air-kitchen-pr-12", "number": 12, "head": "h" },
-                { "kind": "edit", "path": "/r/air-kitchen-pr-14", "branch": "al/fix", "head": "j" },
+                { "path": "/r/air-good", "branch": "william/good", "head": "h" },
+                { "path": "/r/air-detached", "head": "i" },
+                { "path": "/r/air-plain", "branch": "william/plain", "head": "j" },
             ])
         );
 
+        let parse: mlua::Function = m.get("parse_probe").unwrap();
+        let p = to_json(parse.call("touched 0\ncontained 1\non_default 0\n").unwrap());
+        assert_eq!(p, serde_json::json!({ "touched": false, "contained": true, "on_default": false }));
+        assert_eq!(to_json(parse.call("touched 0\ncontained 1\n").unwrap()), serde_json::Value::Null, "truncated: the probe failed");
+
         let verdict: mlua::Function = m.get("verdict").unwrap();
-        let edit = |head: &str| val(serde_json::json!({ "kind": "edit", "head": head, "branch": "b" }));
-        let pr = |n: u64, state: &str, oid: &str| serde_json::json!({ "number": n, "state": state, "headRefOid": oid });
-        let judge = |wt: mlua::Value, prs: serde_json::Value| to_json(verdict.call((wt, val(prs))).unwrap());
-        let judge_on_default = |wt: mlua::Value, prs: serde_json::Value| to_json(verdict.call((wt, val(prs), true)).unwrap());
-        let v = judge(edit("abc"), serde_json::json!([]));
-        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("no PR")));
-        // Merged without a PR, or after its PR closed: HEAD is on origin/<default>.
-        let v = judge_on_default(edit("abc"), serde_json::json!([]));
-        assert_eq!((v["action"].as_str(), v["why"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some("on the default branch"), Some(true)));
-        let v = judge_on_default(edit("def"), serde_json::json!([pr(3, "CLOSED", "abc")]));
-        assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some(true)));
-        let v = judge_on_default(edit("abc"), serde_json::json!([pr(2, "OPEN", "abc")]));
-        assert_eq!(v["action"].as_str(), Some("keep"), "an open PR wins");
-        let v = judge(edit("abc"), serde_json::json!([pr(1, "MERGED", "abc"), pr(2, "OPEN", "abc")]));
-        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("PR #2 open")));
-        let v = judge(edit("def"), serde_json::json!([pr(3, "MERGED", "abc")]));
-        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("local commits not on PR #3")));
-        let v = judge(edit("abc"), serde_json::json!([pr(3, "CLOSED", "abc")]));
-        assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some(false)));
-        let v = judge(edit("abc"), serde_json::json!([pr(1, "CLOSED", "old"), pr(4, "MERGED", "abc")]));
-        assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool(), v["pr"]["number"].as_u64()), (Some("remove"), Some(true), Some(4)));
-        let review = || val(serde_json::json!({ "kind": "pr", "number": 12, "head": "zzz" }));
-        let v = judge(review(), serde_json::json!([pr(12, "MERGED", "zzz")]));
-        assert_eq!((v["action"].as_str(), v["delete_branch"].as_bool()), (Some("remove"), Some(false)));
-        let v = judge(review(), serde_json::json!([pr(12, "MERGED", "abc")]));
-        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("local commits not on PR #12")));
-        let v = judge(review(), serde_json::json!([{ "number": 12, "state": "OPEN" }]));
-        assert_eq!((v["action"].as_str(), v["why"].as_str()), (Some("keep"), Some("PR #12 open")));
-        let v = judge_on_default(review(), serde_json::json!([pr(12, "CLOSED", "abc")]));
-        assert_eq!(v["action"].as_str(), Some("keep"), "a detached PR worktree goes only by its PR");
+        let judge = |branch: Option<&str>, probe: serde_json::Value| -> (String, String, bool) {
+            let mut wt = serde_json::json!({ "path": "/r/x", "head": "abc" });
+            if let Some(b) = branch {
+                wt["branch"] = b.into();
+            }
+            let wt = val(wt);
+            let probe = if probe.is_null() { mlua::Value::Nil } else { val(probe) };
+            let v = to_json(verdict.call((wt, probe, "main")).unwrap());
+            (v["action"].as_str().unwrap().into(), v["why"].as_str().unwrap().into(), v["delete_branch"].as_bool().unwrap_or(false))
+        };
+        let probe = |touched: bool, contained: bool, on_default: bool| serde_json::json!({ "touched": touched, "contained": contained, "on_default": on_default });
+        let keep = |why: &str| ("keep".to_string(), why.to_string(), false);
+        let remove = |delete: bool| ("remove".to_string(), "idle".to_string(), delete);
+        assert_eq!(judge(Some("b"), serde_json::Value::Null), keep("probe failed"));
+        assert_eq!(judge(Some("b"), probe(true, true, true)), keep("touched recently"));
+        assert_eq!(judge(None, probe(false, false, false)), keep("detached commits on no ref"));
+        assert_eq!(judge(None, probe(false, true, true)), remove(false), "detached: no branch to delete");
+        assert_eq!(judge(Some("b"), probe(false, true, true)), remove(true));
+        assert_eq!(judge(Some("main"), probe(false, true, true)), remove(false), "never the default branch");
+        assert_eq!(judge(Some("b"), probe(false, true, false)), remove(false), "unmerged commits stay on the branch");
 
         let del: String = m.get::<mlua::Function>("delete_branch_sh").unwrap().call(("william/x'y", "abc")).unwrap();
         assert_eq!(del, r#"[ "$(git rev-parse --verify -q 'refs/heads/william/x'\''y')" = 'abc' ] && git branch -D 'william/x'\''y'"#);
+    }
+
+    /// prune-worktrees: the probe script against a real repo, so a find/xargs
+    /// slip can't read fresh work as idle (it's removed with --force).
+    #[test]
+    fn prune_probe_reads_a_real_worktree() {
+        let lua = mlua::Lua::new();
+        let m = prune_module(&lua);
+        let script: String = m.get::<mlua::Function>("probe_sh").unwrap().call((4320, "refs/remotes/origin/main")).unwrap();
+        let repo = crate::test_util::TestRepo::with_files(&[("a.txt", "a")]);
+        let wt = format!("{}-wt", repo.path());
+        let det = format!("{}-det", repo.path());
+        repo.sh(&format!("git worktree add -q -b b {wt} && git worktree add -q --detach {det} && git -C {det} commit -q --allow-empty -m loose"));
+        let probe = |dir: &str| -> (bool, String) {
+            let out = std::process::Command::new("sh").arg("-c").arg(&script).current_dir(dir).output().unwrap();
+            (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        // Everything the probe looks at, a week old.
+        let backdate = |dir: &str| {
+            let sh = r#"touch -t 202001010000 "$(git rev-parse --git-path logs/HEAD)"; git ls-files -z -m -o --exclude-standard | xargs -0 touch -t 202001010000 2>/dev/null; true"#;
+            assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(dir).status().unwrap().success());
+        };
+
+        assert_eq!(probe(&wt), (true, "touched 1\ncontained 1\non_default 1\n".into()), "just checked out");
+        backdate(&wt);
+        assert_eq!(probe(&wt).1, "touched 0\ncontained 1\non_default 1\n");
+        // The first path after logs/HEAD: catches a list that isn't NUL-separated.
+        std::fs::write(format!("{wt}/new.txt"), "x").unwrap();
+        assert!(probe(&wt).1.starts_with("touched 1\n"), "a fresh untracked file");
+        std::fs::remove_file(format!("{wt}/new.txt")).unwrap();
+        std::fs::write(format!("{wt}/a.txt"), "edited").unwrap();
+        assert!(probe(&wt).1.starts_with("touched 1\n"), "a fresh edit");
+        backdate(&wt);
+        assert!(probe(&wt).1.starts_with("touched 0\n"), "an old edit");
+
+        assert_eq!(probe(&det).1, "touched 1\ncontained 0\non_default 0\n", "a commit on no ref");
+        let (ok, out) = probe(&std::env::temp_dir().display().to_string());
+        assert!(!ok && out.is_empty(), "outside a repo: fail, print nothing ({out})");
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&det);
     }
 
     /// dashboard plugin: parsing `ps`/`df`/`du` output (macOS and Linux) and

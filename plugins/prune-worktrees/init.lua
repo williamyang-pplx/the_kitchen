@@ -1,20 +1,18 @@
--- prune-worktrees: every interval_minutes, remove the worktrees of work that
--- is done.
+-- prune-worktrees: every interval_minutes, remove the worktrees nobody uses.
 --
--- Three kinds go: worktrees on a branch whose PRs are all merged/closed,
--- detached PR worktrees (<repo>-kitchen-pr-<N>, opened by the github plugin
--- when the PR's branch wasn't usable) whose PR #N is merged/closed, and
--- worktrees on a branch with no open PR whose HEAD is already on
--- origin/<default> (merged without a PR). None may have an open tab.
+-- A worktree goes when it has no tab, no tmux pane (kitchen's or yours) has
+-- its cwd in it, and nothing in it was touched for idle_days: no commit or
+-- checkout (its HEAD reflog), no edit to a modified, staged or untracked
+-- file. Uncommitted changes go with it (`worktree remove --force`).
 --
--- Per workspace (on its own host): `kitchenctl worktree list` says which
--- worktrees have no tab; gh (on the mac) says whether their PRs are done and
--- which commit GitHub has. A worktree goes only when its HEAD is that commit
--- or is on origin/<default>. `kitchenctl worktree remove` (never
--- --force) re-checks the tab and refuses dirty worktrees at removal time.
--- Anything doubtful is kept and logged.
+-- Commits are never lost: the branch stays, unless its tip is already on
+-- origin/<default> (then it's deleted too), and a detached HEAD that no ref
+-- contains keeps its worktree. The main checkout and spares are never
+-- touched. `kitchenctl worktree remove` re-checks the tab at removal time.
 
 local M = {}
+
+local SOCKET = "kitchen" -- the kitchen's tmux socket (kitchen-core tmux::SOCKET_NAME)
 
 local function q(s)
   return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
@@ -24,11 +22,18 @@ local function basename(path)
   return path:match("[^/]+$") or path
 end
 
--- worktree.list entries that may be pruned, before asking GitHub. `tabs`: the
--- workspace's tabs from kitchen.workspaces(). Each returned entry gets
--- `kind = "edit" | "pr"`, and `number` for "pr". Tabs are also matched by
--- branch / worktree name, in case a tab spells its path differently from git.
-function M.candidates(list, tabs)
+-- True when `path` is `dir` or inside it. Both drop a leading /private
+-- first: a pane's cwd is getcwd()'s spelling (/private/tmp), git's may not be.
+local function within(path, dir)
+  path, dir = path:gsub("^/private/", "/"), dir:gsub("^/private/", "/")
+  return path == dir or path:sub(1, #dir + 1) == dir .. "/"
+end
+
+-- worktree.list entries that may be collected. `tabs`: the workspace's tabs
+-- (kitchen.workspaces()), also matched by branch / worktree name in case a
+-- tab spells its path differently from git. `panes`: cwd of every tmux pane
+-- on the workspace's host. Returns { path, branch (or nil), head } entries.
+function M.candidates(list, tabs, panes)
   local branches, names = {}, {}
   for _, t in ipairs(tabs or {}) do
     if t.branch then
@@ -38,65 +43,89 @@ function M.candidates(list, tabs)
       names[basename(t.worktree)] = true
     end
   end
-  local out = {}
-  for _, wt in ipairs(list) do
-    if wt.role == "edit" and wt.tab == nil and not names[basename(wt.path)] then
-      local n = wt.path:match("%-kitchen%-pr%-(%d+)$")
-      if wt.branch and not branches[wt.branch] then
-        table.insert(out, { kind = "edit", path = wt.path, branch = wt.branch, head = wt.head })
-      elseif not wt.branch and n then
-        table.insert(out, { kind = "pr", path = wt.path, number = tonumber(n), head = wt.head })
+  local function in_pane(path)
+    for _, p in ipairs(panes or {}) do
+      if within(p, path) then
+        return true
       end
+    end
+    return false
+  end
+  local out = {}
+  -- (role "main" / "spare": the main checkout and the spare pool, never collected)
+  for _, wt in ipairs(list) do
+    local tabbed = wt.tab ~= nil or names[basename(wt.path)] or (wt.branch and branches[wt.branch])
+    if wt.role == "edit" and not tabbed and not in_pane(wt.path) then
+      table.insert(out, { path = wt.path, branch = wt.branch, head = wt.head })
     end
   end
   return out
 end
 
-function M.has_open(prs)
-  for _, pr in ipairs(prs) do
-    if pr.state == "OPEN" then
-      return true
-    end
-  end
-  return false
+-- Shell, run in the worktree on its host, that prints three lines:
+--   touched 0|1    logs/HEAD or a modified, staged or untracked file has an
+--                  mtime within `minutes`
+--   contained 0|1  on a branch, or (detached) some ref contains HEAD
+--   on_default 0|1 HEAD is an ancestor of `default_ref`
+-- It fails (non-zero, before any output) when a git listing fails, so a
+-- broken probe keeps the worktree instead of reading as "not touched".
+function M.probe_sh(minutes, default_ref)
+  return table.concat({
+    "set -e",
+    "l=$(mktemp); trap 'rm -f \"$l\"' EXIT",
+    -- an assignment, so set -e stops here outside a repo
+    "h=$(git rev-parse --git-path logs/HEAD)",
+    -- NUL-terminated, and always one path, so find never runs without any
+    [[printf '%s\0' "$h" > "$l"]],
+    [[git ls-files -z -m -o --exclude-standard >> "$l"]],
+    [[git diff --cached -z --name-only >> "$l"]],
+    -- paths before primaries (BSD find insists); deleted files just error
+    [[t=$(xargs -0 sh -c 'find "$@" -maxdepth 0 -mmin -]] .. math.floor(minutes) .. [[ -print 2>/dev/null; true' _ < "$l" | head -n1)]],
+    [[if [ -n "$t" ]; then echo "touched 1"; else echo "touched 0"; fi]],
+    -- for-each-ref --contains walks every ref, so only when detached
+    [[if git symbolic-ref -q HEAD >/dev/null || [ -n "$(git for-each-ref --contains HEAD --count=1)" ]; then echo "contained 1"; else echo "contained 0"; fi]],
+    "if git merge-base --is-ancestor HEAD " .. q(default_ref) .. ' 2>/dev/null; then echo "on_default 1"; else echo "on_default 0"; fi',
+  }, "\n")
 end
 
--- What to do with candidate `wt` given its PRs: the branch's PR list for
--- kind "edit", { PR #number } for kind "pr". `on_default`: wt.head is on
--- origin/<default> (only looked up when no PR is open).
--- Returns { action = "remove" | "keep", why, pr, delete_branch }.
-function M.verdict(wt, prs, on_default)
-  local newest
-  for _, pr in ipairs(prs) do
-    if pr.state == "OPEN" then
-      return { action = "keep", why = "PR #" .. pr.number .. " open", pr = pr }
+-- { touched, contained, on_default } (booleans) from probe_sh's output, or
+-- nil when a line is missing (the probe failed: keep the worktree).
+function M.parse_probe(stdout)
+  local p = {}
+  for _, key in ipairs({ "touched", "contained", "on_default" }) do
+    local v = (stdout or ""):match(key .. " ([01])")
+    if not v then
+      return nil
     end
-    if not newest or pr.number > newest.number then
-      newest = pr
-    end
+    p[key] = v == "1"
   end
-  if newest and newest.headRefOid and wt.head == newest.headRefOid then
-    -- (a detached PR worktree has no branch to delete)
-    local done = "PR #" .. newest.number .. " " .. newest.state:lower()
-    return { action = "remove", why = done, pr = newest, delete_branch = wt.kind == "edit" and newest.state == "MERGED" }
+  return p
+end
+
+-- What to do with candidate `wt` given its probe (nil: it failed) and the
+-- workspace's default branch. Returns { action = "remove" | "keep", why, delete_branch }.
+function M.verdict(wt, probe, default_branch)
+  if not probe then
+    return { action = "keep", why = "probe failed" }
   end
-  if on_default and wt.kind == "edit" then
-    return { action = "remove", why = "on the default branch", pr = newest, delete_branch = true }
+  if probe.touched then
+    return { action = "keep", why = "touched recently" }
   end
-  if not newest then
-    return { action = "keep", why = "no PR" }
+  if not wt.branch and not probe.contained then
+    return { action = "keep", why = "detached commits on no ref" }
   end
-  return { action = "keep", why = "local commits not on PR #" .. newest.number, pr = newest }
+  local delete = wt.branch ~= nil and wt.branch ~= default_branch and probe.on_default
+  return { action = "remove", why = "idle", delete_branch = delete }
 end
 
 -- Shell line that deletes `branch` only while its tip is still `oid` (the
--- worktree's HEAD, which is a merged PR's head or on the default branch, so
--- the work is on GitHub). `-D` because `-d` refuses squash-merged branches.
+-- removed worktree's HEAD, already on the default branch). `-D` because `-d`
+-- checks against the main checkout's HEAD, not origin/<default>.
 function M.delete_branch_sh(branch, oid)
   return '[ "$(git rev-parse --verify -q ' .. q("refs/heads/" .. branch) .. ')" = ' .. q(oid) .. " ] && git branch -D " .. q(branch)
 end
 
--- run_sync with gh and kitchenctl on the PATH.
+-- run_sync with kitchenctl on the PATH.
 local function sh(spec)
   spec.sh = "export PATH=" .. (kitchen.config.path or "") .. ':"$PATH"; ' .. spec.sh
   return kitchen.run_sync(spec)
@@ -110,42 +139,26 @@ local function why(res)
   return text
 end
 
--- gh's PRs for candidate `wt`, or nil (and a reason) when gh failed.
-local function prs_for(slug, wt)
-  local cmd
-  if wt.kind == "pr" then
-    cmd = "gh pr view " .. wt.number .. " -R " .. q(slug) .. " --json number,state,url,headRefOid"
-  else
-    cmd = "gh pr list -R " .. q(slug) .. " --head " .. q(wt.branch) .. " --state all --json number,state,url,headRefOid --limit 10"
-  end
-  local res = sh({ host = "local", timeout = 20, sh = cmd })
+-- cwd of every tmux pane on `host`, on the kitchen's socket and the default
+-- one. A server that isn't running answers nothing; that's fine.
+local function panes_on(host)
+  local fmt = " list-panes -a -F '#{pane_current_path}' 2>/dev/null; "
+  local res = kitchen.run_sync({ host = host, timeout = 30, sh = "tmux -L " .. SOCKET .. fmt .. "tmux" .. fmt .. "true" })
   if res.code ~= 0 then
-    return nil, "gh failed: " .. why(res)
+    -- (ssh failed: without the panes every worktree would look unused)
+    error("tmux panes: " .. why(res))
   end
-  local ok, v = pcall(kitchen.json.decode, res.stdout)
-  if not ok or type(v) ~= "table" then
-    return nil, "gh answered " .. res.stdout
+  local panes = {}
+  for line in res.stdout:gmatch("[^\n]+") do
+    table.insert(panes, line)
   end
-  if wt.kind == "pr" then
-    return { v }
-  end
-  return v
-end
-
--- Whether commit `oid` is on origin/<default> in `ws`'s repo.
-local function on_default(ws, oid)
-  local ref = "refs/remotes/origin/" .. (ws.default_branch or "main")
-  return kitchen.run_sync({ host = ws.host, cwd = ws.repo_path, cmd = { "git", "merge-base", "--is-ancestor", oid, ref } }).code == 0
+  return panes
 end
 
 -- One pass over workspace `ws`; returns the removed worktree paths and how many it kept.
-local function prune_workspace(ws)
+local function prune_workspace(ws, minutes)
   local log = function(...)
     kitchen.log("[" .. ws.name .. "]", ...)
-  end
-  if not ws.github_slug then
-    log("not a GitHub repo, skipped")
-    return {}, 0
   end
   local res = sh({ host = "local", timeout = 60, sh = "kitchenctl --json worktree list -w " .. q(ws.id) })
   local ok, list = pcall(kitchen.json.decode, res.stdout)
@@ -153,16 +166,14 @@ local function prune_workspace(ws)
     log("worktree list failed:", why(res))
     error("worktree list failed: " .. why(res))
   end
+  local panes = panes_on(ws.host)
+  local default = ws.default_branch or "main"
   local removed, kept = {}, 0
-  for _, wt in ipairs(M.candidates(list, ws.tabs)) do
-    local prs, err = prs_for(ws.github_slug, wt)
-    local v = { action = "keep", why = err }
-    if prs then
-      local merged = wt.kind == "edit" and wt.branch ~= ws.default_branch and not M.has_open(prs) and on_default(ws, wt.head)
-      v = M.verdict(wt, prs, merged)
-    end
+  for _, wt in ipairs(M.candidates(list, ws.tabs, panes)) do
+    local probe = kitchen.run_sync({ host = ws.host, cwd = wt.path, timeout = 120, sh = M.probe_sh(minutes, "refs/remotes/origin/" .. default) })
+    local v = M.verdict(wt, probe.code == 0 and M.parse_probe(probe.stdout) or nil, default)
     if v.action == "remove" then
-      -- worktree.remove doesn't re-check HEAD: a commit made since the list must not be lost.
+      -- A tab being opened checks a worktree out before its tab exists.
       local head = kitchen.run_sync({ host = ws.host, cmd = { "git", "-C", wt.path, "rev-parse", "HEAD" } })
       if head.code ~= 0 or head.stdout:gsub("%s+", "") ~= wt.head then
         v = { action = "keep", why = "HEAD moved" }
@@ -174,7 +185,7 @@ local function prune_workspace(ws)
     else
       -- Deleting a big checkout on a devbox takes minutes. A timeout only
       -- kills kitchenctl: the app carries on, so the outcome is unknown.
-      local rm = sh({ host = "local", timeout = 900, sh = "kitchenctl --json worktree remove " .. q(wt.path) .. " -w " .. q(ws.id) })
+      local rm = sh({ host = "local", timeout = 900, sh = "kitchenctl --json worktree remove --force " .. q(wt.path) .. " -w " .. q(ws.id) })
       if rm.timed_out then
         log("gave up waiting on", wt.path, "(" .. v.why .. "); the removal may still finish, branch kept")
       elseif rm.code ~= 0 then
@@ -200,9 +211,10 @@ local manual = false -- the next pass was asked for with prune-worktrees.run
 local function pass()
   local was_manual = manual
   manual = false
+  local minutes = math.max(60, (tonumber(kitchen.config.idle_days) or 3) * 1440)
   local removed, totals, per_ws = {}, { removed = 0, kept = 0, failed_workspaces = 0 }, {}
   for _, ws in ipairs(kitchen.workspaces()) do
-    local ok, got, kept = pcall(prune_workspace, ws)
+    local ok, got, kept = pcall(prune_workspace, ws, minutes)
     if ok then
       for _, p in ipairs(got) do
         table.insert(removed, basename(p))
@@ -225,7 +237,7 @@ end
 
 -- The kitchen runs it on schedule and never starts one while another is going.
 local timer = kitchen.every("pass", math.max(1, tonumber(kitchen.config.interval_minutes) or 60) * 60, pass, {
-  desc = "remove worktrees of merged/closed PRs",
+  desc = "remove worktrees idle for idle_days",
   first_delay = 60,
 })
 
@@ -235,6 +247,6 @@ kitchen.command("run", function()
     manual = false
     kitchen.notify("a prune pass is already running")
   end
-end, { desc = "prune worktrees of merged/closed PRs now" })
+end, { desc = "remove idle worktrees now" })
 
 return M

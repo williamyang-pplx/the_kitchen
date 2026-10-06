@@ -1,10 +1,13 @@
 name = "prune-worktrees"
 version = "0.1.0"
-description = "Every so often, remove clean worktrees whose PR is merged or closed, or whose branch is already on the default branch (no open tab, no unpushed commits)"
+description = "Every so often, remove worktrees nobody uses: no tab, no tmux pane in them, untouched for idle_days (uncommitted changes go too; branches stay)"
 api = 7
 
 [config]
 # Minutes between passes; the first pass runs about a minute after the kitchen starts.
 interval_minutes = 60
-# Where gh and kitchenctl live when the kitchen was started from Finder (minimal PATH).
+# A worktree is idle when no commit/checkout and no edit to a changed or
+# untracked file happened in this many days (fractions ok; at least an hour).
+idle_days = 3
+# Where kitchenctl lives when the kitchen was started from Finder (minimal PATH).
 path = "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"
