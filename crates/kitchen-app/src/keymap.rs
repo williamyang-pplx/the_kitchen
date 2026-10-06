@@ -17,7 +17,7 @@
 //! | ⌘H / ⌘L     | previous / next tab                           |
 //! | ⌘⇧H / ⌘⇧L   | focused viewer: file list ↔ code              |
 //! | ⌘⇧J / ⌘⇧K   | focused viewer: next / previous changed file  |
-//! | ⌘T          | new tab: a name or a PR link — own worktree   |
+//! | ⌘T          | new tab: a name — own worktree + branch       |
 //! | ⌘-click     | open the path / URL under the pointer (terminal) |
 //! | ⌘R          | rename the current tab                        |
 //! | ⌘W          | close tab                                     |

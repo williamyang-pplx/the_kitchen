@@ -71,11 +71,7 @@ impl Dialog {
     }
 
     pub fn new_tab() -> Dialog {
-        // A link just copied from the browser is the likely input (selected,
-        // so typing a name replaces it).
-        let clip = std::process::Command::new("pbpaste").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        let text = clip.filter(|c| c.starts_with("https://") && !c.contains(char::is_whitespace)).unwrap_or_default();
-        Dialog::NewTab(NewTabDialog { text, first_frame: true })
+        Dialog::NewTab(NewTabDialog { text: String::new(), first_frame: true })
     }
 
     pub fn confirm_close(tab: &Tab) -> Dialog {
@@ -308,13 +304,13 @@ impl NewTabDialog {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
         ui.heading("New tab");
         ui.label(
-            RichText::new("A name: its own worktree + branch off the latest origin. A PR link: the PR's branch. Claude runs in it.")
+            RichText::new("A name: its own worktree + branch off the latest origin. Claude runs in it.")
                 .color(theme::DIM)
                 .size(12.0),
         );
         ui.add_space(8.0);
         let field = ui.add(
-            egui::TextEdit::singleline(&mut self.text).hint_text("tab name, or https://github.com/ppl-ai/air/pull/14211").desired_width(500.0),
+            egui::TextEdit::singleline(&mut self.text).hint_text("tab name").desired_width(500.0),
         );
         if self.first_frame {
             focus_select_all(ui, &field, &self.text);
@@ -323,9 +319,7 @@ impl NewTabDialog {
         ui.add_space(10.0);
         let text = self.text.trim().to_string();
         buttons(ui, "Create", true, || {
-            if is_link(&text) {
-                engine.spawn("open", move |e| e.open_text(&text));
-            } else if let Some(ws) = engine.selected_workspace() {
+            if let Some(ws) = engine.selected_workspace() {
                 let opts = NewTab { title: Some(text).filter(|t| !t.is_empty()), ..Default::default() };
                 let id = ws.row.id.clone();
                 engine.spawn("new tab", move |e| e.create_tab(&id, opts).map(|_| ()));
@@ -334,8 +328,8 @@ impl NewTabDialog {
     }
 }
 
-/// Text the plugins open (a URL, or `owner/repo#12`) rather than a tab name.
-fn is_link(text: &str) -> bool {
+/// Text the plugins open (a URL, or `owner/repo#12`) rather than a command (⌘⇧P).
+pub(crate) fn is_link(text: &str) -> bool {
     let short_ref = text.split_once('#').is_some_and(|(repo, n)| repo.matches('/').count() == 1 && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
     !text.contains(char::is_whitespace) && (text.contains("://") || text.starts_with("github.com/") || short_ref)
 }

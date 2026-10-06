@@ -216,7 +216,7 @@ fi"#,
     /// fresh), checked out in the sibling worktree `<repo>-<slug>`, with
     /// `.kitchen/` git-excluded. One round trip to the host, no network.
     pub fn create_edit_worktree(&self, base: &str, prefix: &str, slug: &str) -> Result<Worktree> {
-        // `<repo>-kitchen-*` names belong to the kitchen (spares, PR tabs).
+        // `<repo>-kitchen-*` names belong to the kitchen (spares, PR views).
         let slug = if slug.starts_with("kitchen") { format!("tab-{slug}") } else { slug.to_string() };
         let (r, b, pf, sl) = (shell_quote(self.path), shell_quote(base), shell_quote(prefix), shell_quote(&slug));
         let parent = shell_quote(self.parent_dir());

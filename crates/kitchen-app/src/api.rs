@@ -191,7 +191,7 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({
                 "caller": {
                     "workspace": ws.as_ref().map(|w| json!({"id": w.row.id, "name": w.row.name, "host": w.row.host, "repo_path": w.row.repo_path})),
-                    "tab": tab.as_ref().map(|t| json!({"id": t.row.id, "title": t.row.title, "worktree": t.row.worktree, "branch": t.row.branch, "plan_file": t.row.plan_file(), "diff_base": t.row.diff_base})),
+                    "tab": tab.as_ref().map(|t| json!({"id": t.row.id, "title": t.row.title, "worktree": t.row.worktree, "branch": t.row.branch, "plan_file": t.row.plan_file()})),
                 },
                 "focused": {
                     "workspace": selected.as_ref().map(|w| w.row.id.clone()),
@@ -261,15 +261,6 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             let id = engine.resolve_workspace(t.workspace.as_deref(), caller)?;
             let info = engine.workspace_info().into_iter().find(|w| w.id == id).context("workspace vanished")?;
             Ok(serde_json::to_value(info.tabs)?)
-        }
-        "tab.open" => {
-            #[derive(Deserialize)]
-            struct P {
-                text: String,
-            }
-            let a: P = p(params)?;
-            engine.open_text(&a.text)?;
-            Ok(json!({"opening": a.text.trim()}))
         }
         "tab.create" => {
             #[derive(Deserialize)]

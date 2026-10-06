@@ -44,13 +44,12 @@ pub fn render(method: &str, v: &Value) -> String {
             }
             if !tab.is_null() {
                 out.push_str(&format!(
-                    "tab:       {} (id {})\nworktree:  {}\n{}{}{}",
+                    "tab:       {} (id {})\nworktree:  {}\n{}{}",
                     s(&tab["title"]),
                     s(&tab["id"]),
                     s(&tab["worktree"]),
                     opt(&tab["branch"], "branch:    ") + if tab["branch"].is_null() { "" } else { "\n" },
                     opt(&tab["plan_file"], "plan:      ") + if tab["plan_file"].is_null() { "" } else { "\n" },
-                    opt(&tab["diff_base"], "diff base: ") + if tab["diff_base"].is_null() { "" } else { "\n" },
                 ));
             }
             out.push_str(&format!("focused:   workspace {} tab {}\n", s(&v["focused"]["workspace"]), s(&v["focused"]["tab"])));

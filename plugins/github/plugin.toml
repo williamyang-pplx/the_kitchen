@@ -1,7 +1,7 @@
 name = "github"
 version = "0.1.0"
-description = "Open GitHub PR links (⌘T / kitchenctl tab open) as tabs on the PR's branch showing its diff; ⌘M posts review comments to the PR and shows its threads"
-api = 7
+description = "Review a GitHub PR in the current tab: paste its link into ⌘⇧P to see its diff and review comments; ⌘M posts to the PR"
+api = 8
 
 [config]
 # Where gh lives when the kitchen was started from Finder (minimal PATH).

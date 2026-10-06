@@ -71,12 +71,12 @@ pub struct Tab {
 impl Tab {
     /// Rev the tab's changes are shown against.
     pub fn diff_base(&self, ws: &Workspace) -> String {
-        diff_base_of(&ws.row, &self.row)
+        diff_base_of(&ws.row)
     }
 }
 
-fn diff_base_of(ws: &WorkspaceRow, tab: &TabRow) -> String {
-    tab.diff_base.clone().unwrap_or_else(|| format!("origin/{}", ws.default_branch.as_deref().unwrap_or("main")))
+fn diff_base_of(ws: &WorkspaceRow) -> String {
+    format!("origin/{}", ws.default_branch.as_deref().unwrap_or("main"))
 }
 
 /// Environment of a tab's shell (same for a new and a re-created session).
@@ -84,7 +84,7 @@ fn tab_env(ws: &WorkspaceRow, tab: &TabRow, host: &Host) -> Vec<(String, String)
     let mut env = vec![
         (kitchen_proto::ENV_WORKSPACE.to_string(), ws.id.clone()),
         (kitchen_proto::ENV_TAB.to_string(), tab.id.clone()),
-        (kitchen_proto::ENV_DIFF_BASE.to_string(), diff_base_of(ws, tab)),
+        (kitchen_proto::ENV_DIFF_BASE.to_string(), diff_base_of(ws)),
     ];
     env.extend(local_socket_env(host));
     env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), tab.plan_file()));
@@ -97,8 +97,9 @@ pub enum UiCommand {
     OpenViewer { tab_id: String, path: Option<String>, line: Option<usize>, diff: Option<bool> },
     OpenPlan { tab_id: String },
     ReloadPlan { tab_id: String },
-    /// Drop the tab's viewer (its worktree moved or its diff base changed).
-    ResetViewer { tab_id: String },
+    /// Drop the tab's viewer (its worktree moved), or replace it with one on
+    /// `view` = (worktree, diff base) (`kitchen.view`).
+    ResetViewer { tab_id: String, view: Option<(String, String)> },
     Screenshot { path: String, reply: std::sync::mpsc::Sender<Result<(), String>> },
     /// Feed input events to the window (`kitchenctl debug keys`).
     Keys(Vec<egui::Event>),
@@ -126,16 +127,6 @@ pub struct NewTab {
     pub task: Option<String>,
     /// Existing branch to check out (where it is already checked out, if it is).
     pub branch: Option<String>,
-    /// Detached checkout at this rev, when there is no branch.
-    pub rev: Option<String>,
-    /// Refspecs fetched from origin first (same round trip as the checkout);
-    /// for a branch, that branch by default.
-    pub fetch: Vec<String>,
-    /// What the viewer diffs against (default `origin/<default>`).
-    pub diff_base: Option<String>,
-    /// Worktree name (`<repo>-<name>`) for `branch`/`rev` tabs; a tab
-    /// already on it is reused.
-    pub name: Option<String>,
     pub title: Option<String>,
     /// Command typed into the new shell instead of the default agent.
     pub command: Option<String>,
@@ -144,7 +135,21 @@ pub struct NewTab {
     pub focus: Option<bool>,
 }
 
-/// Releases a worktree from [`Engine::opening`] when a rev tab is done.
+/// What `kitchen.view` shows in a tab's viewer instead of the tab's worktree.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct View {
+    pub tab: String,
+    /// Checked out detached in `<repo>-<name>`. None: the tab's own worktree again.
+    pub rev: Option<String>,
+    pub name: Option<String>,
+    /// Refspecs fetched from origin first (same round trip as the checkout).
+    #[serde(default)]
+    pub fetch: Vec<String>,
+    /// What the viewer diffs against (default `origin/<default>`).
+    pub base: Option<String>,
+}
+
+/// Releases a key from [`Engine::opening`] when its checkout is done.
 struct OpeningGuard<'a> {
     engine: &'a Engine,
     key: String,
@@ -663,37 +668,25 @@ impl Engine {
 
     // ================================================================ tabs
 
-    /// Create a tab: worktree + tmux session + agent. Opening a branch or
-    /// rev that a tab already has moves that tab forward instead. Blocking;
-    /// call from a background thread.
+    /// Create a tab: worktree + tmux session + agent. Opening a branch that
+    /// a tab already has moves that tab forward instead. Blocking; call from
+    /// a background thread.
     pub fn create_tab(self: &Arc<Self>, ws_id: &str, opts: NewTab) -> Result<TabRow> {
         let ws = self.workspace(ws_id).context("no such workspace")?;
         let host = ws.host();
         let repo = Repo::new(&host, &ws.row.repo_path);
         let branch = opts.branch.as_deref().filter(|b| !b.is_empty());
-        let what = branch.or(opts.rev.as_deref());
-        // Where a branch or rev goes: a named worktree as is (re-opening
-        // finds it), else one named after it. `kitchen-*` names are the
-        // kitchen's (spares, PR tabs).
-        let target = what.map(|what| {
-            let to = if branch.is_some() { Checkout::Branch(what) } else { Checkout::Detached(what) };
-            let path = match &opts.name {
-                Some(name) => repo.sibling_path(&slugify(name, 60)),
-                None => {
-                    let slug = slugify(what.rsplit('/').next().unwrap_or(what), 40);
-                    let slug = if slug.starts_with("kitchen") { format!("tab-{slug}") } else { slug };
-                    unique_path(&host, &repo.sibling_path(&slug))
-                }
-            };
-            (to, path)
+        // Where a branch goes: a worktree named after it. `kitchen-*` names
+        // are the kitchen's (spares, PR views).
+        let target = branch.map(|b| {
+            let slug = slugify(b.rsplit('/').next().unwrap_or(b), 40);
+            let slug = if slug.starts_with("kitchen") { format!("tab-{slug}") } else { slug };
+            (Checkout::Branch(b), unique_path(&host, &repo.sibling_path(&slug)))
         });
-        let fetch = match (branch, opts.fetch.is_empty()) {
-            (Some(b), true) => vec![branch_refspec(b)],
-            _ => opts.fetch.clone(),
-        };
+        let fetch: Vec<String> = branch.map(branch_refspec).into_iter().collect();
         let _guard = match &target {
             Some((to, path)) => {
-                let key = format!("open:{ws_id}:{}", opts.name.as_deref().or(what).unwrap_or_default());
+                let key = format!("open:{ws_id}:{}", branch.unwrap_or_default());
                 if !self.opening.lock().unwrap().insert(key.clone()) {
                     bail!("{} is already being opened", opts.title.as_deref().unwrap_or(path));
                 }
@@ -702,7 +695,7 @@ impl Engine {
                 // resolved, e.g. /private/tmp, so compare the name), or the
                 // same branch.
                 let dir_name = |p: &str| p.trim_end_matches('/').rsplit('/').next().map(str::to_string);
-                let open = ws.tabs.iter().find(|t| dir_name(&t.row.worktree) == dir_name(path) || (branch.is_some() && t.row.branch.as_deref() == branch));
+                let open = ws.tabs.iter().find(|t| dir_name(&t.row.worktree) == dir_name(path) || t.row.branch.as_deref() == branch);
                 if let Some(tab) = open {
                     return self.reopen_tab(&ws, tab, *to, &fetch, &opts);
                 }
@@ -724,15 +717,15 @@ impl Engine {
             // New-branch tabs start from origin/<default> as the spare warmer
             // last fetched it (at most SPARE_REFRESH old, usually fresher:
             // opening ⌘T fetches), so they never wait on the network.
-            // Existing branches and revs are fetched in the same host round
-            // trip as their checkout.
+            // Existing branches are fetched in the same host round trip as
+            // their checkout.
             let (wt, title) = match &target {
                 Some((to, path)) => {
                     let checked = repo.checkout_worktree(path, *to, &fetch);
                     // The fetch may have moved origin/<default>, and the checkout
                     // may have taken over a spare (even if it failed after).
                     self.refill_spare(ws_id, false);
-                    (checked?.0, what.unwrap_or_default().to_string())
+                    (checked?.0, branch.unwrap_or_default().to_string())
                 }
                 None => {
                     let base = match &ws.row.default_branch {
@@ -761,7 +754,6 @@ impl Engine {
                 branch: wt.branch,
                 tmux_session: session,
                 position: ws.tabs.iter().map(|t| t.row.position).max().unwrap_or(0) + 1,
-                diff_base: opts.diff_base.clone(),
             };
             let worktree = &row.worktree;
             let env = tab_env(&ws.row, &row, &host);
@@ -848,48 +840,47 @@ impl Engine {
         }
     }
 
-    /// A link from ⌘T / `kitchenctl tab open` (a PR link, …): handed to the
-    /// plugins' `open` handlers, which open a tab with `kitchen.tab_open`.
-    pub fn open_text(&self, text: &str) -> Result<()> {
-        let ev = serde_json::json!({ "text": text.trim(), "workspaces": self.workspace_info() });
-        let handled = self.plugins().is_some_and(|p| p.emit("open", ev));
-        if !handled {
-            bail!("no plugin opens {:?} (enable the github plugin for PR links)", text.trim());
-        }
-        Ok(())
-    }
-
-    /// Re-open of a branch or rev tab: move its worktree forward to the
-    /// (re-fetched) branch or rev, keep the session, and refresh the viewer
-    /// if anything changed.
+    /// Re-open of a branch tab: move its worktree forward to the
+    /// (re-fetched) branch, keep the session, and refresh the viewer if HEAD
+    /// moved.
     fn reopen_tab(self: &Arc<Self>, ws: &Workspace, tab: &Tab, to: Checkout, fetch: &[String], opts: &NewTab) -> Result<TabRow> {
         let (wt, moved) = Repo::new(&ws.host(), &ws.row.repo_path).checkout_worktree(&tab.row.worktree, to, fetch)?;
         self.refill_spare(&ws.row.id, false);
-        let mut row = tab.row.clone();
-        let base_changed = opts.diff_base.is_some() && opts.diff_base != row.diff_base;
-        // (a detached PR tab opened again on its branch)
-        let branch_changed = wt.branch != row.branch;
-        if base_changed || branch_changed {
-            if base_changed {
-                row.diff_base = opts.diff_base.clone();
-            }
-            row.branch = wt.branch.clone();
-            self.db().update_tab(&row)?;
-            let mut st = self.state();
-            if let Some(t) = st.workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()).find(|t| t.row.id == row.id) {
-                t.row = row.clone();
-            }
-        }
-        if moved || base_changed {
-            self.push_ui(UiCommand::ResetViewer { tab_id: row.id.clone() });
-        }
         if moved {
-            self.toast(format!("{} updated to {}", row.title, &wt.head[..wt.head.len().min(10)]));
+            self.push_ui(UiCommand::ResetViewer { tab_id: tab.row.id.clone(), view: None });
+            self.toast(format!("{} updated to {}", tab.row.title, &wt.head[..wt.head.len().min(10)]));
         }
         if opts.focus.unwrap_or(true) {
-            self.select_tab(&row.id);
+            self.select_tab(&tab.row.id);
         }
-        Ok(row)
+        Ok(tab.row.clone())
+    }
+
+    /// Show `v` in its tab's viewer: `v.rev` checked out detached in the
+    /// sibling worktree `<repo>-<name>` (taking over a spare when new), or the
+    /// tab's own worktree. Blocking; call from a background thread.
+    pub fn view(self: &Arc<Self>, v: View) -> Result<()> {
+        let (ws, tab) = self.find_tab(&v.tab).context("no such tab")?;
+        let base = v.base.unwrap_or_else(|| tab.diff_base(&ws));
+        let Some(rev) = v.rev else {
+            self.push_ui(UiCommand::ResetViewer { tab_id: v.tab, view: Some((tab.row.worktree, base)) });
+            return Ok(());
+        };
+        let Some(name) = v.name.filter(|n| !n.is_empty()) else { bail!("kitchen.view needs a name with a rev") };
+        let host = ws.host();
+        let repo = Repo::new(&host, &ws.row.repo_path);
+        let path = repo.sibling_path(&slugify(&name, 60));
+        let key = format!("open:{}:{path}", ws.row.id);
+        if !self.opening.lock().unwrap().insert(key.clone()) {
+            bail!("{path} is already being opened");
+        }
+        let _guard = OpeningGuard { engine: self, key };
+        let checked = repo.checkout_worktree(&path, Checkout::Detached(&rev), &v.fetch);
+        // The checkout may have taken over a spare (even if it failed after).
+        self.refill_spare(&ws.row.id, false);
+        let (wt, _) = checked?;
+        self.push_ui(UiCommand::ResetViewer { tab_id: v.tab, view: Some((wt.path, base)) });
+        Ok(())
     }
 
     pub fn select_tab(&self, tab_id: &str) {
@@ -1142,7 +1133,6 @@ fn tab_infos(w: &Workspace) -> Vec<TabInfo> {
             tmux_session: t.row.tmux_session.clone(),
             selected: sel.as_deref() == Some(&t.row.id),
             plan_file: t.row.plan_file(),
-            diff_base: t.row.diff_base.clone(),
             unread: t.unread,
         })
         .collect()
@@ -1167,6 +1157,41 @@ fn local_socket_env(host: &Host) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view checks its rev out beside the repo (once) and points the tab's
+    /// viewer there; without a rev, back at the tab's own worktree.
+    #[test]
+    fn view_checks_out_a_rev_beside_the_repo() {
+        let repo = crate::test_util::TestRepo::new("echo 1 > a");
+        repo.sh("git checkout -qb pr && echo 2 > a && git commit -qam pr && git checkout -q main");
+        let (_ctx, engine) = crate::test_util::engine("local", &repo.path(), &["t"]);
+        let view = |rev: Option<&str>| View { tab: "t".into(), rev: rev.map(String::from), name: Some("kitchen-pr-7".into()), fetch: vec![], base: Some("main".into()) };
+        let shown = |e: &Engine| {
+            e.take_ui_commands().into_iter().find_map(|c| match c {
+                UiCommand::ResetViewer { tab_id, view } if tab_id == "t" => view,
+                _ => None,
+            })
+        };
+        engine.view(view(Some("pr"))).unwrap();
+        let (wt, base) = shown(&engine).unwrap();
+        assert!(wt.ends_with("-kitchen-pr-7") && base == "main", "{wt} {base}");
+        assert_eq!(std::fs::read_to_string(format!("{wt}/a")).unwrap(), "2\n");
+        engine.view(view(Some("pr"))).unwrap();
+        assert_eq!(shown(&engine).unwrap().0, wt, "the same worktree again");
+        engine.view(View { rev: None, name: None, base: None, ..view(None) }).unwrap();
+        assert_eq!(shown(&engine), Some((repo.path(), "origin/main".into())));
+        assert!(engine.view(View { name: None, ..view(Some("pr")) }).is_err(), "a rev needs a name");
+        // The siblings (the view's, and the spare its checkout refilled).
+        while engine.opening.lock().unwrap().iter().any(|k| k.starts_with("spares:")) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let prefix = format!("{}-", repo.dir.file_name().unwrap().to_string_lossy());
+        for d in std::fs::read_dir(repo.dir.parent().unwrap()).unwrap().flatten() {
+            if d.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_dir_all(d.path());
+            }
+        }
+    }
 
     #[test]
     fn file_link_paths() {

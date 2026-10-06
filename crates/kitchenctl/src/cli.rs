@@ -172,10 +172,6 @@ pub enum WorkspaceCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum TabCmd {
-    /// Open something in a tab: plugins handle the text (the github plugin
-    /// opens a PR link on the PR's branch, in the workspace for that repo).
-    #[command(after_help = "Example:\n  kitchenctl tab open https://github.com/ppl-ai/air/pull/14211")]
-    Open { text: String },
     /// List tabs of a workspace.
     #[command(visible_alias = "ls")]
     List {
@@ -482,7 +478,6 @@ impl Cli {
                 WorkspaceCmd::Bootstrap { target } => api("workspace.bootstrap", ws(target)),
             },
             Command::Tab(c) => match c {
-                TabCmd::Open { text } => api("tab.open", json!({"text": text})),
                 TabCmd::List { target } => api("tab.list", ws(target)),
                 TabCmd::New { task, task_file, branch, title, command, no_agent, no_focus, target } => {
                     let task = match task_file {
@@ -620,11 +615,6 @@ mod tests {
         let (m, p) = api_call(&["workspace", "new", "--repo", "~/air"]);
         assert_eq!(m, "workspace.create");
         assert_eq!(p, json!({"repo": "~/air", "host": "local", "name": ""}));
-    }
-
-    #[test]
-    fn tab_open() {
-        assert_eq!(api_call(&["tab", "open", "https://github.com/o/r/pull/3"]), ("tab.open".into(), json!({"text": "https://github.com/o/r/pull/3"})));
     }
 
     #[test]

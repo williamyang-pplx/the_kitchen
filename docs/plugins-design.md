@@ -214,3 +214,10 @@ about LSP:
 * Files go through `UiCommand::OpenViewer` (jump list included), after one
   existence check on the tab's host so a misread path toasts instead of
   stealing focus. Relative paths resolve against the worktree.
+
+## Level 8 (2026-10-06): PR review as a view
+
+* `kitchen.view{tab, rev, name, fetch, base}` replaces `kitchen.tab_open`: a
+  PR is checked out detached beside the repo and shown in the current tab's
+  viewer, with no tab, tmux session or agent of its own. `diff_base` is no
+  longer a tab column; `open` comes from ⌘⇧P with the tab's command ctx.

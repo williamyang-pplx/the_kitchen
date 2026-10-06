@@ -35,7 +35,7 @@ Run commands from **⌘⇧P** (command palette), their keys, or
 `~/.kitchen/logs/plugins/hello.log` (`kitchenctl plugin logs hello`).
 
 Examples in the repo's `plugins/`: `ruff` (Python lint), `python` (`gd`/`gr`
-via the ty language server), `github` (PR links in ⌘T, PR review comments),
+via the ty language server), `github` (PR review via ⌘⇧P),
 `todo` (highlights), `hello` (commands, keys, jobs), `prune-worktrees` (a
 `kitchen.every` timer; removes worktrees with no tab or tmux pane that were
 untouched for `idle_days`) and `dashboard` (worktrees, disk and RAM on the dashboard). `install.sh`
@@ -55,13 +55,15 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 7)
+## API (level 8)
 
-Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
+Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
+tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
 "readonly" role. Level 6 added `kitchen.every`, `kitchen.dashboard` and the `dashboard` event
 (see "Timers" and "Dashboard"). Level 5 added `kitchen.link` (see "Links"). Level 4 added `kitchen.comments`, the `comment` event and
-`kitchen.workspaces()` (see "Comments"). Level 3 added `kitchen.tab_open` and the `open` event (see "Tabs"). Level 2 added `kitchen.spawn`, `kitchen.provide`, `kitchen.json.null`,
+`kitchen.workspaces()` (see "Comments"). Level 3 added `kitchen.tab_open` and the `open` event. Level 2 added `kitchen.spawn`, `kitchen.provide`, `kitchen.json.null`,
 `kitchen.lsp`, and `ctx.viewer.file` / `word`; `ctx.viewer.col` became a raw
 column. Plugins written for level 1 keep working.
 
@@ -71,7 +73,7 @@ column. Plugins written for level 1 keep working.
 kitchen.on("file_opened", function(ev) end)   -- the viewer loaded a file
 kitchen.on("file_changed", function(ev) end)  -- …and it changed on disk since
 kitchen.on("startup", function() end)         -- after init.lua ran
-kitchen.on("open", function(ev) end)          -- a link typed into ⌘T (see Tabs)
+kitchen.on("open", function(ev) end)          -- a link typed into ⌘⇧P (see Views)
 kitchen.on("comment", function(ev) end)       -- ⌘M … ⌘Enter in the viewer (see Comments)
 kitchen.on("dashboard", function(ev) end)     -- a dashboard was shown / hidden (see Dashboard)
 ```
@@ -223,31 +225,26 @@ Runs on every `file_opened`/`file_changed` on the file's host, in its
 worktree, with the viewer's text on stdin; results for superseded versions
 are dropped. See `plugins/ruff/init.lua`.
 
-### Tabs
+### Views
 
 ```lua
-kitchen.on("open", function(ev)   -- ev = { text, workspaces = { {id, name, host, repo_path,
-  -- github_slug, default_branch, selected, tabs}, … } }
-  kitchen.tab_open {
-    workspace = ws.id,
-    branch = "al/fix",          -- what to check out: a branch, or `rev` (any rev, detached)
-    fetch = { "+refs/heads/al/fix:refs/remotes/origin/al/fix" },  -- fetched from origin first
-    diff_base = "origin/main",  -- the viewer diffs against merge-base(HEAD, this)
-    name = "kitchen-pr-12",     -- worktree <repo>-kitchen-pr-12; reopening reuses the tab
-    title = "#12 Fix it",
+kitchen.on("open", function(ev)   -- ev = the command ctx of the tab, plus `text`
+  kitchen.view {
+    tab = ev.tab,
+    rev = "refs/kitchen/pr/12",  -- checked out detached in <repo>-kitchen-pr-12 (no tab, no agent)
+    name = "kitchen-pr-12",
+    fetch = { "+refs/pull/12/head:refs/kitchen/pr/12" },  -- fetched from origin first
+    base = "origin/main",        -- the viewer diffs against merge-base(HEAD, this)
   }
 end)
+kitchen.view { tab = ctx.tab }   -- back to the tab's own worktree
 ```
 
-A link typed into ⌘T (a URL or `owner/repo#N`; anything else names a new
-tab), and `kitchenctl tab open TEXT`, go to every plugin's
-`open` handler, and the one that recognises it calls `kitchen.tab_open`
-(the rest return). Fetch and checkout run in one round trip on the
-workspace's host (a new worktree takes over a spare). Opening the same
-`name` (or branch) again re-fetches, moves the worktree forward (a
-fast-forward; git refuses to overwrite local changes), and reloads the
-viewer. Every tab's shell gets `KITCHEN_DIFF_BASE`. See
-`plugins/github/init.lua` (PR links).
+A link (a URL or `owner/repo#N`) typed into ⌘⇧P goes to every plugin's
+`open` handler; the one that recognises it calls `kitchen.view` (the rest
+return). Fetch and checkout run in one round trip on the workspace's host (a
+new worktree takes over a spare); the tab's viewer then shows that worktree,
+with `ctx.viewer.worktree` set to it. See `plugins/github/init.lua`.
 
 ### Comments
 

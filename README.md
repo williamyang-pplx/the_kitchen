@@ -12,16 +12,17 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
 - **Tabs**: one PR each, in a fresh worktree + branch cut from
   `origin/<default>` as last fetched (a background fetch every 5 minutes and
   when ⌘T opens, so ⌘T never waits on the network). Given a task, the agent starts with `/low-level-plan` and
-  writes a plan you comment on inline (⌘⇧I). ⌘T also takes a PR link
-  (`https://github.com/<org>/<repo>/pull/<n>`, any suffix): the `github`
-  plugin opens that PR's branch in its own worktree, and the viewer shows its
-  diff against the PR's base (as on GitHub). Re-opening the link (or `git
-  pull`) picks up new pushes.
-- File viewer. With changes (a PR tab, or a tab after the agent's
+  writes a plan you comment on inline (⌘⇧I).
+- **PR review**: paste a PR link (`https://github.com/<org>/<repo>/pull/<n>`,
+  any suffix, or `<org>/<repo>#<n>`) into ⌘⇧P and the tab's viewer shows that
+  PR's diff against its base (as on GitHub), checked out beside the repo in
+  `<repo>-kitchen-pr-<n>`. Each PR viewed gets a ⌘⇧P entry (`github.pr_<n>`);
+  `github.own_changes` goes back to the tab's own changes.
+- File viewer. With changes (a PR, or a tab after the agent's
   edits, followed live) ⌘. opens straight on the first changed file's diff,
   next to a tree of just the changed files: j/k in the tree, or ⌘⇧J/⌘⇧K and
   `]c`/`[c` in the code, step through them; `a` in the list switches to the
-  whole repo, ⌘B hides the list. In PR tabs the PR's review comments show
+  whole repo, ⌘B hides the list. On a PR its review comments show
   under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
   commented line) to the PR on GitHub. Tabs without changes open on a folder view
   (`aster/`, set by `viewer_default_dirs`). Vim
@@ -32,7 +33,7 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   viewer diagnostics/highlights, `gd`/`gr` providers, and jobs or
   long-running processes (language servers) on the tab's devbox. Ships with
   `ruff` (Python lint), `python` (`gd` / `gr` from the ty language server),
-  `github` (PR links in ⌘T, PR review comments), `todo`, `prune-worktrees`
+  `github` (PR review via ⌘⇧P), `todo`, `prune-worktrees`
   (hourly, removes the worktrees of merged/closed PRs that no tab uses and
   that hold nothing unpushed) and `dashboard`. ⌘⇧P is the command palette.
 - **Dashboard** (⌘D, or the grid at the right end of the tab strip): each
@@ -85,7 +86,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘H / ⌘L | previous / next tab |
 | ⌘⇧J / ⌘⇧K | in the viewer: next / previous changed file |
 | ⌘⇧H / ⌘⇧L | in the viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
-| ⌘T | new tab — own worktree + branch; type a name, or paste a PR link for the PR's branch |
+| ⌘T | new tab — own worktree + branch |
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |
@@ -93,8 +94,8 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘B | show / hide the viewer's file list |
 | ⌘⇧I | plan reviewer |
 | ⌘⇧R | rename the current workspace |
-| ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins) |
-| ⌘M | comment on the cursor line / selection (viewer, PR tab: posted to the PR on GitHub; on a commented line: a reply) |
+| ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins); paste a PR link to review it |
+| ⌘M | comment on the cursor line / selection (viewer, viewing a PR: posted to the PR on GitHub; on a commented line: a reply) |
 | ⌘Enter | submit comment (plan: send comments to agent) |
 | ⌘D | workspace dashboard; in the viewer or plan: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |

@@ -26,12 +26,10 @@ workspace and tab.
 - **Tab** — its own git worktree `<repo>-<slug>`, on a new branch
   `william/<slug>` cut from freshly fetched `origin/<default>`, or on an
   existing branch. One PR per tab.
-- **PR tab** — opened from a PR link: the PR's branch in
-  `<repo>-kitchen-pr-<N>` (the PR head, detached, for forks and merged PRs).
-  Opening the link again, or `git pull`, brings in new pushes.
-- Every tab has `$KITCHEN_DIFF_BASE`: the tab's changes (your work, or a
-  PR's diff) are `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`.
-- William's review comments on a PR (⌘M in the viewer) are posted to GitHub
+- Every tab has `$KITCHEN_DIFF_BASE` (`origin/<default>`): the tab's changes
+  are `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`.
+- William reviews a PR by pasting its link into ⌘⇧P (its head is checked out
+  in `<repo>-kitchen-pr-<N>`); his comments (⌘M) are posted to GitHub
   as PR review comments. To address them, read them with
   `gh api repos/<owner>/<repo>/pulls/<N>/comments --paginate` (`path`,
   `line`, `side`, `body`, `in_reply_to_id` for replies).
@@ -43,7 +41,6 @@ workspace and tab.
 kitchenctl workspace list
 kitchenctl tab new --task "AI-123: add retries to the judge client"
 kitchenctl tab new --branch william/x        # continue an existing branch
-kitchenctl tab open https://github.com/ppl-ai/air/pull/14211   # a PR's branch; again to update it
 kitchenctl tab send --tab 2 --enter "make test"
 kitchenctl tab read-screen --tab 2 --scrollback 200
 kitchenctl tab send-key --tab 2 C-c

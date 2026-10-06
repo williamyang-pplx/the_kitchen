@@ -190,8 +190,13 @@ impl KitchenApp {
                     self.open_side_for(&tab_id, SideKind::Plan);
                     self.panel_command_for(&tab_id, SideKind::Plan, PanelCmd::Reload);
                 }
-                UiCommand::ResetViewer { tab_id } => {
+                UiCommand::ResetViewer { tab_id, view: None } => {
                     self.viewers.remove(&tab_id);
+                }
+                UiCommand::ResetViewer { tab_id, view: Some((worktree, base)) } => {
+                    let Some((ws, _)) = self.engine.find_tab(&tab_id) else { continue };
+                    self.viewers.insert(tab_id.clone(), crate::viewer::Viewer::at(&self.engine, ws.host(), &tab_id, worktree, base));
+                    self.open_side_for(&tab_id, SideKind::Viewer);
                 }
                 UiCommand::ReloadPlan { tab_id } => {
                     if let Some(p) = self.plans.get_mut(&tab_id) {
@@ -465,6 +470,18 @@ impl KitchenApp {
 
     fn palette_ui(&mut self, ctx: &egui::Context) {
         let Some((_, picker)) = &mut self.palette else { return };
+        // Enter on a link (`owner/repo#12`, a URL): the plugins' `open`
+        // handlers get it with the selected tab's command ctx.
+        let link = Some(picker.query.trim().to_string()).filter(|q| crate::ui::dialogs::is_link(q));
+        if let Some(link) = link.filter(|_| ctx.input(|i| i.key_pressed(Key::Enter))) {
+            self.palette = None;
+            let mut ev = crate::plugins::command_context(&self.engine, &self.selected_tab_id().unwrap_or_default(), None);
+            ev["text"] = link.clone().into();
+            if !self.engine.plugins().is_some_and(|p| p.emit("open", ev)) {
+                self.engine.toast_err(format!("no plugin opens {link}"));
+            }
+            return;
+        }
         let mut result = crate::viewer::picker::PickerResult::Open;
         egui::Area::new(egui::Id::new("palette")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 70.0)).show(ctx, |ui| {
             ui.set_width(620.0);
@@ -936,7 +953,7 @@ impl eframe::App for KitchenApp {
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();
-                centered_note(ui, &format!("{}\n\n⌘T  new tab: a name, or a PR link (own worktree + branch)\n{status}", ws.row.name), theme::DIM)
+                centered_note(ui, &format!("{}\n\n⌘T  new tab: own worktree + branch\n{status}", ws.row.name), theme::DIM)
             }
             (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
         });

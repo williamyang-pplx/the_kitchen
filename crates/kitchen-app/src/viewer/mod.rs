@@ -1,4 +1,4 @@
-//! The file viewer (one per tab). With changes (a PR tab, a tab the
+//! The file viewer (one per tab). With changes (a PR shown with ⌘⇧P, a tab the
 //! agent worked in) it opens on the first changed file's diff, next to a
 //! tree of just the changed files; without, on a folder view at a default
 //! folder such as `aster/`. Plain / diff / outline modes, vim
@@ -195,13 +195,18 @@ pub struct Viewer {
 
 impl Viewer {
     pub fn new(engine: &Arc<Engine>, ws: &Workspace, tab: &Tab) -> Self {
+        Self::at(engine, ws.host(), &tab.row.id, tab.row.worktree.clone(), tab.diff_base(ws))
+    }
+
+    /// A viewer for tab `tab_id` on any worktree of its host (a PR's, `kitchen.view`).
+    pub fn at(engine: &Arc<Engine>, host: Host, tab_id: &str, worktree: String, base_ref: String) -> Self {
         let (tx, rx) = channel();
         let mut v = Self {
             engine: engine.clone(),
-            tab_id: tab.row.id.clone(),
-            host: ws.host(),
-            worktree: tab.row.worktree.clone(),
-            base_ref: tab.diff_base(ws),
+            tab_id: tab_id.to_string(),
+            host,
+            worktree,
+            base_ref,
             tx,
             rx,
             changed: Vec::new(),

@@ -670,40 +670,15 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
         })?,
     )?;
 
-    // Tabs: a tab on a branch or at a git rev (see docs/plugins.md).
+    // Views: what a tab's viewer shows (see docs/plugins.md "Views").
     let c = cx.clone();
     k.set(
-        "tab_open",
+        "view",
         lua.create_function(move |lua, spec: Table| {
-            #[derive(serde::Deserialize)]
-            struct Spec {
-                workspace: String,
-                branch: Option<String>,
-                rev: Option<String>,
-                name: Option<String>,
-                #[serde(default)]
-                fetch: Vec<String>,
-                diff_base: Option<String>,
-                title: Option<String>,
-                focus: Option<bool>,
-            }
-            let s: Spec = serde_json::from_value(to_json(lua, Value::Table(spec))?)
-                .map_err(|e| mlua::Error::runtime(format!("kitchen.tab_open: {e} (needs workspace, and branch or rev)")))?;
-            if s.branch.is_none() && s.rev.is_none() {
-                return Err(mlua::Error::runtime("kitchen.tab_open needs a branch or a rev"));
-            }
+            let v: crate::engine::View =
+                serde_json::from_value(to_json(lua, Value::Table(spec))?).map_err(|e| mlua::Error::runtime(format!("kitchen.view: {e}")))?;
             let Some(e) = c.host.engine() else { return Ok(()) };
-            let opts = crate::engine::NewTab {
-                branch: s.branch,
-                rev: s.rev,
-                name: s.name,
-                fetch: s.fetch,
-                diff_base: s.diff_base,
-                title: s.title,
-                focus: s.focus,
-                ..Default::default()
-            };
-            e.spawn("open tab", move |e| e.create_tab(&s.workspace, opts).map(|_| ()));
+            e.spawn("view", move |e| e.view(v));
             Ok(())
         })?,
     )?;

@@ -1,18 +1,22 @@
--- github: open a PR from its link in a tab on the PR's branch, and review it.
---
--- A PR is its repo + number. The tab checks out the PR's branch in its own
--- worktree, <repo>-kitchen-pr-<N>, and the viewer diffs it against the PR's
--- base branch, like GitHub's "Files changed". Opening the link again (or
--- `git pull`) brings in new pushes. gh (on the mac) supplies the branch,
--- title and base; when the branch can't be used (gh failed, a fork, a merged
--- PR) the tab checks out the PR head (origin's refs/pull/N/head) detached,
--- diffed against the workspace's default branch if gh failed.
---
--- Review comments live on GitHub: the viewer shows the PR's comment threads
--- under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a line
--- that has one) straight to the PR.
+-- github: review a PR in the tab you're in. Paste its link into ⌘⇧P: the PR
+-- head is checked out detached in <repo>-kitchen-pr-<N> (no tab, no agent)
+-- and the tab's viewer shows its diff against the PR's base, with the PR's
+-- review comments under their lines; ⌘M … ⌘Enter posts a comment (or a
+-- reply, on a line that has one) to the PR. Each PR viewed gets a ⌘⇧P entry
+-- (github.pr_<N>) to show it again; github.own_changes shows the tab's own
+-- worktree again.
 
 local M = {}
+
+-- Re-read a PR's comments when a file opens and they're older than this.
+local REFRESH = 60
+-- One compact JSON object per comment (nulls dropped).
+local JQ = ".[] | {id, in_reply_to_id, path, line, original_line, start_line, side, subject_type,"
+  .. " user: .user.login, body, created_at} | with_entries(select(.value != null)) | @json"
+
+-- The PRs whose worktrees the viewer has shown, by "<host>:<worktree path>"
+-- (a repo can be a workspace both here and on a devbox).
+local prs = {} -- key → { slug, n, threads, at, files = {path → file}, drafts = {path → items} }
 
 -- "https://github.com/o/r/pull/12/changes", "github.com/o/r/pull/12", "o/r#12"
 function M.parse(text)
@@ -25,118 +29,9 @@ function M.parse(text)
   end
 end
 
-local function workspace_for(slug, workspaces)
-  local found
-  for _, w in ipairs(workspaces) do
-    if w.github_slug and w.github_slug:lower() == slug:lower() then
-      if w.selected then
-        return w
-      end
-      found = found or w
-    end
-  end
-  return found
-end
-
 local function q(s)
   return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
-
--- The PR head and the default branch, fetched while gh answers.
-function M.prefetch(ws, n)
-  local dflt = ws.default_branch or "main"
-  return { "+refs/pull/" .. n .. "/head:refs/kitchen/pr/" .. n, "+refs/heads/" .. dflt .. ":refs/remotes/origin/" .. dflt }
-end
-
--- The tab for PR `n` of `ws`, given gh's answer (`nil` when gh failed).
--- `prefetched`: M.prefetch already ran, so the PR head and the default
--- branch need no fetch.
-function M.spec(ws, n, info, prefetched)
-  local dflt = ws.default_branch or "main"
-  local base = (info and info.baseRefName) or dflt
-  local spec = { workspace = ws.id, name = "kitchen-pr-" .. n, title = "PR #" .. n }
-  if info and info.title and info.title ~= "" then
-    spec.title = "#" .. n .. " " .. info.title
-  end
-  local fetch = {}
-  if info and info.state == "OPEN" and info.headRefName and not info.isCrossRepository then
-    spec.branch = info.headRefName
-    table.insert(fetch, "+refs/heads/" .. info.headRefName .. ":refs/remotes/origin/" .. info.headRefName)
-  else
-    spec.rev = "refs/kitchen/pr/" .. n
-    if not prefetched then
-      table.insert(fetch, "+refs/pull/" .. n .. "/head:" .. spec.rev)
-    end
-  end
-  if info and info.state == "MERGED" and info.mergeCommit and info.mergeCommit.oid then
-    -- The base branch has moved past the PR (and may be gone): diff against
-    -- the base as it was just before the merge.
-    table.insert(fetch, info.mergeCommit.oid)
-    spec.diff_base = info.mergeCommit.oid .. "^1"
-  else
-    if not (prefetched and base == dflt) then
-      table.insert(fetch, "+refs/heads/" .. base .. ":refs/remotes/origin/" .. base)
-    end
-    spec.diff_base = "origin/" .. base
-  end
-  -- (nil, not {}: an empty table would reach tab_open as an object)
-  spec.fetch = #fetch > 0 and fetch or nil
-  return spec
-end
-
-kitchen.on("open", function(ev)
-  local slug, n = M.parse(ev.text)
-  if not slug then
-    if ev.text:find("github%.com/") then
-      kitchen.notify("not a pull request link: " .. ev.text, "warn")
-    end
-    return
-  end
-  local ws = workspace_for(slug, ev.workspaces)
-  if not ws then
-    kitchen.notify("no workspace for " .. slug .. " — add one with ⌘N", "error")
-    return
-  end
-  kitchen.notify("opening " .. slug .. "#" .. n .. "…")
-  -- Ask gh (on the mac) and fetch the PR on the workspace's host at once;
-  -- the tab opens when both are done.
-  local pending, info, prefetched = 2, nil, false
-  local function done()
-    pending = pending - 1
-    if pending == 0 then
-      kitchen.tab_open(M.spec(ws, n, info, prefetched))
-    end
-  end
-  local sh = "export PATH=" .. (kitchen.config.path or "") .. ':"$PATH"; gh pr view ' .. n .. " -R " .. q(slug)
-    .. " --json title,baseRefName,state,mergeCommit,headRefName,isCrossRepository"
-  kitchen.run({ sh = sh, host = "local", timeout = 20 }, function(res)
-    if res.code == 0 then
-      local ok, v = pcall(kitchen.json.decode, res.stdout)
-      info = ok and v or nil
-    end
-    if not info then
-      local why = (res.stderr ~= "" and res.stderr or res.stdout):gsub("%s+$", "")
-      kitchen.notify("gh pr view failed (" .. why .. ") — diffing against " .. (ws.default_branch or "main"), "warn")
-    end
-    done()
-  end)
-  local fetch = { "git", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin" }
-  for _, r in ipairs(M.prefetch(ws, n)) do
-    table.insert(fetch, r)
-  end
-  kitchen.run({ cmd = fetch, host = ws.host, cwd = ws.repo_path, timeout = 60 }, function(res)
-    prefetched = res.code == 0
-    done()
-  end)
-end)
-
--- Review comments ---------------------------------------------------------
-
--- Re-read a PR's comments when a file opens and they're older than this.
-local REFRESH = 60
--- One compact JSON object per comment (nulls dropped).
-local JQ = ".[] | {id, in_reply_to_id, path, line, original_line, start_line, side, subject_type,"
-  .. " user: .user.login, body, created_at} | with_entries(select(.value != null)) | @json"
 
 local function gh(args, cb)
   local quoted = {}
@@ -152,12 +47,84 @@ local function why(res)
   return (text:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", ""))
 end
 
--- The PR a worktree belongs to: tabs opened from PR links are in
--- <repo>-kitchen-pr-<N> (tab slugs never start with "kitchen").
-function M.pr_number(worktree)
-  local n = worktree:match("%-kitchen%-pr%-(%d+)$")
-  return n and tonumber(n)
+local function basename(path)
+  return (path:gsub("/+$", ""):match("[^/]+$"))
 end
+
+-- The PR whose view `f` ({host, worktree}: a viewer file or ctx.viewer) is
+-- in: its worktree is <repo>-kitchen-pr-<N> beside a GitHub workspace's repo
+-- on the same host. Rebuilt from the name, so it survives a plugin reload.
+local function pr_of(f)
+  local key = f.host .. ":" .. f.worktree
+  if prs[key] then
+    return prs[key]
+  end
+  local repo, n = basename(f.worktree):match("^(.+)%-kitchen%-pr%-(%d+)$")
+  for _, w in ipairs(repo and kitchen.workspaces() or {}) do
+    if w.host == f.host and w.github_slug and basename(w.repo_path) == repo then
+      prs[key] = { slug = w.github_slug, n = tonumber(n), files = {}, drafts = {} }
+      return prs[key]
+    end
+  end
+end
+
+-- The kitchen.view spec that shows PR `n` (gh's `info`) in tab `tab`: its
+-- head detached in <repo>-kitchen-pr-<n>, diffed against its base (for a
+-- merged PR, the base just before the merge; `dflt` if gh names none).
+function M.view(tab, n, info, dflt)
+  local rev = "refs/kitchen/pr/" .. n
+  local spec = { tab = tab, rev = rev, name = "kitchen-pr-" .. n, fetch = { "+refs/pull/" .. n .. "/head:" .. rev } }
+  if info.state == "MERGED" and info.mergeCommit and info.mergeCommit.oid then
+    table.insert(spec.fetch, info.mergeCommit.oid)
+    spec.base = info.mergeCommit.oid .. "^1"
+  else
+    local b = info.baseRefName or dflt
+    table.insert(spec.fetch, "+refs/heads/" .. b .. ":refs/remotes/origin/" .. b)
+    spec.base = "origin/" .. b
+  end
+  return spec
+end
+
+local open
+
+-- Show PR `slug#n` in tab `tab` of workspace `ws`, and add it to ⌘⇧P.
+local function show(ws, tab, slug, n)
+  kitchen.notify("opening " .. slug .. "#" .. n .. "…")
+  gh({ "pr", "view", tostring(n), "-R", slug, "--json", "title,baseRefName,state,mergeCommit" }, function(res)
+    local ok, info = pcall(kitchen.json.decode, res.code == 0 and res.stdout or "")
+    if not (ok and type(info) == "table") then
+      return kitchen.notify("couldn't read " .. slug .. "#" .. n .. ": " .. why(res), "error")
+    end
+    kitchen.view(M.view(tab, n, info, ws.default_branch or "main"))
+    -- (picked from another tab, `open` checks that tab's repo again)
+    local title = (info.title or "") ~= "" and info.title or ("PR #" .. n)
+    kitchen.command("pr_" .. n, function(ctx)
+      open({ text = slug .. "#" .. n, workspace = ctx.workspace, tab = ctx.tab })
+    end, { desc = slug .. "#" .. n .. " " .. title })
+  end)
+end
+
+-- A link typed into ⌘⇧P: ev = { text, workspace, tab, … } (the tab it was typed in).
+function open(ev)
+  local slug, n = M.parse(ev.text)
+  if not slug then
+    if ev.text:find("github%.com/") then
+      kitchen.notify("not a pull request link: " .. ev.text, "warn")
+    end
+    return
+  end
+  for _, w in ipairs(kitchen.workspaces()) do
+    if w.id == ev.workspace then
+      if not (w.github_slug and w.github_slug:lower() == slug:lower()) then
+        return kitchen.notify(slug .. "#" .. n .. " is in another repo: open it from a tab of a " .. slug .. " workspace", "error")
+      end
+      return show(w, ev.tab, slug, n)
+    end
+  end
+end
+kitchen.on("open", open)
+
+-- Review comments ---------------------------------------------------------
 
 -- gh comments → threads (a root comment and its replies), oldest first.
 function M.threads(list)
@@ -236,24 +203,6 @@ function M.post_args(slug, n, ev, sha, file_level)
   return args
 end
 
-local prs = {} -- "slug#n" → { slug, n, threads, at, files = {path → file}, drafts = {path → items} }
-
-local function pr_for(worktree)
-  local n = M.pr_number(worktree)
-  if not n then
-    return
-  end
-  for _, w in ipairs(kitchen.workspaces()) do
-    for _, t in ipairs(w.tabs or {}) do
-      if t.worktree == worktree and w.github_slug then
-        local key = w.github_slug .. "#" .. n
-        prs[key] = prs[key] or { slug = w.github_slug, n = n, files = {}, drafts = {} }
-        return prs[key]
-      end
-    end
-  end
-end
-
 local function render(pr)
   for path, file in pairs(pr.files) do
     local items = pr.threads and M.items(pr.threads, path) or {}
@@ -293,7 +242,7 @@ local function fetch(pr)
 end
 
 kitchen.on("file_opened", function(ev)
-  local pr = pr_for(ev.file.worktree)
+  local pr = pr_of(ev.file)
   if not pr then
     return
   end
@@ -305,9 +254,9 @@ kitchen.on("file_opened", function(ev)
 end)
 
 kitchen.on("comment", function(ev)
-  local pr = pr_for(ev.file.worktree)
+  local pr = pr_of(ev.file)
   if not pr then
-    kitchen.notify("comments are posted to GitHub PRs — open the PR from its link (⌘T) to comment on it", "warn")
+    kitchen.notify("comments go to GitHub PRs: paste a PR link into ⌘⇧P to view one", "warn")
     return
   end
   pr.files[ev.path] = ev.file
@@ -354,12 +303,16 @@ kitchen.on("comment", function(ev)
 end)
 
 kitchen.command("refresh_comments", function(ctx)
-  local pr = ctx.worktree and pr_for(ctx.worktree)
+  local pr = ctx.viewer and pr_of({ host = ctx.host, worktree = ctx.viewer.worktree })
   if pr then
     fetch(pr)
   else
-    kitchen.notify("not a PR tab", "warn")
+    kitchen.notify("the viewer isn't showing a PR", "warn")
   end
-end, { desc = "re-read this PR's review comments from GitHub" })
+end, { desc = "re-read the shown PR's review comments from GitHub" })
+
+kitchen.command("own_changes", function(ctx)
+  kitchen.view({ tab = ctx.tab })
+end, { desc = "show this tab's own worktree in its viewer again" })
 
 return M

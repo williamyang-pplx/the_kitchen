@@ -51,7 +51,6 @@ app is not reachable.
 | `workspace close W` | `workspace.close` | ends tmux sessions; repo + worktrees stay |
 | `workspace bootstrap [-w W]` | `workspace.bootstrap` | pull dotfiles, relink skills, install kitchenctl, start relay |
 | `tab list [-w W]` | `tab.list` | |
-| `tab open TEXT` | `tab.open` | ⌘T with a link: plugins open the text (github: a PR link → tab on the PR's branch, diffed against its base; again → updated) |
 | `tab new [--task T\|--task-file F] [--branch B] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | own worktree + new branch off fresh origin, or `--branch` (fetched; a tab on it is reused); `--task` starts `/low-level-plan` |
 | `tab select T [-w W]` | `tab.select` | ⌘1…⌘9 |
 | `tab rename TITLE [-t T]` | `tab.rename` | |

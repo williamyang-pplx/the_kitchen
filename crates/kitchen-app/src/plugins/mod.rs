@@ -32,10 +32,11 @@ use keys::Chord;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 7;
+pub const API_LEVEL: u32 = 8;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
-/// `open` (a link typed into ⌘T), `comment` (a viewer comment to post),
-/// `dashboard` (a workspace's dashboard was shown or hidden).
+/// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
+/// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
+/// or hidden).
 pub const EMITTED: &[&str] = &["open", "comment", "dashboard"];
 /// File text above this is not handed to plugins (`ev.text()` returns nil).
 pub const MAX_TEXT: usize = 2 * 1024 * 1024;
@@ -902,10 +903,9 @@ mod tests {
         host
     }
 
-    /// The plugins shipped in the repo load; `todo` highlights, and `ruff`
-    /// (when installed) reports diagnostics with the right positions.
+    /// github: PR links, the view of a PR, its comment threads and post arguments.
     #[test]
-    fn github_plugin_turns_links_into_tab_specs() {
+    fn github_plugin_views() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
         lua.load("kitchen = { on = function() end, command = function() end, config = {}, json = {} }").exec().unwrap();
@@ -923,39 +923,19 @@ mod tests {
             let got: (Option<String>, Option<u64>) = parse.call(text).unwrap();
             assert_eq!(got.0.as_deref().zip(got.1), want, "{text}");
         }
-        let spec: mlua::Function = m.get("spec").unwrap();
+        let view: mlua::Function = m.get("view").unwrap();
         let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
-        let ws = lua.to_value(&serde_json::json!({"id": "w1", "default_branch": "main"})).unwrap();
-        // An open PR from this repo: its branch, fetched with the base.
-        let open = lua.to_value(&serde_json::json!({"title": "Fix it", "baseRefName": "dev", "state": "OPEN", "headRefName": "al/fix"})).unwrap();
-        let s = to_json(spec.call((ws.clone(), 12, open)).unwrap());
-        assert_eq!(s["title"], "#12 Fix it");
-        assert_eq!((s["name"].as_str(), s["branch"].as_str(), s.get("rev")), (Some("kitchen-pr-12"), Some("al/fix"), None));
-        assert_eq!(s["diff_base"], "origin/dev");
-        assert_eq!(s["fetch"], serde_json::json!(["+refs/heads/al/fix:refs/remotes/origin/al/fix", "+refs/heads/dev:refs/remotes/origin/dev"]));
-        // A fork, a merged PR, no gh: the PR head, detached.
-        let fork = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "dev", "state": "OPEN", "headRefName": "main", "isCrossRepository": true})).unwrap();
-        let s = to_json(spec.call((ws.clone(), 12, fork)).unwrap());
-        assert_eq!((s.get("branch"), s["rev"].as_str()), (None, Some("refs/kitchen/pr/12")));
+        let info = |v: serde_json::Value| lua.to_value(&v).unwrap();
+        // The PR head, detached, diffed against its base (fetched with it).
+        let s = to_json(view.call(("t1", 12, info(serde_json::json!({"baseRefName": "dev", "state": "OPEN"})), "main")).unwrap());
+        assert_eq!((s["tab"].as_str(), s["name"].as_str(), s["rev"].as_str(), s["base"].as_str()), (Some("t1"), Some("kitchen-pr-12"), Some("refs/kitchen/pr/12"), Some("origin/dev")));
         assert_eq!(s["fetch"], serde_json::json!(["+refs/pull/12/head:refs/kitchen/pr/12", "+refs/heads/dev:refs/remotes/origin/dev"]));
-        let merged = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "dev", "state": "MERGED", "headRefName": "al/fix", "mergeCommit": {"oid": "abc"}})).unwrap();
-        let s = to_json(spec.call((ws.clone(), 12, merged)).unwrap());
-        assert_eq!((s["rev"].as_str(), s["diff_base"].as_str()), (Some("refs/kitchen/pr/12"), Some("abc^1")));
-        let no_gh = to_json(spec.call((ws.clone(), 12, mlua::Value::Nil)).unwrap());
-        assert_eq!((no_gh["title"].as_str(), no_gh["rev"].as_str(), no_gh["diff_base"].as_str()), (Some("PR #12"), Some("refs/kitchen/pr/12"), Some("origin/main")));
-        // After the prefetch (PR head + default branch), a detached PR on the
-        // default branch fetches nothing; a branch or another base still fetch.
-        assert!(to_json(spec.call((ws.clone(), 12, mlua::Value::Nil, true)).unwrap()).get("fetch").is_none());
-        let on_main = lua.to_value(&serde_json::json!({"title": "x", "baseRefName": "main", "state": "OPEN", "headRefName": "al/fix"})).unwrap();
-        assert_eq!(to_json(spec.call((ws.clone(), 12, on_main, true)).unwrap())["fetch"], serde_json::json!(["+refs/heads/al/fix:refs/remotes/origin/al/fix"]));
-        let prefetch: Vec<String> = lua.from_value(m.get::<mlua::Function>("prefetch").unwrap().call((ws, 12)).unwrap()).unwrap();
-        assert_eq!(prefetch, ["+refs/pull/12/head:refs/kitchen/pr/12", "+refs/heads/main:refs/remotes/origin/main"]);
+        assert_eq!(to_json(view.call(("t1", 12, info(serde_json::json!({})), "main")).unwrap())["base"], "origin/main", "no base from gh");
+        // Merged: the base just before the merge.
+        let s = to_json(view.call(("t1", 12, info(serde_json::json!({"baseRefName": "dev", "state": "MERGED", "mergeCommit": {"oid": "abc"}})), "main")).unwrap());
+        assert_eq!((s["base"].as_str(), s["fetch"][1].as_str()), (Some("abc^1"), Some("abc")));
 
         // Review comments: threads from gh's list, items for the viewer, post arguments.
-        let pr_number: mlua::Function = m.get("pr_number").unwrap();
-        assert_eq!(pr_number.call::<Option<u64>>("/r/air-kitchen-pr-14211").unwrap(), Some(14211));
-        assert_eq!(pr_number.call::<Option<u64>>("/r/air-fix-pr-5").unwrap(), None, "a tab's own slug");
-        assert_eq!(pr_number.call::<Option<u64>>("/r/air-kitchen-ro-pr-3").unwrap(), None, "pre-merge read-only tree");
         let list = lua
             .to_value(&serde_json::json!([
                 { "id": 2, "in_reply_to_id": 1, "path": "a.py", "user": "bo", "body": "agreed", "created_at": "2026-10-02T00:00:00Z" },

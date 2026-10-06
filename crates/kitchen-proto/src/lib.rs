@@ -133,9 +133,6 @@ pub struct TabInfo {
     pub selected: bool,
     #[serde(default)]
     pub plan_file: String,
-    /// Rev the viewer diffs against (`origin/<default>` when unset).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diff_base: Option<String>,
     #[serde(default)]
     pub unread: bool,
 }

@@ -65,7 +65,7 @@ pub fn engine(host: &str, wt: &str, tabs: &[&str]) -> (egui::Context, Arc<Engine
     let ws = WorkspaceRow { id: "w".into(), name: "w".into(), host: host.into(), repo_path: wt.into(), github_slug: None, default_branch: Some("main".into()), position: 0, pinned: false };
     db.insert_workspace(&ws).unwrap();
     for (i, id) in tabs.iter().enumerate() {
-        let tab = TabRow { id: id.to_string(), workspace_id: "w".into(), title: id.to_string(), worktree: wt.into(), branch: None, tmux_session: id.to_string(), position: i as i64, diff_base: None };
+        let tab = TabRow { id: id.to_string(), workspace_id: "w".into(), title: id.to_string(), worktree: wt.into(), branch: None, tmux_session: id.to_string(), position: i as i64 };
         db.insert_tab(&tab).unwrap();
     }
     let engine = Engine::new(ctx.clone(), db).unwrap();

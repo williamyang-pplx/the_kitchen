@@ -273,7 +273,7 @@ impl Viewer {
         }
         let who = self.engine.plugins().map(|p| p.listeners("comment")).unwrap_or_default();
         if who.is_empty() {
-            self.status = Some(("no plugin takes comments (the github plugin does, in PR tabs opened from a PR link with ⌘T)".into(), false));
+            self.status = Some(("no plugin takes comments (the github plugin does, for a PR shown with ⌘⇧P)".into(), false));
             return;
         }
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
@@ -343,6 +343,8 @@ impl Viewer {
         serde_json::json!({
             "path": if self.browsing { None } else { self.current.clone() },
             "file": file,
+            // The worktree shown (a PR's, after `kitchen.view`), even while browsing.
+            "worktree": self.worktree,
             "line": line,
             // 1-based character of the raw line (tabs count once), like diagnostics.
             "col": raw_line.map(|l| raw_col(l, self.vim.col)).unwrap_or(self.vim.col + 1),

@@ -34,7 +34,6 @@ CREATE TABLE IF NOT EXISTS tabs (
     branch       TEXT,
     tmux_session TEXT NOT NULL UNIQUE,
     plan_file    TEXT,
-    diff_base    TEXT,
     position     INTEGER NOT NULL,
     created_at   INTEGER NOT NULL
 );
@@ -116,9 +115,6 @@ pub struct TabRow {
     pub branch: Option<String>,
     pub tmux_session: String,
     pub position: i64,
-    /// What the viewer diffs against (any rev); `None` = `origin/<default>`.
-    #[serde(default)]
-    pub diff_base: Option<String>,
 }
 
 impl TabRow {
@@ -173,7 +169,6 @@ fn tab_from(r: &Row) -> rusqlite::Result<TabRow> {
         branch: r.get(4)?,
         tmux_session: r.get(5)?,
         position: r.get(6)?,
-        diff_base: r.get(7)?,
     })
 }
 
@@ -191,7 +186,7 @@ fn plan_comment_from(r: &Row) -> rusqlite::Result<PlanComment> {
 }
 
 const WS_COLS: &str = "id, name, host, repo_path, github_slug, default_branch, position, pinned";
-const TAB_COLS: &str = "id, workspace_id, title, worktree, branch, tmux_session, position, diff_base";
+const TAB_COLS: &str = "id, workspace_id, title, worktree, branch, tmux_session, position";
 const PC_COLS: &str = "id, tab_id, line, end_line, quote, body, state, created_at";
 
 /// Columns added after a table first shipped; `CREATE TABLE IF NOT EXISTS`
@@ -201,10 +196,6 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.query_row("SELECT COUNT(*) FROM pragma_table_info('workspaces') WHERE name = 'pinned'", [], |r| r.get(0))?;
     if !has_pinned {
         conn.execute_batch("ALTER TABLE workspaces ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")?;
-    }
-    let has_base: bool = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('tabs') WHERE name = 'diff_base'", [], |r| r.get(0))?;
-    if !has_base {
-        conn.execute_batch("ALTER TABLE tabs ADD COLUMN diff_base TEXT")?;
     }
     Ok(())
 }
@@ -281,8 +272,8 @@ impl Db {
 
     pub fn insert_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, position, diff_base, created_at)
-             VALUES (?1, ?2, 'edit', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, position, created_at)
+             VALUES (?1, ?2, 'edit', ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 t.id,
                 t.workspace_id,
@@ -291,7 +282,6 @@ impl Db {
                 t.branch,
                 t.tmux_session,
                 t.position,
-                t.diff_base,
                 now()
             ],
         )?;
@@ -300,8 +290,8 @@ impl Db {
 
     pub fn update_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
-            "UPDATE tabs SET title = ?2, worktree = ?3, branch = ?4, position = ?5, diff_base = ?6 WHERE id = ?1",
-            params![t.id, t.title, t.worktree, t.branch, t.position, t.diff_base],
+            "UPDATE tabs SET title = ?2, worktree = ?3, branch = ?4, position = ?5 WHERE id = ?1",
+            params![t.id, t.title, t.worktree, t.branch, t.position],
         )?;
         Ok(())
     }
@@ -467,7 +457,6 @@ mod tests {
             branch: Some("william/x".into()),
             tmux_session: "kt_a_t1".into(),
             position: 1,
-            diff_base: Some("origin/main".into()),
         };
         db.insert_tab(&tab).unwrap();
         assert_eq!(db.tabs("a").unwrap(), vec![tab.clone()]);
@@ -506,7 +495,7 @@ mod tests {
         .unwrap();
         let db = Db::init(conn).unwrap();
         assert!(!db.workspaces().unwrap()[0].pinned);
-        assert_eq!(db.tab("t").unwrap().unwrap().diff_base, None, "old tabs gain diff_base");
+        assert!(db.tab("t").unwrap().is_some(), "old tabs still read");
     }
 
     #[test]
@@ -521,7 +510,6 @@ mod tests {
             branch: None,
             tmux_session: "s".into(),
             position: 1,
-            diff_base: None,
         })
         .unwrap();
         let id = db.add_plan_comment("t", 4, None, "## F1", "rename this").unwrap();
