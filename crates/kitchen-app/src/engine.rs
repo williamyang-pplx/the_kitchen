@@ -96,6 +96,8 @@ fn tab_env(ws: &WorkspaceRow, tab: &TabRow, host: &Host) -> Vec<(String, String)
 pub enum UiCommand {
     OpenViewer { tab_id: String, path: Option<String>, line: Option<usize>, diff: Option<bool> },
     OpenPlan { tab_id: String },
+    /// The tab's viewer shows plugin renderings (`kitchen.render.show`; `None` toggles).
+    Render { tab_id: String, on: Option<bool> },
     ReloadPlan { tab_id: String },
     /// Drop the tab's viewer (its worktree moved), or replace it with one on
     /// `view` = (worktree, diff base) (`kitchen.view`).

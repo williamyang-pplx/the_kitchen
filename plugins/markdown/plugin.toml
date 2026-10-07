@@ -1,0 +1,5 @@
+name = "markdown"
+version = "0.1.0"
+description = "⌘⇧V in the viewer renders Markdown (headings, lists, code, tables, links); ⌘M still comments on the lines a row came from"
+api = 9
+filetypes = ["md", "markdown"]

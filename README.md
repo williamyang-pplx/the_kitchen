@@ -33,7 +33,8 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   viewer diagnostics/highlights, `gd`/`gr` providers, and jobs or
   long-running processes (language servers) on the tab's devbox. Ships with
   `ruff` (Python lint), `python` (`gd` / `gr` from the ty language server),
-  `github` (PR review via ⌘⇧P), `todo`, `prune-worktrees`
+  `github` (PR review via ⌘⇧P), `markdown` (⌘⇧V renders a Markdown file in
+  the viewer; ⌘M still comments on it), `todo`, `prune-worktrees`
   (hourly, removes the worktrees of merged/closed PRs that no tab uses and
   that hold nothing unpushed), `bazel-cache` (every 30 minutes, keeps
   `~/bazel-cache` on the mac and each devbox under 30G: drops the output bases

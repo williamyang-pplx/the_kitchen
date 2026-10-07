@@ -29,6 +29,8 @@ pub enum PanelCmd {
     /// ⌘⇧J / ⌘⇧K while the viewer is focused: next / previous changed file.
     NextFile,
     PrevFile,
+    /// Show plugin renderings of files (`kitchen.render.show`); `None` toggles.
+    Render(Option<bool>),
     /// Palette: pick among the current file's plugin diagnostics.
     Diagnostics,
     /// Open a file (from `kitchenctl viewer open`), or browse a folder if

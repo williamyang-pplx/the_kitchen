@@ -1,9 +1,14 @@
 //! What the code view displays: lines with diff kind, line numbers and
-//! highlight spans. Built from a plain file, a base/head diff, or an outline.
+//! highlight spans. Built from a plain file, a base/head diff, an outline,
+//! or a plugin's rendering of either.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use egui::Color32;
+
+use crate::plugins::decor::RenderRow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -25,11 +30,25 @@ pub struct DocLine {
     pub suffix: Option<String>,
     /// Byte ranges of `text` (tab-expanded) with a color.
     pub spans: Vec<(Range<usize>, Color32)>,
+    /// A rendered row (`kitchen.render`) standing for current-file lines
+    /// `new_no..=last_no()`; painted from this instead of `spans`.
+    pub render: Option<Arc<RenderRow>>,
 }
 
 impl DocLine {
     pub fn plain(text: String, new_no: usize) -> Self {
-        Self { text, kind: LineKind::Normal, old_no: Some(new_no), new_no: Some(new_no), suffix: None, spans: Vec::new() }
+        Self { text, kind: LineKind::Normal, old_no: Some(new_no), new_no: Some(new_no), suffix: None, spans: Vec::new(), render: None }
+    }
+
+    /// The last current-file line this row shows (a rendered row may cover several).
+    pub fn last_no(&self) -> Option<usize> {
+        let n = self.new_no?;
+        Some(self.render.as_ref().map_or(n, |r| r.last_line().max(n)))
+    }
+
+    /// Shows current-file line `n`.
+    pub fn covers_new(&self, n: usize) -> bool {
+        self.new_no.is_some_and(|first| first <= n && self.last_no().is_some_and(|last| n <= last))
     }
 }
 
@@ -100,7 +119,46 @@ impl Doc {
                 _ => new_no.and_then(|n| new_spans.and_then(|s| s.get(n - 1))),
             };
             let spans = spans.cloned().unwrap_or_default();
-            lines.push(DocLine { text: expand_tabs(raw), kind, old_no, new_no, suffix: None, spans });
+            lines.push(DocLine { text: expand_tabs(raw), kind, old_no, new_no, suffix: None, spans, render: None });
+        }
+        Doc { lines }
+    }
+
+    /// `src` (a plain or diff doc) with a plugin's rendering: each row in
+    /// place of the lines it covers, marked added when one of them is.
+    /// Removed lines and lines no row covers stay as they are.
+    pub fn rendered(src: &Doc, rows: &[RenderRow]) -> Doc {
+        let max = src.lines.iter().filter_map(|l| l.new_no).max().unwrap_or(0);
+        let mut owner: HashMap<usize, usize> = HashMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            for n in r.line..=r.last_line().min(max) {
+                owner.entry(n).or_insert(i);
+            }
+        }
+        let mut added = vec![false; rows.len()];
+        for l in src.lines.iter().filter(|l| l.kind == LineKind::Added) {
+            if let Some(&i) = l.new_no.and_then(|n| owner.get(&n)) {
+                added[i] = true;
+            }
+        }
+        let mut shown = vec![false; rows.len()];
+        let mut lines = Vec::new();
+        for l in &src.lines {
+            let row = l.new_no.filter(|_| l.kind != LineKind::Removed).and_then(|n| owner.get(&n).copied());
+            let Some(i) = row else {
+                lines.push(l.clone());
+                continue;
+            };
+            if std::mem::replace(&mut shown[i], true) {
+                continue;
+            }
+            let r = &rows[i];
+            // One display row: no line breaks; tabs as one space keep the span columns.
+            let text: String = r.text.chars().map(|c| if c == '\n' || c == '\t' { ' ' } else { c }).collect();
+            let mut row = r.clone();
+            row.text = text.clone();
+            let kind = if added[i] { LineKind::Added } else { LineKind::Normal };
+            lines.push(DocLine { text, kind, old_no: None, new_no: Some(r.line), suffix: None, spans: Vec::new(), render: Some(Arc::new(row)) });
         }
         Doc { lines }
     }
@@ -121,7 +179,7 @@ impl Doc {
 
     /// Doc index showing current-file line `n` (or the nearest after it).
     pub fn index_of_new(&self, n: usize) -> Option<usize> {
-        self.lines.iter().position(|l| l.new_no.map(|x| x >= n).unwrap_or(false))
+        self.lines.iter().position(|l| l.covers_new(n) || l.new_no.is_some_and(|x| x >= n))
     }
 
     pub fn changed_count(&self) -> (usize, usize) {
@@ -154,6 +212,30 @@ mod tests {
         assert_eq!(d.hunk_starts(), vec![1, 5]);
         assert_eq!(d.index_of_new(2), Some(2));
         assert_eq!(d.changed_count(), (2, 1));
+    }
+
+    fn row(line: usize, end_line: Option<usize>, text: &str) -> RenderRow {
+        RenderRow { line, end_line, text: text.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn rendered_rows_replace_the_lines_they_cover() {
+        let rows = [row(1, None, "Title"), row(3, Some(4), "one two"), row(9, None, "past the end")];
+        let d = Doc::rendered(&Doc::plain("# Title\n\none\ntwo\nraw\n", None), &rows);
+        let got: Vec<(Option<usize>, Option<usize>, &str, bool)> = d.lines.iter().map(|l| (l.new_no, l.last_no(), l.text.as_str(), l.render.is_some())).collect();
+        assert_eq!(
+            got,
+            vec![(Some(1), Some(1), "Title", true), (Some(2), Some(2), "", false), (Some(3), Some(4), "one two", true), (Some(5), Some(5), "raw", false)],
+            "uncovered lines stay raw; rows past the end go"
+        );
+        assert_eq!(d.index_of_new(4), Some(2), "a line inside a row finds the row");
+        assert!(d.lines[2].covers_new(3) && d.lines[2].covers_new(4) && !d.lines[2].covers_new(5));
+
+        // On a diff: removed lines stay, a row with an added line is added.
+        let diff = Doc::diff("a\nb\nc\n", "a\nB\nc\n", None, None);
+        let d = Doc::rendered(&diff, &[row(1, Some(2), "a B"), row(3, None, "c")]);
+        let got: Vec<(LineKind, Option<usize>, &str)> = d.lines.iter().map(|l| (l.kind, l.new_no, l.text.as_str())).collect();
+        assert_eq!(got, vec![(LineKind::Added, Some(1), "a B"), (LineKind::Removed, None, "b"), (LineKind::Normal, Some(3), "c")]);
     }
 
     #[test]

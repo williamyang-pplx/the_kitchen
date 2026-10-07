@@ -160,7 +160,8 @@ fn plugin_dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &C
                 None | Some(Some(Kind::Diagnostics)) => host.decor.set_diagnostics(&key, &ns, decor::parse_diagnostics(items).map_err(|e| anyhow!(e))?, d.version),
                 Some(Some(Kind::Highlights)) => host.decor.set_highlights(&key, &ns, decor::parse_highlights(items).map_err(|e| anyhow!(e))?, d.version),
                 Some(Some(Kind::Comments)) => host.decor.set_comments(&key, &ns, decor::parse_comments(items).map_err(|e| anyhow!(e))?),
-                Some(None) => bail!("kind is diagnostics, highlights or comments"),
+                Some(Some(Kind::Render)) => host.decor.set_render(&key, &ns, decor::parse_render(items).map_err(|e| anyhow!(e))?, d.version),
+                Some(None) => bail!("kind is diagnostics, highlights, comments or render"),
             }
             engine.ctx.request_repaint();
             Ok(json!({ "ns": ns, "path": key.path }))
@@ -170,7 +171,7 @@ fn plugin_dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &C
             let key = file(&d)?;
             let kind = match d.kind.as_deref() {
                 None => None,
-                Some(k) => Some(Kind::parse(k).ok_or_else(|| anyhow!("kind is diagnostics, highlights or comments"))?),
+                Some(k) => Some(Kind::parse(k).ok_or_else(|| anyhow!("kind is diagnostics, highlights, comments or render"))?),
             };
             host.decor.clear(key.as_ref(), &ext(&d.ns), kind);
             engine.ctx.request_repaint();

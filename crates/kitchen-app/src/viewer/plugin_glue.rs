@@ -249,7 +249,7 @@ impl Viewer {
             .map(|c| {
                 let row = c.line.and_then(|n| {
                     self.doc.lines.iter().position(|l| match c.side {
-                        Side::New => l.new_no == Some(n),
+                        Side::New => l.kind != LineKind::Removed && l.covers_new(n),
                         Side::Old => is_diff && l.old_no == Some(n),
                     })
                 });
@@ -278,11 +278,12 @@ impl Viewer {
         }
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
         let thread = self.comment_blocks().into_iter().find(|(b, id)| b.after == Some(end) && id.is_some());
-        let lines = |i: usize| self.doc.lines.get(i).and_then(|l| l.new_no.or(l.old_no)).unwrap_or(i + 1);
+        let first = self.doc.lines.get(start).and_then(|l| l.new_no.or(l.old_no)).unwrap_or(start + 1);
+        let last = self.doc.lines.get(end).and_then(|l| l.last_no().or(l.old_no)).unwrap_or(end + 1);
         let what = match &thread {
             Some((b, _)) => format!("Reply to {}", b.title),
-            None if end > start => format!("Comment on lines {}–{}", lines(start), lines(end)),
-            None => format!("Comment on line {}", lines(end)),
+            None if end > start || last > first => format!("Comment on lines {first}–{last}"),
+            None => format!("Comment on line {last}"),
         };
         self.reply_to = thread.and_then(|(_, id)| id);
         self.list_focus = false;
@@ -298,17 +299,27 @@ impl Viewer {
             return;
         }
         let Some(path) = self.current.clone() else { return };
-        // A removed line is on the base side; everything else on the current file.
-        let pos = |i: usize| -> (&'static str, Option<usize>) {
+        // A removed line is on the base side; everything else on the current
+        // file. A rendered row stands for its source lines: a range ends on its last.
+        let pos = |i: usize, last: bool| -> (&'static str, Option<usize>) {
             match self.doc.lines.get(i) {
                 Some(l) if l.kind == LineKind::Removed => ("old", l.old_no),
+                Some(l) if last => ("new", l.last_no()),
                 Some(l) => ("new", l.new_no),
                 None => ("new", None),
             }
         };
-        let ((side, line), (start_side, start_line)) = (pos(ed.end), pos(ed.start));
-        let multi = ed.end > ed.start;
-        let quote: Vec<&str> = (ed.start..=ed.end).filter_map(|i| self.doc.lines.get(i).map(|l| l.text.as_str())).collect();
+        let ((side, line), (start_side, start_line)) = (pos(ed.end, true), pos(ed.start, false));
+        let multi = (side, line) != (start_side, start_line);
+        // The source text, also for rendered rows.
+        let raw: Vec<&str> = self.files.get(&path).map(|f| f.text.lines().collect()).unwrap_or_default();
+        let quote: Vec<&str> = (ed.start..=ed.end)
+            .filter_map(|i| self.doc.lines.get(i))
+            .flat_map(|l| match (l.render.is_some(), l.new_no, l.last_no()) {
+                (true, Some(a), Some(b)) => raw.get(a - 1..b.min(raw.len())).unwrap_or_default().to_vec(),
+                _ => vec![l.text.as_str()],
+            })
+            .collect();
         let k = self.file_key(&path);
         let ev = serde_json::json!({
             "file": { "host": k.host, "worktree": k.worktree, "path": k.path, "abs": k.abs() },
@@ -330,8 +341,8 @@ impl Viewer {
     /// The viewer state handed to plugin commands.
     pub fn context(&self) -> serde_json::Value {
         let sel = self.vim.visual_lines().map(|(a, b)| {
-            let line = |i: usize| self.doc.lines.get(i).and_then(|l| l.new_no);
-            serde_json::json!({ "from": line(a), "to": line(b) })
+            let doc = &self.doc.lines;
+            serde_json::json!({ "from": doc.get(a).and_then(|l| l.new_no), "to": doc.get(b).and_then(|l| l.last_no()) })
         });
         let line = if self.browsing { None } else { self.current_source_line() };
         let raw_line = line.and_then(|n| self.current.as_ref().and_then(|p| self.files.get(p)).and_then(|f| f.text.lines().nth(n - 1)));

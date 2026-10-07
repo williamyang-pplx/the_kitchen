@@ -152,6 +152,26 @@ pub fn builtin_conflict(c: &crate::plugins::keys::Chord) -> Option<String> {
     None
 }
 
+/// egui-winit turns ⌘⇧V into a paste (as it does ⌘V) and drops the key, so a
+/// plugin could never bind it. Put the key back in front of the paste: a
+/// plugin chord takes both, otherwise the paste goes on as before. (With an
+/// empty clipboard winit sends nothing at all.) `modifiers`: those held
+/// before these events.
+pub fn unpaste_shift_v(raw: &mut egui::RawInput, mut modifiers: Modifiers) {
+    let mut i = 0;
+    while i < raw.events.len() {
+        match raw.events[i] {
+            egui::Event::ModifiersChanged(m) => modifiers = m,
+            egui::Event::Paste(_) if modifiers.command && modifiers.shift => {
+                raw.events.insert(i, egui::Event::Key { key: Key::V, physical_key: None, pressed: true, repeat: false, modifiers });
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
 /// Plugin chords that apply in the current context, as (registry index, chord).
 pub type PluginChords = Vec<(usize, crate::plugins::keys::Chord)>;
 
@@ -172,6 +192,10 @@ pub fn collect(ctx: &egui::Context, plugin: &PluginChords) -> Vec<Action> {
                 i.events.remove(pos);
                 // Option chords also type a composed character (⌥Y → ¥).
                 if chord.alt && matches!(i.events.get(pos), Some(egui::Event::Text(_))) {
+                    i.events.remove(pos);
+                }
+                // ⌘⇧V comes with the paste it stands for (see `unpaste_shift_v`).
+                if chord.key == Key::V && matches!(i.events.get(pos), Some(egui::Event::Paste(_))) {
                     i.events.remove(pos);
                 }
                 out.push(Action::Plugin(*idx));
@@ -258,6 +282,29 @@ mod tests {
         assert!(builtin_conflict(&Chord::parse("cmd+c").unwrap()).is_some());
         assert!(builtin_conflict(&Chord::parse("cmd+shift+h").unwrap()).is_some());
         assert!(builtin_conflict(&Chord::parse("cmd+shift+u").unwrap()).is_none());
+    }
+
+    #[test]
+    fn cmd_shift_v_reaches_plugin_chords() {
+        use crate::plugins::keys::Chord;
+        let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        // What egui-winit sends for ⌘⇧V: a paste, no key.
+        let run = |chords: &PluginChords, modifiers: Modifiers| {
+            let mut raw = egui::RawInput { events: vec![egui::Event::ModifiersChanged(modifiers), egui::Event::Paste("x".into())], ..Default::default() };
+            unpaste_shift_v(&mut raw, Modifiers::NONE);
+            let ctx = egui::Context::default();
+            let (mut out, mut pasted) = (Vec::new(), false);
+            let mut o = ctx.run_ui(raw, |ui| {
+                out = collect(ui.ctx(), chords);
+                pasted = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+            });
+            o.textures_delta.clear();
+            (out, pasted)
+        };
+        let v = vec![(3, Chord::parse("cmd+shift+v").unwrap())];
+        assert_eq!(run(&v, cmd_shift), (vec![Action::Plugin(3)], false), "the chord takes the paste too");
+        assert_eq!(run(&Vec::new(), cmd_shift), (vec![], true), "unbound, ⌘⇧V still pastes");
+        assert_eq!(run(&v, Modifiers::COMMAND), (vec![], true), "⌘V is a paste");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Decorations pushed by plugins (and by any program over the socket):
-//! diagnostics, highlights and comments, in namespaced sets per file. A set replaces
+//! diagnostics, highlights, comments and renderings, in namespaced sets per file. A set replaces
 //! the previous set of the same namespace and kind wholesale.
 
 use std::collections::HashMap;
@@ -122,6 +122,59 @@ pub struct Comment {
     pub dim: bool,
 }
 
+/// One row of a plugin's rendering of a file (`kitchen.render`, e.g. the
+/// markdown plugin): styled text standing for source lines `line..=end_line`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RenderRow {
+    /// First source line (1-based).
+    pub line: usize,
+    /// Last source line, inclusive (`None` = just `line`).
+    pub end_line: Option<usize>,
+    pub text: String,
+    /// Font size as a multiple of the viewer's (headings > 1).
+    pub size: Option<f32>,
+    pub bold: bool,
+    /// Color of the whole row: a highlight group or `#rrggbb`.
+    pub group: Option<String>,
+    /// `code` (monospace on a panel), `quote` (bar on the left) or `rule`
+    /// (a horizontal line instead of the text).
+    pub block: Option<String>,
+    /// Nesting depth (list items, quotes).
+    pub indent: usize,
+    #[serde(deserialize_with = "list_or_empty_table")]
+    pub spans: Vec<RenderSpan>,
+}
+
+/// A list, also from an empty Lua table (which arrives as `{}`).
+fn list_or_empty_table<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Object(m) if m.is_empty() => Ok(Vec::new()),
+        v => serde_json::from_value(v).map_err(serde::de::Error::custom),
+    }
+}
+
+impl RenderRow {
+    pub fn last_line(&self) -> usize {
+        self.end_line.unwrap_or(self.line).max(self.line)
+    }
+}
+
+/// Styled characters `col..end_col` (1-based, exclusive) of a row's text.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RenderSpan {
+    pub col: usize,
+    pub end_col: Option<usize>,
+    pub bold: bool,
+    pub italic: bool,
+    /// Inline code: monospace on a panel.
+    pub code: bool,
+    pub strike: bool,
+    pub underline: bool,
+    pub group: Option<String>,
+}
+
 fn default_severity() -> Severity {
     Severity::Warning
 }
@@ -186,15 +239,31 @@ pub fn parse_comments(v: serde_json::Value) -> Result<Vec<Comment>, String> {
         .collect()
 }
 
+pub fn parse_render(v: serde_json::Value) -> Result<Vec<RenderRow>, String> {
+    let serde_json::Value::Array(items) = v else { return Err("render rows must be a list".into()) };
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let r: RenderRow = serde_json::from_value(item).map_err(|e| format!("render row #{}: {e}", i + 1))?;
+            if r.line == 0 {
+                return Err(format!("render row #{}: lines are 1-based", i + 1));
+            }
+            Ok(r)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Diagnostics,
     Highlights,
     Comments,
+    Render,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 3] = [Kind::Diagnostics, Kind::Highlights, Kind::Comments];
+    pub const ALL: [Kind; 4] = [Kind::Diagnostics, Kind::Highlights, Kind::Comments, Kind::Render];
 
     pub fn parse(s: &str) -> Option<Kind> {
         Kind::ALL.into_iter().find(|k| k.name() == s)
@@ -205,6 +274,7 @@ impl Kind {
             Kind::Diagnostics => "diagnostics",
             Kind::Highlights => "highlights",
             Kind::Comments => "comments",
+            Kind::Render => "render",
         }
     }
 }
@@ -219,11 +289,13 @@ pub struct Set {
     pub hl_version: Option<String>,
     pub highlights: Vec<Highlight>,
     pub comments: Vec<Comment>,
+    pub render_version: Option<String>,
+    pub render: Arc<Vec<RenderRow>>,
 }
 
 impl Set {
     fn is_empty(&self) -> bool {
-        self.diagnostics.is_empty() && self.highlights.is_empty() && self.comments.is_empty()
+        self.diagnostics.is_empty() && self.highlights.is_empty() && self.comments.is_empty() && self.render.is_empty()
     }
 
     fn clear(&mut self, kind: Kind) {
@@ -231,6 +303,7 @@ impl Set {
             Kind::Diagnostics => self.diagnostics.clear(),
             Kind::Highlights => self.highlights.clear(),
             Kind::Comments => self.comments.clear(),
+            Kind::Render => self.render = Arc::default(),
         }
     }
 }
@@ -255,6 +328,11 @@ impl FileDecor {
 
     pub fn highlights(&self, version: &str) -> Vec<&Highlight> {
         self.sets.iter().filter(|s| s.hl_version.as_deref().is_none_or(|v| v == version)).flat_map(|s| s.highlights.iter()).collect()
+    }
+
+    /// The first rendering made from the text with hash `version`.
+    pub fn render(&self, version: &str) -> Option<&Arc<Vec<RenderRow>>> {
+        self.sets.iter().find(|s| !s.render.is_empty() && s.render_version.as_deref().is_none_or(|v| v == version)).map(|s| &s.render)
     }
 
     /// Comments of every namespace (they follow lines, not text versions).
@@ -307,6 +385,14 @@ impl DecorStore {
     pub fn set_comments(&self, key: &FileKey, ns: &str, mut items: Vec<Comment>) {
         items.truncate(MAX_ITEMS);
         self.update(key, ns, |s| s.comments = items);
+    }
+
+    pub fn set_render(&self, key: &FileKey, ns: &str, mut rows: Vec<RenderRow>, version: Option<String>) {
+        rows.truncate(MAX_ITEMS);
+        self.update(key, ns, |s| {
+            s.render = Arc::new(rows);
+            s.render_version = version;
+        });
     }
 
     fn update(&self, key: &FileKey, ns: &str, f: impl FnOnce(&mut Set)) {
@@ -413,5 +499,12 @@ mod tests {
         assert_eq!(s.get(&key()).unwrap().comments().count(), 2, "clearing diagnostics keeps comments");
         s.clear(Some(&key()), "github", Some(Kind::Comments));
         assert!(s.get(&key()).is_none());
+        let rows = parse_render(serde_json::json!([{ "line": 1, "end_line": 2, "text": "Title", "size": 1.6, "spans": [{ "col": 1, "end_col": 3, "bold": true }] }])).unwrap();
+        assert_eq!((rows[0].last_line(), rows[0].spans[0].end_col), (2, Some(3)));
+        assert!(parse_render(serde_json::json!([{ "line": 0 }])).is_err());
+        s.set_render(&key(), "markdown", rows, Some("v1".into()));
+        let d = s.get(&key()).unwrap();
+        assert_eq!(d.render("v1").map(|r| r.len()), Some(1));
+        assert!(d.render("v2").is_none(), "a rendering of older text is not shown");
     }
 }

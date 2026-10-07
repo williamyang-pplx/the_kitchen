@@ -1,14 +1,22 @@
 //! Read-only code widget with vim navigation, used by the file viewer and
 //! the plan reviewer. It paints a [`Doc`], inline blocks (plan
 //! comments) and an optional comment editor, and turns plain
-//! keys into [`Vim`] motions while focused.
+//! keys into [`Vim`] motions while focused. Rendered rows (`kitchen.render`)
+//! are drawn in a proportional font and wrap instead of scrolling sideways.
 
-use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, CornerRadius, FontId, Key, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use std::sync::Arc;
+
+use egui::text::{CCursor, LayoutJob, TextFormat};
+use egui::{Color32, CornerRadius, FontId, Galley, Key, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use super::doc::{Doc, LineKind};
+use super::highlight::group_color;
 use super::vim::{Vim, VimAction, VimKey, Viewport};
+use crate::plugins::decor::{RenderRow, RenderSpan};
 use crate::theme;
+
+/// Background of rendered code (blocks and inline).
+const CODE_BG: Color32 = Color32::from_rgb(0x24, 0x28, 0x3b);
 
 /// Scroll position; owned by the panel so it survives frames.
 #[derive(Debug, Default, Clone)]
@@ -159,7 +167,10 @@ impl CodeView<'_> {
         let gutter = sign_w + if two_gutters { one_gutter * 2.0 } else { one_gutter };
         let text_x = rect.left() + gutter + 6.0;
         let visible_cols = (((rect.right() - text_x) / cw).floor() as usize).max(8);
-        if vim.col < state.left {
+        let cursor_rendered = doc.lines.get(vim.line).is_some_and(|l| l.render.is_some());
+        if cursor_rendered {
+            // Rendered rows wrap; they never scroll sideways.
+        } else if vim.col < state.left {
             state.left = vim.col;
         } else if vim.col >= state.left + visible_cols {
             state.left = vim.col + 1 - visible_cols;
@@ -175,7 +186,8 @@ impl CodeView<'_> {
         });
 
         let mut y = rect.top();
-        let mut row_hits: Vec<(Rect, usize)> = Vec::new();
+        // Row, doc index, and a rendered row's galley and where it was drawn.
+        let mut row_hits: Vec<(Rect, usize, Option<(Pos2, Arc<Galley>)>)> = Vec::new();
         let mut cursor_drawn = false;
         let block_width = rect.width() - gutter - 24.0;
         let mut editor_rect: Option<Rect> = None;
@@ -197,8 +209,25 @@ impl CodeView<'_> {
                 break;
             }
             let line = &doc.lines[idx];
-            let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_h));
-            row_hits.push((row, idx));
+            let rendered = line.render.as_deref();
+            let over = line.new_no.filter(|_| line.kind != LineKind::Removed).and_then(|n| overlay.and_then(|o| o.lines.get(&n)));
+            // Layout first: a rendered row wraps, so it may be taller than a text row.
+            let (galley, text_pos, row_height) = match rendered {
+                Some(r) => {
+                    let quote = if r.block.as_deref() == Some("quote") { cw * 1.5 } else { 0.0 };
+                    // Clear of the diff's +/- marker.
+                    let x = text_x + cw * 0.8 + r.indent as f32 * cw * 2.0 + quote;
+                    let job = render_job(r, &line.text, font_size, (rect.right() - x - 16.0).max(cw * 8.0));
+                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                    // Room above a heading.
+                    let pad = (r.size.unwrap_or(1.0) - 1.0).max(0.0) * font_size * 0.8;
+                    let h = (galley.size().y + 2.0 + pad).max(row_h);
+                    (galley, Pos2::new(x, y + 1.0 + pad), h)
+                }
+                None => (ui.fonts_mut(|f| f.layout_job(line_job(line, state.left, &font, over))), Pos2::new(text_x, y + 1.0), row_h),
+            };
+            let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_height));
+            row_hits.push((row, idx, rendered.map(|_| (text_pos, galley.clone()))));
             let bg = match line.kind {
                 LineKind::Added => Some(theme::ADDED_BG),
                 LineKind::Removed => Some(theme::REMOVED_BG),
@@ -207,12 +236,28 @@ impl CodeView<'_> {
             if let Some(bg) = bg {
                 painter.rect_filled(row, CornerRadius::ZERO, bg);
             }
+            match rendered.and_then(|r| r.block.as_deref()) {
+                Some("code") => {
+                    let r = Rect::from_min_max(Pos2::new(text_pos.x - 6.0, y), Pos2::new(rect.right() - 10.0, y + row_height));
+                    painter.rect_filled(r, CornerRadius::ZERO, CODE_BG);
+                }
+                Some("quote") => {
+                    painter.rect_filled(Rect::from_min_size(Pos2::new(text_pos.x - cw * 1.2, y), Vec2::new(3.0, row_height)), CornerRadius::ZERO, theme::DIM);
+                }
+                Some("rule") => {
+                    painter.hline(text_pos.x..=rect.right() - 16.0, y + row_height / 2.0, Stroke::new(1.0, theme::BORDER));
+                }
+                _ => {}
+            }
             if idx == vim.line {
                 painter.rect_filled(row, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0x7a, 0xa2, 0xf7, 18));
             }
-            // Visual selection.
+            // Visual selection (whole rows on rendered rows).
             if let Some(((sl, sc), (el, ec), linewise)) = visual {
-                if idx >= sl && idx <= el {
+                if idx >= sl && idx <= el && rendered.is_some() {
+                    let r = Rect::from_min_max(Pos2::new(text_pos.x - 4.0, y), Pos2::new(rect.right() - 10.0, y + row_height));
+                    painter.rect_filled(r, CornerRadius::ZERO, Color32::from_rgb(0x33, 0x46, 0x7c).gamma_multiply(0.8));
+                } else if idx >= sl && idx <= el {
                     let len = line.text.chars().count().max(1);
                     let (c0, c1) = if linewise {
                         (0, len)
@@ -237,38 +282,46 @@ impl CodeView<'_> {
             } else {
                 line.new_no.or(if relative { line.old_no } else { None })
             };
+            // Numbers and signs line up with the text's first row.
+            let ty = text_pos.y;
             if two_gutters {
                 if let Some(o) = line.old_no.filter(|_| line.kind != LineKind::Added) {
-                    painter.text(Pos2::new(rect.left() + sign_w + one_gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, o, small.clone(), num_color);
+                    painter.text(Pos2::new(rect.left() + sign_w + one_gutter - 6.0, ty), egui::Align2::RIGHT_TOP, o, small.clone(), num_color);
                 }
                 if let Some(nn) = number {
-                    painter.text(Pos2::new(rect.left() + gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, nn, small.clone(), num_color);
+                    painter.text(Pos2::new(rect.left() + gutter - 6.0, ty), egui::Align2::RIGHT_TOP, nn, small.clone(), num_color);
                 }
                 let marker = match line.kind {
                     LineKind::Added => "+",
                     LineKind::Removed => "-",
                     LineKind::Normal => "",
                 };
-                painter.text(Pos2::new(rect.left() + gutter + 1.0, y + 1.0), egui::Align2::LEFT_TOP, marker, small, if line.kind == LineKind::Added { theme::GREEN } else { theme::RED });
+                painter.text(Pos2::new(rect.left() + gutter + 1.0, ty), egui::Align2::LEFT_TOP, marker, small, if line.kind == LineKind::Added { theme::GREEN } else { theme::RED });
             } else if let Some(nn) = number {
-                painter.text(Pos2::new(rect.left() + gutter - 6.0, y + 1.0), egui::Align2::RIGHT_TOP, nn, small, num_color);
+                painter.text(Pos2::new(rect.left() + gutter - 6.0, ty), egui::Align2::RIGHT_TOP, nn, small, num_color);
             }
-            let over = line.new_no.filter(|_| line.kind != LineKind::Removed).and_then(|n| overlay.and_then(|o| o.lines.get(&n)));
             if let Some((c, color)) = over.and_then(|o| o.sign) {
-                painter.text(Pos2::new(rect.left() + 3.0, y + 1.0), egui::Align2::LEFT_TOP, c, FontId::monospace(font_size - 1.0), color);
+                painter.text(Pos2::new(rect.left() + 3.0, ty), egui::Align2::LEFT_TOP, c, FontId::monospace(font_size - 1.0), color);
             }
             // Text.
-            let job = line_job(line, state.left, &font, over);
-            let galley = ui.fonts_mut(|f| f.layout_job(job));
-            painter.galley(Pos2::new(text_x, y + 1.0), galley, theme::TEXT);
+            if rendered.is_none_or(|r| r.block.as_deref() != Some("rule")) {
+                painter.galley(text_pos, galley.clone(), theme::TEXT);
+            }
             let after_x = text_x + (line.text.chars().count().saturating_sub(state.left) + 2) as f32 * cw;
-            if let Some(suffix) = &line.suffix {
+            if rendered.is_some() {
+                // Columns of plugin decorations don't map onto a rendering.
+            } else if let Some(suffix) = &line.suffix {
                 painter.text(Pos2::new(after_x, y + 1.0), egui::Align2::LEFT_TOP, suffix, FontId::proportional(font_size - 0.5), theme::DIM);
             } else if let Some((text, color)) = over.and_then(|o| o.virt.as_ref()) {
                 painter.text(Pos2::new(after_x, y + 1.0), egui::Align2::LEFT_TOP, text, FontId::proportional(font_size - 0.5), color.gamma_multiply(0.75));
             }
-            // Cursor.
-            if idx == vim.line && vim.col >= state.left {
+            // Cursor: a bar in a rendered row, a block in a text row.
+            if idx == vim.line && rendered.is_some() {
+                let at = galley.pos_from_cursor(CCursor::new(vim.col)).translate(text_pos.to_vec2());
+                let bar = Rect::from_min_size(at.min, Vec2::new(2.0, at.height().max(ch)));
+                painter.rect_filled(bar, CornerRadius::ZERO, if focused && !editor_focused { theme::TEXT.gamma_multiply(0.9) } else { theme::DIM });
+                cursor_drawn = y + row_height <= rect.bottom();
+            } else if idx == vim.line && vim.col >= state.left {
                 let x = text_x + (vim.col - state.left) as f32 * cw;
                 let r = Rect::from_min_size(Pos2::new(x, y + 1.0), Vec2::new(cw, ch));
                 if focused && !editor_focused {
@@ -281,7 +334,7 @@ impl CodeView<'_> {
                 }
                 cursor_drawn = y + row_h <= rect.bottom();
             }
-            y += row_h;
+            y += row_height;
             // The comment field goes right under its line, above the line's
             // blocks (a long thread would push it out of view).
             if let Some(ed) = editor.as_deref() {
@@ -335,8 +388,11 @@ impl CodeView<'_> {
         if resp.clicked_by(egui::PointerButton::Primary) {
             out.clicked = true;
             if let Some(pos) = resp.interact_pointer_pos() {
-                if let Some((_, idx)) = row_hits.iter().find(|(r, _)| r.contains(pos)) {
-                    let col = (((pos.x - text_x) / cw).max(0.0) as usize) + state.left;
+                if let Some((_, idx, rendered)) = row_hits.iter().find(|(r, ..)| r.contains(pos)) {
+                    let col = match rendered {
+                        Some((at, galley)) => galley.cursor_from_pos(pos - *at).index.0,
+                        None => (((pos.x - text_x) / cw).max(0.0) as usize) + state.left,
+                    };
                     vim.set_cursor(*idx, col.min(doc.lines[*idx].text.chars().count().saturating_sub(1)));
                 }
             }
@@ -372,6 +428,64 @@ fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId, over: Option
         let color = ospans.iter().rev().find(|(r, _)| covers(r)).or_else(|| line.spans.iter().rev().find(|(r, _)| covers(r))).map(|(_, c)| *c).unwrap_or(base);
         let underline = ounder.iter().rev().find(|(r, _)| covers(r)).map(|(_, c)| Stroke::new(1.5, *c)).unwrap_or(Stroke::NONE);
         job.append(&text[a..b], 0.0, TextFormat { font_id: font.clone(), color, underline, ..Default::default() });
+    }
+    job
+}
+
+/// Layout for a rendered row: proportional text (monospace in code) in the
+/// row's and its spans' styles, wrapped at `wrap`.
+fn render_job(r: &RenderRow, text: &str, font_size: f32, wrap: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap;
+    let size = font_size * r.size.unwrap_or(1.0).clamp(0.5, 3.0);
+    let (code_block, quote) = (r.block.as_deref() == Some("code"), r.block.as_deref() == Some("quote"));
+    let base = r.group.as_deref().and_then(group_color).unwrap_or(if quote { theme::MUTED } else { theme::TEXT });
+    // 1-based character columns → byte offsets.
+    let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).chain([text.len()]).collect();
+    let byte = |col: usize| offsets[col.saturating_sub(1).min(offsets.len() - 1)];
+    let spans: Vec<(std::ops::Range<usize>, &RenderSpan)> = r.spans.iter().map(|s| (byte(s.col)..s.end_col.map_or(text.len(), byte), s)).collect();
+    let mut cuts = vec![0, text.len()];
+    for (range, _) in &spans {
+        cuts.extend([range.start, range.end]);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let plain = if code_block { FontId::monospace(size) } else if r.bold { theme::ui_font_bold(size) } else { theme::ui_font(size) };
+    if text.is_empty() {
+        // Still one row of the row's font, for its height and the cursor.
+        job.append("", 0.0, TextFormat { font_id: plain, color: base, ..Default::default() });
+        return job;
+    }
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        let on: Vec<&RenderSpan> = spans.iter().filter(|(range, _)| range.start <= a && range.end >= b).map(|(_, s)| *s).collect();
+        let any = |f: fn(&RenderSpan) -> bool| on.iter().any(|s| f(s));
+        let code = !code_block && any(|s| s.code);
+        let font_id = if code {
+            FontId::monospace(size * 0.9)
+        } else if !code_block && any(|s| s.bold) {
+            theme::ui_font_bold(size)
+        } else {
+            plain.clone()
+        };
+        let color = on.iter().rev().find_map(|s| s.group.as_deref().and_then(group_color)).unwrap_or(base);
+        let stroke = |yes: bool| if yes { Stroke::new(1.0, color) } else { Stroke::NONE };
+        job.append(
+            &text[a..b],
+            0.0,
+            TextFormat {
+                font_id,
+                color,
+                background: if code { CODE_BG } else { Color32::TRANSPARENT },
+                italics: quote || any(|s| s.italic),
+                underline: stroke(any(|s| s.underline)),
+                strikethrough: stroke(any(|s| s.strike)),
+                ..Default::default()
+            },
+        );
     }
     job
 }

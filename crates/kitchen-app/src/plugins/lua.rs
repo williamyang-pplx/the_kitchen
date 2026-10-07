@@ -481,7 +481,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
         })?,
     )?;
 
-    // Decorations: kitchen.diagnostics / kitchen.highlights / kitchen.comments.
+    // Decorations: kitchen.diagnostics / kitchen.highlights / kitchen.comments / kitchen.render.
     for kind in decor::Kind::ALL {
         let t = lua.create_table()?;
         let c = cx.clone();
@@ -505,6 +505,10 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                         let items = decor::parse_comments(items).map_err(mlua::Error::runtime)?;
                         c.host.decor.set_comments(&key, &ns, items);
                     }
+                    decor::Kind::Render => {
+                        let rows = decor::parse_render(items).map_err(mlua::Error::runtime)?;
+                        c.host.decor.set_render(&key, &ns, rows, version);
+                    }
                 }
                 repaint(&c);
                 Ok(())
@@ -523,6 +527,23 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                 Ok(())
             })?,
         )?;
+        if kind == decor::Kind::Render {
+            // kitchen.render.show(tab, on): the tab's viewer shows renderings
+            // (on = nil toggles; tab = nil: the selected tab).
+            let c = cx.clone();
+            t.set(
+                "show",
+                lua.create_function(move |_, (tab, on): (Option<String>, Option<bool>)| {
+                    if let Some(e) = c.host.engine() {
+                        let tab_id = tab.or_else(|| e.selected_workspace().and_then(|w| w.selected().map(|t| t.row.id.clone())));
+                        if let Some(tab_id) = tab_id {
+                            e.push_ui(UiCommand::Render { tab_id, on });
+                        }
+                    }
+                    Ok(())
+                })?,
+            )?;
+        }
         k.set(kind.name(), t)?;
     }
 

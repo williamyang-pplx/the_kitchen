@@ -1,8 +1,8 @@
 //! The file viewer (one per tab). With changes (a PR shown with ⌘⇧P, a tab the
 //! agent worked in) it opens on the first changed file's diff, next to a
 //! tree of just the changed files; without, on a folder view at a default
-//! folder such as `aster/`. Plain / diff / outline modes, vim
-//! navigation, jump-to-definition with a jump list, and ⌘M comments that
+//! folder such as `aster/`. Plain / diff / outline modes, plugin
+//! renderings of a file (the markdown plugin's ⌘⇧V), vim navigation, jump-to-definition with a jump list, and ⌘M comments that
 //! plugins post and draw (the github plugin: PR review comments). All file access goes
 //! through the workspace's [`Host`] on background threads, so devbox
 //! workspaces work the same.
@@ -152,6 +152,10 @@ pub struct Viewer {
     hunk_goto: Option<HunkGoto>,
     diff: bool,
     outline: bool,
+    /// Show plugins' renderings of files that have one (`kitchen.render`).
+    rendered: bool,
+    /// The rendering the doc was built from.
+    render_shown: Option<Arc<Vec<crate::plugins::decor::RenderRow>>>,
     files: HashMap<String, FileData>,
     bases: HashMap<String, BaseData>,
     loading: HashSet<String>,
@@ -229,6 +233,8 @@ impl Viewer {
             hunk_goto: None,
             diff: false,
             outline: false,
+            rendered: false,
+            render_shown: None,
             files: HashMap::new(),
             bases: HashMap::new(),
             loading: HashSet::new(),
@@ -717,6 +723,10 @@ impl Viewer {
             self.doc = Doc::default();
             return;
         };
+        let rows = self.render_rows(&path).filter(|_| !self.outline);
+        if !opt_ptr_eq(&rows, &self.render_shown) {
+            self.doc_key = None;
+        }
         let has_base = self.bases.contains_key(&path);
         let key = (path.clone(), self.diff && has_base, self.outline, self.files.contains_key(&path));
         if self.doc_key.as_ref() == Some(&key) {
@@ -769,6 +779,10 @@ impl Viewer {
         } else {
             Doc::plain(&file.text, file.spans.as_deref())
         };
+        if let Some(rows) = &rows {
+            self.doc = Doc::rendered(&self.doc, rows);
+        }
+        self.render_shown = rows;
         if let Some((line, col)) = keep {
             let col = self.goto_col(line, col);
             self.place_cursor(line, col);
@@ -790,6 +804,13 @@ impl Viewer {
         if self.outline {
             self.request_summaries(&path);
         }
+    }
+
+    /// The rendering of `path` to show: rendered mode is on and a plugin
+    /// rendered the text the viewer holds.
+    fn render_rows(&self, path: &str) -> Option<Arc<Vec<crate::plugins::decor::RenderRow>>> {
+        let file = self.files.get(path).filter(|_| self.rendered)?;
+        self.engine.plugins()?.decor.get(&self.file_key(path))?.render(&file.version).cloned()
     }
 
     /// Put the cursor on source line `line` (1-based), scrolling if needed.
@@ -896,6 +917,21 @@ impl Viewer {
                 self.outline = !self.outline;
                 self.doc_key = None;
             }
+            PanelCmd::Render(on) => {
+                self.rendered = on.unwrap_or(!self.rendered);
+                self.doc_key = None;
+                if self.rendered && !self.browsing {
+                    self.outline = false;
+                }
+                let path = self.current.clone().filter(|_| !self.browsing);
+                self.status = match path {
+                    Some(p) if self.rendered && self.files.contains_key(&p) && self.render_rows(&p).is_none() => {
+                        Some((format!("no plugin rendered {p}; it shows as text"), false))
+                    }
+                    _ if self.browsing => Some((format!("files open {}", if self.rendered { "rendered" } else { "as text" }), false)),
+                    _ => None,
+                };
+            }
             PanelCmd::FilePicker => self.open_file_picker(),
             PanelCmd::FocusList => {
                 if !self.list_focus {
@@ -992,6 +1028,7 @@ impl Viewer {
             let (mode, color) = match (self.browsing, self.outline, self.diff) {
                 (true, ..) => ("FOLDER", theme::PURPLE),
                 (_, true, _) => ("OUTLINE", theme::CYAN),
+                _ if self.render_shown.is_some() => ("RENDERED", theme::YELLOW),
                 (_, _, true) => ("DIFF", theme::GREEN),
                 _ => ("FILE", theme::CYAN),
             };
@@ -1471,6 +1508,14 @@ pub(crate) fn list_row(ui: &mut Ui, selected: bool, text: impl Into<egui::Widget
     resp
 }
 
+fn opt_ptr_eq<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn parent_dir(path: &str) -> &str {
     path.trim_end_matches('/').rsplit_once('/').map(|(d, _)| d).unwrap_or("")
 }
@@ -1612,6 +1657,7 @@ fn kind_color(kind: &str) -> egui::Color32 {
 mod tests {
     use super::*;
     use crate::test_util::{Harness, TestRepo};
+    use doc::LineKind;
 
     fn paths(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1761,6 +1807,61 @@ mod tests {
     /// ⌘M … ⌘Enter hands the comment to the `comment` listener with its
     /// side and line; the comments it sets draw under their rows, and ⌘M on
     /// such a row replies.
+    #[test]
+    fn rendered_markdown_takes_comments() {
+        let plugins = std::env::temp_dir().join(format!("kt-plugins-{}", kitchen_core::util::new_id()));
+        let plug = plugins.join("notes");
+        std::fs::create_dir_all(&plug).unwrap();
+        std::fs::write(plug.join("plugin.toml"), "name = \"notes\"\napi = 4\n").unwrap();
+        std::fs::write(
+            plug.join("init.lua"),
+            r#"kitchen.on("comment", function(ev)
+  local body = ev.text .. "|" .. ev.side .. ":" .. ev.line .. "|" .. tostring(ev.start_line) .. "|" .. ev.quote
+  kitchen.comments.set(ev.file, { { id = "c1", line = ev.line, side = ev.side, title = "@me", body = body } })
+end)"#,
+        )
+        .unwrap();
+        let bundled = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        std::fs::create_dir_all(plugins.join("md")).unwrap();
+        std::os::unix::fs::symlink(bundled.join("markdown"), plugins.join("md/markdown")).unwrap();
+        let h = Harness::new(TestRepo::new("printf '# T\\n\\nold para\\n' > README.md"));
+        h.repo.sh("printf '# T\\n\\nline *one*\\nline two\\n' > README.md && git commit -qam change");
+        let engine = &h.engine;
+        engine.set_plugins(crate::plugins::PluginHost::start(engine, vec![plugins.clone(), plugins.join("md")]));
+        let mut v = h.viewer();
+        h.settle(&mut v, &|v| v.current.as_deref() == Some("README.md") && v.bases.contains_key("README.md") && engine.plugins().unwrap().list().len() == 2);
+        v.command(PanelCmd::Render(None), engine);
+        h.settle(&mut v, &|v| v.render_shown.is_some());
+        let rows: Vec<(LineKind, Option<usize>, &str, bool)> = v.doc.lines.iter().map(|l| (l.kind, l.new_no, l.text.as_str(), l.render.is_some())).collect();
+        assert_eq!(
+            rows,
+            vec![
+                (LineKind::Normal, Some(1), "T", true),
+                (LineKind::Normal, Some(2), "", true),
+                (LineKind::Removed, None, "old para", false),
+                (LineKind::Added, Some(3), "line one line two", true),
+            ]
+        );
+        // ⌘M on the paragraph comments on both of its lines.
+        v.place_cursor(4, 0);
+        assert_eq!(v.vim.line, 3, "line 4 is in the paragraph's row");
+        v.command(PanelCmd::Comment, engine);
+        assert!(v.editor.as_ref().unwrap().label.starts_with("Comment on lines 3–4"));
+        h.frame(&mut v);
+        h.text(&mut v, "nice");
+        v.command(PanelCmd::Submit, engine);
+        h.frame(&mut v);
+        h.settle(&mut v, &|v| !v.comment_blocks().is_empty());
+        let (block, _) = v.comment_blocks().remove(0);
+        assert_eq!((block.after, block.body.as_str()), (Some(3), "nice|new:4|3|line *one*\nline two"), "the source lines are quoted");
+        // Back to text: the comment stays on its line.
+        v.command(PanelCmd::Render(None), engine);
+        h.settle(&mut v, &|v| v.render_shown.is_none() && v.doc.lines.iter().all(|l| l.render.is_none()));
+        let row = v.comment_blocks()[0].0.after.unwrap();
+        assert_eq!(v.doc.lines[row].new_no, Some(4));
+        let _ = std::fs::remove_dir_all(&plugins);
+    }
+
     #[test]
     fn comments_go_to_plugins_and_come_back() {
         let plugins = std::env::temp_dir().join(format!("kt-plugins-{}", kitchen_core::util::new_id()));

@@ -198,6 +198,11 @@ impl KitchenApp {
                     self.viewers.insert(tab_id.clone(), crate::viewer::Viewer::at(&self.engine, ws.host(), &tab_id, worktree, base));
                     self.open_side_for(&tab_id, SideKind::Viewer);
                 }
+                UiCommand::Render { tab_id, on } => {
+                    if let Some(v) = self.viewers.get_mut(&tab_id) {
+                        v.command(PanelCmd::Render(on), &self.engine);
+                    }
+                }
                 UiCommand::ReloadPlan { tab_id } => {
                     if let Some(p) = self.plans.get_mut(&tab_id) {
                         p.command(PanelCmd::Reload, &self.engine);
@@ -869,10 +874,11 @@ impl KitchenApp {
 }
 
 impl eframe::App for KitchenApp {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if !self.injected.is_empty() {
             raw_input.events.append(&mut self.injected);
         }
+        keymap::unpaste_shift_v(raw_input, ctx.input(|i| i.modifiers));
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {

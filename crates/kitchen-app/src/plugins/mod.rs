@@ -32,7 +32,7 @@ use keys::Chord;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 8;
+pub const API_LEVEL: u32 = 9;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
 /// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
@@ -903,6 +903,47 @@ mod tests {
         host
     }
 
+    /// markdown: every source line in exactly one row, and the rows' styles.
+    #[test]
+    fn markdown_plugin_rows() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/markdown/lua/markdown.lua");
+        let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
+        let rows_of = |text: &str| -> Vec<decor::RenderRow> {
+            let f: mlua::Function = m.get("rows").unwrap();
+            let v: serde_json::Value = lua.from_value(f.call(text).unwrap()).unwrap();
+            decor::parse_render(v).unwrap()
+        };
+        let text = "---\ntitle: x\n---\n# Title *é*\n\n\nSome **bold** and `code`,\na [link](http://x) and snake_case_word.\n\n- one\n  more of one\n- [x] done\n  1. nested\n\n> quoted _it_\n\n```rust\nfn f() {\n\tx\n}\n```\n\n| a | b |\n|---|:-:|\n| `1` | two |\n\n---\nSetext\n===\n\n    indented code\n";
+        let rows = rows_of(text);
+        let n = text.lines().count();
+        let mut owner = vec![0; n + 1];
+        for r in &rows {
+            for l in r.line..=r.last_line() {
+                owner[l] += 1;
+            }
+        }
+        assert!(owner[1..].iter().all(|&c| c == 1), "each line in one row: {owner:?}");
+        let find = |line: usize| rows.iter().find(|r| r.line == line).unwrap();
+        assert_eq!((find(1).block.as_deref(), find(4).text.as_str(), find(4).size, find(4).bold), (Some("code"), "Title é", Some(1.6), true));
+        assert_eq!(find(4).spans[0].col, 7, "columns count characters");
+        let p = find(7);
+        assert_eq!((p.text.as_str(), p.last_line()), ("Some bold and code, a link and snake_case_word.", 8));
+        let styled: Vec<(&str, bool, bool, bool)> =
+            p.spans.iter().map(|s| (&p.text[s.col - 1..s.end_col.unwrap() - 1], s.bold, s.code, s.underline)).collect();
+        assert_eq!(styled, vec![("bold", true, false, false), ("code", false, true, false), ("link", false, false, true)]);
+        assert_eq!((find(10).text.as_str(), find(10).last_line()), ("• one more of one", 11), "an item's continuation joins it");
+        assert_eq!((find(12).text.as_str(), find(13).text.as_str(), find(13).indent), ("☑ done", "1. nested", 1));
+        assert_eq!((find(15).block.as_deref(), find(15).text.as_str(), find(15).spans[0].italic), (Some("quote"), "quoted it", true));
+        assert_eq!((find(17).text.as_str(), find(19).text.as_str(), find(19).block.as_deref()), ("rust", "    x", Some("code")));
+        assert_eq!((find(23).text.as_str(), find(24).text.as_str(), find(25).text.as_str()), ("a │ b  ", "──┼────", "1 │ two"));
+        assert_eq!(find(27).block.as_deref(), Some("rule"));
+        assert_eq!((find(28).text.as_str(), find(28).last_line(), find(28).size), ("Setext", 29, Some(1.6)));
+        assert_eq!((find(31).text.as_str(), find(31).block.as_deref()), ("indented code", Some("code")));
+        assert_eq!(find(5).last_line(), 6, "blank lines collapse");
+    }
+
     /// github: PR links, the view of a PR, its comment threads and post arguments.
     #[test]
     fn github_plugin_views() {
@@ -1399,7 +1440,7 @@ end)
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 8 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        wait(&|| host.list().len() == 9 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);
@@ -1414,6 +1455,13 @@ end)
         let d = host.decor.get(&key).unwrap();
         let h = &d.highlights(&v)[0];
         assert_eq!((h.line, h.col, h.end_col), (4, 4, Some(8)));
+        // markdown renders .md files as they open, and binds ⌘⇧V.
+        let md = FileKey { path: "README.md".into(), ..key.clone() };
+        host.file_loaded(md.clone(), Arc::from("# Hi\n\ntext\n"), false);
+        let mv = content_hash("# Hi\n\ntext\n");
+        wait(&|| host.decor.get(&md).is_some_and(|d| d.render(&mv).is_some()));
+        assert_eq!(host.decor.get(&md).unwrap().render(&mv).unwrap()[0].text, "Hi");
+        assert!(host.registry().chords.iter().any(|c| c.command == "markdown.toggle" && c.chord.label() == "⇧⌘V"));
         if std::process::Command::new("ruff").arg("--version").output().is_ok() {
             wait(&|| host.decor.get(&key).is_some_and(|d| !d.diagnostics(&v).is_empty()));
             let d = host.decor.get(&key).unwrap();
