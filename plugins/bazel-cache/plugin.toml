@@ -1,0 +1,21 @@
+name = "bazel-cache"
+version = "0.1.0"
+description = "Keep Bazel caches on each workspace's host under a budget: drop output bases of removed worktrees, evict least-recently-used cache entries when too big or the disk runs low"
+api = 8
+
+[config]
+# Minutes between passes; the first runs about 2 minutes after the kitchen starts.
+interval_minutes = 30
+# Where agi's .bazelrc puts the caches: workspace/ (output bases), repo/ (the
+# repository cache, with the repo contents cache in repo/contents) and disk/
+# (the disk cache: counted, but left to Bazel's own GC). Missing: nothing to do.
+root = "~/bazel-cache"
+# Clean when the caches total more than this (GiB)...
+max_gb = 30
+# ...or the volume holding them has less than this percent free.
+min_free_percent = 15
+# ...evicting down to this (GiB).
+target_gb = 20
+# A Bazel server with no command for this long may be stopped so the shared
+# caches can be evicted; cache entries used more recently are never evicted.
+idle_minutes = 30

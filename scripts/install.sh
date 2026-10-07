@@ -82,7 +82,7 @@ fi
 # already has a plugin by that name (or removed the link on purpose: .skip-<name>).
 plugins_dir="${KITCHEN_STATE_DIR:-$HOME/.kitchen}/plugins"
 mkdir -p "$plugins_dir"
-for p in ruff todo python github prune-worktrees dashboard; do
+for p in ruff todo python github prune-worktrees dashboard bazel-cache; do
   if [ ! -e "$plugins_dir/$p" ] && [ ! -e "$plugins_dir/.skip-$p" ]; then
     ln -s "$root/plugins/$p" "$plugins_dir/$p"
     echo "plugin: linked $plugins_dir/$p"

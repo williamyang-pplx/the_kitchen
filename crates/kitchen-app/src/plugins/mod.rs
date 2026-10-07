@@ -1128,6 +1128,196 @@ mod tests {
         assert!(rows.rows.is_empty(), "an empty Lua table is an empty row list");
     }
 
+    fn bazel_cache_module(lua: &mlua::Lua) -> mlua::Table {
+        lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/bazel-cache/init.lua");
+        lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap()
+    }
+
+    /// bazel-cache: reading a scan, and what a pass decides to stop and evict.
+    #[test]
+    fn bazel_cache_plugin_plans_evictions() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        let m = bazel_cache_module(&lua);
+        let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
+        let val = |j: serde_json::Value| lua.to_value(&j).unwrap();
+        const G: u64 = 1024 * 1024;
+        let now = 1_000_000;
+
+        let parse: mlua::Function = m.get("parse_scan").unwrap();
+        let text = "df 104857600 52428800\n\
+            server 9 /private/c/workspace/aa\n\
+            server 10 /elsewhere/workspace/zz\n\
+            base 1024 500 1 0 /c/workspace/aa\t/w/my tab\n\
+            base 2048 400 0 1 /c/workspace/bb\t\n\
+            size contents 300 /c/repo/contents/h/u 1\n\
+            used contents 700 /c/repo/contents/h/u 1\n\
+            size contents 50 /c/repo/contents/h/writing\n\
+            size contents 50 /c/repo/contents/.trash/x\n\
+            used contents 50 /c/repo/contents/.trash/x\n\
+            size download 200 /c/repo/content_addressable/sha256/d\n\
+            used download 600 /c/repo/content_addressable/sha256/d\n\
+            disk 4096\n";
+        let s = to_json(parse.call(text).unwrap());
+        assert_eq!(s["df"], serde_json::json!({"size": 104857600, "avail": 52428800}));
+        assert_eq!(s["bases"][0], serde_json::json!({"kib": 1024, "active": 500, "exists": true, "busy": false, "path": "/c/workspace/aa", "workspace": "/w/my tab", "pid": 9}), "server matched by folder name");
+        assert_eq!((s["bases"][1]["pid"].clone(), s["bases"][1]["busy"].clone(), s["bases"][1]["workspace"].clone()), (serde_json::Value::Null, true.into(), serde_json::Value::Null));
+        assert_eq!(
+            s["entries"],
+            serde_json::json!([
+                { "kind": "contents", "kib": 300, "used": 700, "path": "/c/repo/contents/h/u 1" },
+                { "kind": "download", "kib": 200, "used": 600, "path": "/c/repo/content_addressable/sha256/d" },
+            ]),
+            "no `used`: still being written; hidden folders: Bazel's trash"
+        );
+        assert_eq!(s["disk_kib"], 4096);
+        assert_eq!(to_json(parse.call("base 1 1 1 0 /x\t\n").unwrap()), serde_json::Value::Null, "no df: the scan failed");
+
+        let plan: mlua::Function = m.get("plan").unwrap();
+        let cfg = val(serde_json::json!({ "max_gb": 30, "target_gb": 20, "min_free_percent": 15, "idle_minutes": 30 }));
+        let base = |path: &str, gib: u64, ago: u64, exists: bool, pid: Option<u64>, busy: bool| {
+            let mut b = serde_json::json!({ "kib": gib * G, "active": now - ago, "exists": exists, "busy": busy, "path": path, "workspace": format!("/w{path}") });
+            if let Some(p) = pid {
+                b["pid"] = p.into();
+            }
+            b
+        };
+        let entry = |kind: &str, path: &str, gib: u64, ago: u64| serde_json::json!({ "kind": kind, "kib": gib * G, "used": now - ago, "path": path });
+        let df = |size_g: u64, avail_g: u64| serde_json::json!({ "size": size_g * G, "avail": avail_g * G });
+        let run = |scan: serde_json::Value| to_json(plan.call((val(scan), cfg.clone(), now)).unwrap());
+        let paths = |p: &serde_json::Value| -> Vec<String> { p["evict"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap().to_string()).collect() };
+        // (an empty Lua table comes back as {})
+        let stop = |p: &serde_json::Value| -> Vec<u64> { p["stop"].as_array().map(|a| a.iter().map(|v| v.as_u64().unwrap()).collect()).unwrap_or_default() };
+
+        // Under budget: only the orphan goes (not one a server still runs in, nor a kept worktree's).
+        let p = run(serde_json::json!({
+            "df": df(100, 50), "disk_kib": G,
+            "bases": [base("/orphan", 1, 9000, false, None, false), base("/live-orphan", 1, 9000, false, Some(7), false), base("/kept", 2, 9000, true, None, false)],
+            "entries": [entry("contents", "/c1", 1, 9000)],
+        }));
+        assert_eq!(paths(&p), ["/orphan"]);
+        assert_eq!((p["over"].clone(), stop(&p), p["freed_kib"].clone(), p["total_kib"].clone()), (serde_json::Value::Null, vec![], G.into(), (6 * G).into()));
+
+        // Over max_gb (42G): one least-recently-used list down to target_gb,
+        // repo entries by last use and bases by last command, but nothing
+        // used within idle_minutes. The idle server is stopped first.
+        let over = |idle_ago: u64| {
+            serde_json::json!({
+                "df": df(1000, 500), "disk_kib": 2 * G,
+                "bases": [base("/b-idle", 8, idle_ago, true, Some(9), false), base("/b-old", 10, 10000, true, None, false)],
+                "entries": [entry("contents", "/c1", 6, 9000), entry("contents", "/c-recent", 6, 100), entry("download", "/d1", 6, 8000), entry("contents", "/c3", 4, 7000)],
+            })
+        };
+        let p = run(over(5000));
+        assert_eq!(paths(&p), ["/b-old", "/c1", "/d1"]);
+        assert_eq!((p["over"].as_str(), stop(&p), p["short_kib"].clone(), p["blocked"].clone()), (Some("size"), vec![9], 0.into(), serde_json::Value::Null));
+
+        // A server ran a command 100 s ago: the repo cache stays, bases without
+        // a server still go, and the plan falls short.
+        let p = run(over(100));
+        assert_eq!(paths(&p), ["/b-old"]);
+        assert_eq!((p["blocked"].as_str(), stop(&p), p["short_kib"].clone()), (Some("server busy in b-idle"), vec![], (12 * G).into()));
+        // A client holding a base blocks too, even with no server.
+        let mut scan = over(5000);
+        scan["bases"][1]["busy"] = true.into();
+        let p = run(scan);
+        assert_eq!((p["blocked"].as_str(), paths(&p)), (Some("server busy in b-old"), vec!["/b-idle".to_string()]));
+        assert_eq!(stop(&p), [9], "only the server of the base it removes");
+
+        // Low disk (10% free) with the caches under max_gb: free up to min_free_percent.
+        let p = run(serde_json::json!({ "df": df(100, 10), "disk_kib": 0, "bases": [], "entries": [entry("download", "/d1", 6, 9000), entry("download", "/d2", 6, 8000)] }));
+        assert_eq!((p["over"].as_str(), paths(&p)), (Some("disk"), vec!["/d1".to_string()]));
+
+        let sp: mlua::Function = m.get("shell_path").unwrap();
+        assert_eq!(sp.call::<String>("~/a b").unwrap(), r#""$HOME/a b""#);
+        assert_eq!(sp.call::<String>("/x/$y\"").unwrap(), r#""/x/\$y\"""#);
+    }
+
+    /// bazel-cache: scan_sh and evict_sh on a fake cache tree, with fake
+    /// Bazel servers and a client (`sh -c 'sleep 60; true' A-server.jar
+    /// --output_base=…`: the pattern is in the args, as a real server's is).
+    #[test]
+    fn bazel_cache_scripts_on_a_fake_tree() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        let m = bazel_cache_module(&lua);
+        let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
+        let root = std::env::temp_dir().join(format!("kt-bazel-{}", kitchen_core::util::new_id()));
+        let r = root.display().to_string();
+        let sh = |script: &str, stdin: &str| -> String {
+            use std::io::Write;
+            let mut c = std::process::Command::new("sh").arg("-c").arg(script).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+            c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            let out = c.wait_with_output().unwrap();
+            assert!(out.status.success(), "script failed");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        // A process whose args are `args`; reaped in the background so a kill leaves no zombie.
+        let fake = |args: &[&str]| -> u32 {
+            let mut c = std::process::Command::new("sh").arg("-c").arg("sleep 60; true").args(args).spawn().unwrap();
+            let pid = c.id();
+            std::thread::spawn(move || c.wait());
+            pid
+        };
+        let client = fake(&["bazel-client"]);
+        sh(
+            &format!(
+                "set -e; mkdir -p {r:?}; cd {r:?}; mkdir -p workspace/live workspace/kept workspace/orphan/execroot workspace/install repo/contents/h/u1 repo/contents/h/u2 \
+                 repo/content_addressable/sha256/d disk; \
+                 printf 'WORKSPACE: %s\\n\\nmore\\n' {r:?} > workspace/live/README; cp workspace/live/README workspace/kept/README; \
+                 printf 'WORKSPACE: /nonexistent/wt\\n' > workspace/orphan/README; \
+                 printf 'pid=999999\\nowner=client\\n' > workspace/live/lock; printf 'pid={client}\\nowner=client\\n' > workspace/kept/lock; \
+                 touch -t 202001010000 workspace/live/lock; \
+                 echo x > workspace/orphan/execroot/f; chmod 444 workspace/orphan/execroot/f; chmod 555 workspace/orphan/execroot; \
+                 echo x > repo/contents/h/u1/f; touch -t 202001010000 repo/contents/h/u1.recorded_inputs; echo x > repo/contents/h/u2/f; \
+                 echo x > repo/content_addressable/sha256/d/file; touch -t 202001010000 repo/content_addressable/sha256/d/file; echo x > disk/f"
+            ),
+            "",
+        );
+        let server = fake(&["A-server.jar", &format!("--output_base={r}/workspace/live")]);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let scan_sh: String = m.get::<mlua::Function>("scan_sh").unwrap().call(r.as_str()).unwrap();
+        let scan = m.get::<mlua::Function>("parse_scan").unwrap().call::<mlua::Value>(sh(&scan_sh, "")).unwrap();
+        let s = to_json(scan);
+        let bases: std::collections::BTreeMap<String, serde_json::Value> =
+            s["bases"].as_array().unwrap().iter().map(|b| (b["path"].as_str().unwrap().rsplit('/').next().unwrap().to_string(), b.clone())).collect();
+        assert_eq!(bases.keys().collect::<Vec<_>>(), ["kept", "live", "orphan"], "not install/");
+        assert_eq!(bases["live"]["pid"], server, "the fake server");
+        assert_eq!((bases["live"]["exists"].as_bool(), bases["live"]["busy"].as_bool()), (Some(true), Some(false)), "lock's pid is gone");
+        let in_2020 = |v: &serde_json::Value| (1577750000..1577930000).contains(&v.as_i64().unwrap());
+        assert!(in_2020(&bases["live"]["active"]), "the backdated lock: {}", bases["live"]["active"]);
+        assert_eq!(bases["kept"]["busy"], true, "a bazel client holds it");
+        assert_eq!((bases["orphan"]["exists"].as_bool(), bases["orphan"]["workspace"].as_str()), (Some(false), Some("/nonexistent/wt")));
+        let entries: Vec<(String, String)> = s["entries"].as_array().unwrap().iter().map(|e| (e["kind"].as_str().unwrap().into(), e["path"].as_str().unwrap().rsplit('/').next().unwrap().into())).collect();
+        assert_eq!(entries, [("contents".to_string(), "u1".to_string()), ("download".into(), "d".into())], "u2 has no marker yet");
+        assert!(in_2020(&s["entries"][0]["used"]), "the backdated marker");
+        assert!(s["disk_kib"].as_u64().unwrap() > 0 && s["df"]["size"].as_u64().unwrap() > 0);
+
+        let evict: mlua::Function = m.get("evict_sh").unwrap();
+        let run = |plan: serde_json::Value| -> String {
+            let (script, input): (String, String) = evict.call((lua.to_value(&plan).unwrap(), r.as_str())).unwrap();
+            sh(&script, &input)
+        };
+        let item = |kind: &str, rel: &str| serde_json::json!({ "kind": kind, "path": format!("{r}/{rel}"), "kib": 1 });
+        let out = run(serde_json::json!({ "stop": [], "evict": [item("base", "workspace/live"), item("base", "workspace/kept"), item("base", "workspace/orphan"), item("contents", "repo/contents/h/u1"), item("download", "repo/content_addressable/sha256/d")] }));
+        assert_eq!(
+            out,
+            format!("skip {r}/workspace/live server\nskip {r}/workspace/kept client\nfreed {r}/workspace/orphan\nskip {r}/repo/contents/h/u1 server\nskip {r}/repo/content_addressable/sha256/d server\n"),
+            "a server under root keeps the repo cache; read-only files still go"
+        );
+        // Stopping the idle server frees all of it; a contents entry loses its marker too.
+        let out = run(serde_json::json!({ "stop": [server], "evict": [item("contents", "repo/contents/h/u1"), item("download", "repo/content_addressable/sha256/d"), item("base", "workspace/live")] }));
+        assert_eq!(out, format!("freed {r}/repo/contents/h/u1\nfreed {r}/repo/content_addressable/sha256/d\nfreed {r}/workspace/live\n"));
+        assert!(!root.join("repo/contents/h/u1.recorded_inputs").exists() && root.join("repo/contents/h/u2").exists());
+        let parsed = to_json(m.get::<mlua::Function>("parse_evict").unwrap().call("freed /a\nskip /b server\nstuck 4\n").unwrap());
+        assert_eq!(parsed, serde_json::json!({ "freed": { "/a": true }, "skipped": ["/b server"], "stuck": 1 }));
+
+        let _ = std::process::Command::new("kill").arg(client.to_string()).status();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `kitchen.every` runs on schedule and records its runs (stats, errors,
     /// SQLite); `t:run()` starts one now; a reload never overlaps a run that is
     /// still going. `kitchen.dashboard` sections follow the dashboard event.
@@ -1209,7 +1399,7 @@ end)
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 7 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        wait(&|| host.list().len() == 8 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);
