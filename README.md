@@ -55,6 +55,7 @@ scripts/install.sh              # release build, ~/Applications/The Kitchen.app 
 scripts/install.sh --no-linux   # skip the devbox cross-build
 cargo run -p kitchen-app        # development
 scripts/build-cli-linux.sh      # just the devbox binaries (needs cargo-zigbuild + zig)
+scripts/screenshots.sh [DIR]    # PNGs of every view, from an isolated test kitchen
 ```
 
 Needs `git`, `tmux` and `claude` on each host. State is
@@ -104,6 +105,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘D | workspace dashboard; in the viewer or plan: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |
 | ⌘. | switch the whole tab between the terminal and the file viewer (from the plan: back to the terminal) |
+| ⌘/ | list every shortcut |
 | ⌘C / ⌘V | copy / paste |
 
 ## Layout
