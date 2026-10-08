@@ -6,6 +6,19 @@ use egui::{Color32, CornerRadius, Response, RichText, Sense, TextFormat, Ui};
 
 use crate::theme;
 
+/// Height of the header row atop the viewer and the plan.
+pub const HEADER_HEIGHT: f32 = 36.0;
+
+/// A path in monospace: its folders dimmer than its name.
+pub fn path_job(path: &str, size: f32) -> LayoutJob {
+    let split = path.trim_end_matches('/').rfind('/').map(|i| i + 1).unwrap_or(0);
+    let mut job = LayoutJob::default();
+    let format = |color| TextFormat { font_id: egui::FontId::monospace(size), color, valign: egui::Align::Center, ..Default::default() };
+    job.append(&path[..split], 0.0, format(theme::SUBTLE));
+    job.append(&path[split..], 0.0, format(theme::TEXT));
+    job
+}
+
 /// An uppercase section label with a little tracking ("WORKSPACES").
 pub fn section_label(text: &str, color: Color32) -> LayoutJob {
     let mut job = LayoutJob::default();

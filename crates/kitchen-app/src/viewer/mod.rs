@@ -29,6 +29,8 @@ use kitchen_symbols::Symbol;
 use crate::engine::{Engine, Tab, Workspace};
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::theme;
+use crate::ui::widgets;
+use crate::ui::widgets::HEADER_HEIGHT;
 use code_view::{CodeView, ViewState};
 use doc::{Doc, DocLine};
 use highlight::Spans;
@@ -1017,36 +1019,40 @@ impl Viewer {
         }
         let font_size = cx.engine.settings().font_size;
 
-        // Header.
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            let path = if self.browsing {
-                format!("{}/", self.dir)
-            } else {
-                self.current.clone().unwrap_or_else(|| "no file — ⌘P to pick".into())
-            };
-            ui.label(RichText::new(path).monospace().size(12.5).color(theme::TEXT));
-            let (mode, color) = match (self.browsing, self.outline, self.diff) {
-                (true, ..) => ("FOLDER", theme::PURPLE),
-                (_, true, _) => ("OUTLINE", theme::CYAN),
-                _ if self.render_shown.is_some() => ("RENDERED", theme::YELLOW),
-                (_, _, true) => ("DIFF", theme::GREEN),
-                _ => ("FILE", theme::CYAN),
-            };
-            ui.label(RichText::new(mode).font(theme::ui_font_semibold(10.5)).color(theme::BG).background_color(color));
-            if self.diff && !self.outline && !self.browsing {
-                let (a, d) = self.doc.changed_count();
-                ui.label(RichText::new(format!("+{a} −{d}")).size(11.0).color(theme::DIM));
+        // Header: the path (folders dimmer than the name), what is shown, and the file list toggle.
+        let header = ui.available_rect_before_wrap();
+        let header = egui::Rect::from_min_size(header.min, egui::vec2(header.width(), HEADER_HEIGHT));
+        let mut header_ui = ui.new_child(egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        header_ui.add_space(theme::SPACE_M);
+        let path = if self.browsing {
+            format!("{}/", self.dir)
+        } else {
+            self.current.clone().unwrap_or_else(|| "no file — ⌘P to pick".into())
+        };
+        header_ui.label(widgets::path_job(&path, 12.5));
+        header_ui.add_space(theme::SPACE_XS);
+        let (mode, color) = match (self.browsing, self.outline, self.diff) {
+            (true, ..) => ("FOLDER", theme::PURPLE),
+            (_, true, _) => ("OUTLINE", theme::CYAN),
+            _ if self.render_shown.is_some() => ("RENDERED", theme::YELLOW),
+            (_, _, true) => ("DIFF", theme::GREEN),
+            _ => ("FILE", theme::CYAN),
+        };
+        widgets::pill(&mut header_ui, mode, color);
+        if self.diff && !self.outline && !self.browsing {
+            let (a, d) = self.doc.changed_count();
+            header_ui.add_space(theme::SPACE_XS);
+            header_ui.label(RichText::new(format!("+{a}")).font(theme::ui_font_semibold(theme::TEXT_SMALL)).color(theme::GREEN));
+            header_ui.label(RichText::new(format!("−{d}")).font(theme::ui_font_semibold(theme::TEXT_SMALL)).color(theme::RED));
+        }
+        header_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(theme::SPACE_S);
+            if widgets::flat_button(ui, "File list", self.show_files).on_hover_text("Show / hide the file list  ⌘B").clicked_by(egui::PointerButton::Primary) {
+                self.show_files = !self.show_files;
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(8.0);
-                let label = if self.show_files { "hide files ⌘B" } else { "files ⌘B" };
-                if ui.add(egui::Button::new(RichText::new(label).size(11.0).color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary) {
-                    self.show_files = !self.show_files;
-                }
-            });
         });
-        ui.separator();
+        ui.painter().hline(header.x_range(), header.bottom() - 0.5, egui::Stroke::new(1.0, theme::BORDER));
+        ui.advance_cursor_after_rect(header);
 
         // Footer (status line) first so the body gets the rest.
         let footer_h = 20.0;
@@ -1156,7 +1162,6 @@ impl Viewer {
         }
 
         // Status line.
-        let busy = self.vim.search_input.is_some() || self.vim.message.is_some() || self.status.is_some() || self.vim.anchor.is_some();
         let mut footer = ui.new_child(egui::UiBuilder::new().max_rect(footer_rect));
         footer.horizontal_centered(|ui| {
             ui.add_space(8.0);
@@ -1176,11 +1181,7 @@ impl Viewer {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 let pos = format!("{}  L{}:{}", self.vim.pending_display(), self.current_source_line().unwrap_or(0), self.vim.col + 1);
-                ui.label(RichText::new(pos).monospace().size(11.0).color(theme::DIM));
-                if !busy {
-                    let hint = if self.browsing { "j/k move · Enter open · - up · / search · ⌘⇧J next changed file · ⌘P find" } else { "⌘⇧J/K file · ]c/[c change · ⌘M comment · gd def · gr refs · ^o back · - folder · ⌘D ⌘O ⌘B" };
-                    ui.label(RichText::new(hint).size(10.5).color(theme::DIM));
-                }
+                ui.label(RichText::new(pos).monospace().size(11.0).color(theme::SUBTLE));
             });
         });
         ui.advance_cursor_after_rect(body);
@@ -1350,34 +1351,31 @@ impl Viewer {
         let mut clicked: Option<usize> = None;
         let mut all = false;
         egui::ScrollArea::vertical().id_salt(("changes", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(theme::SPACE_S);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("  CHANGED FILES ({})", self.changed.len())).font(theme::ui_font_semibold(10.5)).color(theme::DIM));
+                ui.add_space(theme::SPACE_M);
+                ui.label(widgets::section_label(&format!("Changed files  {}", self.changed.len()), theme::SUBTLE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(6.0);
-                    all = ui.add(egui::Button::new(RichText::new("a: all files").size(10.0).color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary);
+                    ui.add_space(theme::SPACE_XS);
+                    all = widgets::flat_button(ui, "All files", false).on_hover_text("The whole repo  a").clicked_by(egui::PointerButton::Primary);
                 });
             });
-            let f = |col, size| egui::TextFormat { font_id: egui::FontId::proportional(size), color: col, ..Default::default() };
+            ui.add_space(2.0);
+            let f = |col, size| egui::TextFormat { font_id: theme::ui_font(size), color: col, ..Default::default() };
             for r in &rows {
                 let indent = r.depth as f32 * 12.0;
                 let mut job = egui::text::LayoutJob::default();
                 let Some(i) = r.file else {
-                    job.append(&r.label, indent, f(theme::ACCENT.gamma_multiply(0.85), 11.0));
+                    job.append(&r.label, indent, f(theme::SUBTLE, theme::TEXT_SMALL));
                     list_row(ui, false, job);
                     continue;
                 };
                 let c = &self.changed[i];
                 let open = cur == Some(i);
-                let color = match c.status {
-                    'A' => theme::GREEN,
-                    'D' => theme::RED,
-                    'R' => theme::YELLOW,
-                    _ => theme::ACCENT,
-                };
-                job.append(&format!("{} ", c.status), indent, f(color, 11.0));
-                job.append(&r.label, 0.0, f(if open { theme::TEXT } else { theme::TEXT.gamma_multiply(0.85) }, 12.0));
-                job.append(&format!("  +{} −{}", c.added, c.removed), 0.0, f(theme::DIM, 10.5));
+                job.append(&format!("{} ", c.status), indent, egui::TextFormat { font_id: egui::FontId::monospace(10.5), color: status_color(c.status), ..Default::default() });
+                job.append(&r.label, 0.0, f(if open { theme::TEXT } else { theme::MUTED }, theme::TEXT_BODY));
+                job.append(&format!("+{}", c.added), 8.0, f(theme::GREEN.gamma_multiply(0.75), theme::TEXT_SMALL));
+                job.append(&format!("−{}", c.removed), 4.0, f(theme::RED.gamma_multiply(0.75), theme::TEXT_SMALL));
                 let resp = row(ui, open && self.list_focus, open, job).on_hover_text(&c.path);
                 if scroll && open {
                     resp.scroll_to_me(None);
@@ -1398,7 +1396,9 @@ impl Viewer {
 
     /// `keys`: the list has the keyboard.
     fn file_list(&mut self, ui: &mut Ui, keys: bool) {
-        ui.painter().rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, theme::PANEL);
+        let r = ui.max_rect();
+        ui.painter().rect_filled(r, egui::CornerRadius::ZERO, theme::PANEL);
+        ui.painter().vline(r.right() + 0.5, r.y_range(), egui::Stroke::new(1.0, theme::BORDER));
         if self.tree_mode() {
             return self.changes_list(ui, keys);
         }
@@ -1415,24 +1415,23 @@ impl Viewer {
         let mut clicked: Option<usize> = None;
         let mut browse: Option<String> = None;
         egui::ScrollArea::vertical().id_salt(("files", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(theme::SPACE_S);
             if !self.changed.is_empty() {
-                ui.label(RichText::new(format!("  CHANGED FILES ({}) · a: tree", self.changed.len())).font(theme::ui_font_semibold(10.5)).color(theme::DIM));
+                ui.horizontal(|ui| {
+                    ui.add_space(theme::SPACE_M);
+                    ui.label(widgets::section_label(&format!("Changed files  {}", self.changed.len()), theme::SUBTLE)).on_hover_text("a: back to the tree of changes");
+                });
+                ui.add_space(2.0);
             }
             for (i, c) in self.changed.iter().enumerate() {
                 let open = self.current.as_deref() == Some(c.path.as_str()) && !self.browsing;
-                let color = match c.status {
-                    'A' => theme::GREEN,
-                    'D' => theme::RED,
-                    'R' => theme::YELLOW,
-                    _ => theme::ACCENT,
-                };
                 let name = c.path.rsplit('/').next().unwrap_or(&c.path);
                 let mut job = egui::text::LayoutJob::default();
-                let f = |col, size| egui::TextFormat { font_id: egui::FontId::proportional(size), color: col, ..Default::default() };
-                job.append(&format!("{} ", c.status), 0.0, f(color, 11.0));
-                job.append(name, 0.0, f(if open { theme::TEXT } else { theme::TEXT.gamma_multiply(0.85) }, 12.0));
-                job.append(&format!("  +{} −{}", c.added, c.removed), 0.0, f(theme::DIM, 10.5));
+                let f = |col, size| egui::TextFormat { font_id: theme::ui_font(size), color: col, ..Default::default() };
+                job.append(&format!("{} ", c.status), 0.0, egui::TextFormat { font_id: egui::FontId::monospace(10.5), color: status_color(c.status), ..Default::default() });
+                job.append(name, 0.0, f(if open { theme::TEXT } else { theme::MUTED }, theme::TEXT_BODY));
+                job.append(&format!("+{}", c.added), 8.0, f(theme::GREEN.gamma_multiply(0.75), theme::TEXT_SMALL));
+                job.append(&format!("−{}", c.removed), 4.0, f(theme::RED.gamma_multiply(0.75), theme::TEXT_SMALL));
                 let r = row(ui, cursor == Some(i), open, job).on_hover_text(&c.path);
                 if scroll && cursor == Some(i) {
                     r.scroll_to_me(None);
@@ -1446,7 +1445,7 @@ impl Viewer {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(8.0);
-                let crumb = |ui: &mut Ui, text: &str| ui.add(egui::Button::new(RichText::new(text).font(theme::ui_font_semibold(10.5)).color(theme::DIM)).frame(false)).clicked_by(egui::PointerButton::Primary);
+                let crumb = |ui: &mut Ui, text: &str| ui.add(egui::Button::new(RichText::new(text).font(theme::ui_font_semibold(theme::TEXT_LABEL)).color(theme::SUBTLE)).frame(false)).clicked_by(egui::PointerButton::Primary);
                 if crumb(ui, "ROOT") {
                     browse = Some(String::new());
                 }
@@ -1464,13 +1463,13 @@ impl Viewer {
                 let open = !e.is_dir && self.current.as_deref() == Some(e.path.as_str()) && !self.browsing;
                 let n = if e.label == "../" { 0 } else { changed_under.get(e.path.as_str()).copied().unwrap_or(0) };
                 let color = match (e.is_dir, n > 0) {
-                    (true, _) => theme::ACCENT,
+                    (true, _) => theme::ACCENT.gamma_multiply(0.9),
                     (false, true) => theme::YELLOW,
                     _ if open => theme::TEXT,
-                    _ => theme::TEXT.gamma_multiply(0.8),
+                    _ => theme::MUTED,
                 };
                 let text = if n > 0 && e.is_dir { format!("{}  ●{n}", e.label) } else { e.label.clone() };
-                let r = row(ui, cursor == Some(pr + i), open, RichText::new(text).size(11.5).color(color)).on_hover_text(&e.path);
+                let r = row(ui, cursor == Some(pr + i), open, RichText::new(text).font(theme::ui_font(theme::TEXT_BODY)).color(color)).on_hover_text(&e.path);
                 if scroll && cursor == Some(pr + i) {
                     r.scroll_to_me(None);
                 }
@@ -1479,7 +1478,7 @@ impl Viewer {
                 }
             }
             if entries.is_empty() && self.files_state.is_some() {
-                ui.label(RichText::new("  (empty)").size(11.0).color(theme::DIM));
+                ui.label(RichText::new("    (empty)").font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE));
             }
         });
         if let Some(i) = clicked {
@@ -1493,11 +1492,21 @@ impl Viewer {
     }
 }
 
+/// Git status letter colors: added and deleted stand out, modified stays quiet.
+fn status_color(status: char) -> egui::Color32 {
+    match status {
+        'A' => theme::GREEN,
+        'D' => theme::RED,
+        'R' => theme::PURPLE,
+        _ => theme::SUBTLE,
+    }
+}
+
 /// A file-list row: `cursor` is the keyboard cursor, `open` the open file.
 fn row(ui: &mut Ui, cursor: bool, open: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
     let r = list_row(ui, cursor || open, text);
     if cursor {
-        let bar = egui::Rect::from_min_size(r.rect.min, egui::vec2(2.5, r.rect.height()));
+        let bar = egui::Rect::from_min_size(r.rect.min + egui::vec2(4.0, 3.0), egui::vec2(2.5, r.rect.height() - 6.0));
         ui.painter().rect_filled(bar, egui::CornerRadius::ZERO, theme::FOCUS);
     }
     r
@@ -1505,7 +1514,7 @@ fn row(ui: &mut Ui, cursor: bool, open: bool, text: impl Into<egui::WidgetText>)
 
 /// A full-width, flat, left-aligned row (file list, picker).
 pub(crate) fn list_row(ui: &mut Ui, selected: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
-    let pad = egui::vec2(6.0, 2.0);
+    let pad = egui::vec2(10.0, 3.0);
     let width = ui.available_width();
     let galley = text.into().into_galley(ui, Some(egui::TextWrapMode::Truncate), width - 2.0 * pad.x, egui::TextStyle::Button);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, galley.size().y + 2.0 * pad.y), egui::Sense::click());
@@ -1513,11 +1522,11 @@ pub(crate) fn list_row(ui: &mut Ui, selected: bool, text: impl Into<egui::Widget
         let fill = if selected {
             theme::SELECTED
         } else if resp.hovered() {
-            theme::SELECTED.gamma_multiply(0.5)
+            theme::HOVER
         } else {
             egui::Color32::TRANSPARENT
         };
-        ui.painter().rect_filled(rect, egui::CornerRadius::same(3), fill);
+        ui.painter().rect_filled(rect.shrink2(egui::vec2(4.0, 0.0)), egui::CornerRadius::same(theme::RADIUS_S), fill);
         ui.painter().galley(rect.min + pad, galley, theme::TEXT);
     }
     resp

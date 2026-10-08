@@ -192,7 +192,7 @@ impl CodeView<'_> {
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::ZERO, theme::BG);
-        painter.rect_filled(Rect::from_min_size(rect.min, Vec2::new(gutter, rect.height())), CornerRadius::ZERO, theme::PANEL);
+
 
         let visual = vim.anchor.map(|(al, ac, linewise)| {
             let (s, e) = if (al, ac) <= (vim.line, vim.col) { ((al, ac), (vim.line, vim.col)) } else { ((vim.line, vim.col), (al, ac)) };
@@ -266,6 +266,9 @@ impl CodeView<'_> {
             };
             if let Some(bg) = bg {
                 under_shapes.push(Shape::rect_filled(row, CornerRadius::ZERO, bg));
+                // A bar down the left edge marks the change, as on GitHub.
+                let bar = if line.kind == LineKind::Added { theme::GREEN } else { theme::RED };
+                under_shapes.push(Shape::rect_filled(Rect::from_min_size(row.min, Vec2::new(3.0, row_height)), CornerRadius::ZERO, bar.gamma_multiply(0.8)));
             }
             match rendered.and_then(|r| r.block.as_deref()) {
                 Some("code") => {

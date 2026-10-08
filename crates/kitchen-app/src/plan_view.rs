@@ -16,6 +16,7 @@ use kitchen_core::plan;
 use crate::engine::{Engine, Tab, Workspace};
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::theme;
+use crate::ui::widgets;
 use crate::viewer::code_view::{Block, CodeView, Editor, ViewState};
 use crate::viewer::doc::Doc;
 use crate::viewer::highlight;
@@ -227,14 +228,25 @@ impl PlanView {
         let open = self.comments.iter().filter(|c| c.state == "open").count();
         let sent = self.comments.iter().filter(|c| c.state == "sent").count();
         let resolved = self.comments.iter().filter(|c| c.state == "resolved").count();
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(RichText::new("PLAN").font(theme::ui_font_semibold(10.5)).color(theme::BG).background_color(theme::YELLOW));
-            let path = self.path.as_deref().map(|p| p.strip_prefix(&format!("{}/", self.worktree)).unwrap_or(p).to_string());
-            ui.label(RichText::new(path.unwrap_or_else(|| "—".into())).monospace().size(12.0));
-            ui.label(RichText::new(format!("{open} open · {sent} sent · {resolved} resolved")).size(11.0).color(theme::DIM));
+        let header = ui.available_rect_before_wrap();
+        let header = egui::Rect::from_min_size(header.min, egui::vec2(header.width(), widgets::HEADER_HEIGHT));
+        let mut header_ui = ui.new_child(egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        header_ui.add_space(theme::SPACE_M);
+        let path = self.path.as_deref().map(|p| p.strip_prefix(&format!("{}/", self.worktree)).unwrap_or(p).to_string());
+        header_ui.label(widgets::path_job(&path.unwrap_or_else(|| "—".into()), 12.5));
+        header_ui.add_space(theme::SPACE_XS);
+        widgets::pill(&mut header_ui, "PLAN", theme::YELLOW);
+        header_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(theme::SPACE_M);
+            let count = |ui: &mut Ui, n: usize, what: &str, color: egui::Color32| {
+                ui.label(RichText::new(format!("{n} {what}")).font(theme::ui_font(theme::TEXT_SMALL)).color(if n > 0 { color } else { theme::DIM }));
+            };
+            count(ui, resolved, "resolved", theme::SUBTLE);
+            count(ui, sent, "sent", theme::ACCENT);
+            count(ui, open, "open", theme::YELLOW);
         });
-        ui.separator();
+        ui.painter().hline(header.x_range(), header.bottom() - 0.5, egui::Stroke::new(1.0, theme::BORDER));
+        ui.advance_cursor_after_rect(header);
 
         let full = ui.available_rect_before_wrap();
         let footer_h = 20.0;
@@ -253,7 +265,7 @@ impl PlanView {
             None
         };
         if let Some(text) = empty {
-            body_ui.centered_and_justified(|ui| ui.label(RichText::new(text).color(theme::DIM)));
+            body_ui.centered_and_justified(|ui| ui.label(RichText::new(text).font(theme::ui_font(theme::TEXT_BODY)).color(theme::SUBTLE)));
         } else {
             let blocks = self.blocks();
             let out = CodeView {
@@ -281,7 +293,6 @@ impl PlanView {
             }
         }
 
-        let busy = self.vim.search_input.is_some() || self.vim.message.is_some() || self.status.is_some() || self.vim.anchor.is_some();
         let mut f = ui.new_child(egui::UiBuilder::new().max_rect(footer));
         f.horizontal_centered(|ui| {
             ui.add_space(8.0);
@@ -296,10 +307,7 @@ impl PlanView {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
-                ui.label(RichText::new(format!("L{}", self.vim.line + 1)).monospace().size(11.0).color(theme::DIM));
-                if !busy {
-                    ui.label(RichText::new("⌘M comment · ⌘Enter submit / send all to agent").size(10.5).color(theme::DIM));
-                }
+                ui.label(RichText::new(format!("L{}", self.vim.line + 1)).monospace().size(11.0).color(theme::SUBTLE));
             });
         });
         ui.advance_cursor_after_rect(full);

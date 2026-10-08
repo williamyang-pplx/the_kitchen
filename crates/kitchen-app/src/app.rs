@@ -751,7 +751,7 @@ impl KitchenApp {
                 }
                 for (kind, label, keys, action) in [
                     (SideKind::Plan, "Plan", "⌘⇧I", Action::OpenPlan),
-                    (SideKind::Viewer, "Files", "⌘.", Action::ToggleFiles),
+                    (SideKind::Viewer, "Viewer", "⌘.", Action::ToggleFiles),
                 ] {
                     let on = self.focus() == Focus::Side && self.side() == Some(kind) && !self.dashboard.contains(&ws.row.id);
                     if widgets::flat_button(ui, label, on).on_hover_text(format!("{label}  {keys}")).clicked_by(egui::PointerButton::Primary) {
