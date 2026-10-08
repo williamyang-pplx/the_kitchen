@@ -995,7 +995,8 @@ impl Viewer {
 
     fn open_file_picker(&mut self) {
         let (items, bonus) = file_items(&self.changed, &self.all, &self.dir);
-        let mut picker = Picker::with_bonus("open file · changed files and this folder first", items, bonus);
+        let mut picker = Picker::with_bonus("Open file", items, bonus);
+        picker.hint = "Changed files and this folder first".into();
         picker.loading = self.files_state.is_none();
         self.picker = Some((PickerKind::Files, picker));
     }
@@ -1072,7 +1073,21 @@ impl Viewer {
             }
         }
         let mut code_ui = body_ui.new_child(egui::UiBuilder::new().max_rect(code_rect));
-        let picked = self.picker.as_mut().map(|(_, picker)| picker.ui(&mut code_ui, cx.focused));
+        // The picker floats over the code, centered near its top.
+        let picked = self.picker.as_mut().map(|(_, picker)| {
+            let width = (code_rect.width() - 48.0).clamp(320.0, 760.0);
+            let pos = egui::pos2(code_rect.center().x - width / 2.0, code_rect.top() + 24.0);
+            let max_height = (code_rect.height() - 48.0).clamp(160.0, 520.0);
+            egui::Area::new(egui::Id::new(("picker", &self.tab_id)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .show(ui.ctx(), |ui| {
+                    ui.set_width(width);
+                    ui.set_max_height(max_height);
+                    picker.ui(ui, cx.focused)
+                })
+                .inner
+        });
         if matches!(picked, Some(PickerResult::Cancelled | PickerResult::Chosen(_))) && self.provisional_picker() {
             // The user acted on the text matches: a late provider answer is dropped.
             self.pending_nav = None;

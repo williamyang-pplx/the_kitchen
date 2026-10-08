@@ -8,6 +8,10 @@ use egui::{Key, RichText};
 
 use crate::engine::{Engine, NewTab, Tab, Workspace};
 use crate::theme;
+use crate::ui::widgets;
+
+/// Width of a dialog's content (its fields span it).
+const FIELD_WIDTH: f32 = 480.0;
 
 pub enum DialogOutcome {
     Open,
@@ -96,54 +100,83 @@ impl Dialog {
             return DialogOutcome::Closed;
         }
         let mut outcome = DialogOutcome::Open;
-        egui::Modal::new(egui::Id::new("kitchen-dialog")).show(ctx, |ui| {
-            ui.set_width(520.0);
-            outcome = match self {
-                Dialog::NewWorkspace(d) => d.ui(ui, engine),
-                Dialog::NewTab(d) => d.ui(ui, engine),
-                Dialog::Rename(d) => d.ui(ui, engine),
-                Dialog::ConfirmCloseTab { id, title } => confirm(
-                    ui,
-                    &format!("Close tab “{title}”?"),
-                    "Its tmux session (and any agent running in it) ends. The worktree and branch stay on disk.",
-                    || {
-                        let id = id.clone();
-                        engine.spawn("close tab", move |e| e.close_tab(&id));
-                    },
-                ),
-                Dialog::ConfirmCloseWorkspace { id, name } => confirm(
-                    ui,
-                    &format!("Remove workspace “{name}”?"),
-                    "All its tabs' tmux sessions end. Repos and worktrees stay on disk.",
-                    || {
-                        let id = id.clone();
-                        engine.spawn("remove workspace", move |e| e.close_workspace(&id));
-                    },
-                ),
-            };
-        });
+        egui::Modal::new(egui::Id::new("kitchen-dialog"))
+            .frame(widgets::overlay_frame().inner_margin(egui::Margin::same(theme::SPACE_XL as i8)))
+            .backdrop_color(egui::Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(FIELD_WIDTH);
+                outcome = match self {
+                    Dialog::NewWorkspace(d) => d.ui(ui, engine),
+                    Dialog::NewTab(d) => d.ui(ui, engine),
+                    Dialog::Rename(d) => d.ui(ui, engine),
+                    Dialog::ConfirmCloseTab { id, title } => confirm(
+                        ui,
+                        &format!("Close tab “{title}”?"),
+                        "Its tmux session (and any agent running in it) ends. The worktree and branch stay on disk.",
+                        "Close tab",
+                        || {
+                            let id = id.clone();
+                            engine.spawn("close tab", move |e| e.close_tab(&id));
+                        },
+                    ),
+                    Dialog::ConfirmCloseWorkspace { id, name } => confirm(
+                        ui,
+                        &format!("Remove workspace “{name}”?"),
+                        "All its tabs' tmux sessions end. Repos and worktrees stay on disk.",
+                        "Remove",
+                        || {
+                            let id = id.clone();
+                            engine.spawn("remove workspace", move |e| e.close_workspace(&id));
+                        },
+                    ),
+                };
+            });
         outcome
     }
 }
 
-fn confirm(ui: &mut egui::Ui, title: &str, body: &str, on_yes: impl FnOnce()) -> DialogOutcome {
-    ui.heading(title);
-    ui.add_space(6.0);
-    ui.label(RichText::new(body).color(theme::DIM));
-    ui.add_space(10.0);
-    buttons(ui, "Close", true, on_yes)
+fn confirm(ui: &mut egui::Ui, title: &str, body: &str, yes: &str, on_yes: impl FnOnce()) -> DialogOutcome {
+    heading(ui, title, Some(body));
+    buttons(ui, yes, true, on_yes)
 }
 
-/// "<label> ⏎" (enabled when `can`; Enter presses it too) and "Cancel esc".
+/// A dialog's title, and the sentence under it.
+fn heading(ui: &mut egui::Ui, title: &str, body: Option<&str>) {
+    ui.label(RichText::new(title).font(theme::ui_font_semibold(theme::TEXT_HEADING)).color(theme::TEXT));
+    if let Some(body) = body {
+        ui.add_space(theme::SPACE_XS);
+        ui.label(RichText::new(body).font(theme::ui_font(theme::TEXT_BODY)).color(theme::SUBTLE));
+    }
+    ui.add_space(theme::SPACE_L + 2.0);
+}
+
+/// A field's label, just above it.
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).font(theme::ui_font_semibold(theme::TEXT_SMALL)).color(theme::MUTED));
+    ui.add_space(2.0);
+}
+
+/// A single-line text field spanning the dialog.
+fn field<'t>(text: &'t mut String, hint: &str) -> egui::TextEdit<'t> {
+    egui::TextEdit::singleline(text)
+        .font(theme::ui_font(theme::TEXT_BODY))
+        .margin(egui::Margin::symmetric(10, 7))
+        .hint_text(RichText::new(hint).color(theme::DIM))
+        .desired_width(FIELD_WIDTH)
+}
+
+/// Right-aligned "Cancel" and "<label> ⏎" (enabled when `can`; Enter presses it too).
 fn buttons(ui: &mut egui::Ui, label: &str, can: bool, on_yes: impl FnOnce()) -> DialogOutcome {
     let enter = ui.input(|i| i.key_pressed(Key::Enter));
     let mut out = DialogOutcome::Open;
-    ui.horizontal(|ui| {
-        if (ui.add_enabled(can, egui::Button::new(format!("{label}  ⏎"))).clicked() || enter) && can {
+    ui.add_space(theme::SPACE_XL);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.spacing_mut().button_padding = egui::vec2(14.0, 6.0);
+        if (ui.add_enabled(can, widgets::primary_button(&format!("{label}  ⏎"))).clicked() || enter) && can {
             on_yes();
             out = DialogOutcome::Done;
         }
-        if ui.button("Cancel  esc").clicked() {
+        if ui.add(egui::Button::new(RichText::new("Cancel").font(theme::ui_font(theme::TEXT_BODY)))).clicked() {
             out = DialogOutcome::Closed;
         }
     });
@@ -161,25 +194,24 @@ fn focus_select_all(ui: &egui::Ui, field: &egui::Response, text: &str) {
 
 impl NewWorkspace {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
-        ui.heading("New workspace");
-        ui.label(RichText::new("A repository on this mac or on a devbox. Devbox setup pulls your dotfiles and links skills.").color(theme::DIM).size(12.0));
-        ui.add_space(8.0);
+        heading(ui, "New workspace", Some("A repository on this mac or on a devbox. Devbox setup pulls your dotfiles and links skills."));
         let hosts = self.hosts.lock().unwrap().clone();
         let host = hosts.get(self.host_idx).cloned().unwrap_or(HostChoice { alias: "local".into(), devbox: false });
 
-        ui.label("Location");
+        field_label(ui, "Location");
+        ui.spacing_mut().interact_size.y = 32.0;
         egui::ComboBox::from_id_salt("host")
-            .width(480.0)
+            .width(FIELD_WIDTH)
             .selected_text(host_label(&host))
             .show_ui(ui, |ui| {
                 for (i, h) in hosts.iter().enumerate() {
                     ui.selectable_value(&mut self.host_idx, i, host_label(h));
                 }
             });
-        ui.add_space(6.0);
+        ui.add_space(theme::SPACE_M);
 
-        ui.label("Repository path");
-        let repo_resp = ui.add(egui::TextEdit::singleline(&mut self.repo).hint_text(if host.alias == "local" { "~/Documents/air" } else { "~/air" }).desired_width(480.0));
+        field_label(ui, "Repository path");
+        let repo_resp = ui.add(field(&mut self.repo, if host.alias == "local" { "~/Documents/air" } else { "~/air" }));
         if self.first_frame {
             repo_resp.request_focus();
             self.first_frame = false;
@@ -193,18 +225,21 @@ impl NewWorkspace {
             .map(|v| v.iter().filter(|r| r.contains(self.repo.trim())).take(6).cloned().collect())
             .unwrap_or_default();
         if !suggestions.is_empty() && !suggestions.iter().any(|s| s == self.repo.trim()) {
+            ui.add_space(theme::SPACE_XS + 2.0);
             ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
                 for s in suggestions {
-                    if ui.small_button(&s).clicked() {
+                    let chip = egui::Button::new(RichText::new(&s).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::MUTED)).corner_radius(theme::RADIUS_L);
+                    if ui.add(chip).clicked() {
                         self.repo = s;
                     }
                 }
             });
         }
-        ui.add_space(6.0);
-        ui.label("Name (optional)");
-        ui.add(egui::TextEdit::singleline(&mut self.name).hint_text("defaults to the repo name").desired_width(480.0));
-        ui.add_space(10.0);
+        ui.add_space(theme::SPACE_M);
+        field_label(ui, "Name (optional)");
+        ui.add(field(&mut self.name, "defaults to the repo name"));
 
         let (name, host, repo) = (self.name.clone(), host.alias.clone(), self.repo.clone());
         buttons(ui, "Create", !repo.trim().is_empty(), || {
@@ -284,14 +319,12 @@ pub fn parse_ssh_config(text: &str) -> Vec<HostChoice> {
 
 impl Rename {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
-        ui.heading(if self.workspace { "Rename workspace" } else { "Rename tab" });
-        ui.add_space(8.0);
-        let field = ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(500.0));
+        heading(ui, if self.workspace { "Rename workspace" } else { "Rename tab" }, None);
+        let resp = ui.add(field(&mut self.name, "name"));
         if self.first_frame {
-            focus_select_all(ui, &field, &self.name);
+            focus_select_all(ui, &resp, &self.name);
             self.first_frame = false;
         }
-        ui.add_space(10.0);
         let name = self.name.trim().to_string();
         let (id, workspace) = (self.id.clone(), self.workspace);
         buttons(ui, "Rename", !name.is_empty(), || {
@@ -302,21 +335,12 @@ impl Rename {
 
 impl NewTabDialog {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
-        ui.heading("New tab");
-        ui.label(
-            RichText::new("A name: its own worktree + branch off the latest origin. Claude runs in it.")
-                .color(theme::DIM)
-                .size(12.0),
-        );
-        ui.add_space(8.0);
-        let field = ui.add(
-            egui::TextEdit::singleline(&mut self.text).hint_text("tab name").desired_width(500.0),
-        );
+        heading(ui, "New tab", Some("Its own worktree and branch off the latest origin, with Claude running in it."));
+        let resp = ui.add(field(&mut self.text, "tab name"));
         if self.first_frame {
-            focus_select_all(ui, &field, &self.text);
+            focus_select_all(ui, &resp, &self.text);
             self.first_frame = false;
         }
-        ui.add_space(10.0);
         let text = self.text.trim().to_string();
         buttons(ui, "Create", true, || {
             if let Some(ws) = engine.selected_workspace() {
@@ -363,6 +387,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let ctx = egui::Context::default();
+            crate::theme::install(&ctx); // the UI font families
             let engine = Engine::new(ctx.clone(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
             let mut dialog = Dialog::new_tab();
             let mut step = |events: Vec<egui::Event>| {

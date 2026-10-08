@@ -22,6 +22,8 @@ const MAX_ROWS: usize = 300;
 
 pub struct Picker {
     pub title: String,
+    /// Placeholder in the empty query field.
+    pub hint: String,
     /// (label, dimmed detail) per item.
     pub items: Vec<(String, String)>,
     /// Added to an item's score (and orders an empty query, highest first).
@@ -180,7 +182,7 @@ impl Picker {
     }
 
     pub fn with_bonus(title: impl Into<String>, items: Vec<(String, String)>, bonus: Vec<i64>) -> Self {
-        let mut p = Self { title: title.into(), items, bonus, query: String::new(), filtered: Vec::new(), matched: 0, selected: 0, loading: false };
+        let mut p = Self { title: title.into(), hint: "Type to filter".into(), items, bonus, query: String::new(), filtered: Vec::new(), matched: 0, selected: 0, loading: false };
         p.refilter();
         p
     }
@@ -235,20 +237,31 @@ impl Picker {
                 }
             }
         }
-        egui::Frame::NONE.fill(theme::PANEL).stroke(egui::Stroke::new(1.0, theme::ACCENT)).inner_margin(8.0).corner_radius(6.0).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&self.title).size(11.0).color(theme::ACCENT));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let count = if self.loading { "loading files…".to_string() } else { format!("{} / {}", self.matched, self.items.len()) };
-                    ui.label(RichText::new(count).size(11.0).color(theme::DIM));
+        crate::ui::widgets::overlay_frame().inner_margin(egui::Margin::ZERO).show(ui, |ui| {
+            // Title and count.
+            egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 2 }).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(crate::ui::widgets::section_label(&self.title, theme::SUBTLE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let count = if self.loading { "loading files…".to_string() } else { format!("{} / {}", self.matched, self.items.len()) };
+                        ui.label(RichText::new(count).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
+                    });
                 });
             });
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.query)
-                    .id_salt("picker-query")
-                    .desired_width(f32::INFINITY)
-                    .hint_text("type to filter · space-separated terms · ↑↓/ctrl-j/k · Enter · Esc"),
-            );
+            let r = egui::Frame::NONE
+                .inner_margin(egui::Margin { left: 10, right: 10, top: 2, bottom: 8 })
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.query)
+                            .id_salt("picker-query")
+                            .font(theme::ui_font(theme::TEXT_TITLE))
+                            .frame(egui::Frame::NONE)
+                            .margin(egui::Margin::symmetric(6, 4))
+                            .desired_width(f32::INFINITY)
+                            .hint_text(RichText::new(&self.hint).font(theme::ui_font(theme::TEXT_TITLE)).color(theme::DIM)),
+                    )
+                })
+                .inner;
             // The picker is modal: keep the query field focused whenever
             // its panel is (focus can be lost by switching panes).
             if focused && !r.has_focus() {
@@ -257,34 +270,76 @@ impl Picker {
             if r.changed() {
                 self.refilter();
             }
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical().max_height(ui.available_height().max(120.0)).auto_shrink([false, true]).show(ui, |ui| {
-                for (row, (i, pos)) in self.filtered.iter().enumerate() {
-                    let (label, detail) = &self.items[*i];
-                    let sel = row == self.selected;
-                    let mut job = highlighted(label, pos, sel);
-                    if !detail.is_empty() {
-                        let fmt = egui::TextFormat { font_id: egui::FontId::proportional(11.0), color: theme::DIM, ..Default::default() };
-                        job.append(detail, 12.0, fmt);
+            let line = ui.available_rect_before_wrap();
+            ui.painter().hline(line.x_range(), line.top(), egui::Stroke::new(1.0, theme::BORDER));
+            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(6, 6)).show(ui, |ui| {
+                let max = (ui.available_height() - 34.0).max(120.0);
+                egui::ScrollArea::vertical().max_height(max).auto_shrink([false, true]).show(ui, |ui| {
+                    for (row, (i, pos)) in self.filtered.iter().enumerate() {
+                        let (label, detail) = &self.items[*i];
+                        let sel = row == self.selected;
+                        let resp = picker_row(ui, sel, highlighted(label, pos, sel), detail);
+                        if sel {
+                            resp.scroll_to_me(None);
+                        }
+                        if resp.clicked_by(egui::PointerButton::Primary) {
+                            result = PickerResult::Chosen(*i);
+                        }
                     }
-                    let resp = super::list_row(ui, sel, job);
-                    if sel {
-                        resp.scroll_to_me(None);
+                    let note = |ui: &mut egui::Ui, text: &str| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(text).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE));
+                        });
+                    };
+                    if self.filtered.is_empty() {
+                        note(ui, if self.loading { "loading files…" } else { "no matches" });
+                    } else if self.matched > self.filtered.len() {
+                        note(ui, &format!("… {} more — keep typing", self.matched - self.filtered.len()));
                     }
-                    if resp.clicked_by(egui::PointerButton::Primary) {
-                        result = PickerResult::Chosen(*i);
-                    }
-                }
-                if self.filtered.is_empty() {
-                    let msg = if self.loading { "loading files…" } else { "no matches" };
-                    ui.label(RichText::new(msg).color(theme::DIM));
-                } else if self.matched > self.filtered.len() {
-                    ui.label(RichText::new(format!("… {} more — keep typing", self.matched - self.filtered.len())).size(11.0).color(theme::DIM));
-                }
+                });
+            });
+            let line = ui.available_rect_before_wrap();
+            ui.painter().hline(line.x_range(), line.top(), egui::Stroke::new(1.0, theme::BORDER));
+            egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 7, bottom: 8 }).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    crate::ui::widgets::key_hints(ui, &[("↑↓", "select"), ("⏎", "open"), ("esc", "close")]);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new("spaces separate terms").font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
+                    });
+                });
             });
         });
         result
     }
+}
+
+/// One result: the label, and its detail right-aligned and dimmer.
+fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, detail: &str) -> egui::Response {
+    let width = ui.available_width();
+    let pad = egui::vec2(10.0, 5.0);
+    let detail = (!detail.is_empty()).then(|| ui.painter().layout_no_wrap(detail.to_string(), theme::ui_font(theme::TEXT_SMALL), if selected { theme::SUBTLE } else { theme::DIM }));
+    let detail_w = detail.as_ref().map_or(0.0, |g| (g.size().x + 16.0).min(width * 0.45));
+    let mut label = label;
+    label.wrap = egui::text::TextWrapping::truncate_at_width(width - 2.0 * pad.x - detail_w);
+    let galley = ui.painter().layout_job(label);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, galley.size().y + 2.0 * pad.y), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if selected {
+            theme::SELECTED
+        } else if resp.hovered() {
+            theme::HOVER
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(theme::RADIUS), fill);
+        ui.painter().galley(rect.min + pad, galley, theme::TEXT);
+        if let Some(g) = detail {
+            let clip = egui::Rect::from_min_max(egui::pos2(rect.right() - detail_w, rect.top()), rect.max);
+            ui.painter().with_clip_rect(clip).galley(egui::pos2(rect.right() - pad.x - g.size().x, rect.center().y - g.size().y / 2.0), g, theme::DIM);
+        }
+    }
+    resp
 }
 
 /// `label` with the matched bytes in the accent color; the file name brighter than its directory.
@@ -299,9 +354,10 @@ fn highlighted(label: &str, pos: &[usize], selected: bool) -> egui::text::Layout
         }
         let hit = pi < pos.len() && pos[pi] == b;
         let base = match (selected, b >= name_start) {
-            (true, _) => theme::TEXT,
-            (false, true) => theme::TEXT.gamma_multiply(0.85),
-            (false, false) => theme::DIM,
+            (true, true) => theme::TEXT,
+            (true, false) => theme::MUTED,
+            (false, true) => theme::MUTED,
+            (false, false) => theme::SUBTLE,
         };
         let color = if hit { theme::ACCENT } else { base };
         let mut buf = [0u8; 4];
@@ -360,6 +416,7 @@ mod tests {
     #[test]
     fn typing_filters_and_late_items() {
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx); // the UI font families
         let mut p = Picker::new("t", Vec::new());
         p.loading = true;
         let frame = |p: &mut Picker, events: Vec<egui::Event>| {

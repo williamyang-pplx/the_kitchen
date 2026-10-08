@@ -475,7 +475,9 @@ impl KitchenApp {
         items.push((PaletteItem::Diagnostics, ("viewer: diagnostics in this file".into(), "]d / [d".into())));
         items.push((PaletteItem::ReloadPlugins, ("plugins: reload all".into(), format!("{}", kitchen_proto::state_dir().join("plugins").display()))));
         let (kinds, labels): (Vec<PaletteItem>, Vec<(String, String)>) = items.into_iter().unzip();
-        self.palette = Some((kinds, crate::viewer::picker::Picker::new("command palette · ⌘⇧P", labels)));
+        let mut picker = crate::viewer::picker::Picker::new("Commands", labels);
+        picker.hint = "Run a command, or paste a PR link".into();
+        self.palette = Some((kinds, picker));
     }
 
     fn palette_ui(&mut self, ctx: &egui::Context) {
@@ -493,9 +495,9 @@ impl KitchenApp {
             return;
         }
         let mut result = crate::viewer::picker::PickerResult::Open;
-        egui::Area::new(egui::Id::new("palette")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 70.0)).show(ctx, |ui| {
-            ui.set_width(620.0);
-            ui.set_max_height(440.0);
+        egui::Area::new(egui::Id::new("palette")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 96.0)).show(ctx, |ui| {
+            ui.set_width(640.0);
+            ui.set_max_height(460.0);
             result = picker.ui(ui, true);
         });
         match result {
