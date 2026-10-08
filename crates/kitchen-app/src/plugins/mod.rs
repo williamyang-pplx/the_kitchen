@@ -32,7 +32,7 @@ use keys::Chord;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 9;
+pub const API_LEVEL: u32 = 10;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
 /// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
@@ -903,7 +903,8 @@ mod tests {
         host
     }
 
-    /// markdown: every source line in exactly one row, and the rows' styles.
+    /// markdown: every source line in exactly one row; prose as Markdown
+    /// blocks, top-level code a row per line.
     #[test]
     fn markdown_plugin_rows() {
         use mlua::LuaSerdeExt;
@@ -915,7 +916,7 @@ mod tests {
             let v: serde_json::Value = lua.from_value(f.call(text).unwrap()).unwrap();
             decor::parse_render(v).unwrap()
         };
-        let text = "---\ntitle: x\n---\n# Title *é*\n\n\nSome **bold** and `code`,\na [link](http://x) and snake_case_word.\n\n- one\n  more of one\n- [x] done\n  1. nested\n\n> quoted _it_\n\n```rust\nfn f() {\n\tx\n}\n```\n\n| a | b |\n|---|:-:|\n| `1` | two |\n\n---\nSetext\n===\n\n    indented code\n";
+        let text = "---\ntitle: x\n---\n# Title *é*\nSome **bold** and a [link][x],\nmore.\n\n\n- one\n  more of one\n\n  ```sh\n  ls\n  ```\n- [x] done\n  1. nested\n\n> quoted\n>\n> _it_\n\n```rust\nfn f() {\n\tx\n}\n```\n\n| a | b |\n|---|:-:|\n| `1` | two |\n\nSetext\n---\n\n    indented code\n\n[x]: http://x\n";
         let rows = rows_of(text);
         let n = text.lines().count();
         let mut owner = vec![0; n + 1];
@@ -926,22 +927,19 @@ mod tests {
         }
         assert!(owner[1..].iter().all(|&c| c == 1), "each line in one row: {owner:?}");
         let find = |line: usize| rows.iter().find(|r| r.line == line).unwrap();
-        assert_eq!((find(1).block.as_deref(), find(4).text.as_str(), find(4).size, find(4).bold), (Some("code"), "Title é", Some(1.6), true));
-        assert_eq!(find(4).spans[0].col, 7, "columns count characters");
-        let p = find(7);
-        assert_eq!((p.text.as_str(), p.last_line()), ("Some bold and code, a link and snake_case_word.", 8));
-        let styled: Vec<(&str, bool, bool, bool)> =
-            p.spans.iter().map(|s| (&p.text[s.col - 1..s.end_col.unwrap() - 1], s.bold, s.code, s.underline)).collect();
-        assert_eq!(styled, vec![("bold", true, false, false), ("code", false, true, false), ("link", false, false, true)]);
-        assert_eq!((find(10).text.as_str(), find(10).last_line()), ("• one more of one", 11), "an item's continuation joins it");
-        assert_eq!((find(12).text.as_str(), find(13).text.as_str(), find(13).indent), ("☑ done", "1. nested", 1));
-        assert_eq!((find(15).block.as_deref(), find(15).text.as_str(), find(15).spans[0].italic), (Some("quote"), "quoted it", true));
-        assert_eq!((find(17).text.as_str(), find(19).text.as_str(), find(19).block.as_deref()), ("rust", "    x", Some("code")));
-        assert_eq!((find(23).text.as_str(), find(24).text.as_str(), find(25).text.as_str()), ("a │ b  ", "──┼────", "1 │ two"));
-        assert_eq!(find(27).block.as_deref(), Some("rule"));
-        assert_eq!((find(28).text.as_str(), find(28).last_line(), find(28).size), ("Setext", 29, Some(1.6)));
-        assert_eq!((find(31).text.as_str(), find(31).block.as_deref()), ("indented code", Some("code")));
-        assert_eq!(find(5).last_line(), 6, "blank lines collapse");
+        let md = |line: usize| (find(line).markdown.clone().unwrap_or_default(), find(line).last_line());
+        assert_eq!((find(1).block.as_deref(), find(2).text.as_str()), (Some("code"), "title: x"), "front matter is code");
+        assert_eq!((find(2).lang.as_deref(), find(24).lang.as_deref(), find(22).lang.as_deref()), (Some("yaml"), Some("rust"), None), "code rows carry their language");
+        assert_eq!(md(4), ("# Title *é*".into(), 4), "a heading is its own block");
+        assert_eq!(md(5), ("Some **bold** and a [link][x],\nmore.\n\n[x]: http://x".into(), 8), "link definitions go along; blank lines join");
+        assert_eq!(md(9).1, 14, "an item keeps its indented paragraph and code");
+        assert!(md(9).0.ends_with("  ```") && md(15).0.starts_with("- [x] done\n  1. nested"), "each top-level item is a block");
+        assert_eq!(md(18), ("> quoted\n>\n> _it_".into(), 21));
+        assert_eq!((find(22).text.as_str(), find(22).block.as_deref(), find(24).text.as_str()), ("rust", Some("code"), "    x"), "fenced code: a row per line");
+        assert_eq!(md(28).1, 31, "a table is one block");
+        assert_eq!(md(32), ("Setext\n---".into(), 34));
+        assert_eq!((find(35).text.as_str(), find(35).block.as_deref()), ("indented code", Some("code")));
+        assert_eq!((find(36).text.as_str(), find(36).block.as_deref()), ("", None), "a blank line after code is a gap");
     }
 
     /// github: PR links, the view of a PR, its comment threads and post arguments.
@@ -1460,7 +1458,7 @@ end)
         host.file_loaded(md.clone(), Arc::from("# Hi\n\ntext\n"), false);
         let mv = content_hash("# Hi\n\ntext\n");
         wait(&|| host.decor.get(&md).is_some_and(|d| d.render(&mv).is_some()));
-        assert_eq!(host.decor.get(&md).unwrap().render(&mv).unwrap()[0].text, "Hi");
+        assert_eq!(host.decor.get(&md).unwrap().render(&mv).unwrap()[0].markdown.as_deref(), Some("# Hi"));
         assert!(host.registry().chords.iter().any(|c| c.command == "markdown.toggle" && c.chord.label() == "⇧⌘V"));
         if std::process::Command::new("ruff").arg("--version").output().is_ok() {
             wait(&|| host.decor.get(&key).is_some_and(|d| !d.diagnostics(&v).is_empty()));

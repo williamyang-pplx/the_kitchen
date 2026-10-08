@@ -2,12 +2,14 @@
 //! the plan reviewer. It paints a [`Doc`], inline blocks (plan
 //! comments) and an optional comment editor, and turns plain
 //! keys into [`Vim`] motions while focused. Rendered rows (`kitchen.render`)
-//! are drawn in a proportional font and wrap instead of scrolling sideways.
+//! are drawn in a proportional font and wrap instead of scrolling sideways;
+//! a row with Markdown source is drawn by egui_commonmark.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use egui::text::{CCursor, LayoutJob, TextFormat};
-use egui::{Color32, CornerRadius, FontId, Galley, Key, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Color32, CornerRadius, FontId, Galley, Key, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use super::doc::{Doc, LineKind};
 use super::highlight::group_color;
@@ -17,6 +19,18 @@ use crate::theme;
 
 /// Background of rendered code (blocks and inline).
 const CODE_BG: Color32 = Color32::from_rgb(0x24, 0x28, 0x3b);
+/// Body text of rendered Markdown; bold and headings are `theme::TEXT`.
+const PROSE: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
+
+/// Where a row's text was drawn, for clicks.
+enum Hit {
+    /// Monospace text at the view's column grid.
+    Text,
+    /// A rendered row's galley, drawn at the position.
+    Galley(Pos2, Arc<Galley>),
+    /// Markdown: the row as a whole.
+    Block,
+}
 
 /// Scroll position; owned by the panel so it survives frames.
 #[derive(Debug, Default, Clone)]
@@ -186,8 +200,7 @@ impl CodeView<'_> {
         });
 
         let mut y = rect.top();
-        // Row, doc index, and a rendered row's galley and where it was drawn.
-        let mut row_hits: Vec<(Rect, usize, Option<(Pos2, Arc<Galley>)>)> = Vec::new();
+        let mut row_hits: Vec<(Rect, usize, Hit)> = Vec::new();
         let mut cursor_drawn = false;
         let block_width = rect.width() - gutter - 24.0;
         let mut editor_rect: Option<Rect> = None;
@@ -211,38 +224,56 @@ impl CodeView<'_> {
             let line = &doc.lines[idx];
             let rendered = line.render.as_deref();
             let over = line.new_no.filter(|_| line.kind != LineKind::Removed).and_then(|n| overlay.and_then(|o| o.lines.get(&n)));
+            // Backgrounds go under the text, which a Markdown row draws while
+            // it is laid out.
+            let under = painter.add(Shape::Noop);
+            let mut under_shapes: Vec<Shape> = Vec::new();
             // Layout first: a rendered row wraps, so it may be taller than a text row.
             let (galley, text_pos, row_height) = match rendered {
+                Some(r) if r.markdown.is_some() => {
+                    let at = Pos2::new(text_x + cw * 0.8 + r.indent as f32 * cw * 2.0, y + 3.0);
+                    let md = r.markdown.as_deref().unwrap_or_default();
+                    let h = draw_markdown(ui, rect, at, rect.right() - at.x - 16.0, md, font_size, id.with(("md", idx)));
+                    (None, at, (h + 8.0).max(row_h))
+                }
                 Some(r) => {
                     let quote = if r.block.as_deref() == Some("quote") { cw * 1.5 } else { 0.0 };
                     // Clear of the diff's +/- marker.
                     let x = text_x + cw * 0.8 + r.indent as f32 * cw * 2.0 + quote;
-                    let job = render_job(r, &line.text, font_size, (rect.right() - x - 16.0).max(cw * 8.0));
+                    let job = render_job(r, &line.text, &line.spans, font_size, (rect.right() - x - 16.0).max(cw * 8.0));
                     let galley = ui.fonts_mut(|f| f.layout_job(job));
                     // Room above a heading.
                     let pad = (r.size.unwrap_or(1.0) - 1.0).max(0.0) * font_size * 0.8;
                     let h = (galley.size().y + 2.0 + pad).max(row_h);
-                    (galley, Pos2::new(x, y + 1.0 + pad), h)
+                    (Some(galley), Pos2::new(x, y + 1.0 + pad), h)
                 }
-                None => (ui.fonts_mut(|f| f.layout_job(line_job(line, state.left, &font, over))), Pos2::new(text_x, y + 1.0), row_h),
+                None => (Some(ui.fonts_mut(|f| f.layout_job(line_job(line, state.left, &font, over)))), Pos2::new(text_x, y + 1.0), row_h),
             };
             let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_height));
-            row_hits.push((row, idx, rendered.map(|_| (text_pos, galley.clone()))));
+            row_hits.push((
+                row,
+                idx,
+                match (&galley, rendered) {
+                    (_, None) => Hit::Text,
+                    (Some(g), Some(_)) => Hit::Galley(text_pos, g.clone()),
+                    (None, Some(_)) => Hit::Block,
+                },
+            ));
             let bg = match line.kind {
                 LineKind::Added => Some(theme::ADDED_BG),
                 LineKind::Removed => Some(theme::REMOVED_BG),
                 LineKind::Normal => None,
             };
             if let Some(bg) = bg {
-                painter.rect_filled(row, CornerRadius::ZERO, bg);
+                under_shapes.push(Shape::rect_filled(row, CornerRadius::ZERO, bg));
             }
             match rendered.and_then(|r| r.block.as_deref()) {
                 Some("code") => {
                     let r = Rect::from_min_max(Pos2::new(text_pos.x - 6.0, y), Pos2::new(rect.right() - 10.0, y + row_height));
-                    painter.rect_filled(r, CornerRadius::ZERO, CODE_BG);
+                    under_shapes.push(Shape::rect_filled(r, CornerRadius::ZERO, CODE_BG));
                 }
                 Some("quote") => {
-                    painter.rect_filled(Rect::from_min_size(Pos2::new(text_pos.x - cw * 1.2, y), Vec2::new(3.0, row_height)), CornerRadius::ZERO, theme::DIM);
+                    under_shapes.push(Shape::rect_filled(Rect::from_min_size(Pos2::new(text_pos.x - cw * 1.2, y), Vec2::new(3.0, row_height)), CornerRadius::ZERO, theme::DIM));
                 }
                 Some("rule") => {
                     painter.hline(text_pos.x..=rect.right() - 16.0, y + row_height / 2.0, Stroke::new(1.0, theme::BORDER));
@@ -250,13 +281,13 @@ impl CodeView<'_> {
                 _ => {}
             }
             if idx == vim.line {
-                painter.rect_filled(row, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0x7a, 0xa2, 0xf7, 18));
+                under_shapes.push(Shape::rect_filled(row, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0x7a, 0xa2, 0xf7, 18)));
             }
             // Visual selection (whole rows on rendered rows).
             if let Some(((sl, sc), (el, ec), linewise)) = visual {
                 if idx >= sl && idx <= el && rendered.is_some() {
                     let r = Rect::from_min_max(Pos2::new(text_pos.x - 4.0, y), Pos2::new(rect.right() - 10.0, y + row_height));
-                    painter.rect_filled(r, CornerRadius::ZERO, Color32::from_rgb(0x33, 0x46, 0x7c).gamma_multiply(0.8));
+                    under_shapes.push(Shape::rect_filled(r, CornerRadius::ZERO, Color32::from_rgb(0x33, 0x46, 0x7c).gamma_multiply(0.8)));
                 } else if idx >= sl && idx <= el {
                     let len = line.text.chars().count().max(1);
                     let (c0, c1) = if linewise {
@@ -266,13 +297,14 @@ impl CodeView<'_> {
                     };
                     let x0 = text_x + (c0.saturating_sub(state.left)) as f32 * cw;
                     let x1 = text_x + (c1.saturating_sub(state.left)) as f32 * cw;
-                    painter.rect_filled(
+                    under_shapes.push(Shape::rect_filled(
                         Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + cw), y + row_h)),
                         CornerRadius::ZERO,
                         Color32::from_rgb(0x33, 0x46, 0x7c),
-                    );
+                    ));
                 }
             }
+            painter.set(under, Shape::Vec(under_shapes));
             // Gutter numbers.
             let num_color = if idx == vim.line { theme::TEXT } else { theme::DIM };
             let small = FontId::monospace(font_size - 1.0);
@@ -303,9 +335,9 @@ impl CodeView<'_> {
             if let Some((c, color)) = over.and_then(|o| o.sign) {
                 painter.text(Pos2::new(rect.left() + 3.0, ty), egui::Align2::LEFT_TOP, c, FontId::monospace(font_size - 1.0), color);
             }
-            // Text.
-            if rendered.is_none_or(|r| r.block.as_deref() != Some("rule")) {
-                painter.galley(text_pos, galley.clone(), theme::TEXT);
+            // Text (a Markdown row drew its own).
+            if let Some(g) = galley.as_ref().filter(|_| rendered.is_none_or(|r| r.block.as_deref() != Some("rule"))) {
+                painter.galley(text_pos, g.clone(), theme::TEXT);
             }
             let after_x = text_x + (line.text.chars().count().saturating_sub(state.left) + 2) as f32 * cw;
             if rendered.is_some() {
@@ -315,12 +347,18 @@ impl CodeView<'_> {
             } else if let Some((text, color)) = over.and_then(|o| o.virt.as_ref()) {
                 painter.text(Pos2::new(after_x, y + 1.0), egui::Align2::LEFT_TOP, text, FontId::proportional(font_size - 0.5), color.gamma_multiply(0.75));
             }
-            // Cursor: a bar in a rendered row, a block in a text row.
+            // Cursor: a bar in a rendered row (beside a Markdown row), a block in a text row.
             if idx == vim.line && rendered.is_some() {
-                let at = galley.pos_from_cursor(CCursor::new(vim.col)).translate(text_pos.to_vec2());
-                let bar = Rect::from_min_size(at.min, Vec2::new(2.0, at.height().max(ch)));
+                let bar = match &galley {
+                    Some(g) => {
+                        let at = g.pos_from_cursor(CCursor::new(vim.col)).translate(text_pos.to_vec2());
+                        Rect::from_min_size(at.min, Vec2::new(2.0, at.height().max(ch)))
+                    }
+                    None => Rect::from_min_size(Pos2::new(text_pos.x - 7.0, y + 3.0), Vec2::new(2.0, row_height - 6.0)),
+                };
                 painter.rect_filled(bar, CornerRadius::ZERO, if focused && !editor_focused { theme::TEXT.gamma_multiply(0.9) } else { theme::DIM });
-                cursor_drawn = y + row_height <= rect.bottom();
+                // A row taller than the view counts as shown once it is at the top.
+                cursor_drawn = y + row_height <= rect.bottom() || idx == state.top;
             } else if idx == vim.line && vim.col >= state.left {
                 let x = text_x + (vim.col - state.left) as f32 * cw;
                 let r = Rect::from_min_size(Pos2::new(x, y + 1.0), Vec2::new(cw, ch));
@@ -388,10 +426,11 @@ impl CodeView<'_> {
         if resp.clicked_by(egui::PointerButton::Primary) {
             out.clicked = true;
             if let Some(pos) = resp.interact_pointer_pos() {
-                if let Some((_, idx, rendered)) = row_hits.iter().find(|(r, ..)| r.contains(pos)) {
-                    let col = match rendered {
-                        Some((at, galley)) => galley.cursor_from_pos(pos - *at).index.0,
-                        None => (((pos.x - text_x) / cw).max(0.0) as usize) + state.left,
+                if let Some((_, idx, hit)) = row_hits.iter().find(|(r, ..)| r.contains(pos)) {
+                    let col = match hit {
+                        Hit::Galley(at, galley) => galley.cursor_from_pos(pos - *at).index.0,
+                        Hit::Block => 0,
+                        Hit::Text => (((pos.x - text_x) / cw).max(0.0) as usize) + state.left,
                     };
                     vim.set_cursor(*idx, col.min(doc.lines[*idx].text.chars().count().saturating_sub(1)));
                 }
@@ -433,8 +472,9 @@ fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId, over: Option
 }
 
 /// Layout for a rendered row: proportional text (monospace in code) in the
-/// row's and its spans' styles, wrapped at `wrap`.
-fn render_job(r: &RenderRow, text: &str, font_size: f32, wrap: f32) -> LayoutJob {
+/// row's and its spans' styles, wrapped at `wrap`. `syntax` colors (byte
+/// ranges) show where no span sets a color.
+fn render_job(r: &RenderRow, text: &str, syntax: &[(std::ops::Range<usize>, Color32)], font_size: f32, wrap: f32) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap;
     let size = font_size * r.size.unwrap_or(1.0).clamp(0.5, 3.0);
@@ -445,8 +485,8 @@ fn render_job(r: &RenderRow, text: &str, font_size: f32, wrap: f32) -> LayoutJob
     let byte = |col: usize| offsets[col.saturating_sub(1).min(offsets.len() - 1)];
     let spans: Vec<(std::ops::Range<usize>, &RenderSpan)> = r.spans.iter().map(|s| (byte(s.col)..s.end_col.map_or(text.len(), byte), s)).collect();
     let mut cuts = vec![0, text.len()];
-    for (range, _) in &spans {
-        cuts.extend([range.start, range.end]);
+    for range in spans.iter().map(|(r, _)| r).chain(syntax.iter().map(|(r, _)| r)) {
+        cuts.extend([range.start.min(text.len()), range.end.min(text.len())]);
     }
     cuts.sort_unstable();
     cuts.dedup();
@@ -458,7 +498,7 @@ fn render_job(r: &RenderRow, text: &str, font_size: f32, wrap: f32) -> LayoutJob
     }
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        if a >= b {
+        if a >= b || !text.is_char_boundary(a) || !text.is_char_boundary(b) {
             continue;
         }
         let on: Vec<&RenderSpan> = spans.iter().filter(|(range, _)| range.start <= a && range.end >= b).map(|(_, s)| *s).collect();
@@ -471,7 +511,12 @@ fn render_job(r: &RenderRow, text: &str, font_size: f32, wrap: f32) -> LayoutJob
         } else {
             plain.clone()
         };
-        let color = on.iter().rev().find_map(|s| s.group.as_deref().and_then(group_color)).unwrap_or(base);
+        let color = on
+            .iter()
+            .rev()
+            .find_map(|s| s.group.as_deref().and_then(group_color))
+            .or_else(|| syntax.iter().rev().find(|(range, _)| range.start <= a && range.end >= b).map(|(_, c)| *c))
+            .unwrap_or(base);
         let stroke = |yes: bool| if yes { Stroke::new(1.0, color) } else { Stroke::NONE };
         job.append(
             &text[a..b],
@@ -488,6 +533,48 @@ fn render_job(r: &RenderRow, text: &str, font_size: f32, wrap: f32) -> LayoutJob
         );
     }
     job
+}
+
+/// Draws Markdown `md` at `at`, `width` wide, clipped to `clip`; returns its
+/// height. Its widgets are disabled, so a click lands on the row (cursor, ⌘M)
+/// and keys stay with vim.
+fn draw_markdown(ui: &mut Ui, clip: Rect, at: Pos2, width: f32, md: &str, font_size: f32, id: egui::Id) -> f32 {
+    let cache = ui.data_mut(|d| d.get_temp_mut_or_default::<Arc<Mutex<CommonMarkCache>>>(egui::Id::new("commonmark")).clone());
+    let max = Rect::from_min_size(at, Vec2::new(width.max(80.0), f32::INFINITY));
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(id).max_rect(max).layout(egui::Layout::top_down(egui::Align::Min)));
+    child.set_clip_rect(clip.intersect(ui.clip_rect()));
+    child.set_style(markdown_style(ui.style(), font_size));
+    child.disable();
+    CommonMarkViewer::new().show(&mut child, &mut cache.lock().unwrap_or_else(|e| e.into_inner()), md);
+    child.min_rect().height()
+}
+
+/// Fonts and colors for rendered Markdown at the viewer's `font_size`.
+fn markdown_style(base: &egui::Style, font_size: f32) -> egui::Style {
+    use egui::TextStyle;
+    let mut s = base.clone();
+    let body = font_size + 1.0;
+    s.text_styles = [
+        (TextStyle::Small, theme::ui_font(body * 0.85)),
+        (TextStyle::Body, theme::ui_font(body)),
+        (TextStyle::Button, theme::ui_font(body)),
+        (TextStyle::Heading, theme::ui_font_bold(body * 2.0)),
+        (TextStyle::Monospace, FontId::monospace(font_size * 0.95)),
+    ]
+    .into();
+    let v = &mut s.visuals;
+    // Text colors come from the widget visuals: plain text dimmer than
+    // bold and headings (egui draws `strong` as a brighter color).
+    v.override_text_color = None;
+    v.widgets.noninteractive.fg_stroke.color = PROSE;
+    v.widgets.inactive.fg_stroke.color = PROSE;
+    v.widgets.active.fg_stroke.color = theme::TEXT;
+    v.code_bg_color = CODE_BG;
+    v.extreme_bg_color = CODE_BG;
+    // Disabled only so it takes no input; drawn at full strength.
+    v.disabled_alpha = 1.0;
+    s.spacing.item_spacing.y = 5.0;
+    s
 }
 
 fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32) -> f32 {

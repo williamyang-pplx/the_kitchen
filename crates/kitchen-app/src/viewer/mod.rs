@@ -1836,15 +1836,15 @@ end)"#,
         assert_eq!(
             rows,
             vec![
-                (LineKind::Normal, Some(1), "T", true),
-                (LineKind::Normal, Some(2), "", true),
+                (LineKind::Normal, Some(1), "# T", true),
                 (LineKind::Removed, None, "old para", false),
-                (LineKind::Added, Some(3), "line one line two", true),
+                (LineKind::Added, Some(3), "line *one* line two", true),
             ]
         );
+        assert!(v.doc.lines[0].covers_new(2), "the blank line joins the heading's row");
         // ⌘M on the paragraph comments on both of its lines.
         v.place_cursor(4, 0);
-        assert_eq!(v.vim.line, 3, "line 4 is in the paragraph's row");
+        assert_eq!(v.vim.line, 2, "line 4 is in the paragraph's row");
         v.command(PanelCmd::Comment, engine);
         assert!(v.editor.as_ref().unwrap().label.starts_with("Comment on lines 3–4"));
         h.frame(&mut v);
@@ -1853,7 +1853,7 @@ end)"#,
         h.frame(&mut v);
         h.settle(&mut v, &|v| !v.comment_blocks().is_empty());
         let (block, _) = v.comment_blocks().remove(0);
-        assert_eq!((block.after, block.body.as_str()), (Some(3), "nice|new:4|3|line *one*\nline two"), "the source lines are quoted");
+        assert_eq!((block.after, block.body.as_str()), (Some(2), "nice|new:4|3|line *one*\nline two"), "the source lines are quoted");
         // Back to text: the comment stays on its line.
         v.command(PanelCmd::Render(None), engine);
         h.settle(&mut v, &|v| v.render_shown.is_none() && v.doc.lines.iter().all(|l| l.render.is_none()));

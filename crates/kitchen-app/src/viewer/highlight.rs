@@ -195,6 +195,13 @@ fn tree_sitter_highlight(config: &HighlightConfiguration, text: &str) -> Option<
     Some(out)
 }
 
+/// Highlight a fenced code block's `text` by its info string (`rust`, `py`,
+/// `sh`, …): a language name or extension.
+pub fn highlight_lang(lang: &str, text: &str) -> Option<Spans> {
+    let ext = syntaxes().find_syntax_by_token(lang).and_then(|s| s.file_extensions.first().cloned()).unwrap_or_else(|| lang.to_string());
+    highlight(&format!("code.{ext}"), text)
+}
+
 /// Highlight `text` as the language of `path` (by file name, extension,
 /// then first line).
 pub fn highlight(path: &str, text: &str) -> Option<Spans> {

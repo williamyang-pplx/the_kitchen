@@ -58,9 +58,9 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 9)
+## API (level 10)
 
-Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -285,7 +285,8 @@ end)
 kitchen.render.set(ev.file, {
   { line = 1, text = "Title", size = 1.6, bold = true },
   { line = 3, end_line = 4, text = "one paragraph", spans = { { col = 5, end_col = 14, italic = true } } },
-  { line = 6, text = "x = 1", block = "code" },
+  { line = 6, text = "x = 1", block = "code", lang = "python" },
+  { line = 8, end_line = 10, markdown = "- one\n- **two**\n- three" },
 }, { version = ev.version })
 kitchen.render.clear(file_or_nil)
 kitchen.render.show(ctx.tab, on)   -- on = nil toggles; tab = nil: the selected tab
@@ -297,7 +298,12 @@ source lines `line..=end_line`, and lines that no row covers are shown as
 text. Rows use a proportional font and wrap. Row keys: `size` (a multiple of
 the font size), `bold`, `group` (a color, as for highlights), `indent`
 (nesting depth), and `block`: `code` (monospace on a panel), `quote` (bar on
-the left) or `rule` (a horizontal line). Span keys: `col`/`end_col`
+the left) or `rule` (a horizontal line). `lang` on code rows (a fence's
+info string or an extension) highlights each run of adjacent rows of that
+language together. A row with `markdown` (CommonMark with GitHub's tables,
+task lists and strikethrough) is drawn by the viewer's Markdown renderer
+(egui_commonmark) instead of from `text` and its styles; its widgets take
+no clicks, so a click picks the row. Span keys: `col`/`end_col`
 (1-based characters of `text`, exclusive), `bold`, `italic`, `code`,
 `strike`, `underline`, `group`. With `version`, a rendering is shown only
 for the text it was made from. In a diff, a row is marked added when one of
@@ -306,7 +312,9 @@ its lines is, and removed lines stay between the rows.
 ⌘M on a row comments on its source lines: `start_line` is the first line
 of the first row, and `line` is the last line of the last row. `quote`
 holds the source text. A comment shows under the row that holds its line.
-`plugins/markdown` renders `.md` files this way and binds ⌘⇧V.
+`plugins/markdown` renders `.md` files this way and binds ⌘⇧V: a
+`markdown` row per heading, paragraph, table, quote and top-level list item,
+and a code row per line of top-level code.
 
 ### Timers
 

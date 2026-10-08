@@ -142,8 +142,14 @@ pub struct RenderRow {
     pub block: Option<String>,
     /// Nesting depth (list items, quotes).
     pub indent: usize,
+    /// A code row's language (a fence's info string, e.g. `rust`): runs of
+    /// rows with the same one are syntax highlighted together.
+    pub lang: Option<String>,
     #[serde(deserialize_with = "list_or_empty_table")]
     pub spans: Vec<RenderSpan>,
+    /// CommonMark source drawn by the viewer's Markdown renderer instead of
+    /// `text`, `spans` and the style keys.
+    pub markdown: Option<String>,
 }
 
 /// A list, also from an empty Lua table (which arrives as `{}`).
