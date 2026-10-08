@@ -819,7 +819,7 @@ impl KitchenApp {
                         for (title, rows) in groups {
                             col.label(widgets::section_label(title, theme::SUBTLE));
                             col.add_space(theme::SPACE_XS);
-                            egui::Grid::new(("shortcuts", title)).num_columns(2).spacing([theme::SPACE_M, 5.0]).min_col_width(64.0).show(col, |ui| {
+                            egui::Grid::new(("shortcuts", title)).num_columns(2).spacing([theme::SPACE_M, 5.0]).min_col_width(96.0).show(col, |ui| {
                                 for (keys, what) in rows.iter() {
                                     ui.label(RichText::new(*keys).font(theme::ui_font_semibold(theme::TEXT_BODY)).color(theme::TEXT));
                                     ui.label(RichText::new(*what).font(theme::ui_font(theme::TEXT_BODY)).color(theme::MUTED));

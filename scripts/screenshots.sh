@@ -89,6 +89,9 @@ keys "<cmd-.>"
 keys "<cmd-d>" 3
 shot 06-dashboard
 keys "<cmd-d>"
+keys "<cmd-/>"
+shot 11-shortcuts
+keys "<esc>"
 
 PLAN=$("$K" plan path -t 2)
 mkdir -p "$(dirname "$PLAN")"

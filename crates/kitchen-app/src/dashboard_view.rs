@@ -11,41 +11,65 @@ use crate::engine::{Engine, Workspace};
 use crate::plugins::dashboard::{Row, Section};
 use crate::plugins::timers::{TimerInfo, wall_now};
 use crate::theme;
+use crate::ui::widgets;
 
 pub fn ui(ui: &mut Ui, engine: &Arc<Engine>, ws: &Workspace) {
     // Relative times ("12m ago") tick; store changes repaint on their own.
     ui.ctx().request_repaint_after(Duration::from_secs(1));
     let Some(plugins) = engine.plugins() else { return };
     let now = wall_now();
+    let timers_list = plugins.timers_info();
+    let sections: Vec<Section> = plugins.dashboard.get(&ws.row.id).map(|s| s.iter().flat_map(|(_, list)| list.iter().cloned()).collect()).unwrap_or_default();
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(18, 14)).show(ui, |ui| {
-            ui.label(RichText::new(format!("{} @ {}", ws.row.name, ws.row.host)).font(theme::ui_font_semibold(14.0)).color(theme::TEXT));
-            ui.add_space(10.0);
-            timers(ui, &plugins.timers_info(), &ws.row.id, now);
-            if let Some(sections) = plugins.dashboard.get(&ws.row.id) {
-                for (_, list) in sections.iter() {
-                    for s in list {
-                        section(ui, s);
-                    }
+        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(theme::SPACE_XL as i8, 20)).show(ui, |ui| {
+            ui.label(RichText::new(&ws.row.name).font(theme::ui_font_semibold(theme::TEXT_HEADING)).color(theme::TEXT));
+            ui.add_space(2.0);
+            ui.label(RichText::new(format!("{} · {}", ws.row.host, ws.row.repo_path)).font(theme::ui_font(theme::TEXT_BODY)).color(theme::SUBTLE));
+            ui.add_space(theme::SPACE_XL - 4.0);
+            // Cards fill columns left to right; as many columns as fit.
+            let n = ((ui.available_width() + theme::SPACE_L) / 440.0).floor().clamp(1.0, 3.0) as usize;
+            ui.spacing_mut().item_spacing.x = theme::SPACE_L;
+            ui.columns(n, |cols| {
+                for c in cols.iter_mut() {
+                    c.spacing_mut().item_spacing.y = theme::SPACE_L;
                 }
-            }
+                card(&mut cols[0], |ui| timers(ui, &timers_list, &ws.row.id, now));
+                for (i, s) in sections.iter().enumerate() {
+                    card(&mut cols[(i + 1) % n], |ui| section(ui, s));
+                }
+            });
         });
     });
 }
 
+/// A raised card holding one dashboard section.
+fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    egui::Frame::NONE
+        .fill(theme::HOVER)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_L))
+        .inner_margin(egui::Margin::same(theme::SPACE_L as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 4.0;
+            add(ui);
+        });
+}
+
 fn heading(ui: &mut Ui, title: &str, note: Option<&str>) {
-    ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title.to_uppercase()).font(theme::ui_font_semibold(11.0)).color(theme::DIM));
+        ui.label(widgets::section_label(title, theme::SUBTLE));
         if let Some(n) = note {
-            ui.label(RichText::new(n).font(theme::ui_font(11.0)).color(theme::MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(n).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
+            });
         }
     });
-    ui.add_space(2.0);
+    ui.add_space(theme::SPACE_XS + 2.0);
 }
 
 fn small(text: impl Into<String>, color: Color32) -> RichText {
-    RichText::new(text.into()).font(theme::ui_font(12.0)).color(color)
+    RichText::new(text.into()).font(theme::ui_font(theme::TEXT_BODY)).color(color)
 }
 
 /// "3h 5m", "42s".
@@ -93,65 +117,70 @@ pub fn timer_when(t: &TimerInfo, now: f64) -> String {
 }
 
 fn timers(ui: &mut Ui, list: &[TimerInfo], ws: &str, now: f64) {
-    heading(ui, "Timers", (list.is_empty()).then_some("no plugin timers"));
-    for t in list {
+    heading(ui, "Timers", None);
+    if list.is_empty() {
+        ui.label(small("no plugin timers", theme::SUBTLE));
+    }
+    for (i, t) in list.iter().enumerate() {
+        if i > 0 {
+            ui.add_space(theme::SPACE_S);
+        }
         ui.horizontal(|ui| {
-            ui.label(small(format!("{}.{}", t.plugin, t.name), if t.running { theme::YELLOW } else { theme::TEXT })).on_hover_text(&t.desc);
-            ui.label(small(timer_when(t, now), theme::MUTED));
+            if t.running {
+                ui.label(RichText::new("●").font(theme::ui_font(theme::TEXT_SMALL)).color(theme::YELLOW));
+            }
+            ui.label(RichText::new(format!("{}.{}", t.plugin, t.name)).font(theme::ui_font_semibold(theme::TEXT_BODY)).color(theme::TEXT)).on_hover_text(&t.desc);
         });
-        let indent = |ui: &mut Ui, text: RichText| {
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
-                ui.label(text);
-            });
-        };
+        ui.label(RichText::new(timer_when(t, now)).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE));
         if let Some(e) = &t.state.last_error {
-            indent(ui, small(e.lines().next().unwrap_or(e), theme::RED));
+            ui.label(RichText::new(e.lines().next().unwrap_or(e)).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::RED));
         }
         let all = stats_line(&t.state.stats);
         if !all.is_empty() {
-            indent(ui, small(format!("last run: {all}"), theme::DIM));
+            ui.label(RichText::new(format!("last run: {all}")).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
         }
         let here = stats_line(t.state.workspaces.get(ws).unwrap_or(&serde_json::Value::Null));
         if !here.is_empty() {
-            indent(ui, small(format!("this workspace: {here}"), theme::DIM));
+            ui.label(RichText::new(format!("this workspace: {here}")).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
         }
     }
-    ui.add_space(8.0);
 }
 
 fn section(ui: &mut Ui, s: &Section) {
     heading(ui, &s.title, s.note.as_deref());
-    egui::Grid::new(("dash", &s.title)).num_columns(3).spacing([14.0, 3.0]).show(ui, |ui| {
-        for r in &s.rows {
-            row(ui, r);
-            ui.end_row();
-        }
-    });
-    ui.add_space(8.0);
-}
-
-fn row(ui: &mut Ui, r: &Row) {
-    let label: String = r.label.chars().take(60).collect();
-    ui.label(small(label, if r.mark { theme::ACCENT } else { theme::TEXT })).on_hover_text(&r.label);
-    ui.label(small(&r.value, theme::DIM));
-    match r.fraction {
-        Some(f) => bar(ui, f),
-        None => {
-            ui.label("");
-        }
+    for r in &s.rows {
+        row(ui, r);
     }
 }
 
-/// A thin fill bar, amber past 80 %, red past 95 %.
-fn bar(ui: &mut Ui, f: f32) {
+/// Label on the left; the value right-aligned before a bar, when there is one.
+fn row(ui: &mut Ui, r: &Row) {
+    const BAR: f32 = 96.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+    let bar_w = if r.fraction.is_some() { BAR + theme::SPACE_M } else { 0.0 };
+    let value = ui.painter().layout_no_wrap(r.value.clone(), theme::ui_font(theme::TEXT_SMALL), theme::SUBTLE);
+    let value_right = rect.right() - bar_w;
+    let label_max = (value_right - value.size().x - theme::SPACE_M - rect.left()).max(40.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(r.label.clone(), theme::ui_font(theme::TEXT_BODY), if r.mark { theme::ACCENT } else { theme::MUTED });
+    job.wrap = egui::text::TextWrapping::truncate_at_width(label_max);
+    let label = ui.painter().layout_job(job);
+    let p = ui.painter();
+    p.galley(egui::pos2(rect.left(), rect.center().y - label.size().y / 2.0), label, theme::MUTED);
+    p.galley(egui::pos2(value_right - value.size().x, rect.center().y - value.size().y / 2.0), value, theme::SUBTLE);
+    if let Some(f) = r.fraction {
+        bar(ui, egui::Rect::from_min_size(egui::pos2(rect.right() - BAR, rect.center().y - 3.0), egui::vec2(BAR, 6.0)), f);
+    }
+    resp.on_hover_text(&r.label);
+}
+
+/// A fill bar, amber past 80 %, red past 95 %.
+fn bar(ui: &Ui, rect: egui::Rect, f: f32) {
     let f = f.clamp(0.0, 1.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 6.0), egui::Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, 3.0, theme::BORDER);
     let color = if f > 0.95 { theme::RED } else if f > 0.8 { theme::YELLOW } else { theme::ACCENT };
     let mut fill = rect;
-    fill.set_width(rect.width() * f);
+    fill.set_width((rect.width() * f).max(if f > 0.0 { 3.0 } else { 0.0 }));
     p.rect_filled(fill, 3.0, color);
 }
 
