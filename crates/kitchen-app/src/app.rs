@@ -14,6 +14,7 @@ use crate::panels::{PanelCmd, PanelCtx};
 use crate::terminal::{TermSession, TerminalView};
 use crate::theme;
 use crate::ui::dialogs::{Dialog, DialogOutcome};
+use crate::ui::widgets;
 
 /// Height of the macOS title bar the window draws under.
 const TITLEBAR_HEIGHT: f32 = 28.0;
@@ -65,6 +66,8 @@ pub struct KitchenApp {
     auto_shot: Option<(Instant, String)>,
     /// ⌘⇧P command palette.
     palette: Option<(Vec<PaletteItem>, crate::viewer::picker::Picker)>,
+    /// The ⌘/ shortcut list is showing.
+    shortcuts: bool,
     /// Workspaces whose dashboard (⌘D) replaces the terminal area.
     dashboard: HashSet<String>,
     /// The workspace plugins were last told has its dashboard on screen.
@@ -96,6 +99,7 @@ impl KitchenApp {
             viewers: HashMap::new(),
             plans: HashMap::new(),
             dialog: None,
+            shortcuts: false,
             screenshots: Vec::new(),
             injected: Vec::new(),
             quit_requested: false,
@@ -253,6 +257,7 @@ impl KitchenApp {
             Action::NextFile => self.side_command(PanelCmd::NextFile),
             Action::PrevFile => self.side_command(PanelCmd::PrevFile),
             Action::Palette => self.open_palette(),
+            Action::Shortcuts => self.shortcuts = !self.shortcuts,
             Action::Plugin(_) => {} // resolved in `ui` against the registry snapshot
             Action::PrevTab => {
                 engine.cycle_tab(-1);
@@ -538,67 +543,70 @@ impl KitchenApp {
     fn sidebar(&mut self, ui: &mut Ui) {
         let workspaces = self.engine.workspaces();
         let selected = self.engine.state().selected.clone();
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(RichText::new("WORKSPACES").font(theme::ui_font_semibold(10.5)).color(theme::MUTED));
-        });
-        ui.add_space(4.0);
         let pinned_count = workspaces.iter().filter(|w| w.row.pinned).count();
+        let header = |ui: &mut Ui, text: &str| {
+            ui.add_space(theme::SPACE_M);
+            ui.horizontal(|ui| {
+                ui.add_space(18.0);
+                ui.label(widgets::section_label(text, theme::SUBTLE));
+            });
+            ui.add_space(theme::SPACE_XS);
+        };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut rects = Vec::with_capacity(workspaces.len());
             // (index, released this frame) of the row being dragged.
             let mut drag: Option<(usize, bool)> = None;
             for (i, ws) in workspaces.iter().enumerate() {
-                if i == pinned_count && i > 0 {
-                    // Divider between the pinned group and the rest.
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 7.0), Sense::hover());
-                    ui.painter().hline(r.x_range().shrink(12.0), r.center().y, egui::Stroke::new(1.0, theme::BORDER));
+                // Pinned workspaces get their own group above the rest.
+                if i == 0 {
+                    header(ui, if pinned_count > 0 { "Pinned" } else { "Workspaces" });
+                } else if i == pinned_count {
+                    header(ui, "Workspaces");
                 }
                 let is_sel = selected.as_deref() == Some(&ws.row.id);
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), Sense::click_and_drag());
+                let (status, status_color) = match (&ws.error, &ws.status) {
+                    (Some(e), _) => (format!("⚠ {e}"), theme::RED),
+                    (None, Some(s)) => (format!("⋯ {s}"), theme::YELLOW),
+                    _ => (String::new(), theme::DIM),
+                };
+                let height = if status.is_empty() { 46.0 } else { 62.0 };
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click_and_drag());
                 rects.push(rect);
                 if resp.dragged_by(egui::PointerButton::Primary) {
                     drag = Some((i, false));
                 } else if resp.drag_stopped_by(egui::PointerButton::Primary) {
                     drag = Some((i, true));
                 }
-                if drag.is_some_and(|(d, _)| d == i) {
-                    ui.painter().rect_filled(rect.shrink2(egui::vec2(4.0, 1.0)), 6.0, Color32::from_rgb(0x1c, 0x1d, 0x28));
+                let card = rect.shrink2(egui::vec2(8.0, 1.0));
+                if drag.is_some_and(|(d, _)| d == i) || (resp.hovered() && !is_sel) {
+                    ui.painter().rect_filled(card, theme::RADIUS as f32, theme::HOVER);
                 } else if is_sel {
-                    ui.painter().rect_filled(rect.shrink2(egui::vec2(4.0, 1.0)), 6.0, theme::SELECTED);
+                    ui.painter().rect_filled(card, theme::RADIUS as f32, theme::SELECTED);
                     ui.painter().rect_filled(
-                        egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 8.0), egui::vec2(3.0, rect.height() - 16.0)),
+                        egui::Rect::from_min_size(card.min + egui::vec2(0.0, 10.0), egui::vec2(3.0, card.height() - 20.0)),
                         2.0,
                         theme::ACCENT,
                     );
-                } else if resp.hovered() {
-                    ui.painter().rect_filled(rect.shrink2(egui::vec2(4.0, 1.0)), 6.0, Color32::from_rgb(0x1c, 0x1d, 0x28));
                 }
-                let x = rect.left() + 14.0;
+                let x = card.left() + 12.0;
                 let p = ui.painter();
-                let host_color = if ws.host().is_local() { theme::GREEN } else { theme::PURPLE };
-                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_bold(13.0), theme::TEXT);
-                let unread = ws.tabs.iter().any(|t| t.unread);
-                if unread {
-                    p.circle_filled(egui::pos2(rect.right() - 16.0, rect.top() + 14.0), 4.0, theme::YELLOW);
+                let name_color = if is_sel { theme::TEXT } else { theme::MUTED };
+                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_semibold(13.0), name_color);
+                if ws.tabs.iter().any(|t| t.unread) {
+                    p.circle_filled(egui::pos2(card.right() - 12.0, rect.top() + 16.0), 3.5, theme::YELLOW);
                 }
-                let hint = if i < 9 { format!("{}", i + 1) } else { String::new() };
-                p.text(egui::pos2(rect.right() - 28.0, rect.top() + 9.0), egui::Align2::RIGHT_TOP, hint, egui::FontId::monospace(9.5), theme::MUTED);
-                if ws.row.pinned {
-                    p.text(egui::pos2(rect.right() - 40.0, rect.top() + 8.0), egui::Align2::RIGHT_TOP, "📌", egui::FontId::proportional(10.0), theme::DIM);
-                }
-                let sub = format!("{} · {} · {} tab{}", ws.row.host, ws.repo_name(), ws.tabs.len(), if ws.tabs.len() == 1 { "" } else { "s" });
-                p.text(egui::pos2(x, rect.top() + 25.0), egui::Align2::LEFT_TOP, sub, theme::ui_font(10.5), host_color);
-                let (status, color) = match (&ws.error, &ws.status) {
-                    (Some(e), _) => (format!("⚠ {e}"), theme::RED),
-                    (None, Some(s)) => (format!("⋯ {s}"), theme::YELLOW),
-                    _ => (String::new(), theme::DIM),
+                let tabs = match ws.tabs.len() {
+                    0 => "no tabs".to_string(),
+                    1 => "1 tab".to_string(),
+                    n => format!("{n} tabs"),
                 };
+                let sub = format!("{} · {} · {tabs}", ws.row.host, ws.repo_name());
+                p.text(egui::pos2(x, rect.top() + 26.0), egui::Align2::LEFT_TOP, sub, theme::ui_font(theme::TEXT_SMALL), theme::SUBTLE);
                 if !status.is_empty() {
-                    let status: String = status.chars().take(40).collect();
-                    p.text(egui::pos2(x, rect.top() + 38.0), egui::Align2::LEFT_TOP, status, theme::ui_font_semibold(10.0), color);
+                    let status: String = status.chars().take(36).collect();
+                    p.text(egui::pos2(x, rect.top() + 42.0), egui::Align2::LEFT_TOP, status, theme::ui_font(theme::TEXT_SMALL), status_color);
                 }
+                let resp = resp.on_hover_text(format!("{}:{}\nworkspace:{}", ws.row.host, ws.row.repo_path, i + 1));
                 if resp.clicked_by(egui::PointerButton::Primary) {
                     self.engine.select_workspace(&ws.row.id);
                 }
@@ -625,10 +633,10 @@ impl KitchenApp {
                 self.workspace_drag(ui, &workspaces, &rects, pinned_count, from, released);
             }
             if workspaces.is_empty() {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("No workspaces").color(theme::DIM));
-                    ui.label(RichText::new("⌘N to create one").color(theme::DIM).size(11.0));
+                header(ui, "Workspaces");
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(RichText::new("None yet").font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE));
                 });
             }
         });
@@ -658,46 +666,59 @@ impl KitchenApp {
         ui.painter().hline(x, y, egui::Stroke::new(2.0, theme::ACCENT));
     }
 
-    /// The strip behind the transparent macOS title bar: the window title,
-    /// and dragging it moves the window.
-    fn titlebar(&mut self, ui: &mut Ui) {
+    /// The strip behind the transparent macOS title bar: where you are
+    /// (workspace › tab, and its branch), and dragging it moves the window.
+    fn titlebar(&mut self, ui: &mut Ui, ws: Option<&Workspace>, tab: Option<&Tab>) {
         let rect = ui.max_rect();
         let resp = ui.interact(rect, ui.id().with("titlebar"), Sense::click_and_drag());
         if resp.drag_started_by(egui::PointerButton::Primary) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
-        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "the kitchen", theme::ui_font_semibold(12.0), theme::MUTED);
-        ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, theme::BORDER));
+        let mut job = egui::text::LayoutJob::default();
+        let fmt = |font: egui::FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: Align::Center, ..Default::default() };
+        match (ws, tab) {
+            (Some(ws), Some(tab)) => {
+                job.append(&ws.row.name, 0.0, fmt(theme::ui_font(12.0), theme::SUBTLE));
+                job.append("›", 7.0, fmt(theme::ui_font(12.0), theme::DIM));
+                job.append(&tab.row.title, 7.0, fmt(theme::ui_font_semibold(12.0), theme::MUTED));
+                if let Some(b) = &tab.row.branch {
+                    job.append(b, 10.0, fmt(egui::FontId::monospace(11.0), theme::DIM));
+                }
+            }
+            (Some(ws), None) => job.append(&ws.row.name, 0.0, fmt(theme::ui_font_semibold(12.0), theme::MUTED)),
+            _ => job.append("the kitchen", 0.0, fmt(theme::ui_font_semibold(12.0), theme::MUTED)),
+        }
+        let galley = ui.painter().layout_job(job);
+        // Clear of the traffic lights on the left.
+        let x = (rect.center().x - galley.size().x / 2.0).max(rect.left() + 84.0);
+        ui.painter().galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, theme::MUTED);
     }
 
     fn footer(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new("＋ Workspace  ⌘N").font(theme::ui_font(11.5))).frame(false)).clicked_by(egui::PointerButton::Primary) {
-                self.run_action(Action::NewWorkspace);
-            }
-        });
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::click());
+        let card = rect.shrink2(egui::vec2(8.0, 2.0));
+        if resp.hovered() {
+            ui.painter().rect_filled(card, theme::RADIUS as f32, theme::HOVER);
+        }
+        let color = if resp.hovered() { theme::TEXT } else { theme::SUBTLE };
+        let p = ui.painter();
+        p.text(egui::pos2(card.left() + 12.0, card.center().y), egui::Align2::LEFT_CENTER, "+   New workspace", theme::ui_font(theme::TEXT_BODY), color);
+        p.text(egui::pos2(card.right() - 10.0, card.center().y), egui::Align2::RIGHT_CENTER, "⌘N", theme::ui_font(theme::TEXT_SMALL), theme::DIM);
+        if resp.clicked_by(egui::PointerButton::Primary) {
+            self.run_action(Action::NewWorkspace);
+        }
     }
 
     fn tab_strip(&mut self, ui: &mut Ui, ws: &Workspace) {
-        ui.horizontal_centered(|ui| {
-            ui.add_space(6.0);
+        let strip = ui.max_rect();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.add_space(theme::SPACE_S);
             let sel = ws.selected().map(|t| t.row.id.clone());
             for (i, tab) in ws.tabs.iter().enumerate() {
                 let is_sel = sel.as_deref() == Some(&tab.row.id);
-                let title: String = tab.row.title.chars().take(28).collect();
-                let mut job = egui::text::LayoutJob::default();
-                let fmt = |c: Color32, size: f32| egui::TextFormat { font_id: theme::ui_font(size), color: c, valign: Align::Center, ..Default::default() };
-                job.append(&format!("{} ", i + 1), 0.0, fmt(theme::MUTED, 11.0));
-                job.append(&format!(" {title}"), 0.0, fmt(if is_sel { theme::TEXT } else { theme::MUTED }, 12.5));
-                if tab.unread {
-                    job.append("  ●", 0.0, fmt(theme::YELLOW, 10.5));
-                }
-                let btn = egui::Button::new(job)
-                    .fill(theme::GREEN.gamma_multiply(if is_sel { 0.35 } else { 0.12 }))
-                    .corner_radius(5.0)
-                    .min_size(egui::vec2(0.0, 24.0));
-                let resp = ui.add(btn).on_hover_text(format!(
+                let title: String = tab.row.title.chars().take(32).collect();
+                let resp = tab_button(ui, strip, Some(i + 1), &title, is_sel, tab.unread, false).on_hover_text(format!(
                     "{}\n{}",
                     tab.row.worktree,
                     tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
@@ -711,29 +732,27 @@ impl KitchenApp {
                 }
             }
             for p in &ws.pending {
-                let label = RichText::new(format!("⋯ {}", p.title.chars().take(28).collect::<String>())).font(theme::ui_font(12.5)).color(theme::GREEN).italics();
-                ui.add(egui::Button::new(label).fill(if p.focus { theme::SELECTED } else { Color32::TRANSPARENT }).corner_radius(5.0).min_size(egui::vec2(0.0, 24.0)))
-                    .on_hover_text("fetching origin and preparing the worktree…");
+                let title: String = p.title.chars().take(32).collect();
+                tab_button(ui, strip, None, &format!("⋯ {title}"), p.focus, false, true).on_hover_text("fetching origin and preparing the worktree…");
             }
-            ui.add_space(8.0);
-            if ui.add(egui::Button::new(RichText::new("＋ tab ⌘T").font(theme::ui_font(11.0)).color(theme::GREEN)).frame(false)).clicked_by(egui::PointerButton::Primary) {
+            ui.add_space(theme::SPACE_XS);
+            if icon_button(ui, strip, "+").on_hover_text("New tab  ⌘T").clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewTab);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(8.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.add_space(theme::SPACE_S);
                 // Rightmost: the dashboard (⌘D).
                 let on = self.dashboard.contains(&ws.row.id);
                 if crate::dashboard_view::button(ui, on).clicked_by(egui::PointerButton::Primary) {
                     self.toggle_dashboard(&ws.row.id);
                 }
-                ui.add_space(4.0);
-                for (kind, label, action) in [
-                    (SideKind::Plan, "Plan ⌘⇧I", Action::OpenPlan),
-                    (SideKind::Viewer, "Files ⌘.", Action::ToggleFiles),
+                for (kind, label, keys, action) in [
+                    (SideKind::Plan, "Plan", "⌘⇧I", Action::OpenPlan),
+                    (SideKind::Viewer, "Files", "⌘.", Action::ToggleFiles),
                 ] {
-                    let on = self.focus() == Focus::Side && self.side() == Some(kind);
-                    let text = RichText::new(label).font(theme::ui_font(11.0)).color(if on { theme::ACCENT } else { theme::MUTED });
-                    if ui.add(egui::Button::new(text).frame(false)).clicked_by(egui::PointerButton::Primary) {
+                    let on = self.focus() == Focus::Side && self.side() == Some(kind) && !self.dashboard.contains(&ws.row.id);
+                    if widgets::flat_button(ui, label, on).on_hover_text(format!("{label}  {keys}")).clicked_by(egui::PointerButton::Primary) {
                         if on {
                             self.set_focus(Focus::Terminal);
                         } else {
@@ -750,33 +769,69 @@ impl KitchenApp {
             let st = self.engine.state();
             st.toasts.last().filter(|t| t.at.elapsed() < Duration::from_secs(if t.error { 12 } else { 5 })).cloned()
         };
+        let rect = ui.max_rect();
+        ui.painter().hline(rect.x_range(), rect.top() + 0.5, egui::Stroke::new(1.0, theme::BORDER));
         ui.horizontal_centered(|ui| {
-            ui.add_space(8.0);
-            let focus = match (self.focus(), self.side()) {
-                (Focus::Terminal, _) => "TERMINAL",
-                (Focus::Side, Some(SideKind::Viewer)) => "VIEWER",
-                (Focus::Side, Some(SideKind::Plan)) => "PLAN",
-                (Focus::Side, None) => "TERMINAL",
+            ui.add_space(theme::SPACE_S);
+            let (focus, hints): (&str, &[(&str, &str)]) = match (self.focus(), self.side()) {
+                (Focus::Side, Some(SideKind::Viewer)) => ("VIEWER", &[("⌘P", "find file"), ("⌘M", "comment"), ("⌘D", "diff"), ("⌘.", "terminal"), ("⌘/", "shortcuts")]),
+                (Focus::Side, Some(SideKind::Plan)) => ("PLAN", &[("⌘M", "comment"), ("⌘⏎", "submit"), ("⌘.", "viewer"), ("⌘/", "shortcuts")]),
+                _ => ("TERMINAL", &[("⌘T", "new tab"), ("⌘.", "viewer"), ("⌘⇧P", "commands"), ("⌘/", "shortcuts")]),
             };
-            ui.label(RichText::new(focus).font(theme::ui_font_semibold(10.5)).color(theme::BG).background_color(theme::ACCENT));
+            widgets::pill(ui, focus, theme::ACCENT);
             if let Some(t) = toast {
-                ui.label(RichText::new(t.text).size(11.5).color(if t.error { theme::RED } else { theme::TEXT }));
+                ui.add_space(theme::SPACE_XS);
+                ui.label(RichText::new(t.text).font(theme::ui_font(theme::TEXT_SMALL)).color(if t.error { theme::RED } else { theme::MUTED }));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(match (self.focus(), self.side()) {
-                        (Focus::Side, Some(SideKind::Viewer)) => "⌘⇧H/L files ↔ code · ⌘⇧J/K changed file · ⌘P find · ⌘M comment · ⌘B files · ⌘. terminal · ⌘D diff · ⌘O outline",
-                        (Focus::Side, Some(_)) => "⌘M comment · ⌘Enter submit · ⌘. viewer · ⌘H/L tab · ⌘J/K workspace",
-                        _ => "⌘H/L or ⌘1-9 tab · ⌘T new · ⌘R rename · ⌘W close · ⌘. viewer · ⌘J/K workspace",
-                    })
-                        .size(10.5)
-                        .color(theme::DIM),
-                );
+                ui.add_space(theme::SPACE_M);
+                widgets::key_hints(ui, hints);
             });
         });
         if self.engine.state().toasts.last().map(|t| t.at.elapsed() < Duration::from_secs(12)).unwrap_or(false) {
             ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    /// ⌘/: every shortcut, grouped, over whatever is shown.
+    fn shortcuts_ui(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.shortcuts = false;
+            return;
+        }
+        let area = egui::Area::new(egui::Id::new("shortcuts")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0)).show(ctx, |ui| {
+            widgets::overlay_frame().inner_margin(egui::Margin::same(theme::SPACE_XL as i8)).show(ui, |ui| {
+                ui.set_width(720.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Keyboard shortcuts").font(theme::ui_font_semibold(theme::TEXT_TITLE)).color(theme::TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        widgets::key_hints(ui, &[("esc", "close")]);
+                    });
+                });
+                ui.add_space(theme::SPACE_L);
+                ui.columns(2, |cols| {
+                    for (col, groups) in cols.iter_mut().zip(SHORTCUTS) {
+                        for (title, rows) in groups {
+                            col.label(widgets::section_label(title, theme::SUBTLE));
+                            col.add_space(theme::SPACE_XS);
+                            egui::Grid::new(("shortcuts", title)).num_columns(2).spacing([theme::SPACE_M, 5.0]).min_col_width(64.0).show(col, |ui| {
+                                for (keys, what) in rows.iter() {
+                                    ui.label(RichText::new(*keys).font(theme::ui_font_semibold(theme::TEXT_BODY)).color(theme::TEXT));
+                                    ui.label(RichText::new(*what).font(theme::ui_font(theme::TEXT_BODY)).color(theme::MUTED));
+                                    ui.end_row();
+                                }
+                            });
+                            col.add_space(theme::SPACE_L);
+                        }
+                    }
+                });
+            });
+        });
+        if area.response.clicked_elsewhere() {
+            self.shortcuts = false;
         }
     }
 
@@ -791,7 +846,9 @@ impl KitchenApp {
                 }
                 let reg = self.engine.plugins().map(|p| p.registry());
                 let rules = reg.as_ref().map(|r| &r.links[..]).unwrap_or(&[]);
-                let (resp, link) = TerminalView::new(session).font_size(font_size).focused(focused).links(rules).show(ui);
+                // Breathing room between the text and the window chrome.
+                let margin = egui::Margin { left: 12, right: 8, top: 8, bottom: 4 };
+                let (resp, link) = egui::Frame::NONE.inner_margin(margin).show(ui, |ui| TerminalView::new(session).font_size(font_size).focused(focused).links(rules).show(ui)).inner;
                 if resp.clicked_by(egui::PointerButton::Primary) || resp.drag_started() {
                     self.set_focus(Focus::Terminal);
                 }
@@ -799,7 +856,7 @@ impl KitchenApp {
                     self.engine.open_link(&tab.row.id, link);
                 }
             }
-            Some(TermSlot::Preparing) | None => centered_note(ui, &format!("attaching to {} on {}…", tab.row.tmux_session, ws.row.host), theme::DIM),
+            Some(TermSlot::Preparing) | None => centered_note(ui, &format!("attaching to {} on {}…", tab.row.tmux_session, ws.row.host), theme::SUBTLE),
             Some(TermSlot::Failed { msg, attempts, .. }) => {
                 let msg = format!("cannot attach (attempt {attempts}): {msg}\nretrying…");
                 centered_note(ui, &msg, theme::RED);
@@ -827,7 +884,7 @@ impl KitchenApp {
                 .entry(tab.row.id.clone())
                 .or_insert_with(|| crate::plan_view::PlanView::new(&self.engine, ws, tab))
                 .ui(ui, &mut cx),
-            (_, None) => centered_note(ui, "open a tab first (⌘T)", theme::DIM),
+            (_, None) => centered_note(ui, "open a tab first (⌘T)", theme::SUBTLE),
         }
         if cx.clicked {
             self.set_focus(Focus::Side);
@@ -927,43 +984,46 @@ impl eframe::App for KitchenApp {
         egui::Panel::top("titlebar")
             .exact_size(TITLEBAR_HEIGHT)
             .frame(egui::Frame::NONE.fill(theme::SIDEBAR))
-            .show(ui, |ui| self.titlebar(ui));
+            .show(ui, |ui| self.titlebar(ui, ws.as_ref(), tab.as_ref()));
         egui::Panel::left("workspaces")
             .exact_size(236.0)
             .resizable(false)
             .frame(egui::Frame::NONE.fill(theme::SIDEBAR))
             .show(ui, |ui| {
-                egui::Panel::bottom("sidebar-footer").frame(egui::Frame::NONE.fill(theme::SIDEBAR).inner_margin(6.0)).show(ui, |ui| self.footer(ui));
+                egui::Panel::bottom("sidebar-footer").frame(egui::Frame::NONE.fill(theme::SIDEBAR).inner_margin(egui::Margin::symmetric(0, 6))).show(ui, |ui| self.footer(ui));
                 self.sidebar(ui);
             });
         egui::Panel::bottom("status")
-            .exact_size(22.0)
+            .exact_size(26.0)
             .frame(egui::Frame::NONE.fill(theme::SIDEBAR))
             .show(ui, |ui| self.status_bar(ui));
         if let Some(ws) = &ws {
             egui::Panel::top("tabs")
-                .exact_size(34.0)
-                .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(0, 4)))
+                .exact_size(38.0)
+                .frame(egui::Frame::NONE.fill(theme::SIDEBAR).inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 0 }))
                 .show(ui, |ui| self.tab_strip(ui, ws));
         }
         let creating = ws.as_ref().and_then(|w| w.pending.iter().rev().find(|p| p.focus).cloned());
         let dashboard = ws.as_ref().is_some_and(|w| self.dashboard.contains(&w.row.id));
         let side_shown = self.focus() == Focus::Side && creating.is_none() && !dashboard;
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {            (Some(ws), _) if creating.is_some() => {
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG)).show(ui, |ui| match (&ws, &tab) {
+            (Some(ws), _) if creating.is_some() => {
                 let p = creating.as_ref().unwrap();
-                centered_note(ui, &format!("creating tab “{}” on {}…\nfetching origin · preparing worktree · starting tmux", p.title, ws.row.host), theme::DIM);
+                let body = format!("on {} · fetching origin, preparing the worktree, starting tmux", ws.row.host);
+                widgets::empty_state(ui, &format!("Creating “{}”", p.title), Some(&body), &[]);
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
             (Some(ws), _) if dashboard => crate::dashboard_view::ui(ui, &self.engine, ws),
             (Some(ws), tab) if side_shown => self.side_area(ui, ws, tab.as_ref()),
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
-                let status = ws.status.clone().map(|s| format!("\n\n{s}")).unwrap_or_default();
-                centered_note(ui, &format!("{}\n\n⌘T  new tab: own worktree + branch\n{status}", ws.row.name), theme::DIM)
+                let body = ws.status.clone().unwrap_or_else(|| format!("{} · {}", ws.row.host, ws.row.repo_path));
+                widgets::empty_state(ui, &ws.row.name, Some(&body), &[("⌘T", "New tab, in its own worktree and branch"), ("⌘⇧P", "Review a PR from its link")]);
             }
-            (None, _) => centered_note(ui, "the kitchen\n\n⌘N  new workspace (local repo or devbox)", theme::DIM),
+            (None, _) => widgets::empty_state(ui, "the kitchen", Some("A workspace is a repo on this mac or on a devbox."), &[("⌘N", "New workspace")]),
         });
         self.palette_ui(&ctx);
+        self.shortcuts_ui(&ctx);
         self.save_screenshots(&ctx);
         if profiling() {
             let ms = frame_start.elapsed().as_secs_f64() * 1000.0;
@@ -982,9 +1042,103 @@ impl eframe::App for KitchenApp {
 
 fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
     ui.centered_and_justified(|ui| {
-        ui.label(RichText::new(text).color(color).size(13.0));
+        ui.label(RichText::new(text).color(color).font(theme::ui_font(theme::TEXT_BODY)));
     });
 }
+
+/// A tab in the strip, as tall as the strip: the selected one takes the
+/// content's color, so it reads as the top of what is shown below.
+fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str, selected: bool, unread: bool, pending: bool) -> egui::Response {
+    let mut job = egui::text::LayoutJob::default();
+    let fmt = |font: egui::FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: Align::Center, italics: pending, ..Default::default() };
+    if let Some(n) = number {
+        job.append(&n.to_string(), 0.0, fmt(theme::ui_font(theme::TEXT_SMALL), theme::DIM));
+    }
+    let title_color = if selected { theme::TEXT } else { theme::SUBTLE };
+    job.append(title, if number.is_some() { 7.0 } else { 0.0 }, fmt(theme::ui_font(theme::TEXT_BODY), title_color));
+    let galley = ui.painter().layout_job(job);
+    let dot = if unread { 12.0 } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 28.0 + dot, strip.height()), Sense::click());
+    let top = egui::CornerRadius { nw: theme::RADIUS, ne: theme::RADIUS, sw: 0, se: 0 };
+    if selected {
+        ui.painter().rect_filled(rect, top, theme::BG);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect.shrink2(egui::vec2(0.0, 0.0)), top, theme::HOVER);
+    }
+    let text_color = if resp.hovered() && !selected { theme::MUTED } else { title_color };
+    let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
+    let width = galley.size().x;
+    if resp.hovered() && !selected {
+        ui.painter().galley_with_override_text_color(pos, galley, text_color);
+    } else {
+        ui.painter().galley(pos, galley, text_color);
+    }
+    if unread {
+        ui.painter().circle_filled(egui::pos2(pos.x + width + 9.0, rect.center().y), 3.0, theme::YELLOW);
+    }
+    resp
+}
+
+/// A small square button holding one glyph.
+fn icon_button(ui: &mut Ui, strip: egui::Rect, glyph: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, strip.height()), Sense::click());
+    let square = egui::Rect::from_center_size(rect.center(), egui::vec2(24.0, 24.0));
+    if resp.hovered() {
+        ui.painter().rect_filled(square, theme::RADIUS as f32, theme::HOVER);
+    }
+    let color = if resp.hovered() { theme::TEXT } else { theme::SUBTLE };
+    ui.painter().text(square.center(), egui::Align2::CENTER_CENTER, glyph, theme::ui_font(16.0), color);
+    resp
+}
+
+type ShortcutGroup = (&'static str, &'static [(&'static str, &'static str)]);
+
+/// The ⌘/ list, in two columns.
+const SHORTCUTS: [&[ShortcutGroup]; 2] = [
+    &[
+        (
+            "Workspaces and tabs",
+            &[
+                ("⌘N", "new workspace"),
+                ("⌘J  ⌘K", "next / previous workspace"),
+                ("⌘⇧R", "rename workspace"),
+                ("⌘T", "new tab"),
+                ("⌘1 … ⌘9", "go to tab"),
+                ("⌘H  ⌘L", "previous / next tab"),
+                ("⌘R", "rename tab"),
+                ("⌘W", "close tab"),
+            ],
+        ),
+        (
+            "Everywhere",
+            &[
+                ("⌘.", "terminal ↔ viewer"),
+                ("⌘⇧I", "plan"),
+                ("⌘D", "dashboard (diff in a panel)"),
+                ("⌘⇧P", "commands, or a PR link"),
+                ("⌘/", "this list"),
+                ("⌘Q", "quit"),
+            ],
+        ),
+    ],
+    &[
+        (
+            "Viewer",
+            &[
+                ("⌘P", "find a file"),
+                ("⌘B", "show / hide the file list"),
+                ("⌘⇧H  ⌘⇧L", "file list ↔ code"),
+                ("⌘⇧J  ⌘⇧K", "next / previous changed file"),
+                ("⌘O", "outline"),
+                ("]c  [c", "next / previous change"),
+                ("gd  gr", "definition / references"),
+                ("⌃O", "back"),
+                ("-", "parent folder"),
+            ],
+        ),
+        ("Comments", &[("⌘M", "comment on the line or selection"), ("⌘⏎", "submit (plan: send all to the agent)")]),
+    ],
+];
 
 /// `KITCHEN_PROFILE=1` logs the build time of every frame.
 fn profiling() -> bool {

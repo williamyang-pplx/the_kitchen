@@ -31,6 +31,7 @@
 //! | ⌘D          | dashboard (focused side panel: diff / plain)  |
 //! | ⌘O          | toggle outline (collapsed) mode               |
 //! | ⌘.          | switch the whole tab: terminal ↔ file viewer  |
+//! | ⌘/          | list every shortcut                           |
 //! | ⌘Q          | quit                                          |
 //! | ⌘C / ⌘V     | copy / paste (handled by the focused widget)  |
 
@@ -65,6 +66,8 @@ pub enum Action {
     ToggleViewer,
     Quit,
     Palette,
+    /// ⌘/: the list of every shortcut.
+    Shortcuts,
     /// A plugin chord: index into the registry snapshot passed to [`collect`].
     Plugin(usize),
 }
@@ -133,6 +136,7 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::O, Action::ToggleOutline),
     (Key::Period, Action::ToggleViewer),
     (Key::Q, Action::Quit),
+    (Key::Slash, Action::Shortcuts),
 ];
 
 const DIGITS: [Key; 9] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
