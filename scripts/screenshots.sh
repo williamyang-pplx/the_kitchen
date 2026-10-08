@@ -84,6 +84,11 @@ keys "<esc>"
 keys "<cmd-shift-p>"
 shot 05-palette
 keys "<esc>"
+"$K" viewer open README.md -t 1 >/dev/null
+sleep 1.5
+keys "<cmd-shift-v>"
+shot 12-markdown 2
+keys "<cmd-shift-v>"
 keys "<cmd-.>"
 
 keys "<cmd-d>" 3
