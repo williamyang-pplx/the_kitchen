@@ -1057,13 +1057,18 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str
         job.append(&n.to_string(), 0.0, fmt(theme::ui_font(theme::TEXT_SMALL), theme::DIM));
     }
     let title_color = if selected { theme::TEXT } else { theme::SUBTLE };
-    job.append(title, if number.is_some() { 7.0 } else { 0.0 }, fmt(theme::ui_font(theme::TEXT_BODY), title_color));
+    let title_font = if selected { theme::ui_font_semibold(theme::TEXT_BODY) } else { theme::ui_font(theme::TEXT_BODY) };
+    job.append(title, if number.is_some() { 7.0 } else { 0.0 }, fmt(title_font, title_color));
     let galley = ui.painter().layout_job(job);
     let dot = if unread { 12.0 } else { 0.0 };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 28.0 + dot, strip.height()), Sense::click());
     let top = egui::CornerRadius { nw: theme::RADIUS, ne: theme::RADIUS, sw: 0, se: 0 };
     if selected {
         ui.painter().rect_filled(rect, top, theme::BG);
+        // A bright outline on the top and sides; the bottom stays open
+        // into the content below (clipped off).
+        let outline = egui::Rect::from_min_max(rect.min + egui::vec2(0.75, 0.75), rect.max + egui::vec2(-0.75, 8.0));
+        ui.painter().with_clip_rect(rect).rect_stroke(outline, top, egui::Stroke::new(1.5, theme::ACCENT), egui::StrokeKind::Middle);
     } else if resp.hovered() {
         ui.painter().rect_filled(rect.shrink2(egui::vec2(0.0, 0.0)), top, theme::HOVER);
     }
