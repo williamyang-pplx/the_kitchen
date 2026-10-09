@@ -1206,6 +1206,8 @@ mod tests {
             used contents 50 /c/repo/contents/.trash/x\n\
             size download 200 /c/repo/content_addressable/sha256/d\n\
             used download 600 /c/repo/content_addressable/sha256/d\n\
+            pin aa h/u 1\n\
+            pin aa h/v\n\
             disk 4096\n";
         let s = to_json(parse.call(text).unwrap());
         assert_eq!(s["df"], serde_json::json!({"size": 104857600, "avail": 52428800}));
@@ -1220,6 +1222,7 @@ mod tests {
             "no `used`: still being written; hidden folders: Bazel's trash"
         );
         assert_eq!(s["disk_kib"], 4096);
+        assert_eq!(s["pins"], serde_json::json!({ "aa": { "h/u 1": true, "h/v": true } }));
         assert_eq!(to_json(parse.call("base 1 1 1 0 /x\t\n").unwrap()), serde_json::Value::Null, "no df: the scan failed");
 
         let plan: mlua::Function = m.get("plan").unwrap();
@@ -1242,39 +1245,46 @@ mod tests {
         let p = run(serde_json::json!({
             "df": df(100, 50), "disk_kib": G,
             "bases": [base("/orphan", 1, 9000, false, None, false), base("/live-orphan", 1, 9000, false, Some(7), false), base("/kept", 2, 9000, true, None, false)],
-            "entries": [entry("contents", "/c1", 1, 9000)],
+            "entries": [entry("contents", "/c1", 1, 9000)], "pins": {},
         }));
         assert_eq!(paths(&p), ["/orphan"]);
         assert_eq!((p["over"].clone(), stop(&p), p["freed_kib"].clone(), p["total_kib"].clone()), (serde_json::Value::Null, vec![], G.into(), (6 * G).into()));
 
         // Over max_gb (42G): one least-recently-used list down to target_gb,
         // repo entries by last use and bases by last command, but nothing
-        // used within idle_minutes. The idle server is stopped first.
+        // used within idle_minutes. b-idle's server links to /h/c1.
         let over = |idle_ago: u64| {
             serde_json::json!({
                 "df": df(1000, 500), "disk_kib": 2 * G,
                 "bases": [base("/b-idle", 8, idle_ago, true, Some(9), false), base("/b-old", 10, 10000, true, None, false)],
-                "entries": [entry("contents", "/c1", 6, 9000), entry("contents", "/c-recent", 6, 100), entry("download", "/d1", 6, 8000), entry("contents", "/c3", 4, 7000)],
+                "entries": [entry("contents", "/h/c1", 6, 9000), entry("contents", "/h/c-recent", 6, 100), entry("download", "/d1", 6, 8000), entry("contents", "/h/c3", 4, 7000)],
+                "pins": { "b-idle": { "h/c1": true, "h/c-recent": true } },
             })
         };
         let p = run(over(5000));
-        assert_eq!(paths(&p), ["/b-old", "/c1", "/d1"]);
-        assert_eq!((p["over"].as_str(), stop(&p), p["short_kib"].clone(), p["blocked"].clone()), (Some("size"), vec![9], 0.into(), serde_json::Value::Null));
+        assert_eq!(paths(&p), ["/b-old", "/h/c1", "/d1"]);
+        assert_eq!((p["over"].as_str(), p["short_kib"].clone(), p["blocked"].clone()), (Some("size"), 0.into(), serde_json::Value::Null));
+        assert_eq!(stop(&p), [9], "the idle server links to /h/c1: stopped first");
+        let mut scan = over(5000);
+        scan["pins"] = serde_json::json!({ "b-idle": { "h/c3": true } });
+        assert_eq!(stop(&run(scan)), Vec::<u64>::new(), "it links to nothing the plan removes: left running");
 
-        // A server ran a command 100 s ago: the repo cache stays, bases without
-        // a server still go, and the plan falls short.
+        // A server ran a command 100 s ago: what it links to stays, everything
+        // else (bases without a server, other repo entries) still goes; the
+        // plan falls short.
         let p = run(over(100));
-        assert_eq!(paths(&p), ["/b-old"]);
-        assert_eq!((p["blocked"].as_str(), stop(&p), p["short_kib"].clone()), (Some("server busy in b-idle"), vec![], (12 * G).into()));
-        // A client holding a base blocks too, even with no server.
+        assert_eq!(paths(&p), ["/b-old", "/d1", "/h/c3"]);
+        assert_eq!((p["blocked"].as_str(), stop(&p), p["short_kib"].clone(), p["pinned_kib"].clone()), (Some("server busy in b-idle"), vec![], (2 * G).into(), (6 * G).into()));
+        // A client holding a base keeps it and what it links to, even with no server.
         let mut scan = over(5000);
         scan["bases"][1]["busy"] = true.into();
+        scan["pins"]["b-old"] = serde_json::json!({ "h/c3": true });
         let p = run(scan);
-        assert_eq!((p["blocked"].as_str(), paths(&p)), (Some("server busy in b-old"), vec!["/b-idle".to_string()]));
-        assert_eq!(stop(&p), [9], "only the server of the base it removes");
+        assert_eq!(paths(&p), ["/h/c1", "/d1", "/b-idle"]);
+        assert_eq!((p["blocked"].as_str(), stop(&p)), (Some("server busy in b-old"), vec![9]));
 
         // Low disk (10% free) with the caches under max_gb: free up to min_free_percent.
-        let p = run(serde_json::json!({ "df": df(100, 10), "disk_kib": 0, "bases": [], "entries": [entry("download", "/d1", 6, 9000), entry("download", "/d2", 6, 8000)] }));
+        let p = run(serde_json::json!({ "df": df(100, 10), "disk_kib": 0, "bases": [], "entries": [entry("download", "/d1", 6, 9000), entry("download", "/d2", 6, 8000)], "pins": {} }));
         assert_eq!((p["over"].as_str(), paths(&p)), (Some("disk"), vec!["/d1".to_string()]));
 
         let sp: mlua::Function = m.get("shell_path").unwrap();
@@ -1319,7 +1329,11 @@ mod tests {
                  touch -t 202001010000 workspace/live/lock; \
                  echo x > workspace/orphan/execroot/f; chmod 444 workspace/orphan/execroot/f; chmod 555 workspace/orphan/execroot; \
                  echo x > repo/contents/h/u1/f; touch -t 202001010000 repo/contents/h/u1.recorded_inputs; echo x > repo/contents/h/u2/f; \
-                 echo x > repo/content_addressable/sha256/d/file; touch -t 202001010000 repo/content_addressable/sha256/d/file; echo x > disk/f"
+                 mkdir repo/contents/h/u3; touch repo/contents/h/u3.recorded_inputs; \
+                 echo x > repo/content_addressable/sha256/d/file; touch -t 202001010000 repo/content_addressable/sha256/d/file; echo x > disk/f; \
+                 mkdir workspace/live/external workspace/kept/external workspace/orphan/external; \
+                 ln -s {r:?}/repo/contents/h/u1 workspace/live/external/a; ln -s /elsewhere/x workspace/live/external/b; \
+                 ln -s {r:?}/repo/contents/h/u2 workspace/kept/external/a; ln -s {r:?}/repo/contents/h/u3 workspace/orphan/external/a"
             ),
             "",
         );
@@ -1338,9 +1352,11 @@ mod tests {
         assert!(in_2020(&bases["live"]["active"]), "the backdated lock: {}", bases["live"]["active"]);
         assert_eq!(bases["kept"]["busy"], true, "a bazel client holds it");
         assert_eq!((bases["orphan"]["exists"].as_bool(), bases["orphan"]["workspace"].as_str()), (Some(false), Some("/nonexistent/wt")));
-        let entries: Vec<(String, String)> = s["entries"].as_array().unwrap().iter().map(|e| (e["kind"].as_str().unwrap().into(), e["path"].as_str().unwrap().rsplit('/').next().unwrap().into())).collect();
-        assert_eq!(entries, [("contents".to_string(), "u1".to_string()), ("download".into(), "d".into())], "u2 has no marker yet");
-        assert!(in_2020(&s["entries"][0]["used"]), "the backdated marker");
+        let mut entries: Vec<(String, String, bool)> =
+            s["entries"].as_array().unwrap().iter().map(|e| (e["kind"].as_str().unwrap().into(), e["path"].as_str().unwrap().rsplit('/').next().unwrap().into(), in_2020(&e["used"]))).collect();
+        entries.sort();
+        assert_eq!(entries, [("contents".to_string(), "u1".to_string(), true), ("contents".into(), "u3".into(), false), ("download".into(), "d".into(), true)], "u2 has no marker yet");
+        assert_eq!(s["pins"], serde_json::json!({ "live": { "h/u1": true }, "kept": { "h/u2": true } }), "links of the server's and the client's bases, into repo/contents only");
         assert!(s["disk_kib"].as_u64().unwrap() > 0 && s["df"]["size"].as_u64().unwrap() > 0);
 
         let evict: mlua::Function = m.get("evict_sh").unwrap();
@@ -1349,15 +1365,15 @@ mod tests {
             sh(&script, &input)
         };
         let item = |kind: &str, rel: &str| serde_json::json!({ "kind": kind, "path": format!("{r}/{rel}"), "kib": 1 });
-        let out = run(serde_json::json!({ "stop": [], "evict": [item("base", "workspace/live"), item("base", "workspace/kept"), item("base", "workspace/orphan"), item("contents", "repo/contents/h/u1"), item("download", "repo/content_addressable/sha256/d")] }));
+        let out = run(serde_json::json!({ "stop": [], "evict": [item("base", "workspace/live"), item("base", "workspace/kept"), item("base", "workspace/orphan"), item("contents", "repo/contents/h/u1"), item("contents", "repo/contents/h/u3"), item("download", "repo/content_addressable/sha256/d")] }));
         assert_eq!(
             out,
-            format!("skip {r}/workspace/live server\nskip {r}/workspace/kept client\nfreed {r}/workspace/orphan\nskip {r}/repo/contents/h/u1 server\nskip {r}/repo/content_addressable/sha256/d server\n"),
-            "a server under root keeps the repo cache; read-only files still go"
+            format!("skip {r}/workspace/live server\nskip {r}/workspace/kept client\nfreed {r}/workspace/orphan\nskip {r}/repo/contents/h/u1 linked\nskip {r}/repo/contents/h/u3 used\nfreed {r}/repo/content_addressable/sha256/d\n"),
+            "a running server keeps what its output base links to, a fresh marker keeps its entry, the rest goes; read-only files too"
         );
-        // Stopping the idle server frees all of it; a contents entry loses its marker too.
-        let out = run(serde_json::json!({ "stop": [server], "evict": [item("contents", "repo/contents/h/u1"), item("download", "repo/content_addressable/sha256/d"), item("base", "workspace/live")] }));
-        assert_eq!(out, format!("freed {r}/repo/contents/h/u1\nfreed {r}/repo/content_addressable/sha256/d\nfreed {r}/workspace/live\n"));
+        // Stopping the idle server frees what it linked to; a contents entry loses its marker too.
+        let out = run(serde_json::json!({ "stop": [server], "evict": [item("contents", "repo/contents/h/u1"), item("base", "workspace/live")] }));
+        assert_eq!(out, format!("freed {r}/repo/contents/h/u1\nfreed {r}/workspace/live\n"));
         assert!(!root.join("repo/contents/h/u1.recorded_inputs").exists() && root.join("repo/contents/h/u2").exists());
         let parsed = to_json(m.get::<mlua::Function>("parse_evict").unwrap().call("freed /a\nskip /b server\nstuck 4\n").unwrap());
         assert_eq!(parsed, serde_json::json!({ "freed": { "/a": true }, "skipped": ["/b server"], "stuck": 1 }));

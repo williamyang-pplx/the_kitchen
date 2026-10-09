@@ -16,6 +16,7 @@ max_gb = 30
 min_free_percent = 15
 # ...evicting down to this (GiB).
 target_gb = 20
-# A Bazel server with no command for this long may be stopped so the shared
-# caches can be evicted; cache entries used more recently are never evicted.
+# A Bazel server with no command for this long may be stopped so its output
+# base, and the repo contents it links to, can be evicted (a busy server's
+# links are kept); cache entries used more recently are never evicted.
 idle_minutes = 30

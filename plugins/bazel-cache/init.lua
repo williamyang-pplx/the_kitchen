@@ -9,11 +9,12 @@
 -- bases with no server by last command, in one list.
 --
 -- Never under a running build: an output base goes only when no server runs
--- in it and no command holds it; the shared repo cache only when no Bazel
--- server under `root` runs (idle ones, no command for idle_minutes, are
--- stopped first; a busy one blocks the pass). Entries used within
--- idle_minutes are never evicted. The disk cache is counted, not evicted:
--- agi bounds it with Bazel's own GC.
+-- in it and no command holds it; a repo contents entry never while a running
+-- server's output base links to it (its external/ symlinks; a busy server's
+-- links pin, an idle server, no command for idle_minutes, is stopped first).
+-- Entries used within idle_minutes are never evicted, re-checked right before
+-- each deletion. The disk cache is counted, not evicted: agi bounds it with
+-- Bazel's own GC.
 
 local M = {}
 
@@ -21,6 +22,12 @@ local GIB = 1024 * 1024 -- KiB
 
 local function basename(path)
   return path:match("[^/]+$") or path
+end
+
+-- A repo contents entry's "<hash>/<uuid>", how output bases' links and
+-- entries are matched (so differently spelled roots agree).
+local function key(path)
+  return path:match("[^/]+/[^/]+$") or path
 end
 
 -- The config root → a shell word: a leading ~ becomes "$HOME", and it's
@@ -35,8 +42,10 @@ end
 
 -- Shell (POSIX sh) that defines `st` (prints "<mtime> <path>" for each file
 -- argument, following symlinks), `servers` (pid and args of each Bazel
--- server of this user) and `client_busy <output base>` (a Bazel client holds
--- its lock: the pid in `lock` is alive and is Bazel).
+-- server of this user), `client_busy <output base>` (a Bazel client holds
+-- its lock: the pid in `lock` is alive and is Bazel) and `pins <output
+-- base>` (prints "pin <base folder> <hash>/<uuid>" for each repo contents
+-- entry its external/ links to).
 local PRELUDE = [[
 if [ "$(uname)" = Darwin ]; then sf=-f sv='%m %N'; else sf=-c sv='%Y %n'; fi
 st() { stat -L "$sf" "$sv" "$@" 2>/dev/null; }
@@ -45,6 +54,7 @@ client_busy() {
   c=$(sed -n 's/^pid=//p' "$1/lock" 2>/dev/null | head -n1)
   [ -n "$c" ] && kill -0 "$c" 2>/dev/null && ps -o args= -p "$c" 2>/dev/null | grep -q bazel
 }
+pins() { find "$1/external" -mindepth 1 -maxdepth 1 -type l -exec readlink {} + 2>/dev/null | awk -F/ -v b="${1##*/}" 'NF > 2 && $(NF-2) == "contents" { print "pin", b, $(NF-1) "/" $NF }'; }
 ]]
 
 -- Shell, run on the host, that prints (KiB, epoch seconds; the path last so
@@ -57,6 +67,8 @@ client_busy() {
 --                                             command.profile.gz; exists = the workspace named
 --                                             in its README is a folder (or there's no README);
 --                                             busy = a client holds it (client_busy)
+--   pin <base folder> <hash>/<uuid>           each repo contents entry an output base with a
+--                                             running server, or a busy one, links to (pins)
 --   size <kind> <kib> <path>                  each repo cache entry: kind "contents"
 --                                             (repo/contents/<h>/<uuid>) or "download"
 --                                             (repo/content_addressable/<algo>/<h>)
@@ -73,6 +85,7 @@ d=$(df -Pk "$v" | awk 'NR==2 {printf "df %d %d\n", $2, $4}')
 echo "$d"
 p=$(ps -ww -U "$(id -u)" -o pid=,args=) || exit 1
 printf '%s\n' "$p" | awk '/A-server\.jar/ { for (i = 2; i <= NF; i++) if ($i ~ /^--output_base=/) { sub(/^--output_base=/, "", $i); print "server", $1, $i } }'
+srv=" $(printf '%s\n' "$p" | awk '/A-server\.jar/ { for (i = 2; i <= NF; i++) if ($i ~ /^--output_base=/) { n = split($i, a, "/"); printf "%s ", a[n] } }')"
 [ -d "$r" ] || exit 0
 for b in "$r"/workspace/*/; do
   b=${b%/}
@@ -83,6 +96,7 @@ for b in "$r"/workspace/*/; do
   e=1; [ -n "$w" ] && [ ! -d "$w" ] && e=0
   u=0; client_busy "$b" && u=1
   printf 'base %s %s %s %s %s\t%s\n' "${k:-0}" "$a" "$e" "$u" "$b" "$w"
+  case "$srv" in *" ${b##*/} "*) pins "$b" ;; *) [ $u = 0 ] || pins "$b" ;; esac
 done
 sizes() { find "$1" -mindepth 2 -maxdepth 2 -type d -exec du -sxk {} + 2>/dev/null | awk -v k="$2" '{s = $1; sub(/^[0-9]+[ \t]+/, ""); print "size", k, s, $0}'; }
 [ -d "$r/repo/contents" ] && sizes "$r/repo/contents" contents
@@ -95,14 +109,15 @@ true
 end
 
 -- scan_sh's output → { df = {size, avail}, bases = {{kib, active, exists,
--- busy, path, workspace, pid}}, entries = {{kind, kib, used, path}}, disk_kib },
+-- busy, path, workspace, pid}}, entries = {{kind, kib, used, path}},
+-- pins = { [base folder] = { ["<hash>/<uuid>"] = true } }, disk_kib },
 -- or nil when the df line is missing (the scan failed: do nothing). A base's
 -- pid is its running server's (matched by folder name, so /private and
 -- symlinked spellings agree; servers outside root aren't ours). Entries
 -- without a `used` line are still being written and are left out, as is
 -- anything in a hidden folder (Bazel's own GC trash).
 function M.parse_scan(stdout)
-  local s = { bases = {}, entries = {}, disk_kib = 0 }
+  local s = { bases = {}, entries = {}, pins = {}, disk_kib = 0 }
   local servers, sizes, used, order = {}, {}, {}, {}
   for line in (stdout or ""):gmatch("[^\n]+") do
     local size, avail = line:match("^df (%d+) (%d+)$")
@@ -129,6 +144,11 @@ function M.parse_scan(stdout)
     kind, n, path = line:match("^used (%a+) (%d+) (.+)$")
     if kind then
       used[kind .. " " .. path] = tonumber(n)
+    end
+    local folder, pin = line:match("^pin (%S+) (.+)$")
+    if folder then
+      s.pins[folder] = s.pins[folder] or {}
+      s.pins[folder][pin] = true
     end
     local d = line:match("^disk (%d+)$")
     if d then
@@ -158,11 +178,13 @@ end
 --   evict = { {kind, path, kib} }, orphan bases, then least recently used first
 --   total_kib, freed_kib,        the caches now, and what the plan frees
 --   over = "size" | "disk" | nil, why it cleans past the orphans
---   blocked = "<why>" | nil,     over, but a busy server kept the repo cache
+--   pinned_kib,                  idle repo contents kept because a busy server links to them
+--   blocked = "<why>" | nil,     short, and a busy server kept some of the repo cache
 --   short_kib,                   still over after the plan (0: it fits)
 -- }
 function M.plan(scan, cfg, now)
   local idle = (cfg.idle_minutes or 30) * 60
+  local pins = scan.pins or {}
   local total = scan.disk_kib or 0
   for _, b in ipairs(scan.bases) do
     total = total + b.kib
@@ -170,7 +192,7 @@ function M.plan(scan, cfg, now)
   for _, e in ipairs(scan.entries) do
     total = total + e.kib
   end
-  local p = { stop = {}, evict = {}, total_kib = total, freed_kib = 0, short_kib = 0 }
+  local p = { stop = {}, evict = {}, total_kib = total, freed_kib = 0, pinned_kib = 0, short_kib = 0 }
   local taken = {}
   local function take(kind, path, kib)
     table.insert(p.evict, { kind = kind, path = path, kib = kib })
@@ -198,27 +220,32 @@ function M.plan(scan, cfg, now)
   local got = 0
 
   -- Servers under root: one that's busy (a command holds it, or one ran
-  -- within idle_minutes) keeps the shared repo cache; idle ones get stopped.
-  local stopping, idle_pids = {}, {}
+  -- within idle_minutes) keeps the repo contents its output base links to;
+  -- idle ones may be stopped.
+  local stopping, pinned, busy_in = {}, {}, nil
   for _, b in ipairs(scan.bases) do
     local recent = now - b.active < idle
     if b.busy or (b.pid and recent) then
-      p.blocked = p.blocked or ("server busy in " .. basename(b.workspace or b.path))
+      busy_in = busy_in or basename(b.workspace or b.path)
+      for k in pairs(pins[basename(b.path)] or {}) do
+        pinned[k] = true
+      end
     elseif b.pid and not taken[b.path] then
-      table.insert(idle_pids, b.pid)
       stopping[b.path] = true
     end
   end
 
-  -- One least-recently-used list: repo cache entries by last use (only when
-  -- no server is busy), output bases by last command (none a client holds,
-  -- none whose server stays running). Nothing used within idle_minutes.
+  -- One least-recently-used list: repo cache entries by last use (none a
+  -- busy server links to), output bases by last command (none a client
+  -- holds, none whose server stays running). Nothing used within idle_minutes.
   local units = {}
-  if not p.blocked then
-    for _, e in ipairs(scan.entries) do
-      if now - e.used >= idle then
-        table.insert(units, { kind = e.kind, path = e.path, kib = e.kib, at = e.used })
-      end
+  for _, e in ipairs(scan.entries) do
+    if now - e.used < idle then
+      -- (in use: kept)
+    elseif e.kind == "contents" and pinned[key(e.path)] then
+      p.pinned_kib = p.pinned_kib + e.kib
+    else
+      table.insert(units, { kind = e.kind, path = e.path, kib = e.kib, at = e.used })
     end
   end
   for _, b in ipairs(scan.bases) do
@@ -229,40 +256,50 @@ function M.plan(scan, cfg, now)
   table.sort(units, function(a, b)
     return a.at < b.at
   end)
-  local repo_taken = false
+  local gone = {}
   for _, u in ipairs(units) do
     if got >= need then
       break
     end
     take(u.kind, u.path, u.kib)
     got = got + u.kib
-    repo_taken = repo_taken or u.kind ~= "base"
+    if u.kind == "contents" then
+      gone[key(u.path)] = true
+    end
   end
-  -- Stop only what the plan needs: every idle server when it evicts repo
-  -- entries, else just the servers of the bases it removes.
-  if repo_taken then
-    p.stop = idle_pids
-  else
-    for _, b in ipairs(scan.bases) do
-      if taken[b.path] and stopping[b.path] then
-        table.insert(p.stop, b.pid)
+  -- Stop only what the plan needs: the idle servers of the bases it removes,
+  -- and of the bases linking to repo contents it removes.
+  local function links_gone(b)
+    for k in pairs(pins[basename(b.path)] or {}) do
+      if gone[k] then
+        return true
       end
+    end
+    return false
+  end
+  for _, b in ipairs(scan.bases) do
+    if stopping[b.path] and (taken[b.path] or links_gone(b)) then
+      table.insert(p.stop, b.pid)
     end
   end
   p.short_kib = math.max(need - got, 0)
+  if p.short_kib > 0 and p.pinned_kib > 0 then
+    p.blocked = "server busy in " .. busy_in
+  end
   return p
 end
 
 -- Shell that carries out plan `p`, and its stdin (one "<kind> <path>" line
 -- per item, so thousands of paths never hit an argument-length limit).
 -- SIGTERMs p.stop, waits up to 30 s for them to exit (one still running:
--- "stuck <pid>", and the repo cache is left alone). Right before each
--- deletion it re-checks: an output base, that no server runs in it and no
--- client holds it; a repo cache entry, that no server under root runs
--- (checked before the first and every 100th). A repo contents entry loses
--- its <uuid>.recorded_inputs first, so Bazel sees a miss, never a half-gone
+-- "stuck <pid>"). Right before each deletion it re-checks: an output base,
+-- that no server runs in it and no client holds it; a repo cache entry,
+-- that it wasn't used within `idle_minutes` and (contents) that no output
+-- base with a running server or a client links to it (those links read
+-- before the first entry and every 100th). A repo contents entry loses its
+-- <uuid>.recorded_inputs first, so Bazel sees a miss, never a half-gone
 -- hit. Prints "freed <path>" or "skip <path> <why>" per item.
-function M.evict_sh(p, root)
+function M.evict_sh(p, root, idle_minutes)
   local pids = {}
   for _, pid in ipairs(p.stop or {}) do
     table.insert(pids, tostring(math.floor(pid)))
@@ -271,8 +308,17 @@ function M.evict_sh(p, root)
   for _, it in ipairs(p.evict) do
     table.insert(lines, it.kind .. " " .. it.path)
   end
-  local script = PRELUDE .. "r=" .. M.shell_path(root) .. "\npids='" .. table.concat(pids, " ") .. "'\n" .. [[
-in_root() { servers | awk -v p="--output_base=$r/workspace/" -v h="$1" '{ for (i = 2; i <= NF; i++) if (index($i, p) == 1 && (h == "" || substr($i, length(p) + 1) == h)) f = 1 } END { exit !f }'; }
+  local idle = math.floor((idle_minutes or 30) * 60)
+  local script = PRELUDE .. "r=" .. M.shell_path(root) .. "\npids='" .. table.concat(pids, " ") .. "'\nidle=" .. idle .. "\n" .. [[
+in_root() { servers | awk -v p="--output_base=$r/workspace/" -v h="$1" '{ for (i = 2; i <= NF; i++) if (index($i, p) == 1 && substr($i, length(p) + 1) == h) f = 1 } END { exit !f }'; }
+pf=$(mktemp); trap 'rm -f "$pf"' EXIT
+live_pins() {
+  for b in "$r"/workspace/*/; do
+    b=${b%/}
+    [ -d "$b" ] && [ "${b##*/}" != install ] || continue
+    if in_root "${b##*/}" || client_busy "$b"; then pins "$b"; fi
+  done | awk '{ print $3 }' > "$pf"
+}
 for x in $pids; do kill -TERM "$x" 2>/dev/null; done
 i=0
 while [ -n "$pids" ] && [ $i -lt 30 ]; do
@@ -280,8 +326,7 @@ while [ -n "$pids" ] && [ $i -lt 30 ]; do
   [ $s = 0 ] && break
   sleep 1; i=$((i + 1))
 done
-shared=1
-for x in $pids; do if kill -0 "$x" 2>/dev/null; then echo "stuck $x"; shared=0; fi; done
+for x in $pids; do if kill -0 "$x" 2>/dev/null; then echo "stuck $x"; fi; done
 n=0
 while IFS=' ' read -r kind path; do
   [ -n "$path" ] && [ -e "$path" ] || continue
@@ -289,10 +334,18 @@ while IFS=' ' read -r kind path; do
     if in_root "${path##*/}"; then echo "skip $path server"; continue; fi
     if client_busy "$path"; then echo "skip $path client"; continue; fi
   else
-    if [ $((n % 100)) = 0 ] && [ $shared = 1 ] && in_root ""; then shared=0; fi
+    # (not from the item list on stdin)
+    [ $((n % 100)) = 0 ] && live_pins < /dev/null
     n=$((n + 1))
-    if [ $shared = 0 ]; then echo "skip $path server"; continue; fi
-    [ "$kind" = contents ] && rm -f "$path.recorded_inputs"
+    if [ "$kind" = contents ]; then
+      if grep -qxF "${path#"${path%/*/*}"/}" "$pf"; then echo "skip $path linked"; continue; fi
+      m=$path.recorded_inputs
+    else
+      m=$path/file
+    fi
+    t=$(st "$m" | awk '{ print $1 }')
+    if [ $((${t:-0} + idle)) -gt "$(date +%s)" ]; then echo "skip $path used"; continue; fi
+    [ "$kind" = contents ] && rm -f "$m"
   fi
   chmod -R u+w "$path" 2>/dev/null
   rm -rf "$path" 2>/dev/null
@@ -363,14 +416,14 @@ local function clean_host(host, cfg)
   local free = scan.df.size > 0 and string.format("%.0f%%", scan.df.avail / scan.df.size * 100) or "?"
   local stats = { cache = M.human(p.total_kib), free = free }
   if p.blocked then
-    log("over budget (" .. p.over .. "), repo cache kept:", p.blocked)
+    log("over budget (" .. p.over .. "), " .. M.human(p.pinned_kib) .. " of the repo cache kept:", p.blocked)
     stats.blocked = p.blocked
   end
   if #p.evict == 0 then
     log("cache " .. stats.cache .. ", " .. free .. " free: nothing to evict")
     return stats, 0, p.over ~= nil
   end
-  local script, input = M.evict_sh(p, cfg.root)
+  local script, input = M.evict_sh(p, cfg.root, cfg.idle_minutes)
   local rm = kitchen.run_sync({ host = host, timeout = 1800, sh = script, stdin = input })
   if rm.timed_out then
     log("gave up waiting on the eviction; it may still finish")
@@ -394,7 +447,7 @@ local function clean_host(host, cfg)
     log("skipped", s)
   end
   if r.stuck > 0 then
-    log(r.stuck .. " server(s) didn't stop; repo cache kept")
+    log(r.stuck .. " server(s) didn't stop; what they use was kept")
   end
   local parts = {}
   for _, kind in ipairs({ "base", "contents", "download" }) do
