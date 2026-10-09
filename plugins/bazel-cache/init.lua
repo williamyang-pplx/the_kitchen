@@ -389,12 +389,13 @@ function M.human(k)
   return string.format("%.0fK", k)
 end
 
+-- (a failed scan's stdout runs to megabytes: the end says why it stopped)
 local function why(res)
   if res.timed_out then
     return "timed out"
   end
   local text = (res.stderr ~= "" and res.stderr or res.stdout or ""):gsub("%s+", " ")
-  return text
+  return #text > 300 and "..." .. text:sub(-300) or text
 end
 
 local function config()
