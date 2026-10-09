@@ -292,6 +292,13 @@ impl KitchenApp {
                     self.dialog = Some(Dialog::confirm_close(&t));
                 }
             }
+            Action::ReopenTab => {
+                if let Some(ws) = &ws {
+                    let id = ws.row.id.clone();
+                    engine.spawn("reopen tab", move |e| e.reopen_closed_tab(&id));
+                    self.hide_dashboard();
+                }
+            }
             // VS Code's ⌘B: the viewer's file list (opening the viewer if needed).
             Action::ToggleFiles => {
                 if self.viewer_focused() {
@@ -1114,6 +1121,7 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("⌘H  ⌘L", "previous / next tab"),
                 ("⌘R", "rename tab"),
                 ("⌘W", "close tab"),
+                ("⌘⇧T", "reopen closed tab"),
             ],
         ),
         (

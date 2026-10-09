@@ -6,8 +6,8 @@
 //! shown (see [`Action::scope`]): tab keys (⌘T ⌘W) work in the terminal,
 //! panel keys (⌘M ⌘O ⌘Enter) in a side panel, ⌘P and ⌘⇧H/J/K/L in the
 //! viewer; elsewhere they are swallowed. Tab and workspace switching (⌘H/L
-//! ⌘1-9 ⌘J/K) work everywhere. The rest is global; ⌘D toggles diff in a
-//! side panel and the workspace dashboard elsewhere.
+//! ⌘1-9 ⌘J/K) and ⌘⇧T work everywhere. The rest is global; ⌘D toggles
+//! diff in a side panel and the workspace dashboard elsewhere.
 //!
 //! | keys        | action                                        |
 //! |-------------|-----------------------------------------------|
@@ -21,6 +21,7 @@
 //! | ⌘-click     | open the path / URL under the pointer (terminal) |
 //! | ⌘R          | rename the current tab                        |
 //! | ⌘W          | close tab                                     |
+//! | ⌘⇧T         | reopen the workspace's last closed tab        |
 //! | ⌘P          | fuzzy file picker (focused viewer only)       |
 //! | ⌘B          | show / hide the viewer's file list            |
 //! | ⌘⇧I         | plan reviewer                                 |
@@ -47,6 +48,8 @@ pub enum Action {
     NextTab,
     NewTab,
     CloseTab,
+    /// ⌘⇧T: the selected workspace's most recently closed tab, back.
+    ReopenTab,
     FilePicker,
     /// Viewer: ⌘⇧H / ⌘⇧L move between its file list and code.
     FocusFileList,
@@ -112,6 +115,7 @@ impl Action {
 pub const SHIFT_BINDINGS: &[(Key, Action)] = &[
     (Key::I, Action::OpenPlan),
     (Key::R, Action::RenameWorkspace),
+    (Key::T, Action::ReopenTab),
     (Key::P, Action::Palette),
     (Key::H, Action::FocusFileList),
     (Key::L, Action::FocusCode),
@@ -241,7 +245,7 @@ mod tests {
         }
         // Global keys work everywhere.
         for (side, viewer) in [(false, false), (true, true), (true, false)] {
-            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::PrevWorkspace, Action::PrevTab, Action::NextTab, Action::GoToTab(3), Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::Palette, Action::ToggleViewer, Action::Quit] {
+            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::PrevWorkspace, Action::PrevTab, Action::NextTab, Action::GoToTab(3), Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::ReopenTab, Action::Palette, Action::ToggleViewer, Action::Quit] {
                 assert!(a.allowed(side, viewer), "{a:?}");
             }
         }
@@ -325,6 +329,7 @@ mod tests {
         assert_eq!(press(Key::L, Modifiers::COMMAND), vec![Action::NextTab]);
         assert_eq!(press(Key::R, Modifiers::COMMAND), vec![Action::RenameTab]);
         assert_eq!(press(Key::T, Modifiers::COMMAND), vec![Action::NewTab]);
+        assert_eq!(press(Key::T, cmd_shift), vec![Action::ReopenTab]);
         assert!(press(Key::E, Modifiers::COMMAND).is_empty(), "⌘E is no longer bound");
         assert_eq!(press(Key::P, cmd_shift), vec![Action::Palette]);
         assert_eq!(press(Key::P, Modifiers::COMMAND), vec![Action::FilePicker]);

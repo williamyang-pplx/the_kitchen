@@ -95,6 +95,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |
+| ⌘⇧T | reopen the workspace's last closed tab (its agent continues its last conversation) |
 | ⌘P | fuzzy file picker (in the viewer) |
 | ⌘B | show / hide the viewer's file list |
 | ⌘⇧I | plan reviewer |

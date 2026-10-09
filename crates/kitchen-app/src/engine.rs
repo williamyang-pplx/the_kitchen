@@ -174,6 +174,8 @@ pub struct Engine {
     fresh_sessions: Mutex<std::collections::HashSet<String>>,
     /// Worktrees of rev tabs being opened (a second open waits its turn).
     opening: Mutex<std::collections::HashSet<String>>,
+    /// Tabs closed since launch, newest last: ⌘⇧T reopens them.
+    closed: Mutex<Vec<TabRow>>,
     plugins: std::sync::OnceLock<Arc<crate::plugins::PluginHost>>,
 }
 
@@ -201,6 +203,7 @@ impl Engine {
             settings: Mutex::new(settings),
             fresh_sessions: Mutex::new(Default::default()),
             opening: Mutex::new(Default::default()),
+            closed: Mutex::new(Vec::new()),
             plugins: std::sync::OnceLock::new(),
         }))
     }
@@ -950,6 +953,7 @@ impl Engine {
         let (ws, tab) = self.find_tab(tab_id).context("no such tab")?;
         let _ = Tmux::new(&ws.host()).kill_session(&tab.row.tmux_session);
         self.db().delete_tab(tab_id)?;
+        self.closed.lock().unwrap().push(tab.row.clone());
         let mut st = self.state();
         if let Some(w) = st.workspaces.iter_mut().find(|w| w.row.id == ws.row.id) {
             let idx = w.tabs.iter().position(|t| t.row.id == tab_id).unwrap_or(0);
@@ -960,6 +964,55 @@ impl Engine {
         }
         drop(st);
         self.repaint();
+        Ok(())
+    }
+
+    /// ⌘⇧T: bring back the workspace's most recently closed tab, in its old
+    /// place: a new tmux session in its worktree, the agent continuing its
+    /// last conversation there. Blocking; call from a background thread.
+    pub fn reopen_closed_tab(&self, ws_id: &str) -> Result<()> {
+        let ws = self.workspace(ws_id).context("no such workspace")?;
+        let row = self.take_closed(&ws).context("no closed tab to reopen")?;
+        let host = ws.host();
+        if !host.is_dir(&row.worktree) {
+            bail!("the worktree of {} is gone ({})", row.title, row.worktree);
+        }
+        let (agent, _) = agent_command(&row.worktree, &self.settings(), None);
+        let env = tab_env(&ws.row, &row, &host);
+        self.set_pending(ws_id, Some(PendingTab { id: row.id.clone(), title: row.title.clone(), focus: true }));
+        let started = Tmux::new(&host).new_session_with_setup(&row.tmux_session, &row.worktree, &env, Some(&format!("{agent} --continue")), None);
+        self.clear_pending(ws_id, &row.id);
+        if let Err(e) = started {
+            self.closed.lock().unwrap().push(row);
+            return Err(e);
+        }
+        self.fresh_sessions.lock().unwrap().insert(row.id.clone());
+        self.restore_tab(row)
+    }
+
+    /// Pop the workspace's newest closed tab, skipping those whose worktree
+    /// a tab has open again.
+    fn take_closed(&self, ws: &Workspace) -> Option<TabRow> {
+        let mut closed = self.closed.lock().unwrap();
+        loop {
+            let i = closed.iter().rposition(|t| t.workspace_id == ws.row.id)?;
+            let row = closed.remove(i);
+            if !ws.tabs.iter().any(|t| t.row.worktree == row.worktree) {
+                return Some(row);
+            }
+        }
+    }
+
+    /// Put a closed tab back where it was in the tab strip and select it.
+    fn restore_tab(&self, row: TabRow) -> Result<()> {
+        self.db().insert_tab(&row)?;
+        let mut st = self.state();
+        if let Some(w) = st.workspaces.iter_mut().find(|w| w.row.id == row.workspace_id) {
+            let at = w.tabs.iter().position(|t| t.row.position > row.position).unwrap_or(w.tabs.len());
+            w.tabs.insert(at, Tab { row: row.clone(), unread: false });
+        }
+        drop(st);
+        self.select_tab(&row.id);
         Ok(())
     }
 
@@ -1221,6 +1274,44 @@ mod tests {
         for p in ["/a/x", "~/x", "../x", "dir/"] {
             assert!(!is_searchable(p), "{p:?}");
         }
+    }
+
+    /// A closed tab comes back in its old place; one whose worktree a tab
+    /// has open again is skipped; other workspaces' closed tabs stay put.
+    #[test]
+    fn closed_tabs_come_back_in_place() {
+        let e = engine_with(&["w", "v"]);
+        let tab = |id: &str, ws: &str, position| TabRow {
+            id: id.into(),
+            workspace_id: ws.into(),
+            title: id.into(),
+            worktree: format!("/r-{id}"),
+            branch: None,
+            tmux_session: format!("kt-test-reopen-{id}"),
+            position,
+        };
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            e.restore_tab(tab(id, "w", i as i64)).unwrap();
+        }
+        e.restore_tab(tab("x", "v", 0)).unwrap();
+        let tabs = |e: &Engine, ws: &str| e.workspace(ws).unwrap().tabs.iter().map(|t| t.row.id.clone()).collect::<Vec<_>>();
+        e.close_tab("a").unwrap();
+        e.close_tab("b").unwrap();
+        e.close_tab("x").unwrap();
+        assert_eq!(tabs(&e, "w"), ["c"]);
+
+        let ws = e.workspace("w").unwrap();
+        let b = e.take_closed(&ws).unwrap();
+        assert_eq!(b.id, "b", "newest first, this workspace only");
+        e.restore_tab(b).unwrap();
+        assert_eq!(tabs(&e, "w"), ["b", "c"]);
+        assert_eq!(e.selected_workspace().unwrap().selected().unwrap().row.id, "b");
+        assert_eq!(e.db().tabs("w").unwrap().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["b", "c"], "the order survives a restart");
+
+        // `a`'s worktree is open again in another tab: nothing left to reopen.
+        e.restore_tab(TabRow { worktree: "/r-a".into(), ..tab("a2", "w", 5) }).unwrap();
+        assert!(e.take_closed(&e.workspace("w").unwrap()).is_none());
+        assert_eq!(e.take_closed(&e.workspace("v").unwrap()).unwrap().id, "x");
     }
 
     fn engine_with(ids: &[&str]) -> Arc<Engine> {
