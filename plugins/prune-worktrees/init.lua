@@ -2,8 +2,8 @@
 --
 -- A worktree goes when it has no tab, no tmux pane (kitchen's or yours) has
 -- its cwd in it, and nothing in it was touched for idle_days: no commit or
--- checkout (its HEAD reflog), no edit to a modified, staged or untracked
--- file. Uncommitted changes go with it (`worktree remove --force`).
+-- checkout (the last entry of its HEAD reflog), no edit to a modified, staged
+-- or untracked file. Uncommitted changes go with it (`worktree remove --force`).
 --
 -- Commits are never lost: the branch stays, unless its tip is already on
 -- origin/<default> (then it's deleted too), and a detached HEAD that no ref
@@ -63,24 +63,29 @@ function M.candidates(list, tabs, panes)
 end
 
 -- Shell, run in the worktree on its host, that prints three lines:
---   touched 0|1    logs/HEAD or a modified, staged or untracked file has an
---                  mtime within `minutes`
+--   touched 0|1    the last HEAD reflog entry, or the mtime of a modified,
+--                  staged or untracked file, is within `minutes`
 --   contained 0|1  on a branch, or (detached) some ref contains HEAD
 --   on_default 0|1 HEAD is an ancestor of `default_ref`
+-- The reflog counts by the time in its last entry, not the file's mtime:
+-- `git gc` (which a fetch may start) rewrites every worktree's reflog.
 -- It fails (non-zero, before any output) when a git listing fails, so a
 -- broken probe keeps the worktree instead of reading as "not touched".
 function M.probe_sh(minutes, default_ref)
+  minutes = math.floor(minutes)
   return table.concat({
     "set -e",
     "l=$(mktemp); trap 'rm -f \"$l\"' EXIT",
     -- an assignment, so set -e stops here outside a repo
     "h=$(git rev-parse --git-path logs/HEAD)",
-    -- NUL-terminated, and always one path, so find never runs without any
-    [[printf '%s\0' "$h" > "$l"]],
-    [[git ls-files -z -m -o --exclude-standard >> "$l"]],
+    -- "<old> <new> <name> <<email>> <time> <tz>\t<message>"; no reflog: 0
+    [[r=$(tail -n 1 "$h" 2>/dev/null | sed -n 's/^[^>]*> \([0-9][0-9]*\) .*/\1/p')]],
+    "[ $((${r:-0} + " .. minutes * 60 .. ')) -gt "$(date +%s)" ] && t=1 || t=',
+    [[git ls-files -z -m -o --exclude-standard > "$l"]],
     [[git diff --cached -z --name-only >> "$l"]],
-    -- paths before primaries (BSD find insists); deleted files just error
-    [[t=$(xargs -0 sh -c 'find "$@" -maxdepth 0 -mmin -]] .. math.floor(minutes) .. [[ -print 2>/dev/null; true' _ < "$l" | head -n1)]],
+    -- paths before primaries (BSD find insists); deleted files just error;
+    -- no paths, no find (GNU's would look at ".")
+    [[[ -n "$t" ] || t=$(xargs -0 sh -c '[ $# = 0 ] || find "$@" -maxdepth 0 -mmin -]] .. minutes .. [[ -print 2>/dev/null; true' _ < "$l" | head -n1)]],
     [[if [ -n "$t" ]; then echo "touched 1"; else echo "touched 0"; fi]],
     -- for-each-ref --contains walks every ref, so only when detached
     [[if git symbolic-ref -q HEAD >/dev/null || [ -n "$(git for-each-ref --contains HEAD --count=1)" ]; then echo "contained 1"; else echo "contained 0"; fi]],
@@ -211,7 +216,7 @@ local manual = false -- the next pass was asked for with prune-worktrees.run
 local function pass()
   local was_manual = manual
   manual = false
-  local minutes = math.max(60, (tonumber(kitchen.config.idle_days) or 3) * 1440)
+  local minutes = math.max(60, (tonumber(kitchen.config.idle_days) or 2) * 1440)
   local removed, totals, per_ws = {}, { removed = 0, kept = 0, failed_workspaces = 0 }, {}
   for _, ws in ipairs(kitchen.workspaces()) do
     local ok, got, kept = pcall(prune_workspace, ws, minutes)

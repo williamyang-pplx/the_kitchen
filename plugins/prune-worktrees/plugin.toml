@@ -8,6 +8,7 @@ api = 7
 interval_minutes = 60
 # A worktree is idle when no commit/checkout and no edit to a changed or
 # untracked file happened in this many days (fractions ok; at least an hour).
-idle_days = 3
+# Each agi worktree holds 2-9G (a copied .venv), so they add up fast.
+idle_days = 2
 # Where kitchenctl lives when the kitchen was started from Finder (minimal PATH).
 path = "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"

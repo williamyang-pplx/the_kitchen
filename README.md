@@ -35,8 +35,8 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   `ruff` (Python lint), `python` (`gd` / `gr` from the ty language server),
   `github` (PR review via ⌘⇧P), `markdown` (⌘⇧V renders a Markdown file in
   the viewer; ⌘M still comments on it), `todo`, `prune-worktrees`
-  (hourly, removes the worktrees of merged/closed PRs that no tab uses and
-  that hold nothing unpushed), `bazel-cache` (every 30 minutes, keeps
+  (hourly, removes worktrees that no tab or tmux pane uses and that nobody
+  touched for 2 days; branches stay), `bazel-cache` (every 30 minutes, keeps
   `~/bazel-cache` on the mac and each devbox under 30G: drops the output bases
   of removed worktrees, then the least recently used cache entries, never under
   a running build) and `dashboard`. ⌘⇧P is the command palette.

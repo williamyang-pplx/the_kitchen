@@ -1096,15 +1096,24 @@ mod tests {
             let out = std::process::Command::new("sh").arg("-c").arg(&script).current_dir(dir).output().unwrap();
             (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
         };
-        // Everything the probe looks at, a week old.
+        let run = |dir: &str, sh: &str| assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(dir).status().unwrap().success());
+        // Everything the probe looks at, years old: the reflog's entry times
+        // and the changed files' mtimes.
         let backdate = |dir: &str| {
-            let sh = r#"touch -t 202001010000 "$(git rev-parse --git-path logs/HEAD)"; git ls-files -z -m -o --exclude-standard | xargs -0 touch -t 202001010000 2>/dev/null; true"#;
-            assert!(std::process::Command::new("sh").arg("-c").arg(sh).current_dir(dir).status().unwrap().success());
+            run(
+                dir,
+                r#"h=$(git rev-parse --git-path logs/HEAD); if [ -f "$h" ]; then sed 's/> [0-9]* /> 1577836800 /' "$h" > "$h.new" && mv "$h.new" "$h"; fi; git ls-files -z -m -o --exclude-standard | xargs -0 touch -t 202001010000 2>/dev/null; true"#,
+            )
         };
 
         assert_eq!(probe(&wt), (true, "touched 1\ncontained 1\non_default 1\n".into()), "just checked out");
         backdate(&wt);
         assert_eq!(probe(&wt).1, "touched 0\ncontained 1\non_default 1\n");
+        // git gc rewrites every reflog (a fresh mtime); its entries stay old.
+        run(&wt, "git reflog expire --all --expire=never && touch \"$(git rev-parse --git-path logs/HEAD)\"");
+        assert_eq!(probe(&wt).1, "touched 0\ncontained 1\non_default 1\n", "a reflog rewritten by gc is not a touch");
+        run(&wt, "rm \"$(git rev-parse --git-path logs/HEAD)\"");
+        assert_eq!(probe(&wt), (true, "touched 0\ncontained 1\non_default 1\n".into()), "no reflog, nothing changed");
         // The first path after logs/HEAD: catches a list that isn't NUL-separated.
         std::fs::write(format!("{wt}/new.txt"), "x").unwrap();
         assert!(probe(&wt).1.starts_with("touched 1\n"), "a fresh untracked file");
