@@ -96,6 +96,22 @@ pub fn stats_line(v: &serde_json::Value) -> String {
         .join(" · ")
 }
 
+/// A timer's last-run stats on workspace `ws`'s dashboard: this workspace's
+/// first, then the whole pass's, labelled so a total isn't read as this
+/// workspace's ("all workspaces" only when the timer reports per workspace).
+pub fn stats_lines(t: &TimerInfo, ws: &str) -> Vec<String> {
+    let here = stats_line(t.state.workspaces.get(ws).unwrap_or(&serde_json::Value::Null));
+    let all = stats_line(&t.state.stats);
+    let mut out = Vec::new();
+    if !here.is_empty() {
+        out.push(format!("last run, this workspace: {here}"));
+    }
+    if !all.is_empty() {
+        out.push(if t.state.workspaces.is_object() { format!("last run, all workspaces: {all}") } else { format!("last run: {all}") });
+    }
+    out
+}
+
 /// What one timer row says about when it runs: "every 1h · last 12m ago (took 4m) · next in 48m".
 pub fn timer_when(t: &TimerInfo, now: f64) -> String {
     let mut out = format!("every {}", span(t.interval_secs));
@@ -135,13 +151,8 @@ fn timers(ui: &mut Ui, list: &[TimerInfo], ws: &str, now: f64) {
         if let Some(e) = &t.state.last_error {
             ui.label(RichText::new(e.lines().next().unwrap_or(e)).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::RED));
         }
-        let all = stats_line(&t.state.stats);
-        if !all.is_empty() {
-            ui.label(RichText::new(format!("last run: {all}")).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
-        }
-        let here = stats_line(t.state.workspaces.get(ws).unwrap_or(&serde_json::Value::Null));
-        if !here.is_empty() {
-            ui.label(RichText::new(format!("this workspace: {here}")).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
+        for line in stats_lines(t, ws) {
+            ui.label(RichText::new(line).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
         }
     }
 }
@@ -220,6 +231,10 @@ mod tests {
         t.running = true;
         assert_eq!(timer_when(&t, 1060.0), "every 1h · running for 1m · 3 runs");
         assert_eq!(stats_line(&t.state.stats), "kept 41 · removed 5");
+        assert_eq!(stats_lines(&t, "w1"), ["last run: kept 41 · removed 5"], "no per-workspace stats");
+        t.state.workspaces = serde_json::json!({ "w1": { "kept": 3, "removed": 0 } });
+        assert_eq!(stats_lines(&t, "w1"), ["last run, this workspace: kept 3 · removed 0", "last run, all workspaces: kept 41 · removed 5"]);
+        assert_eq!(stats_lines(&t, "w2"), ["last run, all workspaces: kept 41 · removed 5"]);
         assert_eq!(stats_line(&serde_json::json!({"note": "ok"})), "note ok");
     }
 }

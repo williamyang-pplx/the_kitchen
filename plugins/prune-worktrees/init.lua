@@ -242,7 +242,7 @@ end
 
 -- The kitchen runs it on schedule and never starts one while another is going.
 local timer = kitchen.every("pass", math.max(1, tonumber(kitchen.config.interval_minutes) or 60) * 60, pass, {
-  desc = "remove worktrees idle for idle_days",
+  desc = "remove worktrees idle for idle_days (kept: no tab or pane, but used recently or not safe to remove)",
   first_delay = 60,
 })
 
