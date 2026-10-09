@@ -1338,6 +1338,9 @@ mod tests {
             "",
         );
         let server = fake(&["A-server.jar", &format!("--output_base={r}/workspace/live")]);
+        // A server whose output base is spelled through a symlink (Bazel resolves them).
+        sh(&format!("mkdir {r:?}/workspace/aliased && ln -s {r:?} {r:?}-alias"), "");
+        let aliased = fake(&["A-server.jar", &format!("--output_base={r}-alias/workspace/aliased")]);
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let scan_sh: String = m.get::<mlua::Function>("scan_sh").unwrap().call(r.as_str()).unwrap();
@@ -1345,7 +1348,8 @@ mod tests {
         let s = to_json(scan);
         let bases: std::collections::BTreeMap<String, serde_json::Value> =
             s["bases"].as_array().unwrap().iter().map(|b| (b["path"].as_str().unwrap().rsplit('/').next().unwrap().to_string(), b.clone())).collect();
-        assert_eq!(bases.keys().collect::<Vec<_>>(), ["kept", "live", "orphan"], "not install/");
+        assert_eq!(bases.keys().collect::<Vec<_>>(), ["aliased", "kept", "live", "orphan"], "not install/");
+        assert_eq!(bases["aliased"]["pid"], aliased, "matched by folder name");
         assert_eq!(bases["live"]["pid"], server, "the fake server");
         assert_eq!((bases["live"]["exists"].as_bool(), bases["live"]["busy"].as_bool()), (Some(true), Some(false)), "lock's pid is gone");
         let in_2020 = |v: &serde_json::Value| (1577750000..1577930000).contains(&v.as_i64().unwrap());
@@ -1371,6 +1375,11 @@ mod tests {
             format!("skip {r}/workspace/live server\nskip {r}/workspace/kept client\nfreed {r}/workspace/orphan\nskip {r}/repo/contents/h/u1 linked\nskip {r}/repo/contents/h/u3 used\nfreed {r}/repo/content_addressable/sha256/d\n"),
             "a running server keeps what its output base links to, a fresh marker keeps its entry, the rest goes; read-only files too"
         );
+        let out = run(serde_json::json!({ "stop": [], "evict": [item("base", "workspace/aliased")] }));
+        assert_eq!(out, format!("skip {r}/workspace/aliased server\n"), "a server spelling root another way still counts");
+        // Can't tell what's linked (here mktemp fails; a full disk would too): keep contents.
+        let (script, input): (String, String) = evict.call((lua.to_value(&serde_json::json!({ "stop": [], "evict": [item("contents", "repo/contents/h/u1")] })).unwrap(), r.as_str())).unwrap();
+        assert_eq!(sh(&format!("mktemp() {{ return 1; }}\n{script}"), &input), format!("skip {r}/repo/contents/h/u1 links unknown\n"));
         // Stopping the idle server frees what it linked to; a contents entry loses its marker too.
         let out = run(serde_json::json!({ "stop": [server], "evict": [item("contents", "repo/contents/h/u1"), item("base", "workspace/live")] }));
         assert_eq!(out, format!("freed {r}/repo/contents/h/u1\nfreed {r}/workspace/live\n"));
@@ -1378,8 +1387,9 @@ mod tests {
         let parsed = to_json(m.get::<mlua::Function>("parse_evict").unwrap().call("freed /a\nskip /b server\nstuck 4\n").unwrap());
         assert_eq!(parsed, serde_json::json!({ "freed": { "/a": true }, "skipped": ["/b server"], "stuck": 1 }));
 
-        let _ = std::process::Command::new("kill").arg(client.to_string()).status();
+        let _ = std::process::Command::new("kill").args([client.to_string(), aliased.to_string()]).status();
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(format!("{r}-alias"));
     }
 
     /// `kitchen.every` runs on schedule and records its runs (stats, errors,

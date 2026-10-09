@@ -310,14 +310,19 @@ function M.evict_sh(p, root, idle_minutes)
   end
   local idle = math.floor((idle_minutes or 30) * 60)
   local script = PRELUDE .. "r=" .. M.shell_path(root) .. "\npids='" .. table.concat(pids, " ") .. "'\nidle=" .. idle .. "\n" .. [[
-in_root() { servers | awk -v p="--output_base=$r/workspace/" -v h="$1" '{ for (i = 2; i <= NF; i++) if (index($i, p) == 1 && substr($i, length(p) + 1) == h) f = 1 } END { exit !f }'; }
+# (by folder name: Bazel passes the server its output base with symlinks resolved)
+in_root() { servers | awk -v h="$1" '{ for (i = 2; i <= NF; i++) if ($i ~ /^--output_base=/) { n = split($i, a, "/"); if (a[n] == h) f = 1 } } END { exit !f }'; }
 pf=$(mktemp); trap 'rm -f "$pf"' EXIT
+pins_ok=0
+# pins_ok=1 only when the whole list made it to $pf (a full disk must not
+# read as "nothing linked")
 live_pins() {
-  for b in "$r"/workspace/*/; do
-    b=${b%/}
-    [ -d "$b" ] && [ "${b##*/}" != install ] || continue
-    if in_root "${b##*/}" || client_busy "$b"; then pins "$b"; fi
-  done | awk '{ print $3 }' > "$pf"
+  pins_ok=0
+  { for b in "$r"/workspace/*/; do
+      b=${b%/}
+      [ -d "$b" ] && [ "${b##*/}" != install ] || continue
+      if in_root "${b##*/}" || client_busy "$b"; then pins "$b"; fi
+    done; echo "pin - end"; } | awk '{ print $3 }' > "$pf" && [ "$(tail -n 1 "$pf")" = end ] && pins_ok=1
 }
 for x in $pids; do kill -TERM "$x" 2>/dev/null; done
 i=0
@@ -338,7 +343,9 @@ while IFS=' ' read -r kind path; do
     [ $((n % 100)) = 0 ] && live_pins < /dev/null
     n=$((n + 1))
     if [ "$kind" = contents ]; then
-      if grep -qxF "${path#"${path%/*/*}"/}" "$pf"; then echo "skip $path linked"; continue; fi
+      [ $pins_ok = 1 ] || { echo "skip $path links unknown"; continue; }
+      grep -qxF "${path#"${path%/*/*}"/}" "$pf"
+      [ $? = 1 ] || { echo "skip $path linked"; continue; }
       m=$path.recorded_inputs
     else
       m=$path/file
