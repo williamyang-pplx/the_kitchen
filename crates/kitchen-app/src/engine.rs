@@ -733,9 +733,11 @@ impl Engine {
                     (checked?.0, branch.unwrap_or_default().to_string())
                 }
                 None => {
+                    // (nothing on origin yet, e.g. an empty repo: the main
+                    // checkout's branch, not cached, so a later push is seen)
                     let base = match &ws.row.default_branch {
                         Some(b) => b.clone(),
-                        None => repo.default_branch()?,
+                        None => repo.default_branch().or_else(|_| repo.head_branch())?,
                     };
                     let label = opts.title.clone().or(opts.task.clone()).unwrap_or_else(|| format!("tab-{tab_id}"));
                     let first = label.lines().next().unwrap_or(&label).to_string();

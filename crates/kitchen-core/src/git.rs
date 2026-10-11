@@ -124,6 +124,17 @@ impl<'a> Repo<'a> {
         bail!("cannot determine default branch of {}", self.path)
     }
 
+    /// The branch the main checkout is on, even before its first commit
+    /// (what a repo with nothing on origin will push as its default).
+    pub fn head_branch(&self) -> Result<String> {
+        let b = self.git(&["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap_or_default();
+        let b = b.trim();
+        if b.is_empty() {
+            bail!("cannot determine default branch of {}: nothing on origin, and HEAD is detached", self.path)
+        }
+        Ok(b.to_string())
+    }
+
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
         Ok(parse_worktree_porcelain(&self.git(&["worktree", "list", "--porcelain"])?))
     }
@@ -215,6 +226,9 @@ fi"#,
     /// off `origin/<base>` as last fetched (the app's spare warmer keeps it
     /// fresh), checked out in the sibling worktree `<repo>-<slug>`, with
     /// `.kitchen/` git-excluded. One round trip to the host, no network.
+    /// Without `origin/<base>` (nothing pushed yet) the branch starts from
+    /// the local `<base>`, and in a repo with no commits at all it starts
+    /// empty (`--orphan`, git 2.42+).
     pub fn create_edit_worktree(&self, base: &str, prefix: &str, slug: &str) -> Result<Worktree> {
         // `<repo>-kitchen-*` names belong to the kitchen (spares, PR views).
         let slug = if slug.starts_with("kitchen") { format!("tab-{slug}") } else { slug.to_string() };
@@ -228,16 +242,22 @@ while [ -e {parent}/{name}-"$s" ] || git -C {r} rev-parse --verify --quiet "refs
 done
 P={parent}/{name}-"$s"
 {take_spare}
-# Take over a pre-checked-out spare (instant), else check out from scratch.
-if take_spare "$P"; then
-  if [ "$(git -C "$P" rev-parse HEAD)" = "$(git -C {r} rev-parse origin/{b})" ]; then
+if git -C {r} rev-parse --verify --quiet refs/remotes/origin/{b} >/dev/null; then START=refs/remotes/origin/{b}
+elif git -C {r} rev-parse --verify --quiet refs/heads/{b} >/dev/null; then START=refs/heads/{b}
+else START=; fi
+# No commits to start from: a branch with no history. Else take over a
+# pre-checked-out spare (instant), else check out from scratch.
+if [ -z "$START" ]; then
+  git -C {r} worktree add --quiet --orphan -b {pf}"$s" "$P" || {{ echo "the repo has no commits yet, and starting an empty branch needs git 2.42+" >&2; exit 13; }}
+elif take_spare "$P"; then
+  if [ "$(git -C "$P" rev-parse HEAD)" = "$(git -C {r} rev-parse "$START")" ]; then
     # Same commit: pure ref updates, no index refresh (~0.6s saved on big repos).
-    git -C "$P" branch --no-track {pf}"$s" origin/{b} && git -C "$P" symbolic-ref HEAD refs/heads/{pf}"$s" || {{ give_back "$P"; exit 13; }}
+    git -C "$P" branch --no-track {pf}"$s" "$START" && git -C "$P" symbolic-ref HEAD refs/heads/{pf}"$s" || {{ give_back "$P"; exit 13; }}
   else
-    git -C "$P" checkout --quiet --no-track -b {pf}"$s" origin/{b} || {{ git -C {r} branch -D {pf}"$s" >/dev/null 2>&1; give_back "$P"; exit 13; }}
+    git -C "$P" checkout --quiet --no-track -b {pf}"$s" "$START" || {{ git -C {r} branch -D {pf}"$s" >/dev/null 2>&1; give_back "$P"; exit 13; }}
   fi
 else
-  git -C {r} worktree add --quiet --no-track -b {pf}"$s" "$P" origin/{b} || exit 13
+  git -C {r} worktree add --quiet --no-track -b {pf}"$s" "$P" "$START" || exit 13
 fi
 {exclude}
 echo "KT_TAKEN=$TAKEN"
@@ -463,7 +483,7 @@ fn gunzip_if_gzipped(bytes: Vec<u8>) -> Result<Vec<u8>> {
 /// Shell lines printing `KT_PATH=`/`KT_HEAD=`/`KT_BRANCH=` for [`parse_report`].
 fn report_snippet(dir: &str) -> String {
     format!(
-        r#"echo "KT_PATH=$(git -C {dir} rev-parse --show-toplevel)"; echo "KT_HEAD=$(git -C {dir} rev-parse HEAD)"; echo "KT_BRANCH=$(git -C {dir} symbolic-ref --quiet --short HEAD)""#
+        r#"echo "KT_PATH=$(git -C {dir} rev-parse --show-toplevel)"; echo "KT_HEAD=$(git -C {dir} rev-parse --verify --quiet HEAD)"; echo "KT_BRANCH=$(git -C {dir} symbolic-ref --quiet --short HEAD)""#
     )
 }
 
@@ -783,6 +803,39 @@ mod tests {
         repo.ensure_spare_worktree("main", true).unwrap();
         assert!(spares.iter().all(|s| exists(&format!("{s}/v.txt")) && !exists(&format!("{s}/e.txt"))), "fetch failure tolerated");
         sh(root, &format!("git -C repo remote set-url origin {}", shell_quote(&root.join("origin").display().to_string())));
+    }
+
+    /// Repos with nothing on origin: new tabs start an empty branch until
+    /// there is a commit, then branch off the local default branch.
+    #[test]
+    fn edit_worktree_in_empty_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sh(root, "git init -q -b trunk solo && git init -q --bare -b main origin && git clone -q origin clone 2>/dev/null");
+        for name in ["solo", "clone"] {
+            let path = root.join(name).display().to_string();
+            let repo = Repo::new(&Host::Local, &path);
+            assert!(repo.default_branch().is_err(), "{name}: nothing on origin");
+            let base = repo.head_branch().unwrap();
+            assert_eq!(base, if name == "solo" { "trunk" } else { "main" });
+            let wt = repo.create_edit_worktree(&base, "william/", "first").unwrap();
+            assert!(wt.path.ends_with(&format!("/{name}-first")), "{}", wt.path);
+            assert_eq!(wt.branch.as_deref(), Some("william/first"));
+            assert_eq!(wt.head, "", "no commit yet");
+            std::fs::write(format!("{}/new.txt", wt.path), "x\n").unwrap();
+            let l = repo.listing(&wt.path, &format!("origin/{base}")).unwrap();
+            let changed: Vec<&str> = l.changed.iter().map(|c| c.path.as_str()).collect();
+            assert_eq!(changed, vec!["new.txt"], "{name}: untracked files show as added");
+        }
+
+        // Committed but never pushed: off the local branch.
+        let solo = root.join("solo");
+        sh(&solo, "git config user.email t@t && git config user.name t && echo one > a.txt && git add . && git commit -qm init");
+        let path = solo.display().to_string();
+        let repo = Repo::new(&Host::Local, &path);
+        let wt = repo.create_edit_worktree("trunk", "william/", "second").unwrap();
+        assert_eq!(wt.head.len(), 40);
+        assert!(exists(&format!("{}/a.txt", wt.path)));
     }
 
     /// Existing branches and PR heads, fetched and checked out in one trip,
