@@ -310,6 +310,7 @@ impl KitchenApp {
             Action::FilePicker => self.side_command(PanelCmd::FilePicker),
             Action::OpenPlan => self.open_side(SideKind::Plan, Some(PanelCmd::Reload)),
             Action::Comment => self.side_command(PanelCmd::Comment),
+            Action::Ask => self.side_command(PanelCmd::Ask),
             Action::Submit => self.side_command(PanelCmd::Submit),
             Action::DiffOrDashboard if self.focus() == Focus::Side && self.side().is_some() => self.side_command(PanelCmd::ToggleDiff),
             Action::DiffOrDashboard => {
@@ -1144,6 +1145,7 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("⌘B", "show / hide the file list"),
                 ("⌘⇧H  ⌘⇧L", "file list ↔ code"),
                 ("⌘⇧J  ⌘⇧K", "next / previous changed file"),
+                ("⌘⇧A", "ask about the line or selection"),
                 ("⌘O", "outline"),
                 ("]c  [c", "next / previous change"),
                 ("gd  gr", "definition / references"),

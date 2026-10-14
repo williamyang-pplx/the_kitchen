@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use egui::text::{CCursor, LayoutJob, TextFormat};
-use egui::{Color32, CornerRadius, FontId, Galley, Key, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
+use egui::{Color32, CornerRadius, FontId, Galley, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use super::doc::{Doc, LineKind};
@@ -82,6 +82,8 @@ pub struct Editor {
     pub text: String,
     pub label: String,
     pub needs_focus: bool,
+    /// A ⌘⇧A question: Enter submits it (⇧Enter: a new line).
+    pub ask: bool,
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +92,8 @@ pub struct Output {
     pub clicked: bool,
     /// Esc pressed inside the editor.
     pub cancel_editor: bool,
+    /// Enter pressed in a question field.
+    pub submit_editor: bool,
 }
 
 pub struct CodeView<'a> {
@@ -400,12 +404,17 @@ impl CodeView<'_> {
                 child.label(egui::RichText::new(&ed.label).size(11.0).color(theme::ACCENT));
                 let te = egui::TextEdit::multiline(&mut ed.text)
                     .id(editor_id)
-                    .hint_text("Write a comment…   ⌘Enter submit · Esc cancel")
+                    .hint_text(if ed.ask { "Ask about this code…   Enter ask · ⇧Enter new line · Esc cancel" } else { "Write a comment…   ⌘Enter submit · Esc cancel" })
                     .desired_rows(4)
                     .desired_width(er.width())
                     .font(FontId::proportional(font_size))
                     .background_color(theme::BG)
                     .text_color(theme::TEXT);
+                // Taken before the field sees it, which would add a new line
+                // (`consume_key` ignores Shift, so ⇧Enter is let through first).
+                if ed.ask && editor_focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter)) {
+                    out.submit_editor = true;
+                }
                 let r = child.add(te);
                 if ed.needs_focus {
                     r.request_focus();

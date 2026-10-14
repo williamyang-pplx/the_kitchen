@@ -189,6 +189,7 @@ impl PlanView {
                     text: String::new(),
                     label: format!("Plan comment on {lines} — stays local until you send (⌘Enter with no field open)"),
                     needs_focus: true,
+                    ask: false,
                 });
             }
             // Submit after this frame's typing reaches the editor.
@@ -211,7 +212,7 @@ impl PlanView {
                 self.reload_comments();
                 self.poll_file(true);
             }
-            PanelCmd::ToggleDiff | PanelCmd::ToggleOutline | PanelCmd::FilePicker | PanelCmd::FocusList | PanelCmd::FocusCode | PanelCmd::ToggleFiles | PanelCmd::NextFile | PanelCmd::PrevFile | PanelCmd::Diagnostics | PanelCmd::Render(_) | PanelCmd::Open { .. } => {
+            PanelCmd::Ask | PanelCmd::ToggleDiff | PanelCmd::ToggleOutline | PanelCmd::FilePicker | PanelCmd::FocusList | PanelCmd::FocusCode | PanelCmd::ToggleFiles | PanelCmd::NextFile | PanelCmd::PrevFile | PanelCmd::Diagnostics | PanelCmd::Render(_) | PanelCmd::Open { .. } => {
                 self.status = Some(("plan reviewer: ⌘M comment · ⌘Enter submit / send to agent".into(), false));
             }
         }

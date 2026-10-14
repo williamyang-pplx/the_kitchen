@@ -4,6 +4,7 @@
 //! a workspace on a devbox and a workspace on the mac run the same code; only
 //! the transport (a local process vs. `ssh <alias> ...`) differs.
 
+pub mod ask;
 pub mod bootstrap;
 pub mod db;
 pub mod git;

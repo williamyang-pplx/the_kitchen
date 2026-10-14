@@ -243,16 +243,10 @@ impl Viewer {
         let Some(plugins) = self.engine.plugins() else { return Vec::new() };
         let Some(path) = self.current.as_ref().filter(|_| !self.browsing && !self.outline) else { return Vec::new() };
         let Some(decor) = plugins.decor.get(&self.file_key(path)) else { return Vec::new() };
-        let is_diff = self.doc_key.as_ref().is_some_and(|k| k.1);
         decor
             .comments()
             .map(|c| {
-                let row = c.line.and_then(|n| {
-                    self.doc.lines.iter().position(|l| match c.side {
-                        Side::New => l.kind != LineKind::Removed && l.covers_new(n),
-                        Side::Old => is_diff && l.old_no == Some(n),
-                    })
-                });
+                let row = c.line.and_then(|n| self.row_at(c.side, n));
                 let mut title = c.title.clone();
                 if let (None, Some(n)) = (row, c.line) {
                     let side = if c.side == Side::Old { "base " } else { "" };
@@ -262,6 +256,40 @@ impl Viewer {
                 (block, c.id.clone())
             })
             .collect()
+    }
+
+    /// The doc row showing line `n` of `side`.
+    pub(super) fn row_at(&self, side: Side, n: usize) -> Option<usize> {
+        let is_diff = self.doc_key.as_ref().is_some_and(|k| k.1);
+        self.doc.lines.iter().position(|l| match side {
+            Side::New => l.kind != LineKind::Removed && l.covers_new(n),
+            Side::Old => is_diff && l.old_no == Some(n),
+        })
+    }
+
+    /// Where doc row `i` is: a removed line on the base side, everything else
+    /// in the current file. A rendered row stands for its source lines: a
+    /// range ends (`last`) on its last.
+    pub(super) fn row_line(&self, i: usize, last: bool) -> (Side, Option<usize>) {
+        match self.doc.lines.get(i) {
+            Some(l) if l.kind == LineKind::Removed => (Side::Old, l.old_no),
+            Some(l) if last => (Side::New, l.last_no()),
+            Some(l) => (Side::New, l.new_no),
+            None => (Side::New, None),
+        }
+    }
+
+    /// The source text of doc rows `start..=end`, also for rendered rows.
+    pub(super) fn quote(&self, path: &str, start: usize, end: usize) -> String {
+        let raw: Vec<&str> = self.files.get(path).map(|f| f.text.lines().collect()).unwrap_or_default();
+        let lines: Vec<&str> = (start..=end)
+            .filter_map(|i| self.doc.lines.get(i))
+            .flat_map(|l| match (l.render.is_some(), l.new_no, l.last_no()) {
+                (true, Some(a), Some(b)) => raw.get(a - 1..b.min(raw.len())).unwrap_or_default().to_vec(),
+                _ => vec![l.text.as_str()],
+            })
+            .collect();
+        lines.join("\n")
     }
 
     /// ⌘M: a comment field under the cursor line or visual selection. On a
@@ -287,7 +315,7 @@ impl Viewer {
         };
         self.reply_to = thread.and_then(|(_, id)| id);
         self.list_focus = false;
-        self.editor = Some(Editor { start, end, text: String::new(), label: format!("{what} — ⌘Enter sends it to {} · Esc cancels", who.join(", ")), needs_focus: true });
+        self.editor = Some(Editor { start, end, text: String::new(), label: format!("{what} — ⌘Enter sends it to {} · Esc cancels", who.join(", ")), needs_focus: true, ask: false });
     }
 
     /// Hand the comment field to the `comment` listeners.
@@ -299,27 +327,8 @@ impl Viewer {
             return;
         }
         let Some(path) = self.current.clone() else { return };
-        // A removed line is on the base side; everything else on the current
-        // file. A rendered row stands for its source lines: a range ends on its last.
-        let pos = |i: usize, last: bool| -> (&'static str, Option<usize>) {
-            match self.doc.lines.get(i) {
-                Some(l) if l.kind == LineKind::Removed => ("old", l.old_no),
-                Some(l) if last => ("new", l.last_no()),
-                Some(l) => ("new", l.new_no),
-                None => ("new", None),
-            }
-        };
-        let ((side, line), (start_side, start_line)) = (pos(ed.end, true), pos(ed.start, false));
+        let ((side, line), (start_side, start_line)) = (self.row_line(ed.end, true), self.row_line(ed.start, false));
         let multi = (side, line) != (start_side, start_line);
-        // The source text, also for rendered rows.
-        let raw: Vec<&str> = self.files.get(&path).map(|f| f.text.lines().collect()).unwrap_or_default();
-        let quote: Vec<&str> = (ed.start..=ed.end)
-            .filter_map(|i| self.doc.lines.get(i))
-            .flat_map(|l| match (l.render.is_some(), l.new_no, l.last_no()) {
-                (true, Some(a), Some(b)) => raw.get(a - 1..b.min(raw.len())).unwrap_or_default().to_vec(),
-                _ => vec![l.text.as_str()],
-            })
-            .collect();
         let k = self.file_key(&path);
         let ev = serde_json::json!({
             "file": { "host": k.host, "worktree": k.worktree, "path": k.path, "abs": k.abs() },
@@ -329,7 +338,7 @@ impl Viewer {
             "start_line": if multi { start_line } else { None },
             "start_side": if multi { Some(start_side) } else { None },
             "text": text,
-            "quote": quote.join("\n"),
+            "quote": self.quote(&path, ed.start, ed.end),
             "reply_to": self.reply_to.take(),
             "tab": crate::plugins::command_context(&self.engine, &self.tab_id, None),
         });

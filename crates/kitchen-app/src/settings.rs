@@ -16,6 +16,8 @@ pub struct Settings {
     pub dotfiles_remote_dir: String,
     /// Model used for outline summaries (`claude -p --model <this>`).
     pub summary_model: String,
+    /// Model that answers ⌘⇧A questions in the viewer.
+    pub ask_model: String,
     pub font_size: f32,
     /// Folders the viewer opens at when a tab has no changes (first that exists).
     pub viewer_default_dirs: Vec<String>,
@@ -35,6 +37,7 @@ impl Default for Settings {
             dotfiles_remote_url: "https://github.com/williamyang-pplx/dotfiles".into(),
             dotfiles_remote_dir: "~/.dotfiles".into(),
             summary_model: "haiku".into(),
+            ask_model: "sonnet".into(),
             font_size: 13.0,
             viewer_default_dirs: vec!["aster".into()],
             relative_line_numbers: true,

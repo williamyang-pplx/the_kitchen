@@ -2,11 +2,12 @@
 //! agent worked in) it opens on the first changed file's diff, next to a
 //! tree of just the changed files; without, on a folder view at a default
 //! folder such as `aster/`. Plain / diff / outline modes, plugin
-//! renderings of a file (the markdown plugin's ⌘⇧V), vim navigation, jump-to-definition with a jump list, and ⌘M comments that
-//! plugins post and draw (the github plugin: PR review comments). All file access goes
+//! renderings of a file (the markdown plugin's ⌘⇧V), vim navigation, jump-to-definition with a jump list, ⌘M comments that
+//! plugins post and draw (the github plugin: PR review comments), and ⌘⇧A questions the model answers under the line. All file access goes
 //! through the workspace's [`Host`] on background threads, so devbox
 //! workspaces work the same.
 
+mod ask;
 mod changes_tree;
 pub mod code_view;
 pub mod doc;
@@ -91,6 +92,8 @@ enum Msg {
     Stat { path: String, meta: Option<String> },
     /// A `gd`/`gr` answer (`None`: the provider couldn't tell).
     Nav { token: u64, answer: Option<Vec<crate::plugins::Location>> },
+    /// The model's answer to ⌘⇧A question `id`.
+    Answer { id: u64, result: Result<String, String> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -197,6 +200,10 @@ pub struct Viewer {
     reply_to: Option<String>,
     /// ⌘Enter arrived; submit once the editor has seen this frame's input.
     submit_pending: bool,
+    /// ⌘⇧A questions and their answers, and the last question's id.
+    asks: Vec<ask::Ask>,
+    ask_seq: u64,
+    answerer: ask::Answerer,
 }
 
 impl Viewer {
@@ -267,6 +274,9 @@ impl Viewer {
             editor: None,
             reply_to: None,
             submit_pending: false,
+            asks: Vec::new(),
+            ask_seq: 0,
+            answerer: kitchen_core::ask::answer,
         };
         v.load_file_list(false);
         v
@@ -451,6 +461,7 @@ impl Viewer {
                 }
                 Msg::Grep { token, locs } => self.finish_grep(token, locs),
                 Msg::Nav { token, answer } => self.finish_nav(token, answer),
+                Msg::Answer { id, result } => self.finish_ask(id, result),
                 Msg::Summaries { path, map, error } => {
                     self.summary_pending.remove(&path);
                     if let Some(e) = error {
@@ -698,7 +709,10 @@ impl Viewer {
                         }
                     }
                 }
-                VimAction::Escape => self.status = None,
+                VimAction::Escape => {
+                    self.close_asks();
+                    self.status = None;
+                }
                 VimAction::ScrollBy(_) | VimAction::Center | VimAction::Top | VimAction::Bottom => {}
             }
         }
@@ -897,6 +911,7 @@ impl Viewer {
     pub fn command(&mut self, cmd: PanelCmd, _engine: &Arc<Engine>) {
         match cmd {
             PanelCmd::Comment => self.start_comment(),
+            PanelCmd::Ask => self.start_ask(),
             // Submit after this frame's typing reaches the editor.
             PanelCmd::Submit if self.editor.is_some() => self.submit_pending = true,
             PanelCmd::Submit => self.status = Some(("⌘M comments on the cursor line (V: a range)".into(), false)),
@@ -1132,7 +1147,7 @@ impl Viewer {
                 self.leader_keys(&mut code_ui);
             }
             let comments = self.comment_blocks();
-            let blocks: Vec<code_view::Block> = comments.into_iter().map(|(b, _)| b).collect();
+            let blocks: Vec<code_view::Block> = comments.into_iter().map(|(b, _)| b).chain(self.ask_blocks()).collect();
             let overlay = self.overlay.as_ref().filter(|o| !self.browsing && !self.outline && self.current.as_deref() == Some(o.path.as_str())).map(|o| &o.overlay);
             let out = CodeView {
                 doc: &self.doc,
@@ -1155,8 +1170,12 @@ impl Viewer {
             if out.cancel_editor {
                 self.editor = None;
             }
-            if std::mem::take(&mut self.submit_pending) {
-                self.submit_comment();
+            if std::mem::take(&mut self.submit_pending) || out.submit_editor {
+                if self.editor.as_ref().is_some_and(|e| e.ask) {
+                    self.submit_ask();
+                } else {
+                    self.submit_comment();
+                }
             }
             self.handle_actions(out.actions);
         }
@@ -1928,6 +1947,42 @@ end)"#,
         h.frame(&mut v);
         h.settle(&mut v, &|v| v.comment_blocks().first().is_some_and(|(b, _)| b.body.ends_with("|c1")));
         let _ = std::fs::remove_dir_all(&plugins);
+    }
+
+    #[test]
+    fn questions_are_answered_under_their_line() {
+        let h = Harness::new(TestRepo::new("printf 'a\\nb\\nc\\n' > a.py"));
+        h.repo.sh("printf 'a\\nB\\nc\\n' > a.py && git commit -qam change");
+        let engine = &h.engine;
+        let mut v = h.viewer();
+        v.answerer = |model, cwd, q| Ok(format!("{model}|{}|{}:{}-{}|{}|{}|{}", cwd.is_some(), q.path, q.first, q.last, q.base, q.quote, q.text));
+        h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none());
+        // The first change starts with the removed `b`; V takes the added `B` too.
+        assert_eq!(v.doc.lines[v.vim.line].text, "b");
+        h.text(&mut v, "V");
+        h.text(&mut v, "j");
+        v.command(PanelCmd::Ask, engine);
+        assert!(v.editor.as_ref().is_some_and(|e| e.ask && e.label.starts_with("Ask sonnet about lines")), "{:?}", v.editor.as_ref().map(|e| &e.label));
+        h.frame(&mut v);
+        h.text(&mut v, "why?");
+        // Enter asks (⌘Enter would too).
+        h.key(&mut v, egui::Key::Enter);
+        assert!(v.editor.is_none(), "submitted");
+        let row = v.vim.line;
+        assert_eq!(v.doc.lines[row].text, "B");
+        assert_eq!(v.ask_blocks().first().map(|b| (b.after, b.body.as_str())), Some((Some(row), "thinking…")));
+        h.settle(&mut v, &|v| v.ask_blocks().first().is_some_and(|b| !b.dim));
+        let b = v.ask_blocks().remove(0);
+        // Mixed sides: about the last line, in the current file.
+        assert_eq!(b.body, "sonnet|true|a.py:2-2|false|b\nB|why?");
+        assert!(b.title.starts_with("why?"));
+        // Esc elsewhere keeps it; Esc on its line closes it.
+        v.place_cursor(1, 0);
+        h.key(&mut v, egui::Key::Escape);
+        assert_eq!(v.ask_blocks().len(), 1);
+        v.cursor_to_row(row);
+        h.key(&mut v, egui::Key::Escape);
+        assert!(v.ask_blocks().is_empty());
     }
 
     /// Drives a real viewer against `KT_VIEWER_HOST`:`KT_VIEWER_WT` (e.g. a devbox worktree).

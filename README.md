@@ -24,7 +24,9 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   `]c`/`[c` in the code, step through them; `a` in the list switches to the
   whole repo, ⌘B hides the list. On a PR its review comments show
   under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
-  commented line) to the PR on GitHub. Tabs without changes open on a folder view
+  commented line) to the PR on GitHub. ⌘⇧A asks the model (`ask_model`,
+  sonnet) about the cursor line or selection; Enter sends the question and the
+  answer shows under the line until Esc on it. Tabs without changes open on a folder view
   (`aster/`, set by `viewer_default_dirs`). Vim
   navigation (`-` up a folder, Enter opens), an fzf-style ⌘P file finder (in the viewer)
   (space-separated terms, smart case), diff/plain mode, jump-to-definition and an
@@ -102,6 +104,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘⇧R | rename the current workspace |
 | ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins); paste a PR link to review it |
 | ⌘M | comment on the cursor line / selection (viewer, viewing a PR: posted to the PR on GitHub; on a commented line: a reply) |
+| ⌘⇧A | in the viewer: ask the model about the cursor line / selection (Enter asks; the answer shows under the line, Esc on it closes it) |
 | ⌘Enter | submit comment (plan: send comments to agent) |
 | ⌘D | workspace dashboard; in the viewer or plan: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |

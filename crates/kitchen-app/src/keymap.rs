@@ -4,7 +4,7 @@
 //! A tab shows either its terminal or its side panel (viewer / plan), and
 //! ⌘. switches between the terminal and the viewer. Chords act on what is
 //! shown (see [`Action::scope`]): tab keys (⌘T ⌘W) work in the terminal,
-//! panel keys (⌘M ⌘O ⌘Enter) in a side panel, ⌘P and ⌘⇧H/J/K/L in the
+//! panel keys (⌘M ⌘O ⌘Enter) in a side panel, ⌘P, ⌘⇧A and ⌘⇧H/J/K/L in the
 //! viewer; elsewhere they are swallowed. Tab and workspace switching (⌘H/L
 //! ⌘1-9 ⌘J/K) and ⌘⇧T work everywhere. The rest is global; ⌘D toggles
 //! diff in a side panel and the workspace dashboard elsewhere.
@@ -28,6 +28,7 @@
 //! | ⌘⇧R         | rename the current workspace                  |
 //! | ⌘⇧P         | command palette (plugin commands)             |
 //! | ⌘M          | comment on the cursor line / selection        |
+//! | ⌘⇧A         | focused viewer: ask the model about the line  |
 //! | ⌘Enter      | submit comment (plan: send comments to agent) |
 //! | ⌘D          | dashboard (focused side panel: diff / plain)  |
 //! | ⌘O          | toggle outline (collapsed) mode               |
@@ -62,6 +63,8 @@ pub enum Action {
     RenameTab,
     RenameWorkspace,
     Comment,
+    /// Viewer: ⌘⇧A asks the model about the cursor line / selection.
+    Ask,
     Submit,
     /// ⌘D: diff / plain in a focused side panel, else the workspace dashboard.
     DiffOrDashboard,
@@ -89,7 +92,7 @@ impl Action {
     pub fn scope(self) -> Scope {
         match self {
             Action::NewTab | Action::CloseTab => Scope::Terminal,
-            Action::Comment | Action::Submit | Action::ToggleOutline | Action::FilePicker | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile => Scope::Side,
+            Action::Comment | Action::Ask | Action::Submit | Action::ToggleOutline | Action::FilePicker | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile => Scope::Side,
             _ => Scope::Global,
         }
     }
@@ -106,7 +109,7 @@ impl Action {
 
     /// Side-panel keys only the file viewer has.
     fn viewer_only(self) -> bool {
-        matches!(self, Action::FilePicker | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile)
+        matches!(self, Action::FilePicker | Action::Ask | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile)
     }
 }
 
@@ -121,6 +124,7 @@ pub const SHIFT_BINDINGS: &[(Key, Action)] = &[
     (Key::L, Action::FocusCode),
     (Key::J, Action::NextFile),
     (Key::K, Action::PrevFile),
+    (Key::A, Action::Ask),
 ];
 
 pub const BINDINGS: &[(Key, Action)] = &[
@@ -240,7 +244,7 @@ mod tests {
         assert!(!Action::CloseTab.allowed(true, true));
         assert!(Action::ToggleOutline.allowed(true, true));
         // Viewer-only keys are swallowed in the plan.
-        for a in [Action::FilePicker, Action::FocusFileList, Action::FocusCode, Action::NextFile, Action::PrevFile] {
+        for a in [Action::FilePicker, Action::Ask, Action::FocusFileList, Action::FocusCode, Action::NextFile, Action::PrevFile] {
             assert!(a.allowed(true, true) && !a.allowed(true, false), "{a:?}");
         }
         // Global keys work everywhere.
@@ -325,6 +329,7 @@ mod tests {
         assert_eq!(press(Key::L, cmd_shift), vec![Action::FocusCode]);
         assert_eq!(press(Key::J, cmd_shift), vec![Action::NextFile]);
         assert_eq!(press(Key::K, cmd_shift), vec![Action::PrevFile]);
+        assert_eq!(press(Key::A, cmd_shift), vec![Action::Ask]);
         assert_eq!(press(Key::J, Modifiers::COMMAND), vec![Action::NextWorkspace]);
         assert_eq!(press(Key::L, Modifiers::COMMAND), vec![Action::NextTab]);
         assert_eq!(press(Key::R, Modifiers::COMMAND), vec![Action::RenameTab]);
