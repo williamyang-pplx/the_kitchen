@@ -530,6 +530,8 @@ impl Viewer {
             self.hunk_goto = (line.is_none() && changed).then_some(HunkGoto::First);
         } else if let Some(l) = line {
             self.pending_goto = Some((l, 0));
+            // An explicit line beats a first change still waiting for the base.
+            self.hunk_goto = None;
         }
         self.outline = self.outline && line.is_none();
         self.ensure_loaded(path);
@@ -595,8 +597,8 @@ impl Viewer {
     }
 
     fn goto_loc(&mut self, loc: Loc) {
-        self.outline = false;
-        self.open(&loc.path.clone(), None, false);
+        // A line, so a changed file doesn't go to its first change (and the outline closes).
+        self.open(&loc.path, Some(loc.line), false);
         self.pending_goto = Some((loc.line, loc.col));
     }
 
@@ -1845,6 +1847,42 @@ mod tests {
         assert!(!v.show_files && !v.list_focus);
         v.command(PanelCmd::ToggleFiles, &h.engine);
         assert!(v.show_files);
+    }
+
+    /// Ctrl-o / Ctrl-i return to the line each file was left on, even in a
+    /// changed file's diff (where a plain open goes to the first change).
+    #[test]
+    fn jump_list_restores_lines_in_changed_files() {
+        let h = Harness::new(TestRepo::new("printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n' > a.rs"));
+        h.repo.sh("printf '1\\nX\\n3\\n4\\n5\\n6\\n7\\n8\\n' > a.rs && seq 10 > new.rs && git add . && git commit -qm change");
+        let mut v = h.viewer();
+        let settle = |v: &mut Viewer| {
+            h.settle(v, &|v| {
+                let p = v.current.clone().unwrap_or_default();
+                v.files_state.is_some() && v.files.contains_key(&p) && v.bases.contains_key(&p) && v.hunk_goto.is_none() && v.pending_goto.is_none()
+            });
+            h.frame(v);
+        };
+        settle(&mut v);
+        assert!(v.diff);
+        v.open("new.rs", None, true);
+        settle(&mut v);
+        v.place_cursor(7, 0);
+        v.open("a.rs", None, true);
+        settle(&mut v);
+        assert_eq!(v.current_source_line(), Some(2), "a plain open goes to the first change");
+        v.place_cursor(5, 0);
+        v.jump_back();
+        settle(&mut v);
+        assert_eq!((v.current.as_deref(), v.current_source_line()), (Some("new.rs"), Some(7)));
+        v.jump_forward();
+        settle(&mut v);
+        assert_eq!((v.current.as_deref(), v.current_source_line()), (Some("a.rs"), Some(5)));
+        // A jump within a file that still has its first change queued.
+        v.open("new.rs", None, true);
+        v.goto_loc(Loc { path: "new.rs".into(), line: 9, col: 0 });
+        settle(&mut v);
+        assert_eq!(v.current_source_line(), Some(9));
     }
 
     /// ⌘M … ⌘Enter hands the comment to the `comment` listener with its
