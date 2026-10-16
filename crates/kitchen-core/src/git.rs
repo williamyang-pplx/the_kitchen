@@ -183,12 +183,10 @@ if [ -e "$P" ]; then
   else
     echo "$P is on branch $cur, not $b" >&2; exit 12
   fi
-elif take_spare "$P"; then
-  co "$P" || {{ give_back "$P"; exit 13; }}
-elif [ -n "$local" ]; then
-  git -C {r} worktree add --quiet "$P" "$b" || exit 13
+elif take_spare "$P" && co "$P"; then :
 else
-  git -C {r} worktree add --quiet --track -b "$b" "$P" "origin/$b" || exit 13
+  give_back "$P"
+  if [ -n "$local" ]; then git -C {r} worktree add --quiet "$P" "$b"; else git -C {r} worktree add --quiet --track -b "$b" "$P" "origin/$b"; fi || exit 13
 fi"#,
                 b = shell_quote(branch),
             ),
@@ -198,9 +196,9 @@ before=$(git -C "$P" rev-parse HEAD 2>/dev/null)
 if [ -e "$P" ]; then
   git -C "$P" rev-parse --show-toplevel >/dev/null 2>&1 || {{ echo "$P exists but is not a git worktree" >&2; exit 12; }}
   git -C "$P" checkout --quiet --detach {rv} || exit 13
-elif take_spare "$P"; then
-  git -C "$P" checkout --quiet --detach {rv} || {{ give_back "$P"; exit 13; }}
+elif take_spare "$P" && git -C "$P" checkout --quiet --detach {rv}; then :
 else
+  give_back "$P"
   git -C {r} worktree add --quiet --detach "$P" {rv} || exit 13
 fi"#,
                 rv = shell_quote(&format!("{rev}^{{commit}}")),
@@ -245,18 +243,22 @@ P={parent}/{name}-"$s"
 if git -C {r} rev-parse --verify --quiet refs/remotes/origin/{b} >/dev/null; then START=refs/remotes/origin/{b}
 elif git -C {r} rev-parse --verify --quiet refs/heads/{b} >/dev/null; then START=refs/heads/{b}
 else START=; fi
+spare_checkout() {{
+  if [ "$(git -C "$P" rev-parse HEAD)" = "$(git -C {r} rev-parse "$START")" ]; then
+    # Same commit: pure ref updates, no index refresh (~0.6s saved on big repos).
+    git -C "$P" branch --no-track {pf}"$s" "$START" && git -C "$P" symbolic-ref HEAD refs/heads/{pf}"$s"
+  else
+    git -C "$P" checkout --quiet --no-track -b {pf}"$s" "$START"
+  fi
+}}
 # No commits to start from: a branch with no history. Else take over a
 # pre-checked-out spare (instant), else check out from scratch.
 if [ -z "$START" ]; then
   git -C {r} worktree add --quiet --orphan -b {pf}"$s" "$P" || {{ echo "the repo has no commits yet, and starting an empty branch needs git 2.42+" >&2; exit 13; }}
-elif take_spare "$P"; then
-  if [ "$(git -C "$P" rev-parse HEAD)" = "$(git -C {r} rev-parse "$START")" ]; then
-    # Same commit: pure ref updates, no index refresh (~0.6s saved on big repos).
-    git -C "$P" branch --no-track {pf}"$s" "$START" && git -C "$P" symbolic-ref HEAD refs/heads/{pf}"$s" || {{ give_back "$P"; exit 13; }}
-  else
-    git -C "$P" checkout --quiet --no-track -b {pf}"$s" "$START" || {{ git -C {r} branch -D {pf}"$s" >/dev/null 2>&1; give_back "$P"; exit 13; }}
-  fi
+elif take_spare "$P" && spare_checkout; then :
 else
+  [ -n "$TAKEN" ] && git -C {r} branch -D {pf}"$s" >/dev/null 2>&1
+  give_back "$P"
   git -C {r} worktree add --quiet --no-track -b {pf}"$s" "$P" "$START" || exit 13
 fi
 {exclude}
@@ -284,7 +286,8 @@ echo "KT_TAKEN=$TAKEN"
     /// Keep [`SPARE_COUNT`] spares detached at `origin/<base>`: check out
     /// missing ones and fast-forward stale ones, so taking one over is pure
     /// ref updates. A spare being refreshed is `git worktree lock`ed, which
-    /// makes takeovers skip it. Worktrees on a branch are never touched.
+    /// makes takeovers skip it. Files a killed checkout left in a spare are
+    /// thrown away. Worktrees on a branch are never touched.
     /// With `fetch`, `origin/<base>` is fetched first in the same round trip
     /// (retried once: a concurrent fetch may hold the ref lock); a fetch that
     /// still fails is logged and the spares go to the local ref anyway. The
@@ -316,11 +319,15 @@ for SP in {spares}; do
   [ "$(cat "$A/locked" 2>/dev/null)" = {reason} ] && git -C {r} worktree unlock "$SP"
   git -C "$SP" symbolic-ref -q HEAD >/dev/null && continue
   # Nothing works in an unlocked spare but us: an index.lock is left over
-  # from a git that was killed; reset it to HEAD before going on.
-  [ -e "$A/locked" ] || [ ! -e "$A/index.lock" ] || {{ rm -f "$A/index.lock"; git -C "$SP" reset -q --hard HEAD 2>/dev/null; }}
+  # from a git that was killed; reset it to HEAD (and drop the files it
+  # wrote) before going on.
+  [ -e "$A/locked" ] || [ ! -e "$A/index.lock" ] || {{ rm -f "$A/index.lock"; git -C "$SP" reset -q --hard HEAD 2>/dev/null; git -C "$SP" clean -fdq; }}
   [ "$(git -C "$SP" rev-parse HEAD)" = "$(git -C {r} rev-parse origin/{b})" ] && continue
   git -C {r} worktree lock --reason {reason} "$SP" 2>/dev/null || continue
-  {NICE} git -C "$SP" checkout --quiet --detach origin/{b}; rc=$?
+  # A checkout git refuses (local changes or untracked files in the way,
+  # left by a killed one) is forced: a spare holds nobody's work.
+  {NICE} git -C "$SP" checkout --quiet --detach origin/{b} 2>/dev/null \
+    || {{ {NICE} git -C "$SP" checkout --quiet --force --detach origin/{b} && {NICE} git -C "$SP" clean -fdq; }}; rc=$?
   git -C {r} worktree unlock "$SP"
   [ $rc = 0 ] || err=$rc
 done
@@ -456,7 +463,9 @@ pub fn exclude_snippet(dir: &str) -> String {
 
 /// Shell functions `take_spare DEST`, which moves the first available spare
 /// to DEST and succeeds only if one was moved, and `give_back DEST`, which
-/// moves it back (a checkout after the takeover failed). `git worktree move`
+/// moves it back if one was taken (a checkout after the takeover failed, e.g.
+/// on files a killed refresh left behind: the next refresh cleans it, and the
+/// caller checks out from scratch instead). `git worktree move`
 /// refuses a locked spare (being refreshed); spares on a branch are not
 /// spares, and one with an `index.lock` (a git killed mid-way) is left to
 /// the next refresh. `repo` is quoted.
@@ -465,7 +474,7 @@ fn take_spare_snippet(repo: &str, spares: &[String]) -> String {
     format!(
         r#"TAKEN=
 take_spare() {{ for SP in {}; do [ -e "$SP/.git" ] || continue; git -C "$SP" symbolic-ref -q HEAD >/dev/null && continue; [ -e "$(git -C "$SP" rev-parse --absolute-git-dir)/index.lock" ] && continue; git -C {repo} worktree move "$SP" "$1" 2>/dev/null && TAKEN=$SP && return 0; done; return 1; }}
-give_back() {{ [ -n "$TAKEN" ] && git -C {repo} worktree move "$1" "$TAKEN" 2>/dev/null; true; }}"#,
+give_back() {{ [ -n "$TAKEN" ] && git -C {repo} worktree move "$1" "$TAKEN" 2>/dev/null; TAKEN=; true; }}"#,
         spares.join(" ")
     )
 }
@@ -803,6 +812,31 @@ mod tests {
         repo.ensure_spare_worktree("main", true).unwrap();
         assert!(spares.iter().all(|s| exists(&format!("{s}/v.txt")) && !exists(&format!("{s}/e.txt"))), "fetch failure tolerated");
         sh(root, &format!("git -C repo remote set-url origin {}", shell_quote(&root.join("origin").display().to_string())));
+
+        // Stale spares a killed checkout left dirty (an edit to a file the
+        // checkout changes, an untracked file where it writes one): git
+        // refuses to move them, so a new tab checks out from scratch and
+        // hands the spare back, and the next refresh throws the leftovers
+        // away.
+        sh(root, "cd origin && echo nine > n.txt && echo two > a.txt && git add . && git commit -qm nine");
+        repo.fetch().unwrap();
+        std::fs::write(format!("{}/a.txt", spares[0]), "left over\n").unwrap();
+        std::fs::write(format!("{}/n.txt", spares[1]), "left over\n").unwrap();
+        let i = repo.create_edit_worktree("main", "william/", "dirty").unwrap();
+        assert!(spares.iter().all(|s| exists(s)), "dirty spares handed back");
+        assert_eq!(std::fs::read_to_string(format!("{}/n.txt", i.path)).unwrap(), "nine\n");
+        assert_eq!(i.branch.as_deref(), Some("william/dirty"));
+        let path = repo.sibling_path("dirty-branch");
+        let (wt, _) = repo.checkout_worktree(&path, Checkout::Branch("william/dirty"), &[]).unwrap();
+        assert_eq!(wt.path, i.path, "branch reused where it is");
+        let det = repo.sibling_path("dirty-detached");
+        let (wt, _) = repo.checkout_worktree(&det, Checkout::Detached("origin/main"), &[]).unwrap();
+        assert!(wt.detached && exists(&format!("{det}/n.txt")) && spares.iter().all(|s| exists(s)), "detached: fresh checkout");
+        repo.ensure_spare_worktree("main", false).unwrap();
+        for s in &spares {
+            assert_eq!(std::fs::read_to_string(format!("{s}/n.txt")).unwrap(), "nine\n", "{s} refreshed");
+            assert_eq!(repo.git_in(s, &["status", "--porcelain"]).unwrap(), "", "{s} clean");
+        }
     }
 
     /// Repos with nothing on origin: new tabs start an empty branch until
