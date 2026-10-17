@@ -1148,6 +1148,7 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("⌘⇧A", "ask about the line or selection"),
                 ("⌘O", "outline"),
                 ("]c  [c", "next / previous change"),
+                ("zo  zR  zM", "open a fold / all folds / fold again"),
                 ("gd  gr", "definition / references"),
                 ("⌃O", "back"),
                 ("-", "parent folder"),

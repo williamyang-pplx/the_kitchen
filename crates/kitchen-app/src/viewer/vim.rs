@@ -46,6 +46,11 @@ pub enum VimAction {
     Center,
     Top,
     Bottom,
+    /// zo: open the fold under the cursor (Enter on a fold row does too).
+    OpenFold,
+    /// zR / zM: open every fold in the file / fold the file again.
+    OpenAllFolds,
+    CloseAllFolds,
     /// The cursor moved far enough to be worth recording in the jump list
     /// (gg, G, search, %, {, }).
     BigMove { from: (usize, usize) },
@@ -341,6 +346,9 @@ impl Vim {
             ('z', 'z') => vec![VimAction::Center],
             ('z', 't') => vec![VimAction::Top],
             ('z', 'b') => vec![VimAction::Bottom],
+            ('z', 'o') => vec![VimAction::OpenFold],
+            ('z', 'R') => vec![VimAction::OpenAllFolds],
+            ('z', 'M') => vec![VimAction::CloseAllFolds],
             (']', 'c') => vec![VimAction::NextHunk],
             (']', 'd') => vec![VimAction::NextDiag],
             ('[', 'd') => vec![VimAction::PrevDiag],
@@ -772,6 +780,9 @@ mod tests {
         assert_eq!(v.key(VimKey::Ctrl('o'), &b, Viewport::default()), vec![VimAction::JumpBack]);
         assert_eq!(keys(&mut v, &b, "]c[f"), vec![VimAction::NextHunk, VimAction::PrevFile]);
         assert_eq!(keys(&mut v, &b, "zz"), vec![VimAction::Center]);
+        let at = (v.line, v.col);
+        assert_eq!(keys(&mut v, &b, "zozRzM"), vec![VimAction::OpenFold, VimAction::OpenAllFolds, VimAction::CloseAllFolds]);
+        assert_eq!((v.line, v.col), at, "fold keys don't move the cursor");
         keys(&mut v, &b, "V");
         assert_eq!(v.visual_lines(), Some((0, 0)));
         assert!(v.key(VimKey::Esc, &b, Viewport::default()).is_empty());

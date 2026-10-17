@@ -33,7 +33,7 @@ use crate::theme;
 use crate::ui::widgets;
 use crate::ui::widgets::HEADER_HEIGHT;
 use code_view::{CodeView, ViewState};
-use doc::{Doc, DocLine};
+use doc::{Doc, DocLine, Unfolded};
 use highlight::Spans;
 use picker::{Picker, PickerResult};
 use vim::{Vim, VimAction};
@@ -167,7 +167,12 @@ pub struct Viewer {
     load_errors: HashMap<String, String>,
 
     doc: Doc,
+    /// The folds opened in each file's diff, kept while the viewer lives.
+    unfolded: HashMap<String, Unfolded>,
     doc_key: Option<(String, bool, bool, bool)>,
+    /// The file `doc` shows and whether folded, also after `doc_key` is
+    /// reset: a rebuild of the same file keeps the cursor on its line.
+    doc_shown: Option<(String, bool)>,
     /// Outline row -> 1-based source line.
     outline_lines: Vec<usize>,
     vim: Vim,
@@ -249,7 +254,9 @@ impl Viewer {
             loading: HashSet::new(),
             load_errors: HashMap::new(),
             doc: Doc::default(),
+            unfolded: HashMap::new(),
             doc_key: None,
+            doc_shown: None,
             outline_lines: Vec::new(),
             vim: Vim::default(),
             view: ViewState::default(),
@@ -499,9 +506,9 @@ impl Viewer {
             return self.outline_lines.get(self.vim.line).copied();
         }
         let l = self.doc.lines.get(self.vim.line)?;
-        l.new_no.or_else(|| {
+        l.first_no().or_else(|| {
             // Removed line: the next current-file line.
-            self.doc.lines[self.vim.line..].iter().find_map(|l| l.new_no)
+            self.doc.lines[self.vim.line..].iter().find_map(|l| l.first_no())
         })
     }
 
@@ -684,11 +691,19 @@ impl Viewer {
                 VimAction::Parent => self.browse_parent(),
                 VimAction::NextDiag => self.step_diag(true),
                 VimAction::PrevDiag => self.step_diag(false),
-                VimAction::JumpToDef(_) | VimAction::References(_) | VimAction::NextHunk | VimAction::PrevHunk if self.browsing => {}
+                VimAction::JumpToDef(_)
+                | VimAction::References(_)
+                | VimAction::NextHunk
+                | VimAction::PrevHunk
+                | VimAction::OpenFold
+                | VimAction::OpenAllFolds
+                | VimAction::CloseAllFolds
+                    if self.browsing => {}
                 VimAction::JumpToDef(name) => self.jump_to_def(name),
                 VimAction::References(name) => self.find_references(name),
                 VimAction::JumpBack => self.jump_back(),
                 VimAction::JumpForward => self.jump_forward(),
+                VimAction::Enter if self.open_fold_at(self.vim.line) => {}
                 VimAction::Enter => {
                     if self.outline {
                         if let Some(line) = self.current_source_line() {
@@ -699,11 +714,18 @@ impl Viewer {
                 }
                 VimAction::NextHunk => self.step_hunk(true),
                 VimAction::PrevHunk => self.step_hunk(false),
+                VimAction::OpenFold => {
+                    if !self.open_fold_at(self.vim.line) {
+                        self.status = Some(("no fold under the cursor".into(), false));
+                    }
+                }
+                VimAction::OpenAllFolds => self.set_all_folds(true),
+                VimAction::CloseAllFolds => self.set_all_folds(false),
                 VimAction::NextFile => self.step_file(1),
                 VimAction::PrevFile => self.step_file(-1),
                 VimAction::BigMove { from } => {
                     if let (Some(path), Some(l)) = (self.current.clone(), self.doc.lines.get(from.0)) {
-                        if let Some(line) = l.new_no {
+                        if let Some(line) = l.first_no() {
                             let loc = Loc { path, line, col: from.1 };
                             if self.back.last() != Some(&loc) {
                                 self.back.push(loc);
@@ -727,6 +749,7 @@ impl Viewer {
             let key = (format!("\0{}", self.dir), false, false, self.files_state.is_some());
             if self.doc_key.as_ref() != Some(&key) {
                 self.doc_key = Some(key);
+                self.doc_shown = None;
                 self.entries = dir_entries(&self.all, &self.dir);
                 self.doc = folder_doc(&self.entries, &self.changed);
                 let sel = self.select_entry.take();
@@ -739,6 +762,7 @@ impl Viewer {
         }
         let Some(path) = self.current.clone() else {
             self.doc = Doc::default();
+            self.doc_shown = None;
             return;
         };
         let rows = self.render_rows(&path).filter(|_| !self.outline);
@@ -756,15 +780,22 @@ impl Viewer {
             }
             return;
         }
-        // Keep the cursor on the same source line across rebuilds.
+        // Keep the cursor on the same source line across rebuilds. The fold
+        // hiding it opens for a goto, or when the file showed unfolded until
+        // now (its base just arrived, ⌘D); not after zM, and not for the
+        // line-1 stand-in open() queues next to a first-change goto.
+        let folding = self.diff && has_base && !self.outline;
+        let shown = self.doc_shown.take().filter(|(p, _)| *p == path);
+        let unfold = self.hunk_goto.is_none() && (self.pending_goto.is_some() || shown.as_ref().is_some_and(|s| !s.1));
         let keep = self.pending_goto.take().or_else(|| {
-            if self.doc_key.as_ref().map(|k| k.0 == path).unwrap_or(false) {
+            if shown.is_some() {
                 self.current_source_line().map(|l| (l, self.vim.col))
             } else {
                 None
             }
         });
         self.doc_key = Some(key);
+        self.doc_shown = Some((path.clone(), folding));
         let Some(file) = self.files.get(&path) else {
             self.doc = Doc::default();
             self.pending_goto = keep;
@@ -801,9 +832,16 @@ impl Viewer {
             self.doc = Doc::rendered(&self.doc, rows);
         }
         self.render_shown = rows;
+        if folding {
+            self.doc = self.doc.folded(self.unfolded.get(&path).unwrap_or(&Unfolded::default()));
+        }
         if let Some((line, col)) = keep {
             let col = self.goto_col(line, col);
-            self.place_cursor(line, col);
+            if unfold {
+                self.place_cursor(line, col);
+            } else {
+                self.land_cursor(line, col);
+            }
         }
         if !self.diff || self.outline {
             self.hunk_goto = None;
@@ -831,15 +869,62 @@ impl Viewer {
         self.engine.plugins()?.decor.get(&self.file_key(path))?.render(&file.version).cloned()
     }
 
-    /// Put the cursor on source line `line` (1-based), scrolling if needed.
+    /// Put the cursor on source line `line` (1-based), scrolling if needed. A
+    /// line inside a fold opens the fold; the cursor goes there once the doc
+    /// is rebuilt (next frame).
     fn place_cursor(&mut self, line: usize, col: usize) {
+        let fold = self.doc.index_of_new(line).filter(|&r| !self.outline && self.doc.lines[r].fold.is_some());
+        if fold.is_some_and(|r| self.open_fold_at(r)) {
+            self.pending_goto = Some((line, col));
+            return;
+        }
+        self.land_cursor(line, col);
+    }
+
+    /// Put the cursor on the row showing source line `line` (a fold row if it
+    /// is folded), scrolling if needed.
+    fn land_cursor(&mut self, line: usize, col: usize) {
         let idx = if self.outline {
             self.outline_lines.iter().rposition(|&l| l <= line).unwrap_or(0)
         } else {
             self.doc.index_of_new(line).unwrap_or(self.doc.lines.len().saturating_sub(1))
         };
+        // A fold row's text is empty.
+        let col = if self.doc.lines.get(idx).is_some_and(|l| l.fold.is_some()) { 0 } else { col };
         self.vim.set_cursor(idx, col);
         self.scroll_to_row(idx);
+    }
+
+    /// Open the fold on doc row `row`, if there is one; the next rebuild
+    /// shows its lines and keeps the cursor line. False when `row` is not a
+    /// fold, or while the ⌘M / ⌘⇧A field is open (its rows are doc indices
+    /// a rebuild would move).
+    fn open_fold_at(&mut self, row: usize) -> bool {
+        let (Some(f), Some(path)) = (self.doc.lines.get(row).and_then(|l| l.fold), self.current.clone()) else { return false };
+        if self.editor.is_some() {
+            return false;
+        }
+        self.unfolded.entry(path).or_default().opened.insert(f.first);
+        self.doc_key = None;
+        true
+    }
+
+    /// zR (`open`) / zM: open every fold in the file, or fold it all again.
+    fn set_all_folds(&mut self, open: bool) {
+        let diff = !self.outline && self.doc_key.as_ref().is_some_and(|k| k.1);
+        let Some(path) = self.current.clone().filter(|_| diff) else {
+            self.status = Some(("folds are for diffs (⌘D)".into(), false));
+            return;
+        };
+        if self.editor.is_some() {
+            return;
+        }
+        let u = self.unfolded.entry(path).or_default();
+        u.all = open;
+        if !open {
+            u.opened.clear();
+        }
+        self.doc_key = None;
     }
 
     /// Put the cursor on document row `idx`, a third of the way down.
@@ -1883,6 +1968,64 @@ mod tests {
         v.goto_loc(Loc { path: "new.rs".into(), line: 9, col: 0 });
         settle(&mut v);
         assert_eq!(v.current_source_line(), Some(9));
+    }
+
+    /// A file opened at a folded line before its base arrives (the plain
+    /// file first, then the diff) lands on that line, its fold open.
+    #[test]
+    fn open_at_folded_line_before_the_base() {
+        let h = Harness::new(TestRepo::new("seq 1 60 > a.rs"));
+        h.repo.sh("seq 1 60 | sed -e 's/^10$/ten/' > a.rs && git commit -qam change");
+        let mut v = h.viewer();
+        v.command(PanelCmd::Open { path: Some("a.rs".into()), line: Some(6), diff: Some(true) }, &h.engine);
+        h.settle(&mut v, &|v| v.bases.contains_key("a.rs") && v.pending_goto.is_none() && v.doc.lines.iter().any(|l| l.new_no == Some(6)));
+        h.frame(&mut v);
+        assert_eq!(v.current_source_line(), Some(6));
+        assert!(v.doc.lines.iter().any(|l| l.fold.is_some()), "the rest stays folded");
+    }
+
+    /// A diff opens folded around its changes: a jump into a fold opens it,
+    /// zM folds again, Enter / zo open the fold under the cursor, zR all.
+    #[test]
+    fn diffs_open_folded() {
+        let h = Harness::new(TestRepo::new("seq 1 60 > a.rs"));
+        h.repo.sh("seq 1 60 | sed -e 's/^10$/ten/' -e 's/^50$/fifty/' > a.rs && git commit -qam change");
+        let mut v = h.viewer();
+        let settle = |v: &mut Viewer| {
+            h.settle(v, &|v| v.files.contains_key("a.rs") && v.bases.contains_key("a.rs") && v.hunk_goto.is_none() && v.pending_goto.is_none());
+            h.frame(v);
+        };
+        let folds = |v: &Viewer| v.doc.lines.iter().filter_map(|l| l.fold).map(|f| (f.first, f.last)).collect::<Vec<_>>();
+        settle(&mut v);
+        assert_eq!(v.current.as_deref(), Some("a.rs"));
+        assert_eq!(folds(&v), vec![(1, 6), (14, 46), (54, 60)], "the line-1 goto of a fresh open leaves the first fold shut");
+        assert_eq!(v.current_source_line(), Some(10), "cursor on the first change");
+        h.text(&mut v, "zo");
+        assert_eq!(v.status.as_ref().map(|s| s.0.as_str()), Some("no fold under the cursor"));
+        // A jump into a fold opens it and lands on the line.
+        v.place_cursor(30, 0);
+        settle(&mut v);
+        assert_eq!(v.current_source_line(), Some(30));
+        assert_eq!(folds(&v), vec![(1, 6), (54, 60)]);
+        // zM folds it again: the cursor waits on its fold row.
+        h.text(&mut v, "zM");
+        h.frame(&mut v);
+        assert_eq!(folds(&v).len(), 3);
+        assert!(v.doc.lines[v.vim.line].fold.is_some());
+        assert_eq!(v.current_source_line(), Some(14));
+        // Enter opens it again; zR opens them all, and that outlives a rebuild.
+        h.key(&mut v, egui::Key::Enter);
+        h.frame(&mut v);
+        assert_eq!(folds(&v), vec![(1, 6), (54, 60)]);
+        assert_eq!(v.current_source_line(), Some(14));
+        h.text(&mut v, "zR");
+        h.frame(&mut v);
+        assert!(folds(&v).is_empty());
+        v.command(PanelCmd::ToggleDiff, &h.engine);
+        h.frame(&mut v);
+        v.command(PanelCmd::ToggleDiff, &h.engine);
+        settle(&mut v);
+        assert!(v.diff && folds(&v).is_empty());
     }
 
     /// ⌘M … ⌘Enter hands the comment to the `comment` listener with its

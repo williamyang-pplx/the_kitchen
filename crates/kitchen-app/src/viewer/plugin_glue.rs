@@ -258,33 +258,34 @@ impl Viewer {
             .collect()
     }
 
-    /// The doc row showing line `n` of `side`.
+    /// The doc row showing line `n` of `side` (a fold row if it is folded: a
+    /// comment or answer on a hidden line goes under its fold).
     pub(super) fn row_at(&self, side: Side, n: usize) -> Option<usize> {
         let is_diff = self.doc_key.as_ref().is_some_and(|k| k.1);
         self.doc.lines.iter().position(|l| match side {
             Side::New => l.kind != LineKind::Removed && l.covers_new(n),
-            Side::Old => is_diff && l.old_no == Some(n),
+            Side::Old => is_diff && (l.old_no == Some(n) || l.fold.is_some_and(|f| f.covers_old(n))),
         })
     }
 
     /// Where doc row `i` is: a removed line on the base side, everything else
-    /// in the current file. A rendered row stands for its source lines: a
-    /// range ends (`last`) on its last.
+    /// in the current file. A rendered or fold row stands for its source
+    /// lines: a range ends (`last`) on its last.
     pub(super) fn row_line(&self, i: usize, last: bool) -> (Side, Option<usize>) {
         match self.doc.lines.get(i) {
             Some(l) if l.kind == LineKind::Removed => (Side::Old, l.old_no),
             Some(l) if last => (Side::New, l.last_no()),
-            Some(l) => (Side::New, l.new_no),
+            Some(l) => (Side::New, l.first_no()),
             None => (Side::New, None),
         }
     }
 
-    /// The source text of doc rows `start..=end`, also for rendered rows.
+    /// The source text of doc rows `start..=end`, also for rendered and fold rows.
     pub(super) fn quote(&self, path: &str, start: usize, end: usize) -> String {
         let raw: Vec<&str> = self.files.get(path).map(|f| f.text.lines().collect()).unwrap_or_default();
         let lines: Vec<&str> = (start..=end)
             .filter_map(|i| self.doc.lines.get(i))
-            .flat_map(|l| match (l.render.is_some(), l.new_no, l.last_no()) {
+            .flat_map(|l| match (l.render.is_some() || l.fold.is_some(), l.first_no(), l.last_no()) {
                 (true, Some(a), Some(b)) => raw.get(a - 1..b.min(raw.len())).unwrap_or_default().to_vec(),
                 _ => vec![l.text.as_str()],
             })
@@ -306,8 +307,7 @@ impl Viewer {
         }
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
         let thread = self.comment_blocks().into_iter().find(|(b, id)| b.after == Some(end) && id.is_some());
-        let first = self.doc.lines.get(start).and_then(|l| l.new_no.or(l.old_no)).unwrap_or(start + 1);
-        let last = self.doc.lines.get(end).and_then(|l| l.last_no().or(l.old_no)).unwrap_or(end + 1);
+        let (first, last) = (self.row_line(start, false).1.unwrap_or(start + 1), self.row_line(end, true).1.unwrap_or(end + 1));
         let what = match &thread {
             Some((b, _)) => format!("Reply to {}", b.title),
             None if end > start || last > first => format!("Comment on lines {first}–{last}"),
@@ -351,7 +351,7 @@ impl Viewer {
     pub fn context(&self) -> serde_json::Value {
         let sel = self.vim.visual_lines().map(|(a, b)| {
             let doc = &self.doc.lines;
-            serde_json::json!({ "from": doc.get(a).and_then(|l| l.new_no), "to": doc.get(b).and_then(|l| l.last_no()) })
+            serde_json::json!({ "from": doc.get(a).and_then(|l| l.first_no()), "to": doc.get(b).and_then(|l| l.last_no()) })
         });
         let line = if self.browsing { None } else { self.current_source_line() };
         let raw_line = line.and_then(|n| self.current.as_ref().and_then(|p| self.files.get(p)).and_then(|f| f.text.lines().nth(n - 1)));

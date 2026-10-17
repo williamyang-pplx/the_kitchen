@@ -11,7 +11,7 @@ use egui::text::{CCursor, LayoutJob, TextFormat};
 use egui::{Color32, CornerRadius, FontId, Galley, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
-use super::doc::{Doc, LineKind};
+use super::doc::{Doc, Fold, LineKind};
 use super::highlight::group_color;
 use super::vim::{Vim, VimAction, VimKey, Viewport};
 use crate::plugins::decor::{RenderRow, RenderSpan};
@@ -251,7 +251,13 @@ impl CodeView<'_> {
                     let h = (galley.size().y + 2.0 + pad).max(row_h);
                     (Some(galley), Pos2::new(x, y + 1.0 + pad), h)
                 }
-                None => (Some(ui.fonts_mut(|f| f.layout_job(line_job(line, state.left, &font, over)))), Pos2::new(text_x, y + 1.0), row_h),
+                None => {
+                    let job = match &line.fold {
+                        Some(f) => LayoutJob::simple_singleline(fold_label(f), font.clone(), theme::SUBTLE),
+                        None => line_job(line, state.left, &font, over),
+                    };
+                    (Some(ui.fonts_mut(|f| f.layout_job(job))), Pos2::new(text_x, y + 1.0), row_h)
+                }
             };
             let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_height));
             row_hits.push((
@@ -273,6 +279,9 @@ impl CodeView<'_> {
                 // A bar down the left edge marks the change, as on GitHub.
                 let bar = if line.kind == LineKind::Added { theme::GREEN } else { theme::RED };
                 under_shapes.push(Shape::rect_filled(Rect::from_min_size(row.min, Vec2::new(3.0, row_height)), CornerRadius::ZERO, bar.gamma_multiply(0.8)));
+            }
+            if line.fold.is_some() {
+                under_shapes.push(Shape::rect_filled(row, CornerRadius::ZERO, theme::PANEL));
             }
             match rendered.and_then(|r| r.block.as_deref()) {
                 Some("code") => {
@@ -454,6 +463,11 @@ impl CodeView<'_> {
 }
 
 /// Layout for one line from its spans, starting at char column `left`.
+/// The text of a fold row.
+fn fold_label(f: &Fold) -> String {
+    format!("⋯  {} unchanged lines  ·  zo shows them", f.last + 1 - f.first)
+}
+
 fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId, over: Option<&LineOverlay>) -> LayoutJob {
     let mut job = LayoutJob::default();
     let text = &line.text;

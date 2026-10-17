@@ -1,14 +1,51 @@
 //! What the code view displays: lines with diff kind, line numbers and
 //! highlight spans. Built from a plain file, a base/head diff, an outline,
-//! or a plugin's rendering of either.
+//! or a plugin's rendering of either. A diff can be folded: runs of
+//! unchanged rows far from a change shrink to one fold row.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 use egui::Color32;
 
 use crate::plugins::decor::RenderRow;
+
+/// Unchanged rows kept on each side of a change in a folded diff
+/// (`git diff -U3`; GitHub only takes comments on these lines).
+pub const CONTEXT: usize = 3;
+/// A shorter run of foldable rows stays: a fold row would save almost no room.
+const MIN_FOLD: usize = 4;
+
+/// Unchanged lines a folded diff hides behind one row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fold {
+    /// First and last hidden current-file line (1-based).
+    pub first: usize,
+    pub last: usize,
+    /// Base-side line of `first`; `None` when every hidden row is a plugin
+    /// rendering (rendered rows have no base numbers). Unchanged lines move
+    /// together, so the rest follow it.
+    pub old_first: Option<usize>,
+}
+
+impl Fold {
+    /// Hides base line `n`.
+    pub fn covers_old(&self, n: usize) -> bool {
+        self.old_first.is_some_and(|o| o <= n && n - o <= self.last - self.first)
+    }
+}
+
+/// The folds opened in one file's diff. The viewer keeps one per path for
+/// its lifetime and keys the doc on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unfolded {
+    /// zR: nothing is folded.
+    pub all: bool,
+    /// `Fold::first` of each fold opened one at a time (zo, Enter, a jump
+    /// into it). A run is either all open or all folded.
+    pub opened: HashSet<usize>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -33,22 +70,35 @@ pub struct DocLine {
     /// A rendered row (`kitchen.render`) standing for current-file lines
     /// `new_no..=last_no()`; painted from this instead of `spans`.
     pub render: Option<Arc<RenderRow>>,
+    /// A fold row: stands for these hidden lines. Its `text` is empty (so
+    /// search, `gd` and the plugin `word` see nothing), `kind` is `Normal`,
+    /// and `old_no` / `new_no` are `None` (no gutter numbers).
+    pub fold: Option<Fold>,
 }
 
 impl DocLine {
     pub fn plain(text: String, new_no: usize) -> Self {
-        Self { text, kind: LineKind::Normal, old_no: Some(new_no), new_no: Some(new_no), suffix: None, spans: Vec::new(), render: None }
+        Self { text, kind: LineKind::Normal, old_no: Some(new_no), new_no: Some(new_no), suffix: None, spans: Vec::new(), render: None, fold: None }
     }
 
-    /// The last current-file line this row shows (a rendered row may cover several).
+    /// The first current-file line this row shows (a fold: the first one it hides).
+    pub fn first_no(&self) -> Option<usize> {
+        self.new_no.or(self.fold.map(|f| f.first))
+    }
+
+    /// The last current-file line this row shows (a rendered row may cover
+    /// several; a fold row, every line it hides).
     pub fn last_no(&self) -> Option<usize> {
+        if let Some(f) = self.fold {
+            return Some(f.last);
+        }
         let n = self.new_no?;
         Some(self.render.as_ref().map_or(n, |r| r.last_line().max(n)))
     }
 
-    /// Shows current-file line `n`.
+    /// Shows current-file line `n` (a fold row: hides it).
     pub fn covers_new(&self, n: usize) -> bool {
-        self.new_no.is_some_and(|first| first <= n && self.last_no().is_some_and(|last| n <= last))
+        self.first_no().is_some_and(|first| first <= n && self.last_no().is_some_and(|last| n <= last))
     }
 }
 
@@ -119,7 +169,7 @@ impl Doc {
                 _ => new_no.and_then(|n| new_spans.and_then(|s| s.get(n - 1))),
             };
             let spans = spans.cloned().unwrap_or_default();
-            lines.push(DocLine { text: expand_tabs(raw), kind, old_no, new_no, suffix: None, spans, render: None });
+            lines.push(DocLine { text: expand_tabs(raw), kind, old_no, new_no, suffix: None, spans, render: None, fold: None });
         }
         Doc { lines }
     }
@@ -160,9 +210,65 @@ impl Doc {
             let mut row = r.clone();
             row.text = text.clone();
             let kind = if added[i] { LineKind::Added } else { LineKind::Normal };
-            lines.push(DocLine { text, kind, old_no: None, new_no: Some(r.line), suffix: None, spans: Vec::new(), render: Some(Arc::new(row)) });
+            lines.push(DocLine { text, kind, old_no: None, new_no: Some(r.line), suffix: None, spans: Vec::new(), render: Some(Arc::new(row)), fold: None });
         }
         highlight_code_runs(&mut lines);
+        Doc { lines }
+    }
+
+    /// `self` (a diff, maybe rendered) with each run of at least MIN_FOLD
+    /// rows more than CONTEXT rows from a change behind one fold row, unless
+    /// `open` opened it. Distances and run lengths count rows, not lines: a
+    /// rendered row that stands for several lines is one row on screen.
+    /// A doc with no change, or with `open.all`, comes back whole.
+    pub fn folded(&self, open: &Unfolded) -> Doc {
+        let changed: Vec<bool> = self.lines.iter().map(|l| l.kind != LineKind::Normal).collect();
+        if open.all || !changed.contains(&true) {
+            return self.clone();
+        }
+        // Rows from the nearest change, looking back and then ahead.
+        let n = self.lines.len();
+        let mut dist = vec![usize::MAX; n];
+        let mut last = None;
+        for i in 0..n {
+            if changed[i] {
+                last = Some(i);
+            }
+            dist[i] = last.map_or(usize::MAX, |c| i - c);
+        }
+        last = None;
+        for i in (0..n).rev() {
+            if changed[i] {
+                last = Some(i);
+            }
+            dist[i] = dist[i].min(last.map_or(usize::MAX, |c| c - i));
+        }
+        let mut lines = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            if dist[i] <= CONTEXT {
+                lines.push(self.lines[i].clone());
+                i += 1;
+                continue;
+            }
+            let mut e = i + 1;
+            while e < n && dist[e] > CONTEXT {
+                e += 1;
+            }
+            let run = &self.lines[i..e];
+            let span = run[0].first_no().zip(run[run.len() - 1].last_no());
+            match span {
+                Some((first, last)) if run.len() >= MIN_FOLD && !open.opened.contains(&first) => {
+                    // A rendered first row has no base number: count back
+                    // from the first row that has one, in lines.
+                    let old_first = run.iter().find_map(|l| Some(l.old_no? - (l.first_no()? - first)));
+                    let fold = Fold { first, last, old_first };
+                    lines.push(DocLine { text: String::new(), kind: LineKind::Normal, old_no: None, new_no: None, suffix: None, spans: Vec::new(), render: None, fold: Some(fold) });
+                }
+                _ => lines.extend_from_slice(run),
+            }
+            i = e;
+        }
         Doc { lines }
     }
 
@@ -239,6 +345,58 @@ mod tests {
         assert_eq!(d.hunk_starts(), vec![1, 5]);
         assert_eq!(d.index_of_new(2), Some(2));
         assert_eq!(d.changed_count(), (2, 1));
+    }
+
+    fn numbered(n: usize, changed: &[usize]) -> String {
+        (1..=n).map(|i| if changed.contains(&i) { format!("x{i}\n") } else { format!("{i}\n") }).collect()
+    }
+
+    /// Fold rows as (first, last), other rows as their current-file line (0: removed).
+    fn shape(d: &Doc) -> Vec<(usize, usize)> {
+        d.lines.iter().map(|l| l.fold.map_or((l.new_no.unwrap_or(0), l.new_no.unwrap_or(0)), |f| (f.first, f.last))).collect()
+    }
+
+    #[test]
+    fn folded_diff_hides_far_unchanged_runs() {
+        let d = Doc::diff(&numbered(30, &[]), &numbered(30, &[15]), None, None);
+        let f = d.folded(&Unfolded::default());
+        let mid = [(12, 12), (13, 13), (14, 14), (0, 0), (15, 15), (16, 16), (17, 17), (18, 18)];
+        let want: Vec<(usize, usize)> = [(1, 11)].into_iter().chain(mid).chain([(19, 30)]).collect();
+        assert_eq!(shape(&f), want);
+        let first = &f.lines[0];
+        assert_eq!((first.text.as_str(), first.kind, first.old_no, first.new_no), ("", LineKind::Normal, None, None));
+        assert_eq!(first.fold.unwrap().old_first, Some(1));
+        assert_eq!(f.hunk_starts(), vec![4]);
+        assert_eq!(f.changed_count(), (1, 1));
+        assert_eq!(f.index_of_new(5), Some(0), "a folded line finds its fold");
+        assert_eq!(first.first_no(), Some(1));
+        let end = &f.lines[f.lines.len() - 1];
+        assert!(end.covers_new(30) && !end.covers_new(18));
+        assert!(end.fold.unwrap().covers_old(30) && !end.fold.unwrap().covers_old(31));
+        // Opening the first fold shows its lines; the other stays folded.
+        let open = Unfolded { all: false, opened: HashSet::from([1]) };
+        let f = d.folded(&open);
+        assert_eq!(f.lines.len(), 11 + mid.len() + 1);
+        assert!(f.lines[..11].iter().all(|l| l.fold.is_none()) && f.lines[f.lines.len() - 1].fold.is_some());
+    }
+
+    #[test]
+    fn folded_leaves_short_runs_and_unchanged_docs() {
+        let folds = |d: &Doc| d.lines.iter().filter(|l| l.fold.is_some()).count();
+        // Changes 10 lines apart (9 between): 3 rows left after the context stay.
+        let d = Doc::diff(&numbered(11, &[]), &numbered(11, &[1, 11]), None, None);
+        assert_eq!(folds(&d.folded(&Unfolded::default())), 0);
+        // 10 between: 4 rows left, one fold.
+        let d = Doc::diff(&numbered(12, &[]), &numbered(12, &[1, 12]), None, None);
+        let f = d.folded(&Unfolded::default());
+        assert_eq!(f.lines.iter().filter_map(|l| l.fold).map(|f| (f.first, f.last)).collect::<Vec<_>>(), vec![(5, 8)]);
+        assert_eq!(folds(&d.folded(&Unfolded { all: true, ..Default::default() })), 0, "zR: nothing folded");
+        let same = Doc::diff(&numbered(30, &[]), &numbered(30, &[]), None, None);
+        assert_eq!(folds(&same.folded(&Unfolded::default())), 0, "no change: the whole file");
+        // A rendered first row has no base number: the fold counts back from the next row.
+        let r = Doc::rendered(&Doc::diff(&numbered(20, &[]), &numbered(20, &[20]), None, None), &[row(1, Some(2), "one two")]).folded(&Unfolded::default());
+        let fold = r.lines[0].fold.expect("rows 1..=16 fold");
+        assert_eq!((fold.first, fold.last, fold.old_first), (1, 16, Some(1)));
     }
 
     fn row(line: usize, end_line: Option<usize>, text: &str) -> RenderRow {
