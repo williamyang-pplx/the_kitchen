@@ -32,6 +32,7 @@ egui_commonmark = { version = "0.25", default-features = false, features = ["pul
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSError", "NSObject", "NSSet", "NSBundle"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSError", "NSObject", "NSSet", "NSBundle", "NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSPasteboard", "NSImageRep", "NSBitmapImageRep"] }
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger"] }
 block2 = "0.6"

@@ -141,6 +141,11 @@ impl TermSession {
         let _ = self.sender.send(Msg::Input(bytes.into()));
     }
 
+    /// A handle that pastes into this session from another thread.
+    pub fn paster(&self) -> Paster {
+        Paster { term: self.term.clone(), sender: self.sender.clone() }
+    }
+
     pub fn resize(&mut self, size: GridSize, cell: (u16, u16)) {
         if size == self.size && cell == self.cell {
             return;
@@ -166,6 +171,21 @@ impl TermSession {
 
     pub fn size(&self) -> GridSize {
         self.size
+    }
+}
+
+/// Pastes into a session from a background thread (see [`TermSession::paster`]).
+/// Pasting after the session closed does nothing.
+#[derive(Clone)]
+pub struct Paster {
+    term: Arc<FairMutex<Term<Listener>>>,
+    sender: EventLoopSender,
+}
+
+impl Paster {
+    pub fn paste(&self, text: &str) {
+        let mode = *self.term.lock().mode();
+        let _ = self.sender.send(Msg::Input(input::paste_bytes(text, mode).into()));
     }
 }
 

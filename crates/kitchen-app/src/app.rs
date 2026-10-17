@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Key, Layout, Modifiers, RichText, Sense, Ui};
 
+use crate::attach;
 use crate::engine::{Engine, Tab, UiCommand, Workspace};
 use crate::keymap::{self, Action};
 use crate::panels::{PanelCmd, PanelCtx};
@@ -60,6 +61,8 @@ pub struct KitchenApp {
     screenshots: Vec<(String, Sender<Result<(), String>>)>,
     /// Input events from `kitchenctl debug keys`, fed to the next frame.
     injected: Vec<egui::Event>,
+    /// ⌘V was pressed this frame (see attach.rs).
+    cmd_v: bool,
     /// ⌘Q pressed; closes the window at the end of the frame.
     quit_requested: bool,
     /// Test hook: take a screenshot after a delay, then exit.
@@ -102,6 +105,7 @@ impl KitchenApp {
             shortcuts: false,
             screenshots: Vec::new(),
             injected: Vec::new(),
+            cmd_v: false,
             quit_requested: false,
             auto_shot,
             palette: None,
@@ -859,7 +863,20 @@ impl KitchenApp {
                 // Breathing room between the text and the window chrome.
                 let margin = egui::Margin { left: 12, right: 8, top: 8, bottom: 4 };
                 let (resp, link) = egui::Frame::NONE.inner_margin(margin).show(ui, |ui| TerminalView::new(session).font_size(font_size).focused(focused).links(rules).show(ui)).inner;
-                if resp.clicked_by(egui::PointerButton::Primary) || resp.drag_started() {
+                // ⌘V with an image, and dropped files, paste paths Claude Code can read.
+                let mut sources = Vec::new();
+                if focused && self.cmd_v {
+                    sources.push(attach::Source::Clipboard);
+                }
+                let dropped: Vec<_> = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+                let drop = !dropped.is_empty() && self.dialog.is_none() && self.palette.is_none();
+                if drop {
+                    sources.extend(dropped.into_iter().map(attach::Source::File));
+                }
+                if !sources.is_empty() {
+                    attach::deliver(&self.engine, ws.host(), sources, session.paster());
+                }
+                if drop || resp.clicked_by(egui::PointerButton::Primary) || resp.drag_started() {
                     self.set_focus(Focus::Terminal);
                 }
                 if let Some(link) = link {
@@ -952,6 +969,7 @@ impl eframe::App for KitchenApp {
         let frame_start = Instant::now();
         let ctx = ui.ctx().clone();
         self.poll_attach(&ctx);
+        self.cmd_v = attach::take_cmd_v();
         self.handle_ui_commands(&ctx);
         self.drop_stale_state();
 
@@ -1123,6 +1141,7 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("⌘R", "rename tab"),
                 ("⌘W", "close tab"),
                 ("⌘⇧T", "reopen closed tab"),
+                ("⌘V", "paste (images too, for Claude)"),
             ],
         ),
         (
@@ -1293,5 +1312,50 @@ mod tests {
         assert_eq!(app.focus(), Focus::Terminal);
         step(&mut app, key(Key::Period, Modifiers::COMMAND));
         assert_eq!((app.focus(), app.side()), (Focus::Side, Some(SideKind::Viewer)));
+    }
+
+    #[derive(Debug)]
+    struct Dropped(std::path::PathBuf);
+
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A file dropped on a local tab's terminal is pasted as its path,
+    /// escaped the way Claude Code reads dropped files.
+    #[test]
+    fn dropped_file_pastes_its_path() {
+        let repo = TestRepo::new("echo 1 > a");
+        let (ctx, engine) = test_util::engine("local", &repo.path(), &["t"]);
+        let mut app = KitchenApp::new(engine.clone());
+        let out = repo.dir.join("pasted");
+        let script = format!("stty -icanon -echo; cat > {}", kitchen_core::util::shell_quote(out.to_str().unwrap()));
+        let term = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), script], None, HashMap::new()).unwrap();
+        app.slots.insert("t".into(), TermSlot::Live(term));
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut step = |app: &mut KitchenApp, dropped_files: Vec<egui::DroppedFileHandle>| {
+            let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0)));
+            let raw = egui::RawInput { dropped_files, screen_rect, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        step(&mut app, vec![]);
+        std::thread::sleep(Duration::from_millis(300)); // let stty run first
+        step(&mut app, vec![std::sync::Arc::new(Dropped("/tmp/Screen Shot (1).png".into()))]);
+        let want = r"/tmp/Screen\ Shot\ \(1\).png";
+        let mut got = String::new();
+        for _ in 0..100 {
+            got = std::fs::read_to_string(&out).unwrap_or_default();
+            if got == want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(got, want);
     }
 }

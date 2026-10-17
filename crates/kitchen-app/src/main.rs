@@ -2,6 +2,7 @@
 
 mod api;
 mod app;
+mod attach;
 mod dashboard_view;
 mod engine;
 mod keymap;
@@ -52,6 +53,7 @@ fn main() -> eframe::Result {
             let db = kitchen_core::db::Db::open(&db_path)?;
             let engine = engine::Engine::new(cc.egui_ctx.clone(), db)?;
             notify::install(&engine);
+            attach::install();
             if let Err(e) = api::serve(engine.clone()) {
                 engine.toast_err(format!("API socket: {e:#}"));
             }

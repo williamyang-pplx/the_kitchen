@@ -110,7 +110,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘O | toggle outline (collapsed) mode |
 | ⌘. | switch the whole tab between the terminal and the file viewer (from the plan: back to the terminal) |
 | ⌘/ | list every shortcut |
-| ⌘C / ⌘V | copy / paste |
+| ⌘C / ⌘V | copy / paste; in a terminal, ⌘V with an image on the clipboard (or dropping files on it) pastes the files' paths, which Claude Code attaches. On a devbox the files are first copied to `~/.kitchen/attachments` there |
 
 ## Layout
 
