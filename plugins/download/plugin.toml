@@ -1,0 +1,14 @@
+name = "download"
+version = "0.1.0"
+description = "Pull the files a devbox tab dropped in ~/outbox down to this mac (run `kitchenctl plugin run download.pull` on the devbox)"
+api = 10
+
+[config]
+# Where pulled files land, one folder per devbox: <dest>/<host>/. A leading ~ is $HOME.
+dest = "~/Downloads/devbox"
+# The folder on the devbox to empty, relative to its home.
+outbox = "outbox"
+# Show the pulled file (or the folder, for several) in Finder.
+reveal = true
+# Seconds before a pull is killed.
+timeout = 3600
