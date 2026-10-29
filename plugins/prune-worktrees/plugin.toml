@@ -1,14 +1,14 @@
 name = "prune-worktrees"
 version = "0.1.0"
-description = "Every so often, remove worktrees nobody uses: no tab, no tmux pane in them, untouched for idle_days (uncommitted changes go too; branches stay)"
+description = "Every so often, remove worktrees nobody uses: no tab, no tmux pane in them, untouched for idle_hours (uncommitted changes go too; branches stay)"
 api = 7
 
 [config]
 # Minutes between passes; the first pass runs about a minute after the kitchen starts.
 interval_minutes = 60
 # A worktree is idle when no commit/checkout and no edit to a changed or
-# untracked file happened in this many days (fractions ok; at least an hour).
+# untracked file happened in this many hours (at least 1).
 # Each agi worktree holds 2-9G (a copied .venv), so they add up fast.
-idle_days = 2
+idle_hours = 6
 # Where kitchenctl lives when the kitchen was started from Finder (minimal PATH).
 path = "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"

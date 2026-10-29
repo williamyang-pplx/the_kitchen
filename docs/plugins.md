@@ -38,8 +38,8 @@ Examples in the repo's `plugins/`: `ruff` (Python lint), `python` (`gd`/`gr`
 via the ty language server), `github` (PR review via ⌘⇧P),
 `markdown` (⌘⇧V renders `.md` files in the viewer), `todo` (highlights), `hello` (commands, keys, jobs), `prune-worktrees` (a
 `kitchen.every` timer; removes worktrees with no tab or tmux pane that were
-untouched for `idle_days`), `bazel-cache` (keeps the Bazel caches on each
-workspace's host under `max_gb`, or above `min_free_percent` free, evicting
+untouched for `idle_hours`, 6 by default), `bazel-cache` (keeps the Bazel
+caches on each workspace's host under `max_gb`, or above `min_free_percent` free, evicting
 down to `target_gb`; the output bases of removed worktrees always go),
 `dashboard` (worktrees, disk and RAM on the dashboard) and `download` (a
 `remote = true` command: a devbox tab runs `kitchenctl plugin run

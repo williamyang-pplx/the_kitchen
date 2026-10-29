@@ -1,9 +1,10 @@
 -- prune-worktrees: every interval_minutes, remove the worktrees nobody uses.
 --
--- A worktree goes when it has no tab, no tmux pane (kitchen's or yours) has
--- its cwd in it, and nothing in it was touched for idle_days: no commit or
--- checkout (the last entry of its HEAD reflog), no edit to a modified, staged
--- or untracked file. Uncommitted changes go with it (`worktree remove --force`).
+-- A worktree goes when it has no tab (in any workspace on its repo), no tmux
+-- pane (kitchen's or yours) has its cwd in it, and nothing in it was touched
+-- for idle_hours: no commit or checkout (the last entry of its HEAD reflog),
+-- no edit to a modified, staged or untracked file. Uncommitted changes go
+-- with it (`worktree remove --force`).
 --
 -- Commits are never lost: the branch stays, unless its tip is already on
 -- origin/<default> (then it's deleted too), and a detached HEAD that no ref
@@ -29,10 +30,10 @@ local function within(path, dir)
   return path == dir or path:sub(1, #dir + 1) == dir .. "/"
 end
 
--- worktree.list entries that may be collected. `tabs`: the workspace's tabs
--- (kitchen.workspaces()), also matched by branch / worktree name in case a
--- tab spells its path differently from git. `panes`: cwd of every tmux pane
--- on the workspace's host. Returns { path, branch (or nil), head } entries.
+-- worktree.list entries that may be collected. `tabs`: the tabs of every
+-- workspace on the repo (kitchen.workspaces()), also matched by branch /
+-- worktree name in case a tab spells its path differently from git.
+-- `panes`: cwd of every tmux pane on the workspace's host. Returns { path, branch (or nil), head } entries.
 function M.candidates(list, tabs, panes)
   local branches, names = {}, {}
   for _, t in ipairs(tabs or {}) do
@@ -160,8 +161,10 @@ local function panes_on(host)
   return panes
 end
 
--- One pass over workspace `ws`; returns the removed worktree paths and how many it kept.
-local function prune_workspace(ws, minutes)
+-- One pass over workspace `ws`; `tabs`: those of every workspace on its repo
+-- (worktree.list only knows ws's own). Returns the removed worktree paths and
+-- how many it kept.
+local function prune_workspace(ws, tabs, minutes)
   local log = function(...)
     kitchen.log("[" .. ws.name .. "]", ...)
   end
@@ -174,7 +177,7 @@ local function prune_workspace(ws, minutes)
   local panes = panes_on(ws.host)
   local default = ws.default_branch or "main"
   local removed, kept = {}, 0
-  for _, wt in ipairs(M.candidates(list, ws.tabs, panes)) do
+  for _, wt in ipairs(M.candidates(list, tabs, panes)) do
     local probe = kitchen.run_sync({ host = ws.host, cwd = wt.path, timeout = 120, sh = M.probe_sh(minutes, "refs/remotes/origin/" .. default) })
     local v = M.verdict(wt, probe.code == 0 and M.parse_probe(probe.stdout) or nil, default)
     if v.action == "remove" then
@@ -216,10 +219,20 @@ local manual = false -- the next pass was asked for with prune-worktrees.run
 local function pass()
   local was_manual = manual
   manual = false
-  local minutes = math.max(60, (tonumber(kitchen.config.idle_days) or 2) * 1440)
+  local minutes = math.max(60, (tonumber(kitchen.config.idle_hours) or 6) * 60)
   local removed, totals, per_ws = {}, { removed = 0, kept = 0, failed_workspaces = 0 }, {}
-  for _, ws in ipairs(kitchen.workspaces()) do
-    local ok, got, kept = pcall(prune_workspace, ws, minutes)
+  local workspaces = kitchen.workspaces()
+  -- Several workspaces can share a repo: a tab in any of them keeps its worktree.
+  local tabs = {}
+  for _, ws in ipairs(workspaces) do
+    local key = ws.host .. ":" .. ws.repo_path
+    tabs[key] = tabs[key] or {}
+    for _, t in ipairs(ws.tabs or {}) do
+      table.insert(tabs[key], t)
+    end
+  end
+  for _, ws in ipairs(workspaces) do
+    local ok, got, kept = pcall(prune_workspace, ws, tabs[ws.host .. ":" .. ws.repo_path], minutes)
     if ok then
       for _, p in ipairs(got) do
         table.insert(removed, basename(p))
@@ -242,7 +255,7 @@ end
 
 -- The kitchen runs it on schedule and never starts one while another is going.
 local timer = kitchen.every("pass", math.max(1, tonumber(kitchen.config.interval_minutes) or 60) * 60, pass, {
-  desc = "remove worktrees idle for idle_days (kept: no tab or pane, but used recently or not safe to remove)",
+  desc = "remove worktrees idle for idle_hours (kept: no tab or pane, but used recently or not safe to remove)",
   first_delay = 60,
 })
 
