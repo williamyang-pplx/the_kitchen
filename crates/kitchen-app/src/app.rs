@@ -758,7 +758,7 @@ impl KitchenApp {
                 tab_button(ui, strip, None, &format!("⋯ {title}"), None, p.focus, false, true).on_hover_text("fetching origin and preparing the worktree…");
             }
             ui.add_space(theme::SPACE_XS);
-            if icon_button(ui, strip, "+").on_hover_text("New tab  ⌘T").clicked_by(egui::PointerButton::Primary) {
+            if icon_button(ui, strip, "+").on_hover_text("New edit tab  ⌘T\nNew read tab  ⌘I").clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewTab);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -798,7 +798,7 @@ impl KitchenApp {
             let (focus, hints): (&str, &[(&str, &str)]) = match (self.focus(), self.side()) {
                 (Focus::Side, Some(SideKind::Viewer)) => ("VIEWER", &[("⌘P", "find file"), ("⌘M", "comment"), ("⌘D", "diff"), ("⌘.", "terminal"), ("⌘/", "shortcuts")]),
                 (Focus::Side, Some(SideKind::Plan)) => ("PLAN", &[("⌘M", "comment"), ("⌘⏎", "submit"), ("⌘.", "viewer"), ("⌘/", "shortcuts")]),
-                _ => ("TERMINAL", &[("⌘T", "new tab"), ("⌘.", "viewer"), ("⌘⇧P", "commands"), ("⌘/", "shortcuts")]),
+                _ => ("TERMINAL", &[("⌘T", "new edit tab"), ("⌘I", "new read tab"), ("⌘.", "viewer"), ("⌘⇧P", "commands"), ("⌘/", "shortcuts")]),
             };
             widgets::pill(ui, focus, theme::ACCENT);
             if let Some(t) = toast {
@@ -919,7 +919,7 @@ impl KitchenApp {
                 .entry(tab.row.id.clone())
                 .or_insert_with(|| crate::plan_view::PlanView::new(&self.engine, ws, tab))
                 .ui(ui, &mut cx),
-            (_, None) => centered_note(ui, "open a tab first (⌘T)", theme::SUBTLE),
+            (_, None) => centered_note(ui, "open a tab first (⌘T or ⌘I)", theme::SUBTLE),
         }
         if cx.clicked {
             self.set_focus(Focus::Side);
@@ -1054,7 +1054,7 @@ impl eframe::App for KitchenApp {
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let body = ws.status.clone().unwrap_or_else(|| format!("{} · {}", ws.row.host, ws.row.repo_path));
-                widgets::empty_state(ui, &ws.row.name, Some(&body), &[("⌘T", "New tab, in its own worktree and branch"), ("⌘⇧P", "Review a PR from its link")]);
+                widgets::empty_state(ui, &ws.row.name, Some(&body), &[("⌘T", "New edit tab, in its own worktree and branch"), ("⌘I", "New read tab, in the main checkout"), ("⌘⇧P", "Review a PR from its link")]);
             }
             (None, _) => widgets::empty_state(ui, "the kitchen", Some("A workspace is a repo on this mac or on a devbox."), &[("⌘N", "New workspace")]),
         });
@@ -1150,8 +1150,8 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("⌘N", "new workspace"),
                 ("⌘J  ⌘K", "next / previous workspace"),
                 ("⌘⇧R", "rename workspace"),
-                ("⌘T", "new tab"),
-                ("⌘I", "new tab in the main checkout"),
+                ("⌘T", "new edit tab"),
+                ("⌘I", "new read tab"),
                 ("⌘1 … ⌘9", "go to tab"),
                 ("⌘H  ⌘L", "previous / next tab"),
                 ("⌘R", "rename tab"),

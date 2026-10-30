@@ -341,7 +341,7 @@ impl NewTabDialog {
         } else {
             "Its own worktree and branch off the latest origin, with Claude running in it."
         };
-        heading(ui, if self.main_checkout { "New tab in the main checkout" } else { "New tab" }, Some(sub));
+        heading(ui, if self.main_checkout { "New read tab" } else { "New edit tab" }, Some(sub));
         let resp = ui.add(field(&mut self.text, "tab name"));
         if self.first_frame {
             focus_select_all(ui, &resp, &self.text);
