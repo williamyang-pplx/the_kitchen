@@ -78,7 +78,7 @@ the next workspace setup.
 A tab shows either its terminal or its side panel (the file viewer or the
 plan) on the whole screen; ⌘. switches between the terminal and the viewer,
 and each tab remembers which one it was showing when you come back to it.
-Every app shortcut is ⌘+key, and acts on what is shown: tab keys (⌘T ⌘W)
+Every app shortcut is ⌘+key, and acts on what is shown: tab keys (⌘T ⌘I ⌘W)
 only in the terminal, panel keys (⌘M ⌘O ⌘Enter) only in the viewer or plan;
 the rest are global (⌘D: diff in the viewer or plan, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
 keys (`gd` definition, `gr` references, `Ctrl-o` back, `]d` next diagnostic, …).
@@ -94,6 +94,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘⇧J / ⌘⇧K | in the viewer: next / previous changed file |
 | ⌘⇧H / ⌘⇧L | in the viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
 | ⌘T | new tab — own worktree + branch |
+| ⌘I | new tab in the workspace's main checkout — no worktree or branch, for quick tasks that need no PR (tabs share it) |
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |

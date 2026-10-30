@@ -276,7 +276,14 @@ impl KitchenApp {
                 if let Some(ws) = &ws {
                     // Fetch and refresh the spares while the name is typed.
                     engine.refill_spare(&ws.row.id, true);
-                    self.dialog = Some(Dialog::new_tab());
+                    self.dialog = Some(Dialog::new_tab(false));
+                } else {
+                    engine.toast_err("create a workspace first (⌘N)");
+                }
+            }
+            Action::NewMainCheckoutTab => {
+                if ws.is_some() {
+                    self.dialog = Some(Dialog::new_tab(true));
                 } else {
                     engine.toast_err("create a workspace first (⌘N)");
                 }
@@ -1136,6 +1143,7 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("⌘J  ⌘K", "next / previous workspace"),
                 ("⌘⇧R", "rename workspace"),
                 ("⌘T", "new tab"),
+                ("⌘I", "new tab in the main checkout"),
                 ("⌘1 … ⌘9", "go to tab"),
                 ("⌘H  ⌘L", "previous / next tab"),
                 ("⌘R", "rename tab"),

@@ -134,6 +134,8 @@ pub struct NewTab {
     pub command: Option<String>,
     /// Start no agent at all.
     pub no_agent: bool,
+    /// Run in the workspace's main checkout: no worktree or branch of its own.
+    pub main_checkout: bool,
     pub focus: Option<bool>,
 }
 
@@ -674,13 +676,17 @@ impl Engine {
     // ================================================================ tabs
 
     /// Create a tab: worktree + tmux session + agent. Opening a branch that
-    /// a tab already has moves that tab forward instead. Blocking; call from
-    /// a background thread.
+    /// a tab already has moves that tab forward instead. With
+    /// `opts.main_checkout` the tab runs in the main checkout instead, which
+    /// any number of tabs can share. Blocking; call from a background thread.
     pub fn create_tab(self: &Arc<Self>, ws_id: &str, opts: NewTab) -> Result<TabRow> {
         let ws = self.workspace(ws_id).context("no such workspace")?;
         let host = ws.host();
         let repo = Repo::new(&host, &ws.row.repo_path);
         let branch = opts.branch.as_deref().filter(|b| !b.is_empty());
+        if opts.main_checkout && branch.is_some() {
+            bail!("a main-checkout tab can't check out a branch");
+        }
         // Where a branch goes: a worktree named after it. `kitchen-*` names
         // are the kitchen's (spares, PR views).
         let target = branch.map(|b| {
@@ -725,6 +731,12 @@ impl Engine {
             // Existing branches are fetched in the same host round trip as
             // their checkout.
             let (wt, title) = match &target {
+                None if opts.main_checkout => {
+                    // (git lists the main checkout first)
+                    let main = repo.worktrees()?.into_iter().next().context("the repo has no main checkout")?;
+                    let label = opts.task.as_deref().and_then(|t| t.lines().next()).unwrap_or(ws.repo_name());
+                    (main, label.to_string())
+                }
                 Some((to, path)) => {
                     let checked = repo.checkout_worktree(path, *to, &fetch);
                     // The fetch may have moved origin/<default>, and the checkout

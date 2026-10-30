@@ -3,7 +3,7 @@
 //!
 //! A tab shows either its terminal or its side panel (viewer / plan), and
 //! ⌘. switches between the terminal and the viewer. Chords act on what is
-//! shown (see [`Action::scope`]): tab keys (⌘T ⌘W) work in the terminal,
+//! shown (see [`Action::scope`]): tab keys (⌘T ⌘I ⌘W) work in the terminal,
 //! panel keys (⌘M ⌘O ⌘Enter) in a side panel, ⌘P, ⌘⇧A and ⌘⇧H/J/K/L in the
 //! viewer; elsewhere they are swallowed. Tab and workspace switching (⌘H/L
 //! ⌘1-9 ⌘J/K) and ⌘⇧T work everywhere. The rest is global; ⌘D toggles
@@ -18,6 +18,7 @@
 //! | ⌘⇧H / ⌘⇧L   | focused viewer: file list ↔ code              |
 //! | ⌘⇧J / ⌘⇧K   | focused viewer: next / previous changed file  |
 //! | ⌘T          | new tab: a name — own worktree + branch       |
+//! | ⌘I          | new tab in the main checkout (no worktree)    |
 //! | ⌘-click     | open the path / URL under the pointer (terminal) |
 //! | ⌘R          | rename the current tab                        |
 //! | ⌘W          | close tab                                     |
@@ -48,6 +49,8 @@ pub enum Action {
     PrevTab,
     NextTab,
     NewTab,
+    /// ⌘I: a tab in the workspace's main checkout, no worktree or branch.
+    NewMainCheckoutTab,
     CloseTab,
     /// ⌘⇧T: the selected workspace's most recently closed tab, back.
     ReopenTab,
@@ -91,7 +94,7 @@ pub enum Scope {
 impl Action {
     pub fn scope(self) -> Scope {
         match self {
-            Action::NewTab | Action::CloseTab => Scope::Terminal,
+            Action::NewTab | Action::NewMainCheckoutTab | Action::CloseTab => Scope::Terminal,
             Action::Comment | Action::Ask | Action::Submit | Action::ToggleOutline | Action::FilePicker | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile => Scope::Side,
             _ => Scope::Global,
         }
@@ -132,6 +135,7 @@ pub const BINDINGS: &[(Key, Action)] = &[
     (Key::J, Action::NextWorkspace),
     (Key::K, Action::PrevWorkspace),
     (Key::T, Action::NewTab),
+    (Key::I, Action::NewMainCheckoutTab),
     (Key::R, Action::RenameTab),
     (Key::W, Action::CloseTab),
     (Key::P, Action::FilePicker),
@@ -241,6 +245,7 @@ mod tests {
         assert!(!Action::FocusFileList.allowed(false, false));
         // Viewer focused: panel keys yes, tab create / close keys no.
         assert!(!Action::NewTab.allowed(true, true));
+        assert!(!Action::NewMainCheckoutTab.allowed(true, true));
         assert!(!Action::CloseTab.allowed(true, true));
         assert!(Action::ToggleOutline.allowed(true, true));
         // Viewer-only keys are swallowed in the plan.
@@ -334,6 +339,7 @@ mod tests {
         assert_eq!(press(Key::L, Modifiers::COMMAND), vec![Action::NextTab]);
         assert_eq!(press(Key::R, Modifiers::COMMAND), vec![Action::RenameTab]);
         assert_eq!(press(Key::T, Modifiers::COMMAND), vec![Action::NewTab]);
+        assert_eq!(press(Key::I, Modifiers::COMMAND), vec![Action::NewMainCheckoutTab]);
         assert_eq!(press(Key::T, cmd_shift), vec![Action::ReopenTab]);
         assert!(press(Key::E, Modifiers::COMMAND).is_empty(), "⌘E is no longer bound");
         assert_eq!(press(Key::P, cmd_shift), vec![Action::Palette]);

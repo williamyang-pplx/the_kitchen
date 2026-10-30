@@ -200,6 +200,9 @@ pub enum TabCmd {
         /// Start a plain shell, no agent.
         #[arg(long)]
         no_agent: bool,
+        /// Run in the workspace's main checkout: no worktree or branch (like ⌘I).
+        #[arg(long, conflicts_with = "branch")]
+        main_checkout: bool,
         /// Don't switch the window to the new tab.
         #[arg(long)]
         no_focus: bool,
@@ -479,7 +482,7 @@ impl Cli {
             },
             Command::Tab(c) => match c {
                 TabCmd::List { target } => api("tab.list", ws(target)),
-                TabCmd::New { task, task_file, branch, title, command, no_agent, no_focus, target } => {
+                TabCmd::New { task, task_file, branch, title, command, no_agent, main_checkout, no_focus, target } => {
                     let task = match task_file {
                         Some(f) => Some(read_text(f, stdin)?),
                         None => task.clone(),
@@ -490,7 +493,7 @@ impl Cli {
                             ws(target),
                             json!({
                                 "task": task, "branch": branch, "title": title, "command": command,
-                                "no_agent": no_agent, "focus": !no_focus,
+                                "no_agent": no_agent, "main_checkout": main_checkout, "focus": !no_focus,
                             }),
                         ),
                     )
@@ -587,7 +590,7 @@ mod tests {
     fn tab_new_with_task() {
         let (m, p) = api_call(&["tab", "new", "--task", "AI-1: x", "--branch", "b", "-w", "2"]);
         assert_eq!(m, "tab.create");
-        assert_eq!(p, json!({"workspace": "2", "task": "AI-1: x", "branch": "b", "no_agent": false, "focus": true}));
+        assert_eq!(p, json!({"workspace": "2", "task": "AI-1: x", "branch": "b", "no_agent": false, "main_checkout": false, "focus": true}));
     }
 
     #[test]
@@ -595,6 +598,13 @@ mod tests {
         let (_, p) = api_call(&["tab", "new", "--no-agent", "--no-focus"]);
         assert_eq!(p["focus"], false);
         assert_eq!(p["no_agent"], true);
+    }
+
+    #[test]
+    fn tab_new_main_checkout() {
+        let (_, p) = api_call(&["tab", "new", "--main-checkout"]);
+        assert_eq!(p["main_checkout"], true);
+        assert!(Cli::try_parse_from(["kitchenctl", "tab", "new", "--main-checkout", "--branch", "b"]).is_err(), "a main-checkout tab has no branch");
     }
 
     #[test]

@@ -54,9 +54,10 @@ pub struct Rename {
 }
 
 /// ⌘T: a name, for the tab title and the worktree/branch slug, or a link
-/// (a PR) for the plugins to open.
+/// (a PR) for the plugins to open. ⌘I: a name for a tab in the main checkout.
 pub struct NewTabDialog {
     text: String,
+    main_checkout: bool,
     first_frame: bool,
 }
 
@@ -74,8 +75,8 @@ impl Dialog {
         })
     }
 
-    pub fn new_tab() -> Dialog {
-        Dialog::NewTab(NewTabDialog { text: String::new(), first_frame: true })
+    pub fn new_tab(main_checkout: bool) -> Dialog {
+        Dialog::NewTab(NewTabDialog { text: String::new(), main_checkout, first_frame: true })
     }
 
     pub fn confirm_close(tab: &Tab) -> Dialog {
@@ -335,16 +336,22 @@ impl Rename {
 
 impl NewTabDialog {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
-        heading(ui, "New tab", Some("Its own worktree and branch off the latest origin, with Claude running in it."));
+        let sub = if self.main_checkout {
+            "Claude running in the main checkout, with no worktree or branch of its own."
+        } else {
+            "Its own worktree and branch off the latest origin, with Claude running in it."
+        };
+        heading(ui, if self.main_checkout { "New tab in the main checkout" } else { "New tab" }, Some(sub));
         let resp = ui.add(field(&mut self.text, "tab name"));
         if self.first_frame {
             focus_select_all(ui, &resp, &self.text);
             self.first_frame = false;
         }
         let text = self.text.trim().to_string();
+        let main_checkout = self.main_checkout;
         buttons(ui, "Create", true, || {
             if let Some(ws) = engine.selected_workspace() {
-                let opts = NewTab { title: Some(text).filter(|t| !t.is_empty()), ..Default::default() };
+                let opts = NewTab { title: Some(text).filter(|t| !t.is_empty()), main_checkout, ..Default::default() };
                 let id = ws.row.id.clone();
                 engine.spawn("new tab", move |e| e.create_tab(&id, opts).map(|_| ()));
             }
@@ -389,7 +396,7 @@ mod tests {
             let ctx = egui::Context::default();
             crate::theme::install(&ctx); // the UI font families
             let engine = Engine::new(ctx.clone(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
-            let mut dialog = Dialog::new_tab();
+            let mut dialog = Dialog::new_tab(false);
             let mut step = |events: Vec<egui::Event>| {
                 let mut outcome = DialogOutcome::Closed;
                 let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| outcome = dialog.show(ui.ctx(), &engine));
