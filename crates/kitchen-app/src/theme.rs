@@ -35,6 +35,10 @@ pub const RED: Color32 = Color32::from_rgb(0xf7, 0x76, 0x8e);
 pub const YELLOW: Color32 = Color32::from_rgb(0xe0, 0xaf, 0x68);
 pub const PURPLE: Color32 = Color32::from_rgb(0xbb, 0x9a, 0xf7);
 pub const CYAN: Color32 = Color32::from_rgb(0x7d, 0xcf, 0xff);
+/// Neon tab colors: an edit tab (own worktree, ⌘T) and a read tab (the main
+/// checkout, ⌘I).
+pub const TAB_EDIT: Color32 = Color32::from_rgb(0xc8, 0x5c, 0xff);
+pub const TAB_READ: Color32 = Color32::from_rgb(0xff, 0xe6, 0x3d);
 /// Bright violet marking the focused pane.
 pub const FOCUS: Color32 = Color32::from_rgb(0xb2, 0x6b, 0xff);
 pub const ADDED_BG: Color32 = Color32::from_rgb(0x1f, 0x33, 0x2a);

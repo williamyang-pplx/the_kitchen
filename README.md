@@ -93,8 +93,8 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘H / ⌘L | previous / next tab |
 | ⌘⇧J / ⌘⇧K | in the viewer: next / previous changed file |
 | ⌘⇧H / ⌘⇧L | in the viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
-| ⌘T | new tab — own worktree + branch |
-| ⌘I | new tab in the workspace's main checkout — no worktree or branch, for quick tasks that need no PR (tabs share it) |
+| ⌘T | new tab — own worktree + branch (a purple tab) |
+| ⌘I | new tab in the workspace's main checkout — no worktree or branch, for quick tasks that need no PR (tabs share it; a yellow tab) |
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |

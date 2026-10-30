@@ -73,6 +73,13 @@ impl Tab {
     pub fn diff_base(&self, ws: &Workspace) -> String {
         diff_base_of(&ws.row)
     }
+
+    /// The tab runs in the workspace's main checkout (⌘I), not a worktree of
+    /// its own. (Stored paths may be resolved, e.g. /private/tmp, so compare
+    /// the names: worktrees are `<repo>-<name>` siblings.)
+    pub fn in_main_checkout(&self, ws: &Workspace) -> bool {
+        self.row.worktree.trim_end_matches('/').rsplit('/').next() == Some(ws.repo_name())
+    }
 }
 
 fn diff_base_of(ws: &WorkspaceRow) -> String {
@@ -1326,6 +1333,26 @@ mod tests {
         e.restore_tab(TabRow { worktree: "/r-a".into(), ..tab("a2", "w", 5) }).unwrap();
         assert!(e.take_closed(&e.workspace("w").unwrap()).is_none());
         assert_eq!(e.take_closed(&e.workspace("v").unwrap()).unwrap().id, "x");
+    }
+
+    #[test]
+    fn main_checkout_tabs() {
+        let ws = engine_with(&["w"]).workspace("w").unwrap();
+        let tab = |worktree: &str| Tab {
+            row: TabRow {
+                id: "t".into(),
+                workspace_id: "w".into(),
+                title: "t".into(),
+                worktree: worktree.into(),
+                branch: None,
+                tmux_session: "s".into(),
+                position: 0,
+            },
+            unread: false,
+        };
+        // (the repo is /r)
+        assert!(tab("/r").in_main_checkout(&ws) && tab("/private/r/").in_main_checkout(&ws));
+        assert!(!tab("/r-fix").in_main_checkout(&ws));
     }
 
     fn engine_with(ids: &[&str]) -> Arc<Engine> {

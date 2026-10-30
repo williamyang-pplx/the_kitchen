@@ -739,7 +739,8 @@ impl KitchenApp {
             for (i, tab) in ws.tabs.iter().enumerate() {
                 let is_sel = sel.as_deref() == Some(&tab.row.id);
                 let title: String = tab.row.title.chars().take(32).collect();
-                let resp = tab_button(ui, strip, Some(i + 1), &title, is_sel, tab.unread, false).on_hover_text(format!(
+                let kind = if tab.in_main_checkout(ws) { theme::TAB_READ } else { theme::TAB_EDIT };
+                let resp = tab_button(ui, strip, Some(i + 1), &title, Some(kind), is_sel, tab.unread, false).on_hover_text(format!(
                     "{}\n{}",
                     tab.row.worktree,
                     tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
@@ -754,7 +755,7 @@ impl KitchenApp {
             }
             for p in &ws.pending {
                 let title: String = p.title.chars().take(32).collect();
-                tab_button(ui, strip, None, &format!("⋯ {title}"), p.focus, false, true).on_hover_text("fetching origin and preparing the worktree…");
+                tab_button(ui, strip, None, &format!("⋯ {title}"), None, p.focus, false, true).on_hover_text("fetching origin and preparing the worktree…");
             }
             ui.add_space(theme::SPACE_XS);
             if icon_button(ui, strip, "+").on_hover_text("New tab  ⌘T").clicked_by(egui::PointerButton::Primary) {
@@ -1083,13 +1084,20 @@ fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
 
 /// A tab in the strip, as tall as the strip: the selected one takes the
 /// content's color, so it reads as the top of what is shown below.
-fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str, selected: bool, unread: bool, pending: bool) -> egui::Response {
+/// `kind`: the tab's color (edit or read tab); None for a pending tab.
+#[allow(clippy::too_many_arguments)]
+fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str, kind: Option<Color32>, selected: bool, unread: bool, pending: bool) -> egui::Response {
     let mut job = egui::text::LayoutJob::default();
     let fmt = |font: egui::FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: Align::Center, italics: pending, ..Default::default() };
     if let Some(n) = number {
         job.append(&n.to_string(), 0.0, fmt(theme::ui_font(theme::TEXT_SMALL), theme::DIM));
     }
-    let title_color = if selected { theme::TEXT } else { theme::SUBTLE };
+    let title_color = match (kind, selected) {
+        (Some(c), true) => c,
+        (Some(c), false) => c.gamma_multiply(0.8),
+        (None, true) => theme::TEXT,
+        (None, false) => theme::SUBTLE,
+    };
     let title_font = if selected { theme::ui_font_semibold(theme::TEXT_BODY) } else { theme::ui_font(theme::TEXT_BODY) };
     job.append(title, if number.is_some() { 7.0 } else { 0.0 }, fmt(title_font, title_color));
     let galley = ui.painter().layout_job(job);
@@ -1101,11 +1109,11 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str
         // A bright outline on the top and sides; the bottom stays open
         // into the content below (clipped off).
         let outline = egui::Rect::from_min_max(rect.min + egui::vec2(0.75, 0.75), rect.max + egui::vec2(-0.75, 8.0));
-        ui.painter().with_clip_rect(rect).rect_stroke(outline, top, egui::Stroke::new(1.5, theme::ACCENT), egui::StrokeKind::Middle);
+        ui.painter().with_clip_rect(rect).rect_stroke(outline, top, egui::Stroke::new(1.5, kind.unwrap_or(theme::ACCENT)), egui::StrokeKind::Middle);
     } else if resp.hovered() {
         ui.painter().rect_filled(rect.shrink2(egui::vec2(0.0, 0.0)), top, theme::HOVER);
     }
-    let text_color = if resp.hovered() && !selected { theme::MUTED } else { title_color };
+    let text_color = if resp.hovered() && !selected { kind.unwrap_or(theme::MUTED) } else { title_color };
     let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
     let width = galley.size().x;
     if resp.hovered() && !selected {
