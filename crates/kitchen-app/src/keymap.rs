@@ -29,7 +29,7 @@
 //! | ⌘⇧R         | rename the current workspace                  |
 //! | ⌘⇧P         | command palette (plugin commands)             |
 //! | ⌘M          | comment on the cursor line / selection        |
-//! | ⌘⇧A         | focused viewer: ask the model about the line  |
+//! | ⌘⇧A         | viewer / plan: ask the model about the line   |
 //! | ⌘Enter      | submit comment (plan: send comments to agent) |
 //! | ⌘D          | dashboard (focused side panel: diff / plain)  |
 //! | ⌘O          | toggle outline (collapsed) mode               |
@@ -112,7 +112,7 @@ impl Action {
 
     /// Side-panel keys only the file viewer has.
     fn viewer_only(self) -> bool {
-        matches!(self, Action::FilePicker | Action::Ask | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile)
+        matches!(self, Action::FilePicker | Action::FocusFileList | Action::FocusCode | Action::NextFile | Action::PrevFile)
     }
 }
 
@@ -249,9 +249,11 @@ mod tests {
         assert!(!Action::CloseTab.allowed(true, true));
         assert!(Action::ToggleOutline.allowed(true, true));
         // Viewer-only keys are swallowed in the plan.
-        for a in [Action::FilePicker, Action::Ask, Action::FocusFileList, Action::FocusCode, Action::NextFile, Action::PrevFile] {
+        for a in [Action::FilePicker, Action::FocusFileList, Action::FocusCode, Action::NextFile, Action::PrevFile] {
             assert!(a.allowed(true, true) && !a.allowed(true, false), "{a:?}");
         }
+        // The plan takes questions too.
+        assert!(Action::Ask.allowed(true, true) && Action::Ask.allowed(true, false));
         // Global keys work everywhere.
         for (side, viewer) in [(false, false), (true, true), (true, false)] {
             for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::PrevWorkspace, Action::PrevTab, Action::NextTab, Action::GoToTab(3), Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::ReopenTab, Action::Palette, Action::ToggleViewer, Action::Quit] {

@@ -12,7 +12,9 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
 - **Tabs**: one PR each, in a fresh worktree + branch cut from
   `origin/<default>` as last fetched (a background fetch every 5 minutes and
   when ⌘T opens, so ⌘T never waits on the network). Given a task, the agent starts with `/low-level-plan` and
-  writes a plan you comment on inline (⌘⇧I).
+  writes a plan you comment on inline (⌘⇧I). ⌘⇧A there asks the model about
+  the plan's lines, with the agent's planning session (its Claude Code
+  transcript) as context.
 - **PR review**: paste a PR link (`https://github.com/<org>/<repo>/pull/<n>`,
   any suffix, or `<org>/<repo>#<n>`) into ⌘⇧P and the tab's viewer shows that
   PR's diff against its base (as on GitHub), checked out beside the repo in
@@ -105,7 +107,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘⇧R | rename the current workspace |
 | ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins); paste a PR link to review it |
 | ⌘M | comment on the cursor line / selection (viewer, viewing a PR: posted to the PR on GitHub; on a commented line: a reply) |
-| ⌘⇧A | in the viewer: ask the model about the cursor line / selection (Enter asks; the answer shows under the line, Esc on it closes it) |
+| ⌘⇧A | in the viewer or plan: ask the model about the cursor line / selection (Enter asks; the answer shows under the line, Esc on it closes it) |
 | ⌘Enter | submit comment (plan: send comments to agent) |
 | ⌘D | workspace dashboard; in the viewer or plan: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |

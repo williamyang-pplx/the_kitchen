@@ -1,5 +1,6 @@
-//! ⌘⇧A in the viewer: a question about some lines of a file, answered by
-//! the model (`claude -p` on the mac) next to them. Nothing is stored.
+//! ⌘⇧A in the viewer and the plan reviewer: a question about some lines of
+//! a file or of the plan, answered by the model (`claude -p` on the mac)
+//! next to them. Nothing is stored.
 
 use anyhow::Result;
 
@@ -7,6 +8,9 @@ use crate::host::Host;
 
 /// Most file context sent with a question, in bytes.
 const MAX_CONTEXT: usize = 60_000;
+
+/// Most of the planning agent's transcript sent with a plan question, in bytes.
+pub const MAX_TRACE: usize = 100_000;
 
 /// What the question is about.
 pub struct Question<'a> {
@@ -42,6 +46,47 @@ pub fn build_prompt(q: &Question) -> String {
     )
 }
 
+/// A question about lines of the tab's plan.
+pub struct PlanQuestion<'a> {
+    pub path: &'a str,
+    pub first: usize,
+    pub last: usize,
+    pub quote: &'a str,
+    /// The whole plan (cut down around the question if large).
+    pub plan: &'a str,
+    /// The planning agent's session, condensed (see `trace::condense`).
+    pub trace: Option<&'a str>,
+    pub text: &'a str,
+}
+
+pub fn build_plan_prompt(q: &PlanQuestion) -> String {
+    let (from, ctx) = excerpt(q.plan, q.first.max(1), MAX_CONTEXT);
+    let to = from + ctx.lines().count().saturating_sub(1);
+    let lines = if q.last > q.first { format!("lines {}–{}", q.first, q.last) } else { format!("line {}", q.first) };
+    let trace = match q.trace {
+        Some(t) => format!(
+            "\n\nThe session in which the agent wrote this plan (William's prompts, the agent's \
+             replies, its tool calls and their results, oldest first, long parts cut):\n\
+             <planning-session>\n{t}\n</planning-session>\n"
+        ),
+        None => String::new(),
+    };
+    format!(
+        "William is reviewing an implementation plan an agent wrote, `{path}`, and asks a \
+         question about {lines}:\n\
+         ```\n{quote}\n```\n\n\
+         Question: {text}\n\n\
+         Answer in plain text (no Markdown headings or bold), briefly: a few sentences, \
+         or a short code snippet if that answers it best. Use the planning session below \
+         to explain why the plan says what it says when it can. You may read files of the \
+         repository if the answer needs them; do not change anything.\n\n\
+         Plan `{path}`, lines {from}–{to}:\n```\n{ctx}\n```{trace}",
+        path = q.path,
+        quote = q.quote,
+        text = q.text,
+    )
+}
+
 /// The lines of `source` around 1-based `line`, at most `max` bytes, and
 /// the number of the first.
 fn excerpt(source: &str, line: usize, max: usize) -> (usize, String) {
@@ -71,8 +116,28 @@ fn excerpt(source: &str, line: usize, max: usize) -> (usize, String) {
 /// Ask the model. Blocking. `cwd`: where it may read the repository from
 /// (the worktree on this mac; `None` for a devbox's, which it can't reach).
 pub fn answer(model: &str, cwd: Option<&str>, q: &Question) -> Result<String> {
-    let prompt = build_prompt(q);
-    let argv = ["claude", "-p", "--model", model, "--output-format", "text", "--disallowedTools", "Bash Edit Write NotebookEdit"];
+    run(model, cwd, &build_prompt(q))
+}
+
+/// Ask the model about the plan. Blocking. `cwd` as for [`answer`].
+pub fn answer_plan(model: &str, cwd: Option<&str>, q: &PlanQuestion) -> Result<String> {
+    run(model, cwd, &build_plan_prompt(q))
+}
+
+fn run(model: &str, cwd: Option<&str>, prompt: &str) -> Result<String> {
+    // Not saved as a session: the worktree's newest session must stay the
+    // tab agent's (`--continue`, `trace::latest_transcript`).
+    let argv = [
+        "claude",
+        "-p",
+        "--model",
+        model,
+        "--output-format",
+        "text",
+        "--no-session-persistence",
+        "--disallowedTools",
+        "Bash Edit Write NotebookEdit",
+    ];
     let out = Host::Local.run_with_stdin(&argv, Some(cwd.unwrap_or("/tmp")), Some(prompt.as_bytes()))?;
     Ok(out.into_result("claude -p")?.trim().to_string())
 }
@@ -91,6 +156,18 @@ mod tests {
         assert!(p.contains("File `x.rs`, lines 1–2:"));
         let q = Question { first: 1, last: 2, base: true, ..q };
         assert!(build_prompt(&q).contains("lines 1–2 (removed by this change"));
+    }
+
+    #[test]
+    fn plan_prompt_carries_the_plan_and_the_trace() {
+        let plan = "# Plan\n## F1 cache\n";
+        let q = PlanQuestion { path: "/w/.kitchen/plan.md", first: 2, last: 2, quote: "## F1 cache", plan, trace: None, text: "why?" };
+        let p = build_plan_prompt(&q);
+        assert!(p.contains("about line 2:\n```\n## F1 cache\n```"), "{p}");
+        assert!(p.contains("Plan `/w/.kitchen/plan.md`, lines 1–2:"));
+        assert!(!p.contains("<planning-session>"));
+        let p = build_plan_prompt(&PlanQuestion { trace: Some("[William] add a cache"), ..q });
+        assert!(p.contains("<planning-session>\n[William] add a cache\n</planning-session>"), "{p}");
     }
 
     #[test]

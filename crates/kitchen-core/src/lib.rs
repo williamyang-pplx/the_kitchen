@@ -12,4 +12,5 @@ pub mod host;
 pub mod plan;
 pub mod summaries;
 pub mod tmux;
+pub mod trace;
 pub mod util;
