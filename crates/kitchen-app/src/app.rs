@@ -632,6 +632,19 @@ impl KitchenApp {
                     self.engine.select_workspace(&ws.row.id);
                 }
                 resp.context_menu(|ui| {
+                    if ws.tabs.iter().any(|t| t.unread) && ui.button("Mark as read").clicked_by(egui::PointerButton::Primary) {
+                        if let Err(e) = self.engine.mark_read(Some(&ws.row.id)) {
+                            self.engine.toast_err(format!("{e:#}"));
+                        }
+                        ui.close();
+                    }
+                    let others_unread = workspaces.iter().any(|w| w.row.id != ws.row.id && w.tabs.iter().any(|t| t.unread));
+                    if others_unread && ui.button("Mark all workspaces as read").clicked_by(egui::PointerButton::Primary) {
+                        if let Err(e) = self.engine.mark_read(None) {
+                            self.engine.toast_err(format!("{e:#}"));
+                        }
+                        ui.close();
+                    }
                     let pin_label = if ws.row.pinned { "Unpin" } else { "Pin to top" };
                     if ui.button(pin_label).clicked_by(egui::PointerButton::Primary) {
                         if let Err(e) = self.engine.set_workspace_pinned(&ws.row.id, !ws.row.pinned) {

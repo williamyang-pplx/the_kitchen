@@ -49,6 +49,7 @@ app is not reachable.
 | `workspace select W` / `next` / `prev` | `workspace.select` / `.next` / `.prev` | ⌘J / ⌘K |
 | `workspace rename NAME [-w W]` | `workspace.rename` | |
 | `workspace close W` | `workspace.close` | ends tmux sessions; repo + worktrees stay |
+| `workspace read [-w W \| --all]` | `workspace.mark_read` | clears the yellow unread dots; marks the tabs' notifications read |
 | `workspace bootstrap [-w W]` | `workspace.bootstrap` | pull dotfiles, relink skills, install kitchenctl, start relay |
 | `tab list [-w W]` | `tab.list` | |
 | `tab new [--task T\|--task-file F] [--branch B] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | own worktree + new branch off fresh origin, or `--branch` (fetched; a tab on it is reused); `--task` starts `/low-level-plan` |

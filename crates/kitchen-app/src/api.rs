@@ -249,6 +249,22 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             engine.close_workspace(&id)?;
             Ok(json!({"closed": id}))
         }
+        "workspace.mark_read" => {
+            #[derive(Deserialize)]
+            struct P {
+                workspace: Option<String>,
+                #[serde(default)]
+                all: bool,
+            }
+            let a: P = p(params)?;
+            if a.all {
+                engine.mark_read(None)?;
+                return Ok(json!({"all": true}));
+            }
+            let id = engine.resolve_workspace(a.workspace.as_deref(), caller)?;
+            engine.mark_read(Some(&id))?;
+            Ok(json!({"id": id}))
+        }
         "workspace.bootstrap" => {
             let t: Target = p(params)?;
             let id = engine.resolve_workspace(t.workspace.as_deref(), caller)?;

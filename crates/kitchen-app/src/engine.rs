@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use kitchen_core::db::{Db, PlanComment, TabRow, WorkspaceRow};
 use kitchen_core::git::{Checkout, Repo, branch_refspec};
 use kitchen_core::host::Host;
@@ -933,6 +933,33 @@ impl Engine {
         self.repaint();
     }
 
+    /// Clear the unread dot on every tab of workspace `ws_id` (all
+    /// workspaces when `None`) and mark their notifications read.
+    pub fn mark_read(&self, ws_id: Option<&str>) -> Result<()> {
+        let tabs: Vec<String> = {
+            let mut st = self.state();
+            if let Some(id) = ws_id {
+                ensure!(st.workspaces.iter().any(|w| w.row.id == id), "no such workspace");
+            }
+            st.workspaces
+                .iter_mut()
+                .filter(|w| ws_id.is_none_or(|id| w.row.id == id))
+                .flat_map(|w| w.tabs.iter_mut())
+                .map(|t| {
+                    t.unread = false;
+                    t.row.id.clone()
+                })
+                .collect()
+        };
+        let db = self.db();
+        match ws_id {
+            Some(_) => tabs.iter().try_for_each(|t| db.mark_notifications_read(Some(t)))?,
+            None => db.mark_notifications_read(None)?,
+        }
+        self.repaint();
+        Ok(())
+    }
+
     /// Cmd+<n>: focus the n-th (1-based) tab of the selected workspace.
     pub fn select_tab_index(&self, n: usize) {
         let id = self.selected_workspace().and_then(|w| w.tabs.get(n.wrapping_sub(1)).map(|t| t.row.id.clone()));
@@ -1353,6 +1380,30 @@ mod tests {
         // (the repo is /r)
         assert!(tab("/r").in_main_checkout(&ws) && tab("/private/r/").in_main_checkout(&ws));
         assert!(!tab("/r-fix").in_main_checkout(&ws));
+    }
+
+    /// Marking a workspace read clears its tabs' dots and notifications,
+    /// leaving other workspaces' alone; `None` clears them all.
+    #[test]
+    fn mark_read() {
+        let e = engine_with(&["w", "v"]);
+        for (id, ws) in [("a", "w"), ("b", "w"), ("x", "v")] {
+            let row = TabRow { id: id.into(), workspace_id: ws.into(), title: id.into(), worktree: format!("/r-{id}"), branch: None, tmux_session: format!("kt-test-read-{id}"), position: 0 };
+            e.restore_tab(row).unwrap();
+            e.db().add_notification(Some(ws), Some(id), "done", "").unwrap();
+        }
+        e.state().workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()).for_each(|t| t.unread = true);
+        let unread = |e: &Engine, ws: &str| e.workspace(ws).unwrap().tabs.iter().filter(|t| t.unread).count();
+
+        e.mark_read(Some("w")).unwrap();
+        assert_eq!((unread(&e, "w"), unread(&e, "v")), (0, 1));
+        let left: Vec<_> = e.db().notifications(true, 50).unwrap().into_iter().map(|n| n.tab_id).collect();
+        assert_eq!(left, [Some("x".to_string())]);
+        assert!(e.mark_read(Some("nope")).is_err());
+
+        e.mark_read(None).unwrap();
+        assert_eq!(unread(&e, "v"), 0);
+        assert!(e.db().notifications(true, 50).unwrap().is_empty());
     }
 
     fn engine_with(ids: &[&str]) -> Arc<Engine> {

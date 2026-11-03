@@ -163,6 +163,14 @@ pub enum WorkspaceCmd {
     },
     /// Remove a workspace (ends its tmux sessions; repo and worktrees stay).
     Close { workspace: String },
+    /// Clear a workspace's unread dots (and mark its notifications read).
+    Read {
+        #[command(flatten)]
+        target: WsTarget,
+        /// Every workspace.
+        #[arg(long, conflicts_with = "workspace")]
+        all: bool,
+    },
     /// Re-run host setup: pull dotfiles, link skills, install kitchenctl, start the relay.
     Bootstrap {
         #[command(flatten)]
@@ -478,6 +486,7 @@ impl Cli {
                 WorkspaceCmd::Prev => api("workspace.prev", json!({})),
                 WorkspaceCmd::Rename { name, target } => api("workspace.rename", merge(ws(target), json!({"name": name}))),
                 WorkspaceCmd::Close { workspace } => api("workspace.close", json!({"workspace": workspace})),
+                WorkspaceCmd::Read { target, all } => api("workspace.mark_read", merge(ws(target), json!({"all": all}))),
                 WorkspaceCmd::Bootstrap { target } => api("workspace.bootstrap", ws(target)),
             },
             Command::Tab(c) => match c {
@@ -605,6 +614,13 @@ mod tests {
         let (_, p) = api_call(&["tab", "new", "--main-checkout"]);
         assert_eq!(p["main_checkout"], true);
         assert!(Cli::try_parse_from(["kitchenctl", "tab", "new", "--main-checkout", "--branch", "b"]).is_err(), "a main-checkout tab has no branch");
+    }
+
+    #[test]
+    fn workspace_read() {
+        assert_eq!(api_call(&["workspace", "read", "-w", "2"]), ("workspace.mark_read".into(), json!({"workspace": "2", "all": false})));
+        assert_eq!(api_call(&["workspace", "read", "--all"]).1, json!({"all": true}));
+        assert!(Cli::try_parse_from(["kitchenctl", "workspace", "read", "--all", "-w", "2"]).is_err());
     }
 
     #[test]
