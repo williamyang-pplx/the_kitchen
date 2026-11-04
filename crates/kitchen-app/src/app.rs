@@ -701,12 +701,18 @@ impl KitchenApp {
     }
 
     /// The strip behind the transparent macOS title bar: where you are
-    /// (workspace › tab, and its branch), and dragging it moves the window.
+    /// (workspace › tab, and its branch). Dragging it moves the window, and
+    /// double-clicking it zooms the window to fill the screen (and back),
+    /// like a native title bar.
     fn titlebar(&mut self, ui: &mut Ui, ws: Option<&Workspace>, tab: Option<&Tab>) {
         let rect = ui.max_rect();
         let resp = ui.interact(rect, ui.id().with("titlebar"), Sense::click_and_drag());
         if resp.drag_started_by(egui::PointerButton::Primary) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if resp.double_clicked_by(egui::PointerButton::Primary) {
+            let zoomed = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!zoomed));
         }
         let mut job = egui::text::LayoutJob::default();
         let fmt = |font: egui::FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: Align::Center, ..Default::default() };
