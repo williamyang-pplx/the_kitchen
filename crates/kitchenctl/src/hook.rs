@@ -6,6 +6,8 @@
 //! records each launch (a tool result with `isAsync` and an `agentId`) and
 //! each report (a `<task-notification>` with that `<task-id>`); the agent is
 //! done when every launch has reported.
+//!
+//! The hook input also names the agent's session, which a revived tab resumes.
 
 use std::collections::HashSet;
 
@@ -48,6 +50,12 @@ pub fn should_notify_on_stop(hook_input: &str) -> bool {
     let input: Value = serde_json::from_str(hook_input).unwrap_or_default();
     let Some(path) = input["transcript_path"].as_str() else { return true };
     std::fs::read_to_string(path).map_or(true, |t| pending_agents(&t) == 0)
+}
+
+/// The `session_id` of a hook's stdin, if it has one.
+pub fn session_id(hook_input: &str) -> Option<String> {
+    let input: Value = serde_json::from_str(hook_input).ok()?;
+    input["session_id"].as_str().filter(|s| !s.is_empty()).map(String::from)
 }
 
 /// Every string in `v`, recursively.
@@ -99,6 +107,13 @@ mod tests {
         // Long-lived background commands (dev servers) never report; only agents count.
         let bash = json!({"type": "user", "toolUseResult": {"backgroundTaskId": "b1"}}).to_string();
         assert_eq!(pending_agents(&bash), 0);
+    }
+
+    #[test]
+    fn reads_session_id() {
+        assert_eq!(session_id(r#"{"session_id": "abc-1", "transcript_path": "/x"}"#).as_deref(), Some("abc-1"));
+        assert_eq!(session_id(r#"{"session_id": ""}"#), None);
+        assert_eq!(session_id("not json"), None);
     }
 
     #[test]

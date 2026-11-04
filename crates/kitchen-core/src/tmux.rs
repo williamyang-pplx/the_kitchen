@@ -52,8 +52,8 @@ impl<'a> Tmux<'a> {
         self.host.run(&[TMUX[0], TMUX[1], TMUX[2], "has-session", "-t", &target], None).map(|o| o.ok()).unwrap_or(false)
     }
 
-    /// Create a detached session in `cwd` with `env` (unless it exists),
-    /// then type `command` (if any) into its shell, so the shell survives the
+    /// Create a detached session in `cwd` with `env` (unless it exists) and
+    /// type `command` (if any) into its new shell, so the shell survives the
     /// command exiting.
     ///
     /// Everything runs as one script on the host — one ssh round trip for a
@@ -80,14 +80,14 @@ impl<'a> Tmux<'a> {
         self.host.sh_ok(&script, None).map(|_| ())
     }
 
-    /// Make sure session `name` exists, recreating it in `cwd` when it died.
-    /// Returns `false` (and creates nothing) when `cwd` no longer exists.
-    /// One round trip.
-    pub fn ensure_session(&self, name: &str, cwd: &str, env: &[(String, String)]) -> Result<bool> {
+    /// Make sure session `name` exists, recreating it in `cwd` when it died
+    /// and typing `command` (if any) into the new one. Returns `false` (and
+    /// creates nothing) when `cwd` no longer exists. One round trip.
+    pub fn ensure_session(&self, name: &str, cwd: &str, env: &[(String, String)], command: Option<&str>) -> Result<bool> {
         let script = format!(
             "if [ ! -d {} ]; then echo KT_GONE; else {}; fi",
             shell_quote(cwd),
-            new_session_script(name, cwd, env, None)
+            new_session_script(name, cwd, env, command)
         );
         Ok(!self.host.sh_ok(&script, None)?.contains("KT_GONE"))
     }
@@ -168,24 +168,21 @@ fn new_session_script(name: &str, cwd: &str, env: &[(String, String)], command: 
         .map(|(opt, val)| format!("set-option -t {s} {opt} {val}"))
         .collect::<Vec<_>>()
         .join(" \\; ");
-    let mut script = format!(
-        "if ! {t} has-session -t ={s} 2>/dev/null; then {t} {create} && {t} {options} >/dev/null; fi",
-        create = shell_join(&create),
-    );
+    let mut start = format!("{t} {create} && {t} {options} >/dev/null", create = shell_join(&create));
     if let Some(cmd) = command.filter(|c| !c.trim().is_empty()) {
         // Wait (on the host, 50ms polls) until the pane is non-blank and has
         // been unchanged for 300ms, capped at 8s; then type the command.
-        script.push_str(&format!(
-            "; last=; stable=0; i=0; while [ $i -lt 160 ]; do \
+        start.push_str(&format!(
+            " && {{ last=; stable=0; i=0; while [ $i -lt 160 ]; do \
                cur=$({t} capture-pane -p -t {s}); \
                if [ \"$cur\" = \"$last\" ] && [ -n \"$(printf %s \"$cur\" | tr -d '[:space:]')\" ]; then \
                  stable=$((stable+1)); [ $stable -ge 6 ] && break; else stable=0; fi; \
                last=$cur; i=$((i+1)); sleep 0.05; done; \
-             {t} send-keys -t {s} -l {cmd} && {t} send-keys -t {s} Enter",
+             {t} send-keys -t {s} -l {cmd} && {t} send-keys -t {s} Enter; }}",
             cmd = shell_quote(cmd)
         ));
     }
-    script
+    format!("if ! {t} has-session -t ={s} 2>/dev/null; then {start}; fi")
 }
 
 #[cfg(test)]
@@ -202,17 +199,28 @@ mod tests {
         let env = vec![("KITCHEN_TEST_VAR".to_string(), "hello-kitchen".to_string())];
         t.new_session(&name, "/tmp", &env, Some("echo \"$KITCHEN_TEST_VAR\"")).unwrap();
         assert!(t.has_session(&name));
-        let mut screen = String::new();
-        for _ in 0..40 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            screen = t.capture(&name, None).unwrap();
-            if screen.lines().any(|l| l.trim() == "hello-kitchen") {
-                break;
+        let shows = |line: &str| {
+            let mut screen = String::new();
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                screen = t.capture(&name, None).unwrap();
+                if screen.lines().any(|l| l.trim() == line) {
+                    return Ok(());
+                }
             }
-        }
-        assert!(screen.lines().any(|l| l.trim() == "hello-kitchen"), "screen: {screen}");
+            Err(screen)
+        };
+        shows("hello-kitchen").unwrap();
         assert!(t.list_kitchen_sessions().unwrap().contains(&name));
+
+        // A live session is left alone; a dead one comes back running the command.
+        assert!(t.ensure_session(&name, "/tmp", &env, Some("echo typed-$((40+2))")).unwrap());
+        assert!(shows("typed-42").is_err(), "typed into a live session");
         t.kill_session(&name).unwrap();
         assert!(!t.has_session(&name));
+        assert!(t.ensure_session(&name, "/tmp", &env, Some("echo typed-$((40+2))")).unwrap());
+        shows("typed-42").unwrap();
+        assert!(!t.ensure_session(&name, "/nonexistent-kitchen-dir", &env, None).unwrap(), "gone worktree");
+        t.kill_session(&name).unwrap();
     }
 }

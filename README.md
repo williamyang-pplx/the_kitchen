@@ -65,7 +65,9 @@ scripts/screenshots.sh [DIR]    # PNGs of every view, from an isolated test kitc
 Needs `git`, `tmux` and `claude` on each host. State is
 in `~/.kitchen` (`KITCHEN_STATE_DIR` overrides it for an isolated test
 kitchen). Tabs are tmux sessions on the kitchen's own server:
-`tmux -L kitchen ls`.
+`tmux -L kitchen ls`. When a host restarts (a devbox resumed from pause),
+a tab's session comes back in its worktree with its agent resuming the
+conversation it was in.
 
 ### Agent skill
 
@@ -100,7 +102,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
 | ⌘R | rename the current tab |
 | ⌘W | close tab |
-| ⌘⇧T | reopen the workspace's last closed tab (its agent continues its last conversation) |
+| ⌘⇧T | reopen the workspace's last closed tab (its agent resumes its conversation) |
 | ⌘P | fuzzy file picker (in the viewer) |
 | ⌘B | show / hide the viewer's file list |
 | ⌘⇧I | plan reviewer |

@@ -2,7 +2,7 @@
 //!
 //! Every subcommand maps to exactly one API method (see [`Cli::to_call`]),
 //! except the few that run without the app: `guide`, `version`, and the
-//! hidden `__relay` / `__index` / `__agent-stopped` helpers.
+//! hidden `__relay` / `__index` / `__agent-stopped` / `__agent-session` helpers.
 
 use std::path::PathBuf;
 
@@ -110,6 +110,10 @@ pub enum Command {
         #[arg(long, default_value = "")]
         body: String,
     },
+    /// Claude Code Stop hook (hook JSON on stdin): tell the app the tab's
+    /// agent session, which a revived tab resumes.
+    #[command(name = "__agent-session", hide = true)]
+    AgentSession,
 }
 
 #[derive(Args, Debug, Default, Clone)]
@@ -560,6 +564,10 @@ impl Cli {
                     Call::Skip
                 }
             }
+            Command::AgentSession => match crate::hook::session_id(&stdin()?) {
+                Some(id) => api("tab.agent_session", json!({"session_id": id})),
+                None => Call::Skip,
+            },
             Command::Notifications { unread, limit } => api("notification.list", json!({"unread": unread, "limit": limit})),
             Command::Debug(DebugCmd::Screenshot { path }) => {
                 let abs = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));

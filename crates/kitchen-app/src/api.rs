@@ -292,6 +292,18 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({"id": row.id, "workspace": ws, "title": row.title, "worktree": row.worktree,
                       "branch": row.branch, "tmux_session": row.tmux_session, "plan_file": row.plan_file()}))
         }
+        "tab.agent_session" => {
+            #[derive(Deserialize)]
+            struct P {
+                session_id: String,
+            }
+            let a: P = p(params)?;
+            // Only the tab's own agent reports (its hook runs in the tab): no
+            // falling back to the selected tab.
+            let tab = caller.tab_id.as_deref().context("not called from a kitchen tab")?;
+            engine.set_agent_session(tab, &a.session_id)?;
+            Ok(json!({"tab": tab}))
+        }
         "tab.select" => {
             let t: Target = p(params)?;
             let id = engine.resolve_tab(t.tab.as_deref(), t.workspace.as_deref(), caller)?;

@@ -780,6 +780,8 @@ impl Engine {
                 branch: wt.branch,
                 tmux_session: session,
                 position: ws.tabs.iter().map(|t| t.row.position).max().unwrap_or(0) + 1,
+                agent: !opts.no_agent && opts.command.is_none(),
+                agent_session: None,
             };
             let worktree = &row.worktree;
             let env = tab_env(&ws.row, &row, &host);
@@ -1016,8 +1018,8 @@ impl Engine {
     }
 
     /// ⌘⇧T: bring back the workspace's most recently closed tab, in its old
-    /// place: a new tmux session in its worktree, the agent continuing its
-    /// last conversation there. Blocking; call from a background thread.
+    /// place: a new tmux session in its worktree, the agent resuming its
+    /// conversation. Blocking; call from a background thread.
     pub fn reopen_closed_tab(&self, ws_id: &str) -> Result<()> {
         let ws = self.workspace(ws_id).context("no such workspace")?;
         let row = self.take_closed(&ws).context("no closed tab to reopen")?;
@@ -1025,10 +1027,10 @@ impl Engine {
         if !host.is_dir(&row.worktree) {
             bail!("the worktree of {} is gone ({})", row.title, row.worktree);
         }
-        let (agent, _) = agent_command(&row.worktree, &self.settings(), None);
+        let command = resume_command(&row, &self.settings());
         let env = tab_env(&ws.row, &row, &host);
         self.set_pending(ws_id, Some(PendingTab { id: row.id.clone(), title: row.title.clone(), focus: true }));
-        let started = Tmux::new(&host).new_session_with_setup(&row.tmux_session, &row.worktree, &env, Some(&format!("{agent} --continue")), None);
+        let started = Tmux::new(&host).new_session(&row.tmux_session, &row.worktree, &env, command.as_deref());
         self.clear_pending(ws_id, &row.id);
         if let Err(e) = started {
             self.closed.lock().unwrap().push(row);
@@ -1085,8 +1087,10 @@ impl Engine {
         Tmux::new(&host).capture(&session, scrollback)
     }
 
-    /// Make sure a tab's tmux session exists (recreating a dead one in the
-    /// same worktree). Returns false when the worktree itself is gone.
+    /// Make sure a tab's tmux session exists, recreating a dead one (the
+    /// host restarted, e.g. a devbox resumed from pause) in the same worktree
+    /// with its agent resuming its conversation. Returns false when the
+    /// worktree itself is gone.
     pub fn ensure_session(&self, tab_id: &str) -> Result<bool> {
         if self.fresh_sessions.lock().unwrap().remove(tab_id) {
             return Ok(true); // created moments ago by create_tab
@@ -1094,7 +1098,22 @@ impl Engine {
         let (ws, tab) = self.find_tab(tab_id).context("no such tab")?;
         let host = ws.host();
         let env = tab_env(&ws.row, &tab.row, &host);
-        Tmux::new(&host).ensure_session(&tab.row.tmux_session, &tab.row.worktree, &env)
+        let command = resume_command(&tab.row, &self.settings());
+        Tmux::new(&host).ensure_session(&tab.row.tmux_session, &tab.row.worktree, &env, command.as_deref())
+    }
+
+    /// The tab's agent reported its Claude Code session (Stop hook): the
+    /// one a revived tab resumes.
+    pub fn set_agent_session(&self, tab_id: &str, session: &str) -> Result<()> {
+        {
+            let mut st = self.state();
+            let tab = st.workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()).find(|t| t.row.id == tab_id).context("no such tab")?;
+            if tab.row.agent_session.as_deref() == Some(session) {
+                return Ok(());
+            }
+            tab.row.agent_session = Some(session.to_string());
+        }
+        self.db().set_tab_agent_session(tab_id, session)
     }
 
     // ================================================================ notifications
@@ -1176,6 +1195,20 @@ fn agent_command(worktree: &str, settings: &Settings, task: Option<&str>) -> (St
     (format!("{base} \"$(cat {})\"", shell_quote(&prompt_path)), Some(setup))
 }
 
+/// What a recreated tab session runs: an agent tab's agent resuming the
+/// session it last reported, or (none reported, e.g. a tab from before the
+/// report) the newest conversation in its worktree. Nothing for other tabs.
+fn resume_command(row: &TabRow, settings: &Settings) -> Option<String> {
+    if !row.agent {
+        return None;
+    }
+    let (agent, _) = agent_command(&row.worktree, settings, None);
+    Some(match &row.agent_session {
+        Some(id) => format!("{agent} --resume {}", shell_quote(id)),
+        None => format!("{agent} --continue"),
+    })
+}
+
 /// Where a printed path points: `~/…` expanded on the host, absolute as-is,
 /// anything else under `worktree`.
 fn file_link_path(host: &Host, worktree: &str, path: &str) -> Result<String> {
@@ -1202,22 +1235,30 @@ fn closest(matches: &[String]) -> Option<&String> {
 /// `--settings` for agents the kitchen starts: plan files land where the
 /// plan reviewer looks, and Stop/Notification hooks badge the
 /// tab through `kitchenctl notify` so a finished or blocked agent is visible
-/// from any workspace. Stop stays quiet while background subagents run.
+/// from any workspace. Stop stays quiet while background subagents run, and
+/// reports the agent's session (`__agent-session`) for a revived tab to resume.
 fn agent_settings_json() -> String {
-    let hook = |matcher: &str, command: String| {
-        serde_json::json!([{ "matcher": matcher, "hooks": [{ "type": "command",
-            "command": format!("command -v kitchenctl >/dev/null && {{ {command}; }} >/dev/null 2>&1; true") }] }])
+    let hook = |matcher: &str, commands: &[String]| {
+        let hooks: Vec<_> = commands
+            .iter()
+            .map(|c| serde_json::json!({ "type": "command",
+                "command": format!("command -v kitchenctl >/dev/null && {{ {c}; }} >/dev/null 2>&1; true") }))
+            .collect();
+        serde_json::json!([{ "matcher": matcher, "hooks": hooks }])
     };
     let args = |title: &str| format!("--title '{title}' --body \"$(basename \"$PWD\")\"");
     let stop = hook(
         "",
-        // A kitchenctl older than __agent-stopped exits 2; plain notify then.
-        format!("kitchenctl __agent-stopped {a} || kitchenctl notify {a}", a = args("agent finished")),
+        &[
+            // A kitchenctl older than __agent-stopped exits 2; plain notify then.
+            format!("kitchenctl __agent-stopped {a} || kitchenctl notify {a}", a = args("agent finished")),
+            "kitchenctl __agent-session".to_string(),
+        ],
     );
     // Only prompts that block the agent; idle_prompt repeats Stop a minute later.
     let blocked = hook(
         "permission_prompt|elicitation_dialog|elicitation_url_dialog",
-        format!("kitchenctl notify {}", args("agent needs you")),
+        &[format!("kitchenctl notify {}", args("agent needs you"))],
     );
     serde_json::json!({ "hooks": { "Stop": stop, "Notification": blocked }, "plansDirectory": ".kitchen/plans" }).to_string()
 }
@@ -1337,6 +1378,8 @@ mod tests {
             branch: None,
             tmux_session: format!("kt-test-reopen-{id}"),
             position,
+            agent: true,
+            agent_session: None,
         };
         for (i, id) in ["a", "b", "c"].iter().enumerate() {
             e.restore_tab(tab(id, "w", i as i64)).unwrap();
@@ -1362,6 +1405,35 @@ mod tests {
         assert_eq!(e.take_closed(&e.workspace("v").unwrap()).unwrap().id, "x");
     }
 
+    /// A revived agent tab resumes the session its agent last reported
+    /// (kept across restarts), else its worktree's newest conversation;
+    /// other tabs come back as a plain shell.
+    #[test]
+    fn revived_tabs_resume_their_agent() {
+        let e = engine_with(&["w"]);
+        let row = TabRow {
+            id: "a".into(),
+            workspace_id: "w".into(),
+            title: "a".into(),
+            worktree: "/r-a".into(),
+            branch: None,
+            tmux_session: "kt-test-resume-a".into(),
+            position: 0,
+            agent: true,
+            agent_session: None,
+        };
+        e.restore_tab(row.clone()).unwrap();
+        let settings = e.settings();
+        let command = |e: &Engine| resume_command(&e.find_tab("a").unwrap().1.row, &settings).unwrap();
+        assert!(command(&e).ends_with(" --continue"), "{}", command(&e));
+
+        e.set_agent_session("a", "0b7e-41").unwrap();
+        assert!(command(&e).ends_with(" --resume 0b7e-41"), "{}", command(&e));
+        assert_eq!(e.db().tab("a").unwrap().unwrap().agent_session.as_deref(), Some("0b7e-41"));
+
+        assert_eq!(resume_command(&TabRow { agent: false, ..row }, &settings), None);
+    }
+
     #[test]
     fn main_checkout_tabs() {
         let ws = engine_with(&["w"]).workspace("w").unwrap();
@@ -1374,6 +1446,8 @@ mod tests {
                 branch: None,
                 tmux_session: "s".into(),
                 position: 0,
+                agent: true,
+                agent_session: None,
             },
             unread: false,
         };
@@ -1388,7 +1462,7 @@ mod tests {
     fn mark_read() {
         let e = engine_with(&["w", "v"]);
         for (id, ws) in [("a", "w"), ("b", "w"), ("x", "v")] {
-            let row = TabRow { id: id.into(), workspace_id: ws.into(), title: id.into(), worktree: format!("/r-{id}"), branch: None, tmux_session: format!("kt-test-read-{id}"), position: 0 };
+            let row = TabRow { id: id.into(), workspace_id: ws.into(), title: id.into(), worktree: format!("/r-{id}"), branch: None, tmux_session: format!("kt-test-read-{id}"), position: 0, agent: true, agent_session: None };
             e.restore_tab(row).unwrap();
             e.db().add_notification(Some(ws), Some(id), "done", "").unwrap();
         }

@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS tabs (
     tmux_session TEXT NOT NULL UNIQUE,
     plan_file    TEXT,
     position     INTEGER NOT NULL,
+    agent        INTEGER NOT NULL DEFAULT 1,  -- the kitchen started Claude Code in it (not --no-agent / --command)
+    agent_session TEXT,                       -- that agent's latest session id, resumed if the tmux session dies
     created_at   INTEGER NOT NULL
 );
 
@@ -115,6 +117,10 @@ pub struct TabRow {
     pub branch: Option<String>,
     pub tmux_session: String,
     pub position: i64,
+    /// The kitchen started Claude Code in the tab, so a revived tab starts it again.
+    pub agent: bool,
+    /// The agent's Claude Code session, as its Stop hook last reported it.
+    pub agent_session: Option<String>,
 }
 
 impl TabRow {
@@ -169,6 +175,8 @@ fn tab_from(r: &Row) -> rusqlite::Result<TabRow> {
         branch: r.get(4)?,
         tmux_session: r.get(5)?,
         position: r.get(6)?,
+        agent: r.get(7)?,
+        agent_session: r.get(8)?,
     })
 }
 
@@ -186,16 +194,26 @@ fn plan_comment_from(r: &Row) -> rusqlite::Result<PlanComment> {
 }
 
 const WS_COLS: &str = "id, name, host, repo_path, github_slug, default_branch, position, pinned";
-const TAB_COLS: &str = "id, workspace_id, title, worktree, branch, tmux_session, position";
+const TAB_COLS: &str = "id, workspace_id, title, worktree, branch, tmux_session, position, agent, agent_session";
 const PC_COLS: &str = "id, tab_id, line, end_line, quote, body, state, created_at";
 
 /// Columns added after a table first shipped; `CREATE TABLE IF NOT EXISTS`
 /// leaves older databases without them.
 fn migrate(conn: &Connection) -> Result<()> {
-    let has_pinned: bool =
-        conn.query_row("SELECT COUNT(*) FROM pragma_table_info('workspaces') WHERE name = 'pinned'", [], |r| r.get(0))?;
-    if !has_pinned {
-        conn.execute_batch("ALTER TABLE workspaces ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")?;
+    let added = [
+        ("workspaces", "pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ("tabs", "agent", "INTEGER NOT NULL DEFAULT 1"),
+        ("tabs", "agent_session", "TEXT"),
+    ];
+    for (table, column, decl) in added {
+        let has: bool = conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+            [column],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+        }
     }
     Ok(())
 }
@@ -272,8 +290,8 @@ impl Db {
 
     pub fn insert_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, position, created_at)
-             VALUES (?1, ?2, 'edit', ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, position, agent, agent_session, created_at)
+             VALUES (?1, ?2, 'edit', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 t.id,
                 t.workspace_id,
@@ -282,6 +300,8 @@ impl Db {
                 t.branch,
                 t.tmux_session,
                 t.position,
+                t.agent,
+                t.agent_session,
                 now()
             ],
         )?;
@@ -293,6 +313,11 @@ impl Db {
             "UPDATE tabs SET title = ?2, worktree = ?3, branch = ?4, position = ?5 WHERE id = ?1",
             params![t.id, t.title, t.worktree, t.branch, t.position],
         )?;
+        Ok(())
+    }
+
+    pub fn set_tab_agent_session(&self, id: &str, session: &str) -> Result<()> {
+        self.conn.execute("UPDATE tabs SET agent_session = ?2 WHERE id = ?1", params![id, session])?;
         Ok(())
     }
 
@@ -457,9 +482,13 @@ mod tests {
             branch: Some("william/x".into()),
             tmux_session: "kt_a_t1".into(),
             position: 1,
+            agent: true,
+            agent_session: None,
         };
         db.insert_tab(&tab).unwrap();
         assert_eq!(db.tabs("a").unwrap(), vec![tab.clone()]);
+        db.set_tab_agent_session("t1", "s-1").unwrap();
+        assert_eq!(db.tab("t1").unwrap().unwrap().agent_session.as_deref(), Some("s-1"));
         db.delete_workspace("a").unwrap();
         assert!(db.tab("t1").unwrap().is_none(), "tabs cascade with their workspace");
     }
@@ -478,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_adds_pinned_to_old_databases() {
+    fn migrate_adds_columns_to_old_databases() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, repo_path TEXT NOT NULL,
@@ -495,7 +524,8 @@ mod tests {
         .unwrap();
         let db = Db::init(conn).unwrap();
         assert!(!db.workspaces().unwrap()[0].pinned);
-        assert!(db.tab("t").unwrap().is_some(), "old tabs still read");
+        let tab = db.tab("t").unwrap().expect("old tabs still read");
+        assert!(tab.agent && tab.agent_session.is_none(), "old tabs count as agent tabs");
     }
 
     #[test]
@@ -510,6 +540,8 @@ mod tests {
             branch: None,
             tmux_session: "s".into(),
             position: 1,
+            agent: true,
+            agent_session: None,
         })
         .unwrap();
         let id = db.add_plan_comment("t", 4, None, "## F1", "rename this").unwrap();
