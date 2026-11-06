@@ -1040,15 +1040,15 @@ impl Engine {
         self.restore_tab(row)
     }
 
-    /// Pop the workspace's newest closed tab, skipping those whose worktree
-    /// a tab has open again.
+    /// Pop the workspace's newest closed tab, skipping edit tabs whose
+    /// worktree a tab has open again (read tabs share the main checkout).
     fn take_closed(&self, ws: &Workspace) -> Option<TabRow> {
         let mut closed = self.closed.lock().unwrap();
         loop {
             let i = closed.iter().rposition(|t| t.workspace_id == ws.row.id)?;
-            let row = closed.remove(i);
-            if !ws.tabs.iter().any(|t| t.row.worktree == row.worktree) {
-                return Some(row);
+            let tab = Tab { row: closed.remove(i), unread: false };
+            if tab.in_main_checkout(ws) || !ws.tabs.iter().any(|t| t.row.worktree == tab.row.worktree) {
+                return Some(tab.row);
             }
         }
     }
@@ -1366,7 +1366,8 @@ mod tests {
     }
 
     /// A closed tab comes back in its old place; one whose worktree a tab
-    /// has open again is skipped; other workspaces' closed tabs stay put.
+    /// has open again is skipped (unless it is a read tab); other workspaces'
+    /// closed tabs stay put.
     #[test]
     fn closed_tabs_come_back_in_place() {
         let e = engine_with(&["w", "v"]);
@@ -1403,6 +1404,12 @@ mod tests {
         e.restore_tab(TabRow { worktree: "/r-a".into(), ..tab("a2", "w", 5) }).unwrap();
         assert!(e.take_closed(&e.workspace("w").unwrap()).is_none());
         assert_eq!(e.take_closed(&e.workspace("v").unwrap()).unwrap().id, "x");
+
+        // Read tabs share the main checkout: one comes back while another is open.
+        e.restore_tab(TabRow { worktree: "/r".into(), ..tab("r1", "w", 6) }).unwrap();
+        e.restore_tab(TabRow { worktree: "/r".into(), ..tab("r2", "w", 7) }).unwrap();
+        e.close_tab("r2").unwrap();
+        assert_eq!(e.take_closed(&e.workspace("w").unwrap()).unwrap().id, "r2");
     }
 
     /// A revived agent tab resumes the session its agent last reported
