@@ -89,8 +89,6 @@ for p in ruff todo python github markdown prune-worktrees dashboard bazel-cache 
   fi
 done
 
-echo "skill: link $root/skill/kitchen into your dotfiles skills/ so agents learn kitchenctl"
-
 if [ "$bundle" = 1 ]; then
   # Quit the installed app (dev builds from `cargo run` are left alone), wait
   # up to 10 s for it to exit, then open the new build.
