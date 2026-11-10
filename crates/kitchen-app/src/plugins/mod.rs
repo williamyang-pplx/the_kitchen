@@ -1131,28 +1131,55 @@ mod tests {
     }
 
     /// prune-worktrees: the `git worktree prune` each pass starts with forgets
-    /// a worktree whose directory is gone, never one that exists or is locked.
+    /// a worktree whose directory is gone, never one that exists or that
+    /// someone locked; a dead `git worktree add`'s "initializing" lock is
+    /// lifted only once its directory is gone and the lock is old.
     #[test]
     fn prune_plugin_forgets_only_missing_worktrees() {
         let lua = mlua::Lua::new();
         let m = prune_module(&lua);
         let repo = crate::test_util::TestRepo::with_files(&[("a.txt", "a")]);
         let wt = |name: &str| format!("{}-{name}", repo.path());
-        let (open, gone, locked) = (wt("open"), wt("gone"), wt("locked"));
-        repo.sh(&format!("git worktree add -q -b open {open} && git worktree add -q -b gone {gone} && git worktree add -q -b locked {locked} && git worktree lock {locked} && rm -rf {gone} {locked}"));
-        let argv: Vec<String> = m.get::<mlua::Function>("forget_missing_cmd").unwrap().call(repo.path()).unwrap();
-        let out = std::process::Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
-        assert!(out.status.success());
-        let said = String::from_utf8_lossy(&out.stderr).into_owned();
-        assert!(said.contains("-gone: ") && !said.contains("-open") && !said.contains("-locked"), "{said}");
+        let add = |name: &str, setup: &str| {
+            let (path, lock) = (wt(name), format!(".git/worktrees/$(basename {})/locked", wt(name)));
+            repo.sh(&format!("git worktree add -q -b {name} {path} && {}", setup.replace("{path}", &path).replace("{lock}", &lock)));
+        };
+        let old = "touch -t 202001010000 {lock}";
+        add("open", "true");
+        add("gone", "rm -rf {path}");
+        add("mine", &format!("git worktree lock {{path}} && {old} && rm -rf {{path}}"));
+        add("fresh", "git worktree lock --reason initializing {path} && rm -rf {path}");
+        add("stuck", &format!("git worktree lock --reason initializing {{path}} && {old} && rm -rf {{path}}"));
+        add("busy", &format!("git worktree lock --reason initializing {{path}} && {old}"));
+        repo.sh(&format!("git -c worktree.useRelativePaths=true worktree add -q -b relative {}", wt("relative")));
+        repo.sh(&format!("git worktree lock --reason initializing {0} && touch -t 202001010000 .git/worktrees/$(basename {0})/locked && rm -rf {0}", wt("relative")));
+
+        let script: String = m.get::<mlua::Function>("forget_missing_sh").unwrap().call(360).unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(&script).current_dir(repo.path()).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+        let mut unlocked: Vec<&str> = stdout.lines().filter_map(|l| l.strip_prefix("unlocked ")).filter_map(|p| p.rsplit('-').next()).collect();
+        unlocked.sort();
+        assert_eq!(unlocked, ["relative", "stuck"], "{stdout}");
+        for name in ["gone", "stuck", "relative"] {
+            assert!(stderr.contains(&format!("-{name}: ")), "{name} forgotten: {stderr}");
+        }
         let list = std::process::Command::new("git").args(["-C", &repo.path(), "worktree", "list", "--porcelain"]).output().unwrap();
         // (git spells the temp dir /private/var on macOS: compare the ends)
         let mut left: Vec<String> = String::from_utf8_lossy(&list.stdout).lines().filter_map(|l| l.strip_prefix("worktree ")).filter_map(|p| p.rsplit('-').next()).map(String::from).collect();
         left[1..].sort();
-        assert_eq!(left[1..], ["locked", "open"], "{left:?}");
-        assert!(std::path::Path::new(&format!("{open}/a.txt")).exists(), "the open worktree's files stay");
-        repo.sh("git rev-parse --verify -q refs/heads/gone >/dev/null"); // its branch stays too
-        let _ = std::fs::remove_dir_all(&open);
+        assert_eq!(left[1..], ["busy", "fresh", "mine", "open"], "{left:?}");
+        assert!(std::path::Path::new(&format!("{}/a.txt", wt("open"))).exists(), "the open worktree's files stay");
+        repo.sh("git rev-parse --verify -q refs/heads/gone >/dev/null && git rev-parse --verify -q refs/heads/stuck >/dev/null"); // branches stay
+        // Run again: nothing more to do, and a repo without worktrees is fine.
+        let again = std::process::Command::new("sh").arg("-c").arg(&script).current_dir(repo.path()).output().unwrap();
+        assert!(again.status.success() && again.stdout.is_empty() && again.stderr.is_empty(), "{again:?}");
+        let bare = crate::test_util::TestRepo::with_files(&[("a.txt", "a")]);
+        let none = std::process::Command::new("sh").arg("-c").arg(&script).current_dir(bare.path()).output().unwrap();
+        assert!(none.status.success() && none.stdout.is_empty(), "{none:?}");
+        for name in ["open", "busy"] {
+            let _ = std::fs::remove_dir_all(wt(name));
+        }
     }
 
     /// dashboard plugin: parsing `ps`/`df`/`du` output (macOS and Linux) and

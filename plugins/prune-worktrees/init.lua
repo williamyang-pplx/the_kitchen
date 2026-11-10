@@ -15,6 +15,8 @@
 -- worktrees whose directory is already gone (a cleaned /tmp, an rm -rf):
 -- their probe can't run, so they'd be kept forever. It removes only git's
 -- bookkeeping for those; it skips a worktree that exists or is locked.
+-- One lock is lifted first: the "initializing" lock of a `git worktree add`
+-- that was killed, once its directory is gone and the lock is idle_hours old.
 
 local M = {}
 
@@ -136,10 +138,34 @@ function M.delete_branch_sh(branch, oid)
   return '[ "$(git rev-parse --verify -q ' .. q("refs/heads/" .. branch) .. ')" = ' .. q(oid) .. " ] && git branch -D " .. q(branch)
 end
 
--- argv that makes the repo at `repo_path` forget worktrees whose directory
--- no longer exists; -v names each one on stderr.
-function M.forget_missing_cmd(repo_path)
-  return { "git", "-C", repo_path, "worktree", "prune", "-v" }
+-- Shell, run in a repo, that makes git forget the worktrees whose directory
+-- is gone (`git worktree prune`; -v names each one on stderr).
+-- Prune skips locked worktrees, and a `git worktree add` killed mid-checkout
+-- leaves its "initializing" lock behind for good. So that lock goes first
+-- (printing "unlocked <path>") when the worktree's directory doesn't exist
+-- and the lock is older than `minutes`: a live add creates the directory
+-- moments after the lock and keeps it. Any other lock reason is someone's
+-- `git worktree lock` and stays. ("initializing" is git's English text: under
+-- a translated locale the lock stays too.)
+function M.forget_missing_sh(minutes)
+  minutes = math.floor(minutes)
+  return table.concat({
+    "set -e",
+    "c=$(git rev-parse --git-common-dir)",
+    'for d in "$c"/worktrees/*/; do',
+    '  d=${d%/}; l="$d/locked"',
+    '  [ -f "$l" ] && [ "$(cat "$l")" = initializing ] || continue',
+    -- gitdir holds "<worktree>/.git", relative to $d with worktree.useRelativePaths;
+    -- an add killed before writing it has no directory either
+    '  w=; g=$(cat "$d/gitdir" 2>/dev/null) || true',
+    '  if [ -n "$g" ]; then case $g in /*) ;; *) g="$d/$g" ;; esac; w=${g%/.git}; fi',
+    '  [ -z "$w" ] || [ ! -e "$w" ] || continue',
+    '  [ -n "$(find "$l" -mmin +' .. minutes .. ')" ] || continue',
+    -- all `git worktree unlock` does, which can't always find a missing path
+    '  rm -f "$l"; echo "unlocked ${w:-$d}"',
+    "done",
+    "git worktree prune -v",
+  }, "\n")
 end
 
 -- run_sync with kitchenctl on the PATH.
@@ -172,15 +198,15 @@ local function panes_on(host)
   return panes
 end
 
--- Forget the missing worktrees of `ws`'s repo (M.forget_missing_cmd). A
+-- Forget the missing worktrees of `ws`'s repo (M.forget_missing_sh). A
 -- failure is only logged: the pass goes on without it.
-local function forget_missing(ws)
-  local res = kitchen.run_sync({ host = ws.host, timeout = 60, cmd = M.forget_missing_cmd(ws.repo_path) })
+local function forget_missing(ws, minutes)
+  local res = kitchen.run_sync({ host = ws.host, cwd = ws.repo_path, timeout = 60, sh = M.forget_missing_sh(minutes) })
   if res.code ~= 0 then
     kitchen.log("[" .. ws.name .. "] git worktree prune failed:", why(res))
     return
   end
-  for line in (res.stderr or ""):gmatch("[^\n]+") do
+  for line in ((res.stdout or "") .. (res.stderr or "")):gmatch("[^\n]+") do
     kitchen.log("[" .. ws.name .. "]", "forgot", line)
   end
 end
@@ -251,7 +277,7 @@ local function pass()
   for _, ws in ipairs(workspaces) do
     local key = ws.host .. ":" .. ws.repo_path
     if not tabs[key] then
-      forget_missing(ws)
+      forget_missing(ws, minutes)
       tabs[key] = {}
     end
     for _, t in ipairs(ws.tabs or {}) do
