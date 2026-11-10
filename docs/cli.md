@@ -70,8 +70,10 @@ app is not reachable.
 | `notifications [--unread] [--limit N]` | `notification.list` | |
 | `debug screenshot PATH` | `debug.screenshot` | PNG of the window |
 
-Hidden helpers: `__relay` (devbox tunnel, above) and `__index` (symbol
-extraction for devbox viewers; not wired up yet — it exits with an error).
+Hidden helpers: `__relay` (devbox tunnel, above), `__index` (symbol
+extraction for devbox viewers; not wired up yet — it exits with an error),
+and `__prompt-context` (UserPromptSubmit hook: asks `prompt.context` and
+prints the note about the tabs a prompt mentions; silent on any error).
 
 ## Building for devboxes
 

@@ -11,6 +11,7 @@ mod notify;
 mod panels;
 mod plan_view;
 mod plugins;
+mod prompt_context;
 mod relay;
 mod settings;
 mod terminal;

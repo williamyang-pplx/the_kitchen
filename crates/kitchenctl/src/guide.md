@@ -45,6 +45,19 @@ kitchenctl notify --title "tests green" --body "PR ready for review"
 kitchenctl worktree list
 ```
 
+## Messaging other tabs
+
+A prompt that mentions a tab ("tab 2", "agi tab 3") comes with a
+`<kitchen-context>` note saying which tab that is and how to reach its agent:
+SendMessage to the ListAgents peer with the same tmux session. For a tab
+ListAgents doesn't show (it runs on another machine), or to find a tab
+yourself:
+
+```bash
+kitchenctl --json tab list                       # index, id, tmux_session per tab
+kitchenctl tab send -t <tab id> --enter "<text>"
+```
+
 ## Planning phase
 
 Every PR starts with a plan. When you were started with a task:

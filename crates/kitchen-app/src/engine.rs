@@ -1237,6 +1237,8 @@ fn closest(matches: &[String]) -> Option<&String> {
 /// tab through `kitchenctl notify` so a finished or blocked agent is visible
 /// from any workspace. Stop stays quiet while background subagents run, and
 /// reports the agent's session (`__agent-session`) for a revived tab to resume.
+/// UserPromptSubmit adds the note about the tabs a prompt mentions
+/// (`__prompt-context`).
 fn agent_settings_json() -> String {
     let hook = |matcher: &str, commands: &[String]| {
         let hooks: Vec<_> = commands
@@ -1260,7 +1262,18 @@ fn agent_settings_json() -> String {
         "permission_prompt|elicitation_dialog|elicitation_url_dialog",
         &[format!("kitchenctl notify {}", args("agent needs you"))],
     );
-    serde_json::json!({ "hooks": { "Stop": stop, "Notification": blocked }, "plansDirectory": ".kitchen/plans" }).to_string()
+    // Keeps stdout (Claude Code adds it to the prompt), unlike `hook`. Drops
+    // stderr and the status: exit 2 would block the prompt, and an old kitchenctl exits 2.
+    let prompt = serde_json::json!([{ "hooks": [{
+        "type": "command",
+        "timeout": 10,
+        "command": "command -v kitchenctl >/dev/null 2>&1 && kitchenctl __prompt-context 2>/dev/null; true",
+    }] }]);
+    serde_json::json!({
+        "hooks": { "Stop": stop, "Notification": blocked, "UserPromptSubmit": prompt },
+        "plansDirectory": ".kitchen/plans",
+    })
+    .to_string()
 }
 
 fn tab_infos(w: &Workspace) -> Vec<TabInfo> {
@@ -1410,6 +1423,22 @@ mod tests {
         e.restore_tab(TabRow { worktree: "/r".into(), ..tab("r2", "w", 7) }).unwrap();
         e.close_tab("r2").unwrap();
         assert_eq!(e.take_closed(&e.workspace("w").unwrap()).unwrap().id, "r2");
+    }
+
+    /// The prompt hook's stdout reaches Claude Code, and nothing it does can
+    /// fail the hook (exit 2 would block the prompt).
+    #[test]
+    fn prompt_hook_keeps_stdout_and_never_fails() {
+        let settings: serde_json::Value = serde_json::from_str(&agent_settings_json()).unwrap();
+        let hooks = &settings["hooks"];
+        let entry = &hooks["UserPromptSubmit"][0];
+        assert!(entry.get("matcher").is_none(), "{entry}");
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.ends_with("kitchenctl __prompt-context 2>/dev/null; true"), "{command}");
+        let run = &command[command.find("&&").unwrap()..];
+        assert!(!run.contains(" >/dev/null") && !run.contains("2>&1"), "{command}");
+        assert!(hooks["Stop"][0]["hooks"].as_array().is_some_and(|h| h.len() == 2), "{hooks}");
+        assert!(hooks["Notification"][0]["matcher"].as_str().is_some_and(|m| m.contains("permission_prompt")), "{hooks}");
     }
 
     /// A revived agent tab resumes the session its agent last reported

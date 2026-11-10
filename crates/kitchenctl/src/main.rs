@@ -8,6 +8,7 @@ mod render;
 
 use std::io::BufReader;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use serde_json::json;
@@ -19,6 +20,10 @@ pub const GUIDE: &str = include_str!("guide.md");
 
 const EXIT_API: u8 = 1;
 const EXIT_UNREACHABLE: u8 = 3;
+
+/// How long the prompt-context hook waits for the app. William's prompt is
+/// held until the hook returns.
+const PROMPT_CONTEXT_TIMEOUT: Duration = Duration::from_secs(4);
 
 fn main() -> ExitCode {
     let cli = Cli::parse_from(cli::normalize_args(std::env::args().collect()));
@@ -72,6 +77,16 @@ fn main() -> ExitCode {
                     ExitCode::from(EXIT_UNREACHABLE)
                 }
             }
+        }
+        Call::PromptContext { prompt } => {
+            let socket = cli.socket.clone().unwrap_or_else(kitchen_proto::default_socket_path);
+            // Any failure prints nothing: the prompt goes through as typed.
+            if let Ok(v) = client::call_with_timeout(&socket, "prompt.context", json!({"prompt": prompt}), PROMPT_CONTEXT_TIMEOUT)
+                && let Some(text) = v["text"].as_str().filter(|t| !t.is_empty())
+            {
+                println!("{text}");
+            }
+            ExitCode::SUCCESS
         }
         Call::Skip => ExitCode::SUCCESS,
         Call::Index(paths) => {

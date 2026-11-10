@@ -428,6 +428,17 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             Ok(json!({"resolved": a.id}))
         }
 
+        // ------------------------------------------------------------ prompt
+        // Claude Code's UserPromptSubmit hook in a tab (`kitchenctl __prompt-context`).
+        "prompt.context" => {
+            #[derive(Deserialize)]
+            struct P {
+                prompt: String,
+            }
+            let a: P = p(params)?;
+            Ok(json!({"text": crate::prompt_context::build(engine, caller, &a.prompt)}))
+        }
+
         // ------------------------------------------------------------ notifications
         "notify" => {
             #[derive(Deserialize)]

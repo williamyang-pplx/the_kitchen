@@ -2,7 +2,8 @@
 //!
 //! Every subcommand maps to exactly one API method (see [`Cli::to_call`]),
 //! except the few that run without the app: `guide`, `version`, and the
-//! hidden `__relay` / `__index` / `__agent-stopped` / `__agent-session` helpers.
+//! hidden `__relay` / `__index` / `__agent-stopped` / `__agent-session` /
+//! `__prompt-context` helpers.
 
 use std::path::PathBuf;
 
@@ -114,6 +115,11 @@ pub enum Command {
     /// agent session, which a revived tab resumes.
     #[command(name = "__agent-session", hide = true)]
     AgentSession,
+    /// Claude Code UserPromptSubmit hook (hook JSON on stdin): print what the
+    /// kitchen adds to the prompt (the tabs it mentions). Prints nothing on
+    /// any error.
+    #[command(name = "__prompt-context", hide = true)]
+    PromptContext,
 }
 
 #[derive(Args, Debug, Default, Clone)]
@@ -422,6 +428,8 @@ pub enum Call {
     Version,
     Relay,
     Index(Vec<PathBuf>),
+    /// `prompt.context` for the hook: print its text; never fail.
+    PromptContext { prompt: String },
     /// Nothing to do (exit 0).
     Skip,
 }
@@ -568,6 +576,11 @@ impl Cli {
                 Some(id) => api("tab.agent_session", json!({"session_id": id})),
                 None => Call::Skip,
             },
+            Command::PromptContext => match stdin().ok().as_deref().and_then(crate::hook::prompt) {
+                // Unreadable stdin skips, rather than exiting 2 (which would block the prompt).
+                Some(prompt) => Call::PromptContext { prompt },
+                None => Call::Skip,
+            },
             Command::Notifications { unread, limit } => api("notification.list", json!({"unread": unread, "limit": limit})),
             Command::Debug(DebugCmd::Screenshot { path }) => {
                 let abs = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));
@@ -601,6 +614,18 @@ mod tests {
     fn verifies_clap_definition() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn prompt_context_reads_the_hook_prompt() {
+        let with_stdin = |stdin: &str| {
+            let cli = Cli::try_parse_from(["kitchenctl", "__prompt-context"]).unwrap();
+            cli.to_call_with(&mut || Ok(stdin.to_string())).unwrap()
+        };
+        assert_eq!(with_stdin(r#"{"prompt":"tab 2"}"#), Call::PromptContext { prompt: "tab 2".into() });
+        assert_eq!(with_stdin("garbage"), Call::Skip);
+        let unreadable = Cli::try_parse_from(["kitchenctl", "__prompt-context"]).unwrap().to_call_with(&mut || anyhow::bail!("closed"));
+        assert_eq!(unreadable.unwrap(), Call::Skip, "an unreadable stdin must not exit 2");
     }
 
     #[test]

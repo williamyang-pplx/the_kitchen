@@ -16,12 +16,19 @@ pub enum CallError {
     Connect(anyhow::Error),
 }
 
+/// One call, waiting up to 10 minutes for the answer.
 pub fn call(socket: &Path, method: &str, params: Value) -> Result<Value, CallError> {
-    let resp = roundtrip(socket, method, params).map_err(CallError::Connect)?;
+    // Tab creation fetches and builds worktrees; allow it time.
+    call_with_timeout(socket, method, params, Duration::from_secs(600))
+}
+
+/// [`call`], giving up after `timeout` without an answer.
+pub fn call_with_timeout(socket: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value, CallError> {
+    let resp = roundtrip(socket, method, params, timeout).map_err(CallError::Connect)?;
     if resp.ok { Ok(resp.result) } else { Err(CallError::Api(resp.error.unwrap_or_else(|| "unknown error".into()))) }
 }
 
-fn roundtrip(socket: &Path, method: &str, params: Value) -> Result<Response> {
+fn roundtrip(socket: &Path, method: &str, params: Value, timeout: Duration) -> Result<Response> {
     let stream = UnixStream::connect(socket).with_context(|| {
         format!(
             "cannot reach the kitchen at {} — is the app running? (on a devbox the relay starts \
@@ -29,8 +36,8 @@ fn roundtrip(socket: &Path, method: &str, params: Value) -> Result<Response> {
             socket.display()
         )
     })?;
-    // Tab creation fetches and builds worktrees; allow it time.
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let req = Request { id: 1, method: method.to_string(), params, caller: Caller::from_env() };
     kitchen_proto::write_line(&stream, &req)?;
     let mut reader = BufReader::new(&stream);

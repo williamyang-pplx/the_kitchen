@@ -1,5 +1,5 @@
-//! Claude Code Stop hook: is the main agent done, or only between
-//! background subagents?
+//! Claude Code hooks: is the main agent done, or only between background
+//! subagents (Stop)? And the prompt William sent (UserPromptSubmit).
 //!
 //! The main agent's turn ends (and Stop fires) each time a background
 //! subagent reports back, while others still run. The session transcript
@@ -58,6 +58,12 @@ pub fn session_id(hook_input: &str) -> Option<String> {
     input["session_id"].as_str().filter(|s| !s.is_empty()).map(String::from)
 }
 
+/// The `prompt` of a UserPromptSubmit hook's stdin, if it has one.
+pub fn prompt(hook_input: &str) -> Option<String> {
+    let input: Value = serde_json::from_str(hook_input).ok()?;
+    input["prompt"].as_str().filter(|s| !s.is_empty()).map(String::from)
+}
+
 /// Every string in `v`, recursively.
 fn strings(v: &Value) -> Vec<&str> {
     match v {
@@ -114,6 +120,14 @@ mod tests {
         assert_eq!(session_id(r#"{"session_id": "abc-1", "transcript_path": "/x"}"#).as_deref(), Some("abc-1"));
         assert_eq!(session_id(r#"{"session_id": ""}"#), None);
         assert_eq!(session_id("not json"), None);
+    }
+
+    #[test]
+    fn reads_prompt() {
+        assert_eq!(prompt(r#"{"prompt": "hi", "session_id": "s"}"#).as_deref(), Some("hi"));
+        assert_eq!(prompt(r#"{"prompt": ""}"#), None);
+        assert_eq!(prompt("{}"), None);
+        assert_eq!(prompt("not json"), None);
     }
 
     #[test]
