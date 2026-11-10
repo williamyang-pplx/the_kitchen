@@ -10,6 +10,11 @@
 -- origin/<default> (then it's deleted too), and a detached HEAD that no ref
 -- contains keeps its worktree. The main checkout and spares are never
 -- touched. `kitchenctl worktree remove` re-checks the tab at removal time.
+--
+-- Each pass first runs `git worktree prune` once per repo, so git forgets
+-- worktrees whose directory is already gone (a cleaned /tmp, an rm -rf):
+-- their probe can't run, so they'd be kept forever. It removes only git's
+-- bookkeeping for those; it skips a worktree that exists or is locked.
 
 local M = {}
 
@@ -131,6 +136,12 @@ function M.delete_branch_sh(branch, oid)
   return '[ "$(git rev-parse --verify -q ' .. q("refs/heads/" .. branch) .. ')" = ' .. q(oid) .. " ] && git branch -D " .. q(branch)
 end
 
+-- argv that makes the repo at `repo_path` forget worktrees whose directory
+-- no longer exists; -v names each one on stderr.
+function M.forget_missing_cmd(repo_path)
+  return { "git", "-C", repo_path, "worktree", "prune", "-v" }
+end
+
 -- run_sync with kitchenctl on the PATH.
 local function sh(spec)
   spec.sh = "export PATH=" .. (kitchen.config.path or "") .. ':"$PATH"; ' .. spec.sh
@@ -159,6 +170,19 @@ local function panes_on(host)
     table.insert(panes, line)
   end
   return panes
+end
+
+-- Forget the missing worktrees of `ws`'s repo (M.forget_missing_cmd). A
+-- failure is only logged: the pass goes on without it.
+local function forget_missing(ws)
+  local res = kitchen.run_sync({ host = ws.host, timeout = 60, cmd = M.forget_missing_cmd(ws.repo_path) })
+  if res.code ~= 0 then
+    kitchen.log("[" .. ws.name .. "] git worktree prune failed:", why(res))
+    return
+  end
+  for line in (res.stderr or ""):gmatch("[^\n]+") do
+    kitchen.log("[" .. ws.name .. "]", "forgot", line)
+  end
 end
 
 -- One pass over workspace `ws`; `tabs`: those of every workspace on its repo
@@ -226,7 +250,10 @@ local function pass()
   local tabs = {}
   for _, ws in ipairs(workspaces) do
     local key = ws.host .. ":" .. ws.repo_path
-    tabs[key] = tabs[key] or {}
+    if not tabs[key] then
+      forget_missing(ws)
+      tabs[key] = {}
+    end
     for _, t in ipairs(ws.tabs or {}) do
       table.insert(tabs[key], t)
     end

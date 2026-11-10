@@ -1130,6 +1130,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&det);
     }
 
+    /// prune-worktrees: the `git worktree prune` each pass starts with forgets
+    /// a worktree whose directory is gone, never one that exists or is locked.
+    #[test]
+    fn prune_plugin_forgets_only_missing_worktrees() {
+        let lua = mlua::Lua::new();
+        let m = prune_module(&lua);
+        let repo = crate::test_util::TestRepo::with_files(&[("a.txt", "a")]);
+        let wt = |name: &str| format!("{}-{name}", repo.path());
+        let (open, gone, locked) = (wt("open"), wt("gone"), wt("locked"));
+        repo.sh(&format!("git worktree add -q -b open {open} && git worktree add -q -b gone {gone} && git worktree add -q -b locked {locked} && git worktree lock {locked} && rm -rf {gone} {locked}"));
+        let argv: Vec<String> = m.get::<mlua::Function>("forget_missing_cmd").unwrap().call(repo.path()).unwrap();
+        let out = std::process::Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+        assert!(out.status.success());
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(said.contains("-gone: ") && !said.contains("-open") && !said.contains("-locked"), "{said}");
+        let list = std::process::Command::new("git").args(["-C", &repo.path(), "worktree", "list", "--porcelain"]).output().unwrap();
+        // (git spells the temp dir /private/var on macOS: compare the ends)
+        let mut left: Vec<String> = String::from_utf8_lossy(&list.stdout).lines().filter_map(|l| l.strip_prefix("worktree ")).filter_map(|p| p.rsplit('-').next()).map(String::from).collect();
+        left[1..].sort();
+        assert_eq!(left[1..], ["locked", "open"], "{left:?}");
+        assert!(std::path::Path::new(&format!("{open}/a.txt")).exists(), "the open worktree's files stay");
+        repo.sh("git rev-parse --verify -q refs/heads/gone >/dev/null"); // its branch stays too
+        let _ = std::fs::remove_dir_all(&open);
+    }
+
     /// dashboard plugin: parsing `ps`/`df`/`du` output (macOS and Linux) and
     /// turning it into sections.
     #[test]
