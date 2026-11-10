@@ -71,11 +71,11 @@ conversation it was in.
 
 ### Agent skill
 
-`skill/kitchen/SKILL.md` teaches agents `kitchenctl` (same text as
-`kitchenctl guide`; regenerate with `scripts/sync-skill.py`). Skills are
-symlinked from the dotfiles repo, so add it there — for example copy it to
-`~/Documents/dotfiles/skills/helpers/kitchen/` — and it reaches devboxes on
-the next workspace setup.
+Every agent the kitchen starts gets the `kitchenctl` guide in its context:
+a SessionStart hook runs `kitchenctl guide` (on this mac and on devboxes),
+so nothing needs installing. The same text ships as `skill/kitchen/SKILL.md`
+for agents started outside the kitchen; regenerate it with
+`scripts/sync-skill.py`.
 
 ## Keybindings
 

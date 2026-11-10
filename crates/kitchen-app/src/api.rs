@@ -286,8 +286,13 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
                 #[serde(flatten)]
                 opts: NewTab,
             }
-            let a: P = p(params)?;
+            let mut a: P = p(params)?;
             let ws = engine.resolve_workspace(a.workspace.as_deref(), caller)?;
+            // A prompt from another tab says where it came from.
+            let from = caller.tab_id.as_deref().and_then(|t| engine.find_tab(t));
+            if let (Some(prompt), Some((_, from))) = (a.opts.prompt.as_mut().filter(|p| !p.trim().is_empty()), from) {
+                prompt.push_str(&crate::engine::handoff_note(&from.row));
+            }
             let row = engine.create_tab(&ws, a.opts)?;
             Ok(json!({"id": row.id, "workspace": ws, "title": row.title, "worktree": row.worktree,
                       "branch": row.branch, "tmux_session": row.tmux_session, "plan_file": row.plan_file()}))

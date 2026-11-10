@@ -41,6 +41,8 @@ workspace and tab.
 kitchenctl workspace list
 kitchenctl tab new --task "AI-123: add retries to the judge client"
 kitchenctl tab new --branch william/x        # continue an existing branch
+kitchenctl tab new --title "retry judge" --prompt-file part-2.md --no-focus   # agent starts on that message
+kitchenctl tab new --read --prompt "why does the relay drop on sleep?"        # read tab (main checkout)
 kitchenctl tab send --tab 2 --enter "make test"
 kitchenctl tab read-screen --tab 2 --scrollback 200
 kitchenctl tab send-key --tab 2 C-c
@@ -48,6 +50,17 @@ kitchenctl viewer open src/lib.rs --line 42 --diff
 kitchenctl notify --title "tests green" --body "PR ready for review"
 kitchenctl worktree list
 ```
+
+## Handing work to a new tab
+
+`tab new --prompt T` (or `--prompt-file F`, `-` for stdin) starts the new
+tab's agent on T as its first message, with no planning phase. Without
+`--read` the tab gets its own worktree and branch (an edit tab); with `--read`
+it runs in the main checkout. When you run it from a kitchen tab, a note
+naming your tab, worktree, branch and plan file is appended, so put what the
+new agent needs into T (what to do, which plan items, what is done already) and
+let it read the rest from your worktree. `--json` prints the new tab's id;
+watch it with `tab read-screen --tab <id>`.
 
 ## Planning phase
 

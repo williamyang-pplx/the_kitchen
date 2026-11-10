@@ -191,29 +191,39 @@ pub enum TabCmd {
         target: WsTarget,
     },
     /// Open a tab in its own worktree, on a new branch off the latest origin
-    /// or on --branch; with --task the agent starts planning (/low-level-plan).
+    /// or on --branch (or a read tab with --read); with --task the agent starts
+    /// planning (/low-level-plan), with --prompt it starts on that message.
     #[command(after_help = "Examples:\n  kitchenctl tab new --task \"AI-9586: retry judge calls\"\n  \
+        kitchenctl tab new --title \"retry judge calls\" --prompt-file part-2.md --no-focus\n  \
+        kitchenctl tab new --read --prompt \"Why does the relay drop on sleep?\"\n  \
         kitchenctl tab new --branch william/old-work\n  kitchenctl tab new --no-agent")]
     New {
         /// Task/ticket text; the agent starts the planning phase with it.
-        #[arg(long)]
+        #[arg(long, group = "first_message")]
         task: Option<String>,
         /// Read the task text from a file (`-` for stdin).
-        #[arg(long, conflicts_with = "task", value_name = "FILE")]
+        #[arg(long, group = "first_message", value_name = "FILE")]
         task_file: Option<String>,
+        /// First message for the agent, sent as is (no planning phase). From a
+        /// kitchen tab, a note naming that tab (worktree, plan file) is appended.
+        #[arg(long, group = "first_message")]
+        prompt: Option<String>,
+        /// Read the prompt from a file (`-` for stdin).
+        #[arg(long, group = "first_message", value_name = "FILE")]
+        prompt_file: Option<String>,
         /// Existing branch to check out (fetched first; a tab already on it is reused).
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
         title: Option<String>,
         /// Command typed into the new shell instead of the default agent.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["prompt", "prompt_file"])]
         command: Option<String>,
         /// Start a plain shell, no agent.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["prompt", "prompt_file"])]
         no_agent: bool,
-        /// Run in the workspace's main checkout: no worktree or branch (like ⌘I).
-        #[arg(long, conflicts_with = "branch")]
+        /// A read tab: the workspace's main checkout, no worktree or branch (like ⌘I).
+        #[arg(long, visible_alias = "read", conflicts_with = "branch")]
         main_checkout: bool,
         /// Don't switch the window to the new tab.
         #[arg(long)]
@@ -495,17 +505,21 @@ impl Cli {
             },
             Command::Tab(c) => match c {
                 TabCmd::List { target } => api("tab.list", ws(target)),
-                TabCmd::New { task, task_file, branch, title, command, no_agent, main_checkout, no_focus, target } => {
+                TabCmd::New { task, task_file, prompt, prompt_file, branch, title, command, no_agent, main_checkout, no_focus, target } => {
                     let task = match task_file {
                         Some(f) => Some(read_text(f, stdin)?),
                         None => task.clone(),
+                    };
+                    let prompt = match prompt_file {
+                        Some(f) => Some(read_text(f, stdin)?),
+                        None => prompt.clone(),
                     };
                     api(
                         "tab.create",
                         merge(
                             ws(target),
                             json!({
-                                "task": task, "branch": branch, "title": title, "command": command,
+                                "task": task, "prompt": prompt, "branch": branch, "title": title, "command": command,
                                 "no_agent": no_agent, "main_checkout": main_checkout, "focus": !no_focus,
                             }),
                         ),
@@ -615,6 +629,17 @@ mod tests {
         let (_, p) = api_call(&["tab", "new", "--no-agent", "--no-focus"]);
         assert_eq!(p["focus"], false);
         assert_eq!(p["no_agent"], true);
+    }
+
+    #[test]
+    fn tab_new_with_prompt() {
+        let (_, p) = api_call(&["tab", "new", "--read", "--prompt", "look at x", "--no-focus"]);
+        assert_eq!(p, json!({"prompt": "look at x", "no_agent": false, "main_checkout": true, "focus": false}));
+        assert_eq!(api_call(&["tab", "new", "--prompt-file", "-"]).1["prompt"], "from stdin");
+        for clash in [&["--task", "t"][..], &["--task-file", "f"], &["--command", "c"], &["--no-agent"]] {
+            let argv = [&["kitchenctl", "tab", "new", "--prompt", "p"][..], clash].concat();
+            assert!(Cli::try_parse_from(argv).is_err(), "--prompt with {clash:?}");
+        }
     }
 
     #[test]

@@ -134,6 +134,8 @@ pub struct State {
 pub struct NewTab {
     /// Ticket / task description. The agent starts planning on it.
     pub task: Option<String>,
+    /// First message for the agent, sent as is (no planning phase).
+    pub prompt: Option<String>,
     /// Existing branch to check out (where it is already checked out, if it is).
     pub branch: Option<String>,
     pub title: Option<String>,
@@ -694,6 +696,12 @@ impl Engine {
         if opts.main_checkout && branch.is_some() {
             bail!("a main-checkout tab can't check out a branch");
         }
+        let prompt = opts.prompt.as_deref().filter(|p| !p.trim().is_empty());
+        if prompt.is_some() && (opts.task.is_some() || opts.command.is_some() || opts.no_agent) {
+            bail!("a prompt starts the default agent: no task, command or no-agent with it");
+        }
+        // What names the tab when no title is given.
+        let label = opts.task.as_deref().or(prompt).and_then(|t| t.lines().map(str::trim).find(|l| !l.is_empty()));
         // Where a branch goes: a worktree named after it. `kitchen-*` names
         // are the kitchen's (spares, PR views).
         let target = branch.map(|b| {
@@ -727,7 +735,7 @@ impl Engine {
         let pending_title = opts
             .title
             .clone()
-            .or_else(|| opts.task.as_deref().and_then(|t| t.lines().next()).map(String::from))
+            .or_else(|| label.map(String::from))
             .or_else(|| branch.map(String::from))
             .unwrap_or_else(|| "new tab".into());
         self.set_pending(ws_id, Some(PendingTab { id: tab_id.clone(), title: pending_title, focus }));
@@ -741,8 +749,7 @@ impl Engine {
                 None if opts.main_checkout => {
                     // (git lists the main checkout first)
                     let main = repo.worktrees()?.into_iter().next().context("the repo has no main checkout")?;
-                    let label = opts.task.as_deref().and_then(|t| t.lines().next()).unwrap_or(ws.repo_name());
-                    (main, label.to_string())
+                    (main, label.unwrap_or(ws.repo_name()).to_string())
                 }
                 Some((to, path)) => {
                     let checked = repo.checkout_worktree(path, *to, &fetch);
@@ -758,8 +765,8 @@ impl Engine {
                         Some(b) => b.clone(),
                         None => repo.default_branch().or_else(|_| repo.head_branch())?,
                     };
-                    let label = opts.title.clone().or(opts.task.clone()).unwrap_or_else(|| format!("tab-{tab_id}"));
-                    let first = label.lines().next().unwrap_or(&label).to_string();
+                    let first = opts.title.as_deref().or(label).map(String::from).unwrap_or_else(|| format!("tab-{tab_id}"));
+                    let first = first.lines().next().unwrap_or_default().to_string();
                     let mut slug = slugify(&first, 40);
                     if slug.is_empty() {
                         slug = format!("tab-{tab_id}");
@@ -791,7 +798,11 @@ impl Engine {
             } else if let Some(c) = opts.command.clone() {
                 Some(c)
             } else {
-                let (cmd, prompt_setup) = agent_command(worktree, &settings, opts.task.as_deref());
+                let first_message = match opts.task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(task) => Some(plan::planning_prompt(task, &plan::plan_file_for(worktree))),
+                    None => prompt.map(String::from),
+                };
+                let (cmd, prompt_setup) = agent_command(worktree, &settings, first_message.as_deref());
                 setup = prompt_setup;
                 Some(cmd)
             };
@@ -1176,23 +1187,33 @@ impl Engine {
 }
 
 /// The shell command that starts a tab's agent, plus a setup snippet
-/// that writes the planning prompt file (run in the same host round trip as
-/// the tmux session). With a task, the agent begins in the planning phase
-/// (`/low-level-plan`).
-fn agent_command(worktree: &str, settings: &Settings, task: Option<&str>) -> (String, Option<String>) {
+/// that writes its first message to a file (run in the same host round trip
+/// as the tmux session). The file is the tab's own: read tabs share the main
+/// checkout's `.kitchen/`.
+fn agent_command(worktree: &str, settings: &Settings, first_message: Option<&str>) -> (String, Option<String>) {
     let base = format!("{} --settings {}", settings.edit_agent_command, shell_quote(&agent_settings_json()));
-    let Some(task) = task.map(str::trim).filter(|t| !t.is_empty()) else {
+    let Some(message) = first_message else {
         return (base, None);
     };
     let dir = format!("{worktree}/{}", plan::KITCHEN_DIR);
-    let prompt_path = format!("{dir}/prompt.md");
-    let setup = format!(
-        "mkdir -p {} && printf %s {} > {}",
-        shell_quote(&dir),
-        shell_quote(&plan::planning_prompt(task, &plan::plan_file_for(worktree))),
-        shell_quote(&prompt_path)
-    );
-    (format!("{base} \"$(cat {})\"", shell_quote(&prompt_path)), Some(setup))
+    let path = shell_quote(&format!("{dir}/prompt-{}.md", new_id()));
+    let setup = format!("mkdir -p {} && printf %s {} > {path}", shell_quote(&dir), shell_quote(message));
+    (format!("{base} \"$(cat {path}; rm -f {path})\""), Some(setup))
+}
+
+/// Appended to a prompt sent from another tab: where that tab's files are,
+/// and how to message it.
+pub fn handoff_note(from: &TabRow) -> String {
+    format!(
+        "\n\n(Sent from kitchen tab \"{}\" (id {}), worktree {}{}. Its plan, if it has one, is {}. \
+         To message that tab: `kitchenctl tab send --tab {} --enter \"...\"`.)",
+        from.title,
+        from.id,
+        from.worktree,
+        from.branch.as_deref().map(|b| format!(", branch {b}")).unwrap_or_default(),
+        from.plan_file(),
+        from.id,
+    )
 }
 
 /// What a recreated tab session runs: an agent tab's agent resuming the
@@ -1260,7 +1281,14 @@ fn agent_settings_json() -> String {
         "permission_prompt|elicitation_dialog|elicitation_url_dialog",
         &[format!("kitchenctl notify {}", args("agent needs you"))],
     );
-    serde_json::json!({ "hooks": { "Stop": stop, "Notification": blocked }, "plansDirectory": ".kitchen/plans" }).to_string()
+    // Its stdout joins the agent's context: the kitchen guide, every session.
+    let guide = serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command",
+        "command": "command -v kitchenctl >/dev/null && kitchenctl guide 2>/dev/null; true" }] }]);
+    serde_json::json!({
+        "hooks": { "SessionStart": guide, "Stop": stop, "Notification": blocked },
+        "plansDirectory": ".kitchen/plans",
+    })
+    .to_string()
 }
 
 fn tab_infos(w: &Workspace) -> Vec<TabInfo> {
@@ -1439,6 +1467,45 @@ mod tests {
         assert_eq!(e.db().tab("a").unwrap().unwrap().agent_session.as_deref(), Some("0b7e-41"));
 
         assert_eq!(resume_command(&TabRow { agent: false, ..row }, &settings), None);
+    }
+
+    /// Kitchen agents load the guide at session start, and start on their
+    /// first message from a per-tab file that the command removes.
+    #[test]
+    fn agent_command_and_settings() {
+        let settings: serde_json::Value = serde_json::from_str(&agent_settings_json()).unwrap();
+        let start = &settings["hooks"]["SessionStart"][0];
+        assert_eq!(start["matcher"], "", "every session: startup, resume, clear, compact");
+        assert_eq!(start["hooks"][0]["command"], "command -v kitchenctl >/dev/null && kitchenctl guide 2>/dev/null; true");
+
+        let s = Settings::default();
+        assert_eq!(agent_command("/r-a", &s, None).1, None);
+        let file = |message: &str| {
+            let (cmd, setup) = agent_command("/r-a", &s, Some(message));
+            let setup = setup.unwrap();
+            let file = setup.rsplit("> ").next().unwrap().to_string();
+            assert!(file.starts_with("/r-a/.kitchen/prompt-") && file.ends_with(".md"), "{setup}");
+            assert!(cmd.ends_with(&format!("\"$(cat {file}; rm -f {file})\"")), "{cmd}");
+            (setup, file)
+        };
+        let (setup, first) = file("it's x");
+        assert!(setup.contains(r"'it'\''s x'"), "{setup}");
+        assert_ne!(file("y").1, first, "a file per tab");
+
+        let from = TabRow {
+            id: "p1".into(),
+            workspace_id: "w".into(),
+            title: "plan".into(),
+            worktree: "/r-plan".into(),
+            branch: Some("william/plan".into()),
+            tmux_session: "s".into(),
+            position: 0,
+            agent: true,
+            agent_session: None,
+        };
+        let note = handoff_note(&from);
+        assert!(note.contains("worktree /r-plan, branch william/plan") && note.contains("/r-plan/.kitchen/plan.md"), "{note}");
+        assert!(note.contains("kitchenctl tab send --tab p1"), "{note}");
     }
 
     #[test]

@@ -52,7 +52,7 @@ app is not reachable.
 | `workspace read [-w W \| --all]` | `workspace.mark_read` | clears the yellow unread dots; marks the tabs' notifications read |
 | `workspace bootstrap [-w W]` | `workspace.bootstrap` | pull dotfiles, relink skills, install kitchenctl, start relay |
 | `tab list [-w W]` | `tab.list` | |
-| `tab new [--task T\|--task-file F] [--branch B] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | own worktree + new branch off fresh origin, or `--branch` (fetched; a tab on it is reused); `--task` starts `/low-level-plan` |
+| `tab new [--task T\|--task-file F\|--prompt T\|--prompt-file F] [--branch B\|--read] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | own worktree + new branch off fresh origin, or `--branch` (fetched; a tab on it is reused), or `--read` (`--main-checkout`): the main checkout; `--task` starts `/low-level-plan`, `--prompt` starts the agent on that message (from a kitchen tab, with a note naming the calling tab) |
 | `tab select T [-w W]` | `tab.select` | ⌘1…⌘9 |
 | `tab rename TITLE [-t T]` | `tab.rename` | |
 | `tab close [-t T]` | `tab.close` | ends the tmux session; worktree stays |
