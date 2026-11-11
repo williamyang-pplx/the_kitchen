@@ -63,8 +63,9 @@ watch it with `tab read-screen --tab <id>`.
 Every PR starts with a plan. When you were started with a task:
 
 1. Produce the plan with the `low-level-plan` skill. Write the full plan as
-   markdown to `$KITCHEN_PLAN_FILE` (`.kitchen/plan.md` in the worktree; the
-   `.kitchen/` directory is git-ignored).
+   markdown to `$KITCHEN_PLAN_FILE` (`.kitchen/tabs/<tab id>/plan.md` in the
+   worktree, your tab's own; the `.kitchen/` directory is git-ignored). Plan
+   mode writes its plans to the same tab directory.
 2. Run `kitchenctl plan ready`. William reviews it in the plan viewer and
    leaves inline comments.
 3. When comments arrive: `kitchenctl plan comments` lists them with id, line,

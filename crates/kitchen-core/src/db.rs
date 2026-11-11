@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS plan_comments (
     end_line    INTEGER,
     quote       TEXT NOT NULL,             -- the line text when commented, to re-anchor after edits
     body        TEXT NOT NULL,
+    plan_path   TEXT,                      -- the plan file commented on
     state       TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'sent', 'resolved')),
     created_at  INTEGER NOT NULL,
     sent_at     INTEGER,
@@ -126,7 +127,7 @@ pub struct TabRow {
 impl TabRow {
     /// Where the tab's agent keeps its plan.
     pub fn plan_file(&self) -> String {
-        crate::plan::plan_file_for(&self.worktree)
+        crate::plan::plan_file_for(&self.worktree, &self.id)
     }
 }
 
@@ -138,8 +139,11 @@ pub struct PlanComment {
     pub end_line: Option<i64>,
     pub quote: String,
     pub body: String,
+    /// The plan file it was made on (`None`: made before comments recorded it).
+    pub plan_path: Option<String>,
     pub state: String,
     pub created_at: i64,
+    pub resolved_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -188,14 +192,16 @@ fn plan_comment_from(r: &Row) -> rusqlite::Result<PlanComment> {
         end_line: r.get(3)?,
         quote: r.get(4)?,
         body: r.get(5)?,
-        state: r.get(6)?,
-        created_at: r.get(7)?,
+        plan_path: r.get(6)?,
+        state: r.get(7)?,
+        created_at: r.get(8)?,
+        resolved_at: r.get(9)?,
     })
 }
 
 const WS_COLS: &str = "id, name, host, repo_path, github_slug, default_branch, position, pinned";
 const TAB_COLS: &str = "id, workspace_id, title, worktree, branch, tmux_session, position, agent, agent_session";
-const PC_COLS: &str = "id, tab_id, line, end_line, quote, body, state, created_at";
+const PC_COLS: &str = "id, tab_id, line, end_line, quote, body, plan_path, state, created_at, resolved_at";
 
 /// Columns added after a table first shipped; `CREATE TABLE IF NOT EXISTS`
 /// leaves older databases without them.
@@ -204,6 +210,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("workspaces", "pinned", "INTEGER NOT NULL DEFAULT 0"),
         ("tabs", "agent", "INTEGER NOT NULL DEFAULT 1"),
         ("tabs", "agent_session", "TEXT"),
+        ("plan_comments", "plan_path", "TEXT"),
     ];
     for (table, column, decl) in added {
         let has: bool = conn.query_row(
@@ -333,10 +340,10 @@ impl Db {
         Ok(st.query_map([tab_id], plan_comment_from)?.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn add_plan_comment(&self, tab_id: &str, line: i64, end_line: Option<i64>, quote: &str, body: &str) -> Result<i64> {
+    pub fn add_plan_comment(&self, tab_id: &str, plan_path: &str, line: i64, end_line: Option<i64>, quote: &str, body: &str) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO plan_comments (tab_id, line, end_line, quote, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![tab_id, line, end_line, quote, body, now()],
+            "INSERT INTO plan_comments (tab_id, plan_path, line, end_line, quote, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![tab_id, plan_path, line, end_line, quote, body, now()],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -522,7 +529,15 @@ mod tests {
              INSERT INTO tabs VALUES ('t', 'a', 'readonly', 't', '/w', NULL, 12, 's', NULL, 1, 0);",
         )
         .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE plan_comments (id INTEGER PRIMARY KEY, tab_id TEXT NOT NULL, line INTEGER NOT NULL, end_line INTEGER,
+             quote TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL,
+             sent_at INTEGER, resolved_at INTEGER);
+             INSERT INTO plan_comments (tab_id, line, quote, body, created_at) VALUES ('t', 1, 'q', 'b', 0);",
+        )
+        .unwrap();
         let db = Db::init(conn).unwrap();
+        assert_eq!(db.plan_comments("t").unwrap()[0].plan_path, None, "old comments name no plan");
         assert!(!db.workspaces().unwrap()[0].pinned);
         let tab = db.tab("t").unwrap().expect("old tabs still read");
         assert!(tab.agent && tab.agent_session.is_none(), "old tabs count as agent tabs");
@@ -544,8 +559,11 @@ mod tests {
             agent_session: None,
         })
         .unwrap();
-        let id = db.add_plan_comment("t", 4, None, "## F1", "rename this").unwrap();
+        let id = db.add_plan_comment("t", "/w/p.md", 4, None, "## F1", "rename this").unwrap();
         assert!(db.set_plan_comment_state(id, "sent").unwrap());
         assert_eq!(db.plan_comments("t").unwrap()[0].state, "sent");
+        assert!(db.set_plan_comment_state(id, "resolved").unwrap());
+        let c = &db.plan_comments("t").unwrap()[0];
+        assert_eq!((c.plan_path.as_deref(), c.resolved_at.is_some()), (Some("/w/p.md"), true));
     }
 }

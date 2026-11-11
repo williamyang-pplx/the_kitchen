@@ -419,8 +419,8 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             }
             let a: P = p(params)?;
             let id = engine.resolve_tab(a.tab.as_deref(), a.workspace.as_deref(), caller)?;
-            let comments: Vec<_> =
-                engine.plan_comments(&id)?.into_iter().filter(|c| a.all || c.state != "resolved").collect();
+            // Only the plan the tab shows now: not another plan's, nor ones it moved past.
+            let comments: Vec<_> = engine.current_plan_comments(&id)?.into_iter().filter(|c| a.all || c.state != "resolved").collect();
             Ok(serde_json::to_value(comments)?)
         }
         "plan.resolve" => {

@@ -12,27 +12,54 @@ use crate::host::Host;
 /// the repo's `info/exclude` so it never shows up in `git status`.
 pub const KITCHEN_DIR: &str = ".kitchen";
 
-pub fn plan_file_for(worktree: &str) -> String {
-    format!("{}/{KITCHEN_DIR}/plan.md", worktree.trim_end_matches('/'))
+/// A tab's own kitchen files, relative to its worktree. Plans live here
+/// rather than at the worktree's root so tabs that share a worktree (read
+/// tabs share the main checkout) or reuse one keep separate plans.
+pub fn tab_dir(tab_id: &str) -> String {
+    format!("{KITCHEN_DIR}/tabs/{tab_id}")
 }
 
-/// Claude Code's plan mode writes its plans here when kitchen launches it
-/// with `plansDirectory` set (must be inside the project root).
-pub fn plans_dir_for(worktree: &str) -> String {
-    format!("{}/{KITCHEN_DIR}/plans", worktree.trim_end_matches('/'))
+pub fn plan_file_for(worktree: &str, tab_id: &str) -> String {
+    format!("{}/{}/plan.md", worktree.trim_end_matches('/'), tab_dir(tab_id))
 }
 
-/// The plan document to show: `.kitchen/plan.md` or the newest plan-mode
-/// file under `.kitchen/plans/`, whichever changed last.
-pub fn current_plan_path(host: &Host, worktree: &str) -> Option<String> {
+/// Claude Code's plan mode writes the tab's plans here when kitchen launches
+/// it with this as `plansDirectory` (relative to the worktree, which it must
+/// be inside).
+pub fn plans_dir(tab_id: &str) -> String {
+    format!("{}/plans", tab_dir(tab_id))
+}
+
+/// The plan document a tab shows, and when it last changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanDoc {
+    pub path: String,
+    /// Modification time, in seconds (as `util::now`).
+    pub modified: i64,
+}
+
+/// The tab's `plan.md` or its newest plan-mode file, whichever changed last.
+pub fn current_plan(host: &Host, worktree: &str, tab_id: &str) -> Option<PlanDoc> {
+    // GNU stat first (devboxes), then BSD (this mac).
     let script = format!(
-        "ls -t {f} {d}/*.md 2>/dev/null | head -1",
-        f = crate::util::shell_quote(&plan_file_for(worktree)),
-        d = crate::util::shell_quote(&plans_dir_for(worktree)),
+        "p=$(ls -t {f} {d}/*.md 2>/dev/null | head -1); [ -n \"$p\" ] || exit 0\n\
+         stat -c %Y \"$p\" 2>/dev/null || stat -f %m \"$p\"; printf '%s\\n' \"$p\"",
+        f = crate::util::shell_quote(&plan_file_for(worktree, tab_id)),
+        d = crate::util::shell_quote(&format!("{}/{}", worktree.trim_end_matches('/'), plans_dir(tab_id))),
     );
     let out = host.sh(&script, None).ok()?;
-    let p = out.stdout.trim();
-    (!p.is_empty()).then(|| p.to_string())
+    let mut lines = out.stdout.lines();
+    let modified = lines.next()?.trim().parse().ok()?;
+    let path = lines.next()?.trim().to_string();
+    Some(PlanDoc { path, modified })
+}
+
+/// Whether `c` shows on `plan`: it was made on that file, and isn't a
+/// resolved comment the plan has since moved past (rewritten after it was
+/// resolved, e.g. a new plan in the same plan-mode file).
+pub fn shows_on(c: &PlanComment, plan: &PlanDoc) -> bool {
+    c.plan_path.as_deref() == Some(plan.path.as_str())
+        && !(c.state == "resolved" && c.resolved_at.is_some_and(|t| plan.modified > t))
 }
 
 /// Instructions typed into a fresh tab's agent to start planning.
@@ -107,8 +134,10 @@ mod tests {
             end_line: None,
             quote: quote.into(),
             body: "b".into(),
+            plan_path: Some("/w/p.md".into()),
             state: "open".into(),
             created_at: 0,
+            resolved_at: None,
         }
     }
 
@@ -122,9 +151,21 @@ mod tests {
     #[test]
     fn feedback_lists_every_comment() {
         let a = pc(7, 3, "## F1");
-        let msg = feedback_message("/w/.kitchen/plan.md", &[&a]);
+        let msg = feedback_message("/w/.kitchen/tabs/t/plan.md", &[&a]);
         assert!(msg.contains("[comment 7] line 3: `## F1`"));
         assert!(msg.contains("kitchenctl plan resolve"));
+    }
+
+    #[test]
+    fn comments_show_on_their_plan_until_it_moves_past_them() {
+        let plan = PlanDoc { path: "/w/p.md".into(), modified: 100 };
+        let open = pc(1, 1, "x");
+        assert!(shows_on(&open, &plan));
+        assert!(!shows_on(&PlanComment { plan_path: Some("/w/old.md".into()), ..open.clone() }, &plan), "another plan's");
+        assert!(!shows_on(&PlanComment { plan_path: None, ..open.clone() }, &plan), "from before plans had paths");
+        let resolved = |at| PlanComment { state: "resolved".into(), resolved_at: Some(at), ..open.clone() };
+        assert!(shows_on(&resolved(100), &plan), "resolved after the last revision");
+        assert!(!shows_on(&resolved(99), &plan), "the plan changed since");
     }
 
     #[test]
@@ -132,8 +173,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let w = tmp.path().display().to_string();
         std::process::Command::new("git").args(["init", "-q", &w]).status().unwrap();
-        assert_eq!(current_plan_path(&Host::Local, &w), None);
-        Host::Local.write_file(&plan_file_for(&w), "# p").unwrap();
-        assert_eq!(current_plan_path(&Host::Local, &w), Some(plan_file_for(&w)));
+        assert_eq!(current_plan(&Host::Local, &w, "a"), None);
+        Host::Local.write_file(&plan_file_for(&w, "a"), "# p").unwrap();
+        let doc = current_plan(&Host::Local, &w, "a").expect("plan.md");
+        assert_eq!(doc.path, plan_file_for(&w, "a"));
+        assert!((doc.modified - crate::util::now()).abs() < 60, "{doc:?}");
+        assert_eq!(current_plan(&Host::Local, &w, "b"), None, "another tab's plan");
+        let mode = format!("{w}/{}/jolly-otter.md", plans_dir("a"));
+        Host::Local.write_file(&mode, "# m").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&mode).unwrap().set_modified(later).unwrap();
+        assert_eq!(current_plan(&Host::Local, &w, "a").unwrap().path, mode, "the newer file");
     }
 }

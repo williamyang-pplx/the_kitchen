@@ -27,7 +27,7 @@ use crate::viewer::vim::{Vim, VimAction};
 const POLL: Duration = Duration::from_secs(2);
 
 enum Msg {
-    Loaded { path: Option<String>, text: Option<String> },
+    Loaded { plan: Option<plan::PlanDoc>, text: Option<String> },
     Sent(Result<usize, String>),
     Answer { id: u64, result: Result<String, String> },
 }
@@ -52,7 +52,8 @@ pub struct PlanView {
     worktree: String,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    path: Option<String>,
+    /// The plan shown (the tab's newest plan file) and when it last changed.
+    plan: Option<plan::PlanDoc>,
     text: Option<String>,
     loaded_once: bool,
     in_flight: bool,
@@ -80,7 +81,7 @@ impl PlanView {
             worktree: tab.row.worktree.clone(),
             tx,
             rx,
-            path: None,
+            plan: None,
             text: None,
             loaded_once: false,
             in_flight: false,
@@ -104,29 +105,38 @@ impl PlanView {
         }
         self.in_flight = true;
         self.last_poll = Some(Instant::now());
-        let (host, wt, tx, ctx) = (self.host.clone(), self.worktree.clone(), self.tx.clone(), self.engine.ctx.clone());
+        let (host, wt, tab, tx, ctx) = (self.host.clone(), self.worktree.clone(), self.tab_id.clone(), self.tx.clone(), self.engine.ctx.clone());
         std::thread::spawn(move || {
-            let path = plan::current_plan_path(&host, &wt);
-            let text = path.as_deref().and_then(|p| host.read_file(p).ok());
-            let _ = tx.send(Msg::Loaded { path, text });
+            let plan = plan::current_plan(&host, &wt, &tab);
+            let text = plan.as_ref().and_then(|doc| host.read_file(&doc.path).ok());
+            let _ = tx.send(Msg::Loaded { plan, text });
             ctx.request_repaint();
         });
     }
 
+    /// The comments that show on the plan: made on this file, minus resolved
+    /// ones the plan has since been rewritten past.
     fn reload_comments(&mut self) {
-        self.comments = self.engine.plan_comments(&self.tab_id).unwrap_or_default();
+        let all = self.engine.plan_comments(&self.tab_id).unwrap_or_default();
+        self.comments = match &self.plan {
+            Some(doc) => all.into_iter().filter(|c| plan::shows_on(c, doc)).collect(),
+            None => Vec::new(),
+        };
     }
 
     fn receive(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Loaded { path, text } => {
+                Msg::Loaded { plan, text } => {
                     self.in_flight = false;
                     self.loaded_once = true;
-                    self.path = path;
+                    let changed = plan != self.plan;
+                    self.plan = plan;
                     if text != self.text {
                         self.text = text;
                         self.rebuild();
+                    } else if changed {
+                        self.reload_comments();
                     }
                 }
                 Msg::Sent(r) => match r {
@@ -220,7 +230,7 @@ impl PlanView {
         self.vim.anchor = None;
         let quote = self.doc.lines.get(ed.start..=ed.end).unwrap_or_default().iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
         let plan_text = self.text.clone().unwrap_or_default();
-        let path = self.path.clone().unwrap_or_else(|| plan::plan_file_for(&self.worktree));
+        let path = self.plan.as_ref().map(|d| d.path.clone()).unwrap_or_else(|| plan::plan_file_for(&self.worktree, &self.tab_id));
         let model = self.engine.settings().ask_model;
         // On this mac the model may read the rest of the repo.
         let cwd = matches!(self.host, Host::Local).then(|| self.worktree.clone());
@@ -243,9 +253,13 @@ impl PlanView {
             self.editor = Some(ed);
             return;
         }
+        let Some(path) = self.plan.as_ref().map(|d| d.path.clone()) else {
+            self.status = Some(("no plan to comment on yet".into(), false));
+            return;
+        };
         let quote = self.doc.lines.get(ed.start).map(|l| l.text.clone()).unwrap_or_default();
         let end = (ed.end > ed.start).then_some(ed.end as i64 + 1);
-        match self.engine.add_plan_comment(&self.tab_id, ed.start as i64 + 1, end, &quote, &body) {
+        match self.engine.add_plan_comment(&self.tab_id, &path, ed.start as i64 + 1, end, &quote, &body) {
             Ok(id) => self.status = Some((format!("comment #{id} saved · ⌘Enter (no field open) sends open comments to the agent"), false)),
             Err(e) => self.status = Some((format!("{e:#}"), true)),
         }
@@ -276,14 +290,14 @@ impl PlanView {
             PanelCmd::Submit if self.editor.is_some() => self.submit_pending = true,
             PanelCmd::Submit => {
                 let open = self.comments.iter().filter(|c| c.state == "open").count();
-                if open == 0 {
+                let Some(path) = self.plan.as_ref().map(|d| d.path.clone()).filter(|_| open > 0) else {
                     self.status = Some(("no open comments to send (⌘M to comment)".into(), false));
                     return;
-                }
+                };
                 self.status = Some((format!("sending {open} comment(s)…"), false));
                 let (engine, tab, tx) = (self.engine.clone(), self.tab_id.clone(), self.tx.clone());
                 std::thread::spawn(move || {
-                    let r = engine.send_plan_feedback(&tab).map_err(|e| format!("{e:#}"));
+                    let r = engine.send_plan_feedback(&tab, &path).map_err(|e| format!("{e:#}"));
                     let _ = tx.send(Msg::Sent(r));
                     engine.ctx.request_repaint();
                 });
@@ -313,7 +327,7 @@ impl PlanView {
         let header = egui::Rect::from_min_size(header.min, egui::vec2(header.width(), widgets::HEADER_HEIGHT));
         let mut header_ui = ui.new_child(egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)));
         header_ui.add_space(theme::SPACE_M);
-        let path = self.path.as_deref().map(|p| p.strip_prefix(&format!("{}/", self.worktree)).unwrap_or(p).to_string());
+        let path = self.plan.as_ref().map(|d| d.path.as_str()).map(|p| p.strip_prefix(&format!("{}/", self.worktree)).unwrap_or(p).to_string());
         header_ui.label(widgets::path_job(&path.unwrap_or_else(|| "—".into()), 12.5));
         header_ui.add_space(theme::SPACE_XS);
         widgets::pill(&mut header_ui, "PLAN", theme::YELLOW);
@@ -339,8 +353,9 @@ impl PlanView {
             Some("loading plan…".into())
         } else if self.text.is_none() {
             Some(format!(
-                "the agent hasn't written a plan yet\n\nit will appear here when the agent writes {}\n(or a plan-mode file under .kitchen/plans/)",
-                plan::plan_file_for(".")
+                "the agent hasn't written a plan yet\n\nit will appear here when the agent writes {}\n(or a plan-mode file under {}/)",
+                plan::plan_file_for(".", &self.tab_id),
+                plan::plans_dir(&self.tab_id)
             ))
         } else {
             None
@@ -435,9 +450,41 @@ mod tests {
         panic!("plan view never settled");
     }
 
+    /// Tabs sharing a worktree keep their own plans; a tab shows the comments
+    /// made on its current plan file, until that file is rewritten past them.
+    #[test]
+    fn plans_and_comments_are_per_tab_and_per_plan() {
+        let repo = TestRepo::with_files(&[(".kitchen/tabs/t/plan.md", "# Plan\n## F1\n")]);
+        let (ctx, engine) = engine("local", &repo.path(), &["t", "u"]);
+        let w = engine.workspaces()[0].clone();
+        let mut other = PlanView::new(&engine, &w, &w.tabs[1]);
+        settle(&ctx, &engine, &mut other, &|p| p.loaded_once);
+        assert_eq!((other.plan.as_ref(), other.text.as_ref()), (None, None), "not tab t's plan");
+
+        let path = format!("{}/.kitchen/tabs/t/plan.md", repo.path());
+        let db = engine.db();
+        let resolved = db.add_plan_comment("t", &path, 2, None, "## F1", "done").unwrap();
+        db.set_plan_comment_state(resolved, "resolved").unwrap();
+        let open = db.add_plan_comment("t", &path, 1, None, "# Plan", "still open").unwrap();
+        db.add_plan_comment("t", "/elsewhere/old-plan.md", 1, None, "# Plan", "another plan's").unwrap();
+        drop(db);
+        let ids = |p: &PlanView| p.comments.iter().map(|c| c.id).collect::<Vec<_>>();
+        let mut p = PlanView::new(&engine, &w, &w.tabs[0]);
+        settle(&ctx, &engine, &mut p, &|p| p.doc.lines.len() == 2);
+        assert_eq!(ids(&p), [open, resolved]);
+
+        // The agent writes the next plan into the same file.
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        p.command(PanelCmd::Reload, &engine);
+        settle(&ctx, &engine, &mut p, &|p| p.comments.len() == 1);
+        assert_eq!(ids(&p), [open], "the resolved one is the old plan's");
+        assert_eq!(engine.current_plan_comments("t").unwrap().iter().map(|c| c.id).collect::<Vec<_>>(), [open]);
+    }
+
     #[test]
     fn questions_are_answered_under_their_lines() {
-        let repo = TestRepo::with_files(&[(".kitchen/plan.md", "# Plan\n## F1 cache\nuse an LRU\n")]);
+        let repo = TestRepo::with_files(&[(".kitchen/tabs/t/plan.md", "# Plan\n## F1 cache\nuse an LRU\n")]);
         let (ctx, engine) = engine("local", &repo.path(), &["t"]);
         let w = engine.workspaces()[0].clone();
         let mut p = PlanView::new(&engine, &w, &w.tabs[0]);

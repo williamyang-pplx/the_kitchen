@@ -22,7 +22,11 @@ for agent-driven PR work across local repos and Perplexity devboxes.
     `origin/<default>` as last fetched, no fetch of its own; or an existing branch
     (or a rev, detached), fetched in the same round trip as its checkout. Opening a
     branch or rev a tab already has fast-forwards that tab (never a reset). With a
-    task, the agent starts with `/low-level-plan` and writes `.kitchen/plan.md`.
+    task, the agent starts with `/low-level-plan` and writes
+    `.kitchen/tabs/<tab>/plan.md`. Plans and plan-mode files are per tab (read tabs
+    share the main checkout). The plan reviewer shows the tab's newest plan file
+    and only comments made on that file, and hides resolved comments once the
+    plan is rewritten after them.
   - *spares*: two detached worktrees `<repo>-kitchen-spare[-2]` kept at
     `origin/<default>`: a per-workspace warmer fetches it and fast-forwards them
     every 5 minutes and when the ⌘T dialog opens (also after every other fetch of

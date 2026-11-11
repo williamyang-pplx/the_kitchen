@@ -799,10 +799,10 @@ impl Engine {
                 Some(c)
             } else {
                 let first_message = match opts.task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                    Some(task) => Some(plan::planning_prompt(task, &plan::plan_file_for(worktree))),
+                    Some(task) => Some(plan::planning_prompt(task, &plan::plan_file_for(worktree, &tab_id))),
                     None => prompt.map(String::from),
                 };
-                let (cmd, prompt_setup) = agent_command(worktree, &settings, first_message.as_deref());
+                let (cmd, prompt_setup) = agent_command(worktree, &tab_id, &settings, first_message.as_deref());
                 setup = prompt_setup;
                 Some(cmd)
             };
@@ -1152,21 +1152,32 @@ impl Engine {
         self.db().plan_comments(tab_id)
     }
 
-    pub fn add_plan_comment(&self, tab_id: &str, line: i64, end_line: Option<i64>, quote: &str, body: &str) -> Result<i64> {
-        let id = self.db().add_plan_comment(tab_id, line, end_line, quote, body)?;
+    pub fn add_plan_comment(&self, tab_id: &str, plan_path: &str, line: i64, end_line: Option<i64>, quote: &str, body: &str) -> Result<i64> {
+        let id = self.db().add_plan_comment(tab_id, plan_path, line, end_line, quote, body)?;
         self.repaint();
         Ok(id)
     }
 
-    /// Send every open plan comment to the tab's agent as one message.
-    pub fn send_plan_feedback(&self, tab_id: &str) -> Result<usize> {
-        let (_, tab) = self.find_tab(tab_id).context("no such tab")?;
+    /// The comments that show on the tab's current plan (none without a
+    /// plan). Blocking: reads the host.
+    pub fn current_plan_comments(&self, tab_id: &str) -> Result<Vec<PlanComment>> {
+        let (ws, tab) = self.find_tab(tab_id).context("no such tab")?;
+        let Some(doc) = plan::current_plan(&ws.host(), &tab.row.worktree, tab_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(self.plan_comments(tab_id)?.into_iter().filter(|c| plan::shows_on(c, &doc)).collect())
+    }
+
+    /// Send every open comment on the plan at `plan_path` to the tab's agent
+    /// as one message.
+    pub fn send_plan_feedback(&self, tab_id: &str, plan_path: &str) -> Result<usize> {
         let comments = self.plan_comments(tab_id)?;
-        let open: Vec<&PlanComment> = comments.iter().filter(|c| c.state == "open").collect();
+        let open: Vec<&PlanComment> =
+            comments.iter().filter(|c| c.state == "open" && c.plan_path.as_deref() == Some(plan_path)).collect();
         if open.is_empty() {
             bail!("no open plan comments to send");
         }
-        let msg = plan::feedback_message(&tab.row.plan_file(), &open);
+        let msg = plan::feedback_message(plan_path, &open);
         self.send_text(tab_id, &msg, true)?;
         let db = self.db();
         for c in &open {
@@ -1190,8 +1201,8 @@ impl Engine {
 /// that writes its first message to a file (run in the same host round trip
 /// as the tmux session). The file is the tab's own: read tabs share the main
 /// checkout's `.kitchen/`.
-fn agent_command(worktree: &str, settings: &Settings, first_message: Option<&str>) -> (String, Option<String>) {
-    let base = format!("{} --settings {}", settings.edit_agent_command, shell_quote(&agent_settings_json()));
+fn agent_command(worktree: &str, tab_id: &str, settings: &Settings, first_message: Option<&str>) -> (String, Option<String>) {
+    let base = format!("{} --settings {}", settings.edit_agent_command, shell_quote(&agent_settings_json(tab_id)));
     let Some(message) = first_message else {
         return (base, None);
     };
@@ -1223,7 +1234,7 @@ fn resume_command(row: &TabRow, settings: &Settings) -> Option<String> {
     if !row.agent {
         return None;
     }
-    let (agent, _) = agent_command(&row.worktree, settings, None);
+    let (agent, _) = agent_command(&row.worktree, &row.id, settings, None);
     Some(match &row.agent_session {
         Some(id) => format!("{agent} --resume {}", shell_quote(id)),
         None => format!("{agent} --continue"),
@@ -1253,12 +1264,12 @@ fn closest(matches: &[String]) -> Option<&String> {
     matches.iter().min_by_key(|m| (m.matches('/').count(), m.as_str()))
 }
 
-/// `--settings` for agents the kitchen starts: plan files land where the
-/// plan reviewer looks, and Stop/Notification hooks badge the
+/// `--settings` for agents the kitchen starts: plan files land in the
+/// tab's own directory, where the plan reviewer looks, and Stop/Notification hooks badge the
 /// tab through `kitchenctl notify` so a finished or blocked agent is visible
 /// from any workspace. Stop stays quiet while background subagents run, and
 /// reports the agent's session (`__agent-session`) for a revived tab to resume.
-fn agent_settings_json() -> String {
+fn agent_settings_json(tab_id: &str) -> String {
     let hook = |matcher: &str, commands: &[String]| {
         let hooks: Vec<_> = commands
             .iter()
@@ -1286,7 +1297,7 @@ fn agent_settings_json() -> String {
         "command": "command -v kitchenctl >/dev/null && kitchenctl guide 2>/dev/null; true" }] }]);
     serde_json::json!({
         "hooks": { "SessionStart": guide, "Stop": stop, "Notification": blocked },
-        "plansDirectory": ".kitchen/plans",
+        "plansDirectory": plan::plans_dir(tab_id),
     })
     .to_string()
 }
@@ -1473,15 +1484,16 @@ mod tests {
     /// first message from a per-tab file that the command removes.
     #[test]
     fn agent_command_and_settings() {
-        let settings: serde_json::Value = serde_json::from_str(&agent_settings_json()).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&agent_settings_json("a")).unwrap();
         let start = &settings["hooks"]["SessionStart"][0];
         assert_eq!(start["matcher"], "", "every session: startup, resume, clear, compact");
         assert_eq!(start["hooks"][0]["command"], "command -v kitchenctl >/dev/null && kitchenctl guide 2>/dev/null; true");
 
         let s = Settings::default();
-        assert_eq!(agent_command("/r-a", &s, None).1, None);
+        assert_eq!(settings["plansDirectory"], ".kitchen/tabs/a/plans", "the tab's own");
+        assert_eq!(agent_command("/r-a", "a", &s, None).1, None);
         let file = |message: &str| {
-            let (cmd, setup) = agent_command("/r-a", &s, Some(message));
+            let (cmd, setup) = agent_command("/r-a", "a", &s, Some(message));
             let setup = setup.unwrap();
             let file = setup.rsplit("> ").next().unwrap().to_string();
             assert!(file.starts_with("/r-a/.kitchen/prompt-") && file.ends_with(".md"), "{setup}");
@@ -1504,7 +1516,7 @@ mod tests {
             agent_session: None,
         };
         let note = handoff_note(&from);
-        assert!(note.contains("worktree /r-plan, branch william/plan") && note.contains("/r-plan/.kitchen/plan.md"), "{note}");
+        assert!(note.contains("worktree /r-plan, branch william/plan") && note.contains("/r-plan/.kitchen/tabs/p1/plan.md"), "{note}");
         assert!(note.contains("kitchenctl tab send --tab p1"), "{note}");
     }
 
