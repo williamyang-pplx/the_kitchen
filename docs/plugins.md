@@ -41,12 +41,15 @@ via the ty language server), `github` (PR review via ⌘⇧P),
 untouched for `idle_hours`, 6 by default), `bazel-cache` (keeps the Bazel
 caches on each workspace's host under `max_gb`, or above `min_free_percent` free, evicting
 down to `target_gb`; the output bases of removed worktrees always go),
-`dashboard` (worktrees, disk and RAM on the dashboard) and `download` (a
+`dashboard` (worktrees, disk and RAM on the dashboard), `download` (a
 `remote = true` command: a devbox tab runs `kitchenctl plugin run
 download.pull` and its `~/outbox/` is rsynced to `~/Downloads/devbox/<host>/`
-on the mac). `install.sh` links `ruff`, `python`, `todo`, `github`,
-`markdown`, `prune-worktrees`, `bazel-cache`, `dashboard` and `download` into
-`~/.kitchen/plugins/`.
+on the mac) and `mcp-token-sync` (every 5 minutes, copies the mac's MCP
+OAuth tokens for the `servers` it lists, without refresh tokens, into
+`~/.claude/.credentials.json` on every devbox with an open workspace; Claude
+on the mac stays the only one that refreshes). `install.sh` links `ruff`,
+`python`, `todo`, `github`, `markdown`, `prune-worktrees`, `bazel-cache`,
+`dashboard`, `download` and `mcp-token-sync` into `~/.kitchen/plugins/`.
 
 ## Configuration
 

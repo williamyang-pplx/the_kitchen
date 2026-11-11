@@ -1444,6 +1444,169 @@ mod tests {
         let _ = std::fs::remove_file(format!("{r}-alias"));
     }
 
+    fn mcp_token_sync_module(lua: &mlua::Lua) -> mlua::Table {
+        lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/mcp-token-sync/init.lua");
+        lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap()
+    }
+
+    /// mcp-token-sync: finding the mac's entries by serverName without their
+    /// refresh tokens, hosts, payload, and reading the box's answers.
+    #[test]
+    fn mcp_token_sync_picks_entries_and_reads_answers() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        let m = mcp_token_sync_module(&lua);
+        let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
+        let val = |j: serde_json::Value| lua.to_value(&j).unwrap();
+        let f = |name: &str| m.get::<mlua::Function>(name).unwrap();
+
+        let slack = "plugin:slack:slack";
+        let store = val(serde_json::json!({ "mcpOAuth": {
+            "plugin:slack:slack|old": { "serverName": slack, "accessToken": "tok-old", "expiresAt": 1000, "refreshToken": "ref-old" },
+            "plugin:slack:slack|live": {
+                "serverName": slack, "accessToken": "tok-live", "expiresAt": 2_000_000_000_000i64, "refreshToken": "ref-live",
+                "clientSecret": "sec", "clientId": "cid", "scope": "s", "discoveryState": { "oauthMetadataFound": true },
+            },
+            "plugin:slack:slack|noexp": { "serverName": slack, "accessToken": "tok-noexp" },
+            "linear|h": { "serverName": "linear", "refreshToken": "ref-only" },
+            "junk": "not an entry",
+        }}));
+        let names = val(serde_json::json!([slack, "linear", "gone"]));
+        let got = to_json(f("mac_entries").call((store.clone(), names.clone())).unwrap());
+        assert_eq!(
+            got,
+            serde_json::json!([
+                {
+                    "name": slack, "key": "plugin:slack:slack|live", "expires_at": 2_000_000_000_000i64,
+                    "entry": { "serverName": slack, "accessToken": "tok-live", "expiresAt": 2_000_000_000_000i64, "clientId": "cid", "scope": "s", "discoveryState": { "oauthMetadataFound": true } },
+                },
+                { "name": "linear", "missing": true },
+                { "name": "gone", "missing": true },
+            ]),
+            "the longest-lived entry, without refreshToken / clientSecret; no accessToken = missing"
+        );
+        let only_noexp = val(serde_json::json!({ "mcpOAuth": { "a|1": { "serverName": "a", "accessToken": "t" } } }));
+        let got = to_json(f("mac_entries").call((only_noexp, val(serde_json::json!(["a"])))).unwrap());
+        assert_eq!(got, serde_json::json!([{ "name": "a", "key": "a|1", "entry": { "serverName": "a", "accessToken": "t" } }]), "no expiresAt: picked, no expiry");
+        let none = to_json(f("mac_entries").call((val(serde_json::json!({})), val(serde_json::json!(["a"])))).unwrap());
+        assert_eq!(none, serde_json::json!([{ "name": "a", "missing": true }]), "no mcpOAuth at all");
+
+        let now = 1_000_000.0;
+        let left = |e: serde_json::Value| -> Option<f64> { f("seconds_left").call((val(e), now)).unwrap() };
+        assert_eq!(left(serde_json::json!({ "expires_at": (1_000_000 + 301) * 1000 })), Some(301.0));
+        assert_eq!(left(serde_json::json!({ "name": "a" })), None, "no expiry");
+        assert_eq!(left(serde_json::json!({ "missing": true, "expires_at": 5 })), None);
+
+        let workspaces = val(serde_json::json!([
+            { "id": "w1", "host": "local" },
+            { "id": "w2", "host": "box-a" },
+            { "id": "w3", "host": "box-b" },
+            { "id": "w4", "host": "box-a" },
+        ]));
+        let (hosts, ws_of): (mlua::Value, mlua::Value) = f("hosts").call(workspaces).unwrap();
+        assert_eq!(to_json(hosts), serde_json::json!(["box-a", "box-b"]));
+        assert_eq!(to_json(ws_of), serde_json::json!({ "box-a": ["w2", "w4"], "box-b": ["w3"] }));
+
+        let entries = val(serde_json::json!([
+            { "name": "live", "key": "live|1", "entry": { "accessToken": "t1" }, "expires_at": 2_000_000_000i64 },
+            { "name": "expired", "key": "expired|1", "entry": { "accessToken": "t2" }, "expires_at": 999_000_000i64 },
+            { "name": "forever", "key": "forever|1", "entry": { "accessToken": "t3" } },
+            { "name": "gone", "missing": true },
+        ]));
+        let payload = to_json(f("payload").call((entries, now)).unwrap());
+        assert_eq!(
+            payload,
+            serde_json::json!({ "servers": [
+                { "name": "live", "key": "live|1", "entry": { "accessToken": "t1" } },
+                { "name": "forever", "key": "forever|1", "entry": { "accessToken": "t3" } },
+            ] }),
+            "missing and expired entries stay home"
+        );
+        let entries = f("mac_entries").call::<mlua::Value>((store, names)).unwrap();
+        let text = to_json(f("payload").call((entries, now)).unwrap()).to_string();
+        assert!(!text.contains("refreshToken") && !text.contains("ref-") && !text.contains("sec"), "{text}");
+
+        let status = |code: i32, out: &str, err: &str| -> String { f("box_status").call((code, out, err)).unwrap() };
+        assert_eq!(status(0, "plugin:slack:slack:\n  Scope: x\n  Status: ✔ Connected\n  Type: http\n", ""), "connected");
+        assert_eq!(status(0, "  Status: ✔ Connected", ""), "connected", "last line, no newline");
+        assert_eq!(status(1, "", "No MCP server named \"x\". Configured servers: a"), "missing");
+        assert_eq!(status(0, "  Status: ⚠ Needs authentication\n", ""), "⚠ Needs authentication");
+        assert_eq!(status(127, "", "sh: claude: not found"), "unknown");
+    }
+
+    /// mcp-token-sync: MERGE_PY against a temp HOME — creates the file (600),
+    /// keeps other keys, matches by serverName, writes only on change, never
+    /// clobbers a broken file.
+    #[test]
+    fn mcp_token_sync_merge_script_on_a_temp_home() {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let lua = mlua::Lua::new();
+        let script: String = mcp_token_sync_module(&lua).get("MERGE_PY").unwrap();
+        let home = std::env::temp_dir().join(format!("kt-mcp-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (dir, file) = (home.join(".claude"), home.join(".claude/.credentials.json"));
+        let run = |payload: &serde_json::Value| -> (bool, String) {
+            let mut c = std::process::Command::new("python3")
+                .arg("-c")
+                .arg(&script)
+                .env("HOME", &home)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            c.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+            let out = c.wait_with_output().unwrap();
+            (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let read = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap() };
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let entry = serde_json::json!({ "serverName": "plugin:slack:slack", "accessToken": "tok-1", "expiresAt": 5 });
+        let payload = serde_json::json!({ "servers": [{ "name": "plugin:slack:slack", "key": "plugin:slack:slack|mac", "entry": entry }] });
+
+        assert_eq!(run(&payload), (true, "updated plugin:slack:slack\n".into()), "no ~/.claude yet");
+        assert_eq!((mode(&dir), mode(&file)), (0o700, 0o600));
+        assert_eq!(read(), serde_json::json!({ "mcpOAuth": { "plugin:slack:slack|mac": entry } }));
+        let before = std::fs::metadata(&file).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(run(&payload), (true, String::new()), "unchanged: nothing printed");
+        let after = std::fs::metadata(&file).unwrap();
+        assert_eq!((after.ino(), after.mtime_nsec(), after.mtime()), (before.ino(), before.mtime_nsec(), before.mtime()), "unchanged: not rewritten");
+
+        // The box hashed the server under another key; other keys and servers stay.
+        let other = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "keep" },
+            "mcpOAuth": {
+                "plugin:slack:slack|box": { "serverName": "plugin:slack:slack", "accessToken": "stale" },
+                "linear|h": { "serverName": "linear", "accessToken": "lin" },
+                "weird": 3,
+            },
+        });
+        std::fs::write(&file, other.to_string()).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(run(&payload), (true, "updated plugin:slack:slack\n".into()));
+        assert_eq!(
+            read(),
+            serde_json::json!({
+                "claudeAiOauth": { "accessToken": "keep" },
+                "mcpOAuth": { "plugin:slack:slack|box": entry, "linear|h": { "serverName": "linear", "accessToken": "lin" }, "weird": 3 },
+            }),
+            "written under the box's key, not the mac's"
+        );
+        assert_eq!(mode(&file), 0o600, "a 644 file comes back 600");
+
+        for broken in ["{not json", r#"{"mcpOAuth": null}"#, "[]", ""] {
+            std::fs::write(&file, broken).unwrap();
+            assert!(!run(&payload).0, "{broken:?}: fails");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), broken, "{broken:?}: left alone");
+        }
+        let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, [".credentials.json"], "no temp files left");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// `kitchen.every` runs on schedule and records its runs (stats, errors,
     /// SQLite); `t:run()` starts one now; a reload never overlaps a run that is
     /// still going. `kitchen.dashboard` sections follow the dashboard event.
@@ -1525,7 +1688,7 @@ end)
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 9 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        wait(&|| host.list().len() == 11 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);

@@ -1,0 +1,16 @@
+name = "mcp-token-sync"
+version = "0.1.0"
+description = "Every few minutes, push the mac's MCP OAuth tokens (no refresh tokens) to every devbox with an open workspace, so Claude there stays logged in"
+api = 10
+
+[config]
+# Claude Code MCP server names to sync (as `claude mcp list` prints them).
+# Adding a server = adding its name here, and installing it on the boxes.
+servers = ["plugin:slack:slack"]
+# Minutes between passes (at least 1). Claude refreshes a token only in its
+# last 5 minutes, so keep this at 5 or less: a longer gap leaves a box with an
+# expired token until the next pass.
+interval_minutes = 5
+# Where claude lives when the kitchen was started from Finder (minimal PATH),
+# and on a devbox (~/.local/bin).
+path = "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"

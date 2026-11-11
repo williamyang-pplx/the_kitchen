@@ -43,7 +43,9 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   touched for 2 days; branches stay), `bazel-cache` (every 30 minutes, keeps
   `~/bazel-cache` on the mac and each devbox under 30G: drops the output bases
   of removed worktrees, then the least recently used cache entries, never under
-  a running build) and `dashboard`. ⌘⇧P is the command palette.
+  a running build), `mcp-token-sync` (every 5 minutes, pushes the mac's MCP
+  OAuth tokens, e.g. Slack's, to each open devbox, so Claude there stays
+  logged in) and `dashboard`. ⌘⇧P is the command palette.
 - **Dashboard** (⌘D, or the grid at the right end of the tab strip): each
   plugin timer's runs (last fired, next due, stats), and the workspace's
   worktrees, disk and RAM on its host, from the `dashboard` plugin.
