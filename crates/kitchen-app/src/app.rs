@@ -1303,7 +1303,7 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("⌘⇧H  ⌘⇧L", "file list ↔ code"),
                 ("⌘⇧J  ⌘⇧K", "next / previous changed file"),
                 ("⌘⇧S", "switch between the tab's PRs"),
-                ("⌘⇧A", "ask about the line or selection"),
+                ("⌘⇧A", "ask about the line or selection (again: follow up)"),
                 ("⌘O", "outline"),
                 ("]c  [c", "next / previous change"),
                 ("zo  zR  zM", "open a fold / all folds / fold again"),

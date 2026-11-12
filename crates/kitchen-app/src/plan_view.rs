@@ -2,8 +2,8 @@
 //! document with inline comments. ⌘M comments on the cursor line or visual
 //! selection, ⌘Enter submits it; ⌘Enter with no comment open sends every
 //! open comment to the tab's agent in one message. ⌘⇧A asks the planning
-//! agent (a fork of its session) a question about the lines;
-//! the answer shows under them until Esc on their line. The file is re-read
+//! agent (a fork of its session) a question about the lines, ⌘⇧A on them
+//! again a follow-up; the answers show under them until Esc on their line. The file is re-read
 //! every couple of seconds so the agent's revisions show up live.
 
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use kitchen_core::db::PlanComment;
 use kitchen_core::host::Host;
 use kitchen_core::{ask, plan};
 
+use crate::ask_thread::{self, Thread};
 use crate::engine::{Engine, Tab, Workspace};
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::theme;
@@ -29,21 +30,14 @@ const POLL: Duration = Duration::from_secs(2);
 enum Msg {
     Loaded { plan: Option<plan::PlanDoc>, text: Option<String> },
     Sent(Result<usize, String>),
-    Answer { id: u64, result: Result<String, String> },
+    Answer(ask_thread::Answer),
 }
 
-/// Answers a plan question (the model; a fake in tests).
-type Answerer = fn(&ask::Asker, &ask::PlanQuestion) -> anyhow::Result<String>;
-
-/// A ⌘⇧A question and, once the model replies, its answer.
+/// A ⌘⇧A thread.
 struct PlanAsk {
-    id: u64,
-    /// Doc index of the last asked line: the answer goes under it.
+    /// Doc index of the last asked line: the answers go under it.
     line: usize,
-    question: String,
-    asked: Instant,
-    /// `None` while the model is answering.
-    answer: Option<Result<String, String>>,
+    thread: Thread,
 }
 
 pub struct PlanView {
@@ -69,7 +63,9 @@ pub struct PlanView {
     submit_pending: bool,
     asks: Vec<PlanAsk>,
     ask_seq: u64,
-    answerer: Answerer,
+    /// The thread the open question field follows up on.
+    follow_up: Option<u64>,
+    answerer: ask_thread::Answerer,
 }
 
 impl PlanView {
@@ -96,7 +92,8 @@ impl PlanView {
             submit_pending: false,
             asks: Vec::new(),
             ask_seq: 0,
-            answerer: ask::answer_plan,
+            follow_up: None,
+            answerer: ask::ask,
         }
     }
 
@@ -147,12 +144,11 @@ impl PlanView {
                     }
                     Err(e) => self.status = Some((e, true)),
                 },
-                Msg::Answer { id, result } => {
-                    // A question closed while it was being answered is gone.
-                    if let Some(a) = self.asks.iter_mut().find(|a| a.id == id) {
-                        a.answer = Some(result);
-                    }
-                }
+                Msg::Answer(ans) => match self.asks.iter_mut().find(|a| a.thread.id == ans.id) {
+                    Some(a) => a.thread.finish(ans.asker, ans.result),
+                    // Closed while it was being answered.
+                    None => ask_thread::discard(ans),
+                },
             }
         }
     }
@@ -176,10 +172,6 @@ impl PlanView {
     }
 
     fn blocks(&self) -> Vec<Block> {
-        if self.asks.iter().any(|a| a.answer.is_none()) {
-            // The thinking card counts seconds.
-            self.engine.ctx.request_repaint_after(Duration::from_millis(500));
-        }
         let last = self.doc.lines.len().saturating_sub(1);
         self.comments
             .iter()
@@ -196,14 +188,21 @@ impl PlanView {
                 let at = (c.end_line.unwrap_or(c.line).max(1) as usize - 1).min(last);
                 Block { after: Some(at), title: format!("comment #{} · {lines} · {label}", c.id), body: c.body.clone(), color, dim, question: false }
             })
-            .chain(self.asks.iter().map(|a| Block::answer(a.line.min(last), &a.question, a.answer.as_ref(), a.asked)))
+            .chain(self.asks.iter().flat_map(|a| a.thread.blocks(a.line.min(last), &self.engine.ctx)))
             .collect()
     }
 
-    /// ⌘⇧A: a question field under the cursor line or visual selection.
+    /// ⌘⇧A: a question field under the cursor line or visual selection. On
+    /// a line with answers (and no selection), a follow-up to the last.
     fn start_ask(&mut self) {
         if self.doc.lines.is_empty() {
             self.status = Some(("no plan to ask about yet".into(), false));
+            return;
+        }
+        self.follow_up = self.vim.visual_lines().is_none().then(|| self.asks_on_cursor().last().copied()).flatten();
+        if let Some(a) = self.follow_up.and_then(|id| self.asks.iter().find(|a| a.thread.id == id)) {
+            let label = format!("Follow up on “{}” — Enter asks · Esc cancels", a.thread.question());
+            self.editor = Some(Editor { start: self.vim.line, end: self.vim.line, text: String::new(), label, needs_focus: true, ask: true });
             return;
         }
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
@@ -222,9 +221,23 @@ impl PlanView {
             self.editor = Some(ed);
             return;
         }
+        if let Some(id) = self.follow_up.take() {
+            let (tx, ctx, answer) = (self.tx.clone(), self.engine.ctx.clone(), self.answerer);
+            let Some(a) = self.asks.iter_mut().find(|a| a.thread.id == id) else { return };
+            let sent = a.thread.follow_up(&text, answer, move |ans| {
+                let _ = tx.send(Msg::Answer(ans));
+                ctx.request_repaint();
+            });
+            if let Err(why) = sent {
+                self.status = Some((why.into(), true));
+                self.follow_up = Some(id);
+                self.editor = Some(ed);
+            }
+            return;
+        }
         self.ask_seq += 1;
         let id = self.ask_seq;
-        self.asks.push(PlanAsk { id, line: ed.end, question: text.clone(), asked: Instant::now(), answer: None });
+        self.asks.push(PlanAsk { line: ed.end, thread: Thread::new(id, &text) });
         self.vim.anchor = None;
         let quote = self.doc.lines.get(ed.start..=ed.end).unwrap_or_default().iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
         let plan_text = self.text.clone().unwrap_or_default();
@@ -236,10 +249,16 @@ impl PlanView {
         std::thread::spawn(move || {
             let asker = ask::Asker::for_tab(host, tab.as_ref(), &wt, &model);
             let q = ask::PlanQuestion { path: &path, first, last, quote: &quote, plan: &plan_text, text: &text };
-            let result = answer(&asker, &q).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Msg::Answer { id, result });
+            let result = answer(&asker, &ask::Prompt::Plan(q)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Answer(ask_thread::Answer { id, asker, result }));
             ctx.request_repaint();
         });
+    }
+
+    /// The threads under the cursor line, oldest first.
+    fn asks_on_cursor(&self) -> Vec<u64> {
+        let last = self.doc.lines.len().saturating_sub(1);
+        self.asks.iter().filter(|a| a.line.min(last) == self.vim.line).map(|a| a.thread.id).collect()
     }
 
     /// Save the open comment field as a plan comment.
@@ -389,10 +408,11 @@ impl PlanView {
                 }
             }
             if out.actions.iter().any(|a| matches!(a, VimAction::Escape)) {
-                // Esc: close the answers under the cursor line.
-                let line = self.vim.line;
-                let last = self.doc.lines.len().saturating_sub(1);
-                self.asks.retain(|a| a.line.min(last) != line);
+                // Esc: close the threads under the cursor line.
+                let shut = self.asks_on_cursor();
+                let (closed, kept): (Vec<PlanAsk>, _) = std::mem::take(&mut self.asks).into_iter().partition(|a| shut.contains(&a.thread.id));
+                self.asks = kept;
+                ask_thread::close(closed.into_iter().map(|a| a.thread));
                 self.status = None;
             }
         }
@@ -485,7 +505,11 @@ mod tests {
         let (ctx, engine) = engine("local", &repo.path(), &["t"]);
         let w = engine.workspaces()[0].clone();
         let mut p = PlanView::new(&engine, &w, &w.tabs[0]);
-        p.answerer = |a, q| Ok(format!("{}|{}|{}-{}|{}|{}|{}", a.model, a.session.is_some(), q.first, q.last, q.quote, q.plan.lines().count(), q.text));
+        p.answerer = |a, p| match p {
+            ask::Prompt::Plan(q) => Ok(format!("{}|{}|{}-{}|{}|{}|{}", a.model, a.session.is_some(), q.first, q.last, q.quote, q.plan.lines().count(), q.text)),
+            ask::Prompt::FollowUp(t) => Ok(format!("follow|{t}")),
+            ask::Prompt::File(_) => unreachable!(),
+        };
         settle(&ctx, &engine, &mut p, &|p| p.doc.lines.len() == 3);
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("jV".into())]);
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("j".into())]);
@@ -499,12 +523,21 @@ mod tests {
         assert_eq!(ask(&p).map(|b| (b.after, b.body)), Some((Some(2), "thinking… 0s".into())));
         settle(&ctx, &engine, &mut p, &|p| ask(p).is_some_and(|b| !b.dim));
         assert_eq!(ask(&p).unwrap().body, "sonnet|false|2-3|## F1 cache\nuse an LRU|3|why LRU?");
+        // ⌘⇧A on its line follows up.
+        p.command(PanelCmd::Ask, &engine);
+        assert!(p.editor.as_ref().is_some_and(|e| e.label.starts_with("Follow up on “why LRU?”")));
+        frame(&ctx, &engine, &mut p, Vec::new());
+        frame(&ctx, &engine, &mut p, vec![egui::Event::Text("how big?".into())]);
+        frame(&ctx, &engine, &mut p, key(egui::Key::Enter));
+        let follow = |p: &PlanView| p.blocks().into_iter().find(|b| b.title == "↳ how big?");
+        settle(&ctx, &engine, &mut p, &|p| follow(p).is_some_and(|b| !b.dim));
+        assert_eq!(follow(&p).map(|b| (b.after, b.body)), Some((Some(2), "follow|how big?".into())));
         // Esc elsewhere keeps it; Esc on its line closes it.
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("k".into())]);
         frame(&ctx, &engine, &mut p, key(egui::Key::Escape));
         assert!(ask(&p).is_some());
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("j".into())]);
         frame(&ctx, &engine, &mut p, key(egui::Key::Escape));
-        assert!(ask(&p).is_none());
+        assert!(ask(&p).is_none() && follow(&p).is_none());
     }
 }

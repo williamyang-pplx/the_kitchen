@@ -95,8 +95,8 @@ enum Msg {
     Stat { path: String, meta: Option<String> },
     /// A `gd`/`gr` answer (`None`: the provider couldn't tell).
     Nav { token: u64, answer: Option<Vec<crate::plugins::Location>> },
-    /// The model's answer to ⌘⇧A question `id`.
-    Answer { id: u64, result: Result<String, String> },
+    /// The model's answer in a ⌘⇧A thread.
+    Answer(crate::ask_thread::Answer),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -211,10 +211,12 @@ pub struct Viewer {
     reply_to: Option<String>,
     /// ⌘Enter arrived; submit once the editor has seen this frame's input.
     submit_pending: bool,
-    /// ⌘⇧A questions and their answers, and the last question's id.
+    /// ⌘⇧A threads, and the last one's id.
     asks: Vec<ask::Ask>,
     ask_seq: u64,
-    answerer: ask::Answerer,
+    /// The thread the open question field follows up on.
+    follow_up: Option<u64>,
+    answerer: crate::ask_thread::Answerer,
     /// When ⌘⇧S last asked the plugins for the PR menu (until it changes).
     asked: Option<std::time::Instant>,
     /// Since when the code area has been waiting for files.
@@ -294,8 +296,9 @@ impl Viewer {
             reply_to: None,
             submit_pending: false,
             asks: Vec::new(),
+            follow_up: None,
             ask_seq: 0,
-            answerer: kitchen_core::ask::answer,
+            answerer: kitchen_core::ask::ask,
             asked: None,
             loading_since: None,
         };
@@ -482,7 +485,7 @@ impl Viewer {
                 }
                 Msg::Grep { token, locs } => self.finish_grep(token, locs),
                 Msg::Nav { token, answer } => self.finish_nav(token, answer),
-                Msg::Answer { id, result } => self.finish_ask(id, result),
+                Msg::Answer(ans) => self.finish_ask(ans),
                 Msg::Summaries { path, map, error } => {
                     self.summary_pending.remove(&path);
                     if let Some(e) = error {
@@ -2208,7 +2211,11 @@ end)"#,
         h.repo.sh("printf 'a\\nB\\nc\\n' > a.py && git commit -qam change");
         let engine = &h.engine;
         let mut v = h.viewer();
-        v.answerer = |a, q| Ok(format!("{}|{}|{}:{}-{}|{}|{}|{}", a.model, a.session.is_some(), q.path, q.first, q.last, q.base, q.quote, q.text));
+        v.answerer = |a, p| match p {
+            kitchen_core::ask::Prompt::File(q) => Ok(format!("{}|{}|{}:{}-{}|{}|{}|{}", a.model, a.session.is_some(), q.path, q.first, q.last, q.base, q.quote, q.text)),
+            kitchen_core::ask::Prompt::FollowUp(t) => Ok(format!("{}|{t}", a.thread.len())),
+            kitchen_core::ask::Prompt::Plan(_) => unreachable!(),
+        };
         h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none());
         // The first change starts with the removed `b`; V takes the added `B` too.
         assert_eq!(v.doc.lines[v.vim.line].text, "b");
@@ -2229,10 +2236,23 @@ end)"#,
         // Mixed sides: about the last line, in the current file.
         assert_eq!(b.body, "sonnet|false|a.py:2-2|false|b\nB|why?");
         assert!(b.title.starts_with("why?"));
-        // Esc elsewhere keeps it; Esc on its line closes it.
+        // ⌘⇧A on its line follows up in the thread's session (a uuid).
+        v.command(PanelCmd::Ask, engine);
+        assert!(v.editor.as_ref().is_some_and(|e| e.label.starts_with("Follow up on “why?”")), "{:?}", v.editor.as_ref().map(|e| &e.label));
+        h.frame(&mut v);
+        h.text(&mut v, "and B?");
+        h.key(&mut v, egui::Key::Enter);
+        h.settle(&mut v, &|v| v.ask_blocks().len() == 2 && v.ask_blocks().iter().all(|b| !b.dim));
+        let b = v.ask_blocks().remove(1);
+        assert_eq!((b.after, b.title.as_str(), b.body.as_str()), (Some(row), "↳ and B?", "36|and B?"));
+        // Esc elsewhere keeps the thread; Esc on its line closes it.
         v.place_cursor(1, 0);
         h.key(&mut v, egui::Key::Escape);
-        assert_eq!(v.ask_blocks().len(), 1);
+        assert_eq!(v.ask_blocks().len(), 2);
+        // Elsewhere ⌘⇧A asks a new question.
+        v.command(PanelCmd::Ask, engine);
+        assert!(v.editor.as_ref().is_some_and(|e| e.label.starts_with("Ask the agent")));
+        h.key(&mut v, egui::Key::Escape);
         v.cursor_to_row(row);
         h.key(&mut v, egui::Key::Escape);
         assert!(v.ask_blocks().is_empty());

@@ -2,6 +2,7 @@
 
 mod api;
 mod app;
+mod ask_thread;
 mod attach;
 mod dashboard_view;
 mod engine;
