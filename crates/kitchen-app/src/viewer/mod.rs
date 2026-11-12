@@ -1483,7 +1483,7 @@ impl Viewer {
             ui.add_space(theme::SPACE_S);
             ui.horizontal(|ui| {
                 ui.add_space(theme::SPACE_M);
-                ui.label(widgets::section_label(&format!("Changed files  {}", self.changed.len()), theme::SUBTLE));
+                changed_header(ui, &self.changed);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(theme::SPACE_XS);
                     all = widgets::flat_button(ui, "All files", false).on_hover_text("The whole repo  a").clicked_by(egui::PointerButton::Primary);
@@ -1548,7 +1548,7 @@ impl Viewer {
             if !self.changed.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(theme::SPACE_M);
-                    ui.label(widgets::section_label(&format!("Changed files  {}", self.changed.len()), theme::SUBTLE)).on_hover_text("a: back to the tree of changes");
+                    changed_header(ui, &self.changed).on_hover_text("a: back to the tree of changes");
                 });
                 ui.add_space(2.0);
             }
@@ -1622,6 +1622,21 @@ impl Viewer {
 }
 
 /// Git status letter colors: added and deleted stand out, modified stays quiet.
+/// "CHANGED FILES  n" and the lines the changes add and remove in all.
+fn changed_header(ui: &mut Ui, changed: &[ChangedFile]) -> egui::Response {
+    let mut job = widgets::section_label(&format!("Changed files  {}", changed.len()), theme::SUBTLE);
+    let (added, removed) = diff_totals(changed);
+    let f = |color| egui::TextFormat { font_id: theme::ui_font_semibold(theme::TEXT_SMALL), color, ..Default::default() };
+    job.append(&format!("+{added}"), 8.0, f(theme::GREEN));
+    job.append(&format!("−{removed}"), 4.0, f(theme::RED));
+    ui.label(job)
+}
+
+/// Lines added and removed across `changed`.
+fn diff_totals(changed: &[ChangedFile]) -> (u64, u64) {
+    changed.iter().fold((0, 0), |(a, r), c| (a + u64::from(c.added), r + u64::from(c.removed)))
+}
+
 fn status_color(status: char) -> egui::Color32 {
     match status {
         'A' => theme::GREEN,
@@ -1818,6 +1833,13 @@ mod tests {
 
     fn cf(path: &str, status: char, old: Option<&str>) -> ChangedFile {
         ChangedFile { path: path.into(), old_path: old.map(String::from), status, added: 0, removed: 0 }
+    }
+
+    #[test]
+    fn diff_totals_add_up_every_file() {
+        let changed = [ChangedFile { added: 3, removed: 1, ..cf("a.rs", 'M', None) }, ChangedFile { added: 40, removed: 0, ..cf("b.rs", 'A', None) }];
+        assert_eq!(diff_totals(&changed), (43, 1));
+        assert_eq!(diff_totals(&[]), (0, 0));
     }
 
     #[test]
