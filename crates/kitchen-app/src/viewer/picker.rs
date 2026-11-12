@@ -1,4 +1,6 @@
 //! Fuzzy picker overlay: files (⌘P in the viewer) and definition candidates.
+//! In menu mode (the ⌘⇧S PR menu) it is a short list under section headers,
+//! moved through with j/k or picked by row number, with no query field.
 //!
 //! Matching is fzf-like: the query is split on whitespace and every term must
 //! match. A term matches as a substring when it can (strongly preferred,
@@ -32,9 +34,16 @@ pub struct Picker {
     /// (item index, matched byte positions in the label), best first.
     pub(crate) filtered: Vec<(usize, Vec<usize>)>,
     matched: usize,
-    selected: usize,
+    pub(crate) selected: usize,
     /// Items are still being fetched.
     pub loading: bool,
+    /// Shown while `loading`.
+    pub loading_note: String,
+    /// Menu mode: no query field; j/k and arrows move, 1–9 pick that row,
+    /// Enter picks, Esc closes. Items keep their order.
+    menu: bool,
+    /// Menu mode: (first item index, header) of each section.
+    sections: Vec<(usize, String)>,
 }
 
 struct Term {
@@ -182,9 +191,47 @@ impl Picker {
     }
 
     pub fn with_bonus(title: impl Into<String>, items: Vec<(String, String)>, bonus: Vec<i64>) -> Self {
-        let mut p = Self { title: title.into(), hint: "Type to filter".into(), items, bonus, query: String::new(), filtered: Vec::new(), matched: 0, selected: 0, loading: false };
+        let mut p = Self {
+            title: title.into(),
+            hint: "Type to filter".into(),
+            items,
+            bonus,
+            query: String::new(),
+            filtered: Vec::new(),
+            matched: 0,
+            selected: 0,
+            loading: false,
+            loading_note: "loading files…".into(),
+            menu: false,
+            sections: Vec::new(),
+        };
         p.refilter();
         p
+    }
+
+    /// A menu-mode picker over `items` in their order, under `sections`.
+    pub fn menu(title: impl Into<String>, items: Vec<(String, String)>, sections: Vec<(usize, String)>) -> Self {
+        // Equal bonuses keep the index order (`refilter` breaks ties by index).
+        let mut p = Self::new(title, items);
+        p.menu = true;
+        p.sections = sections;
+        p
+    }
+
+    /// Put the cursor on item `item`, if it is listed.
+    pub fn select(&mut self, item: usize) {
+        if let Some(row) = self.filtered.iter().position(|(i, _)| *i == item) {
+            self.selected = row;
+        }
+    }
+
+    /// Menu mode: new items and sections, the cursor staying on its row.
+    pub fn set_menu(&mut self, items: Vec<(String, String)>, sections: Vec<(usize, String)>) {
+        let keep = self.selected;
+        let n = items.len();
+        self.set_items(items, vec![0; n]);
+        self.sections = sections;
+        self.selected = keep.min(n.saturating_sub(1));
     }
 
     /// Replace the items (e.g. once the file list arrives), keeping the query.
@@ -213,17 +260,38 @@ impl Picker {
     pub fn ui(&mut self, ui: &mut egui::Ui, focused: bool) -> PickerResult {
         let mut result = PickerResult::Open;
         if focused {
-            let (up, down, enter, esc) = ui.input_mut(|i| {
+            let menu = self.menu;
+            if menu {
+                // Nothing else types while the menu is up (an open ⌘M draft
+                // would take j/k as text).
+                ui.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+            }
+            let (up, down, enter, esc, digit) = ui.input_mut(|i| {
                 let ctrl = egui::Modifiers::CTRL;
-                (
-                    i.consume_key(egui::Modifiers::NONE, Key::ArrowUp) || i.consume_key(ctrl, Key::K) || i.consume_key(ctrl, Key::P),
-                    i.consume_key(egui::Modifiers::NONE, Key::ArrowDown) || i.consume_key(ctrl, Key::J) || i.consume_key(ctrl, Key::N),
-                    i.consume_key(egui::Modifiers::NONE, Key::Enter),
-                    i.consume_key(egui::Modifiers::NONE, Key::Escape),
-                )
+                let none = egui::Modifiers::NONE;
+                let keys = (
+                    i.consume_key(none, Key::ArrowUp) || i.consume_key(ctrl, Key::K) || i.consume_key(ctrl, Key::P) || (menu && i.consume_key(none, Key::K)),
+                    i.consume_key(none, Key::ArrowDown) || i.consume_key(ctrl, Key::J) || i.consume_key(ctrl, Key::N) || (menu && i.consume_key(none, Key::J)),
+                    i.consume_key(none, Key::Enter),
+                    i.consume_key(none, Key::Escape),
+                    if menu { DIGITS.iter().position(|k| i.consume_key(none, *k)) } else { None },
+                );
+                if menu {
+                    // The keys' text too, or the viewer's vim reads "3" as a
+                    // count once the menu closes this frame.
+                    i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+                }
+                keys
             });
             if esc {
                 return PickerResult::Cancelled;
+            }
+            if let Some((i, _)) = digit.and_then(|d| self.filtered.get(d)) {
+                return PickerResult::Chosen(*i);
             }
             if up {
                 self.selected = self.selected.saturating_sub(1);
@@ -243,32 +311,38 @@ impl Picker {
                 ui.horizontal(|ui| {
                     ui.label(crate::ui::widgets::section_label(&self.title, theme::SUBTLE));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let count = if self.loading { "loading files…".to_string() } else { format!("{} / {}", self.matched, self.items.len()) };
+                        let count = if self.loading { self.loading_note.clone() } else { format!("{} / {}", self.matched, self.items.len()) };
                         ui.label(RichText::new(count).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
                     });
                 });
             });
-            let r = egui::Frame::NONE
-                .inner_margin(egui::Margin { left: 10, right: 10, top: 2, bottom: 8 })
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .id_salt("picker-query")
-                            .font(theme::ui_font(theme::TEXT_TITLE))
-                            .frame(egui::Frame::NONE)
-                            .margin(egui::Margin::symmetric(6, 4))
-                            .desired_width(f32::INFINITY)
-                            .hint_text(RichText::new(&self.hint).font(theme::ui_font(theme::TEXT_TITLE)).color(theme::DIM)),
-                    )
-                })
-                .inner;
-            // The picker is modal: keep the query field focused whenever
-            // its panel is (focus can be lost by switching panes).
-            if focused && !r.has_focus() {
-                r.request_focus();
-            }
-            if r.changed() {
-                self.refilter();
+            if self.menu {
+                egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 2, bottom: 8 }).show(ui, |ui| {
+                    ui.label(RichText::new(&self.hint).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
+                });
+            } else {
+                let r = egui::Frame::NONE
+                    .inner_margin(egui::Margin { left: 10, right: 10, top: 2, bottom: 8 })
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.query)
+                                .id_salt("picker-query")
+                                .font(theme::ui_font(theme::TEXT_TITLE))
+                                .frame(egui::Frame::NONE)
+                                .margin(egui::Margin::symmetric(6, 4))
+                                .desired_width(f32::INFINITY)
+                                .hint_text(RichText::new(&self.hint).font(theme::ui_font(theme::TEXT_TITLE)).color(theme::DIM)),
+                        )
+                    })
+                    .inner;
+                // The picker is modal: keep the query field focused whenever
+                // its panel is (focus can be lost by switching panes).
+                if focused && !r.has_focus() {
+                    r.request_focus();
+                }
+                if r.changed() {
+                    self.refilter();
+                }
             }
             let line = ui.available_rect_before_wrap();
             ui.painter().hline(line.x_range(), line.top(), egui::Stroke::new(1.0, theme::BORDER));
@@ -278,7 +352,15 @@ impl Picker {
                     for (row, (i, pos)) in self.filtered.iter().enumerate() {
                         let (label, detail) = &self.items[*i];
                         let sel = row == self.selected;
-                        let resp = picker_row(ui, sel, highlighted(label, pos, sel), detail);
+                        if let Some((_, header)) = self.sections.iter().find(|(first, _)| first == i) {
+                            ui.add_space(if row == 0 { 0.0 } else { 6.0 });
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                ui.label(crate::ui::widgets::section_label(header, theme::DIM));
+                            });
+                        }
+                        let job = if self.menu { numbered(row, label, sel) } else { highlighted(label, pos, sel) };
+                        let resp = picker_row(ui, sel, job, detail);
                         if sel {
                             resp.scroll_to_me(None);
                         }
@@ -293,7 +375,7 @@ impl Picker {
                         });
                     };
                     if self.filtered.is_empty() {
-                        note(ui, if self.loading { "loading files…" } else { "no matches" });
+                        note(ui, if self.loading { &self.loading_note } else if self.menu { "nothing to show" } else { "no matches" });
                     } else if self.matched > self.filtered.len() {
                         note(ui, &format!("… {} more — keep typing", self.matched - self.filtered.len()));
                     }
@@ -303,6 +385,10 @@ impl Picker {
             ui.painter().hline(line.x_range(), line.top(), egui::Stroke::new(1.0, theme::BORDER));
             egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 7, bottom: 8 }).show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    if self.menu {
+                        crate::ui::widgets::key_hints(ui, &[("j/k", "select"), ("1–9", "jump"), ("⏎", "show"), ("esc", "close")]);
+                        return;
+                    }
                     crate::ui::widgets::key_hints(ui, &[("↑↓", "select"), ("⏎", "open"), ("esc", "close")]);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("spaces separate terms").font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
@@ -340,6 +426,19 @@ fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, d
         }
     }
     resp
+}
+
+/// Keys that pick menu rows 1–9.
+const DIGITS: [Key; 9] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+
+/// A menu row: its number (1–9, the key that picks it) and its label, plain.
+fn numbered(row: usize, label: &str, selected: bool) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::FontId::monospace(12.5);
+    let number = if row < DIGITS.len() { format!("{}  ", row + 1) } else { "   ".into() };
+    job.append(&number, 0.0, egui::TextFormat { font_id: font.clone(), color: theme::DIM, ..Default::default() });
+    job.append(label, 0.0, egui::TextFormat { font_id: font, color: if selected { theme::TEXT } else { theme::MUTED }, ..Default::default() });
+    job
 }
 
 /// `label` with the matched bytes in the accent color; the file name brighter than its directory.
@@ -411,6 +510,44 @@ mod tests {
         assert!(rank("Main", PATHS).is_empty(), "uppercase is case-sensitive");
         let (_, pos) = Query::new("main").score("aster/src/main.rs").unwrap();
         assert_eq!(pos, vec![10, 11, 12, 13]);
+    }
+
+    /// The PR menu: j/k move, a digit picks its row (and its text never
+    /// reaches the viewer), Esc closes, a new menu keeps the cursor's row,
+    /// and a focused text field gives the keyboard up.
+    #[test]
+    fn menu_keys_move_pick_and_cancel() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let items = |n: usize| (0..n).map(|i| (format!("#{i}"), String::new())).collect::<Vec<_>>();
+        let mut p = Picker::menu("PRs", items(4), vec![(0, "main ← a".into()), (2, "main ← c".into())]);
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let field = egui::Id::new("draft");
+        let frame = |p: &mut Picker, events: Vec<egui::Event>| {
+            let mut result = PickerResult::Open;
+            let mut left = Vec::new();
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                result = p.ui(ui, true);
+                left = ui.input(|i| i.events.clone());
+            });
+            out.textures_delta.clear();
+            (result, left)
+        };
+        ctx.memory_mut(|m| m.request_focus(field));
+        for k in [egui::Key::J, egui::Key::J, egui::Key::K] {
+            assert!(matches!(frame(&mut p, vec![key(k), egui::Event::Text(format!("{k:?}").to_lowercase())]).0, PickerResult::Open));
+        }
+        assert_eq!(p.selected, 1);
+        assert!(!ctx.memory(|m| m.has_focus(field)), "an open ⌘M draft doesn't get the keys");
+        let (r, left) = frame(&mut p, vec![key(egui::Key::Num3), egui::Event::Text("3".into())]);
+        assert!(matches!(r, PickerResult::Chosen(2)));
+        assert!(!left.iter().any(|e| matches!(e, egui::Event::Text(_))), "vim never reads the 3 as a count");
+        assert!(matches!(frame(&mut p, vec![key(egui::Key::Num9)]).0, PickerResult::Open), "no row 9");
+        p.selected = 3;
+        p.set_menu(items(3), vec![(0, "main ← a".into())]);
+        assert_eq!(p.selected, 2, "clamped to the new rows");
+        assert_eq!(p.items[p.filtered[0].0].0, "#0", "items keep their order");
+        assert!(matches!(frame(&mut p, vec![key(egui::Key::Escape)]).0, PickerResult::Cancelled));
     }
 
     #[test]

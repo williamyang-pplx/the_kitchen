@@ -26,7 +26,9 @@ for agent-driven PR work across local repos and Perplexity devboxes.
     `.kitchen/tabs/<tab>/plan.md`. Plans and plan-mode files are per tab (read tabs
     share the main checkout). The plan reviewer shows the tab's newest plan file
     and only comments made on that file, and hides resolved comments once the
-    plan is rewritten after them.
+    plan is rewritten after them. The agent lists the PRs it opened in
+    `.kitchen/tabs/<tab>/prs`; ⌘⇧S switches the tab's viewer between them, and the
+    app keeps every viewer the tab showed, so switching back is instant.
   - *spares*: two detached worktrees `<repo>-kitchen-spare[-2]` kept at
     `origin/<default>`: a per-workspace warmer fetches it and fast-forwards them
     every 5 minutes and when the ⌘T dialog opens (also after every other fetch of

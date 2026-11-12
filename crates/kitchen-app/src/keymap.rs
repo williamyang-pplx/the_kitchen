@@ -17,6 +17,7 @@
 //! | ⌘H / ⌘L     | previous / next tab                           |
 //! | ⌘⇧H / ⌘⇧L   | focused viewer: file list ↔ code              |
 //! | ⌘⇧J / ⌘⇧K   | focused viewer: next / previous changed file  |
+//! | ⌘⇧S         | the viewer's PR menu (the tab's PRs; j/k)     |
 //! | ⌘T          | new tab: a name — own worktree + branch       |
 //! | ⌘I          | new tab in the main checkout (no worktree)    |
 //! | ⌘-click     | open the path / URL under the pointer (terminal) |
@@ -77,6 +78,8 @@ pub enum Action {
     Palette,
     /// ⌘/: the list of every shortcut.
     Shortcuts,
+    /// ⌘⇧S: the viewer's PR menu; from the terminal, the viewer opens first.
+    ViewMenu,
     /// A plugin chord: index into the registry snapshot passed to [`collect`].
     Plugin(usize),
 }
@@ -128,6 +131,7 @@ pub const SHIFT_BINDINGS: &[(Key, Action)] = &[
     (Key::J, Action::NextFile),
     (Key::K, Action::PrevFile),
     (Key::A, Action::Ask),
+    (Key::S, Action::ViewMenu),
 ];
 
 pub const BINDINGS: &[(Key, Action)] = &[
@@ -256,7 +260,7 @@ mod tests {
         assert!(Action::Ask.allowed(true, true) && Action::Ask.allowed(true, false));
         // Global keys work everywhere.
         for (side, viewer) in [(false, false), (true, true), (true, false)] {
-            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::PrevWorkspace, Action::PrevTab, Action::NextTab, Action::GoToTab(3), Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::ReopenTab, Action::Palette, Action::ToggleViewer, Action::Quit] {
+            for a in [Action::DiffOrDashboard, Action::NewWorkspace, Action::NextWorkspace, Action::PrevWorkspace, Action::PrevTab, Action::NextTab, Action::GoToTab(3), Action::ToggleFiles, Action::OpenPlan, Action::RenameTab, Action::RenameWorkspace, Action::ReopenTab, Action::Palette, Action::ToggleViewer, Action::ViewMenu, Action::Quit] {
                 assert!(a.allowed(side, viewer), "{a:?}");
             }
         }
@@ -276,6 +280,14 @@ mod tests {
     fn press(key: Key, modifiers: Modifiers) -> Vec<Action> {
         let event = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
         press_events(vec![egui::Event::ModifiersChanged(modifiers), event]).0
+    }
+
+    /// ⌘⇧S opens the PR menu, and no plugin can take it.
+    #[test]
+    fn cmd_shift_s_is_the_pr_menu() {
+        assert_eq!(press(Key::S, Modifiers::COMMAND | Modifiers::SHIFT), vec![Action::ViewMenu]);
+        let chord = crate::plugins::keys::Chord::parse("cmd+shift+s").unwrap();
+        assert_eq!(builtin_conflict(&chord).as_deref(), Some("⌘⇧S"));
     }
 
     #[test]

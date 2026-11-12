@@ -306,7 +306,7 @@ impl PlanView {
                 self.reload_comments();
                 self.poll_file(true);
             }
-            PanelCmd::ToggleDiff | PanelCmd::ToggleOutline | PanelCmd::FilePicker | PanelCmd::FocusList | PanelCmd::FocusCode | PanelCmd::ToggleFiles | PanelCmd::NextFile | PanelCmd::PrevFile | PanelCmd::Diagnostics | PanelCmd::Render(_) | PanelCmd::Open { .. } => {
+            PanelCmd::ToggleDiff | PanelCmd::ToggleOutline | PanelCmd::FilePicker | PanelCmd::FocusList | PanelCmd::FocusCode | PanelCmd::ToggleFiles | PanelCmd::NextFile | PanelCmd::PrevFile | PanelCmd::Diagnostics | PanelCmd::Render(_) | PanelCmd::Open { .. } | PanelCmd::ViewMenu => {
                 self.status = Some(("plan reviewer: ⌘M comment · ⌘⇧A ask · ⌘Enter submit / send to agent".into(), false));
             }
         }
@@ -429,7 +429,7 @@ mod tests {
     fn frame(ctx: &egui::Context, engine: &Arc<Engine>, p: &mut PlanView, events: Vec<egui::Event>) {
         let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), events, ..Default::default() };
         let mut out = ctx.run_ui(input, |ui| {
-            let mut cx = PanelCtx { engine, focused: true, clicked: false };
+            let mut cx = PanelCtx { engine, focused: true, clicked: false, view: None };
             p.ui(ui, &mut cx);
         });
         out.textures_delta.clear();

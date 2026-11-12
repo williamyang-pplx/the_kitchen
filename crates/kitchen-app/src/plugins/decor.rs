@@ -153,7 +153,7 @@ pub struct RenderRow {
 }
 
 /// A list, also from an empty Lua table (which arrives as `{}`).
-fn list_or_empty_table<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+pub(crate) fn list_or_empty_table<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
     match serde_json::Value::deserialize(d)? {
         serde_json::Value::Object(m) if m.is_empty() => Ok(Vec::new()),
         v => serde_json::from_value(v).map_err(serde::de::Error::custom),

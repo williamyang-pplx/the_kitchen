@@ -221,3 +221,23 @@ about LSP:
   PR is checked out detached beside the repo and shown in the current tab's
   viewer, with no tab, tmux session or agent of its own. `diff_base` is no
   longer a tab column; `open` comes from ⌘⇧P with the tab's command ctx.
+
+## Level 11 (2026-11-11): the PR menu
+
+* The tab's agent lists its PRs in `.kitchen/tabs/<tab>/prs`
+  (`$KITCHEN_PRS_FILE`), next to its plan. A tab can hold several stacks, and
+  no git history says reliably which branches a tab made (a reused spare
+  brings its reflog along; `git branch` leaves no trace of the worktree).
+* `views` event + `kitchen.views{tab, entries}`: the core owns ⌘⇧S, the menu
+  (a picker in menu mode: sections, j/k, 1–9), the header button and the
+  viewer cache. Plugins only say what the rows are; GitHub knowledge stays in
+  the github plugin. The core reads the list and the checked-out branch in
+  one round trip and hands both over, so plugins don't need the tab dir.
+* Rows resolve to (worktree, base) in the engine (`shown_by`, shared with
+  `kitchen.view`), so the menu and the header know which row is on screen.
+* The app keeps one viewer per (tab, worktree, base) until the tab closes.
+  Every switch takes a number when it is picked, and the UI drops a
+  `ShowViewer` older than the last switch, so a slow first checkout can't
+  take the screen back. A cached row shows at once; its checkout is then
+  refreshed, and its viewers are rebuilt (same file and line) only if HEAD
+  moved.

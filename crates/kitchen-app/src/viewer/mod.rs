@@ -15,6 +15,7 @@ pub mod highlight;
 mod nav;
 pub mod picker;
 mod plugin_glue;
+mod view_menu;
 pub mod vim;
 
 use std::collections::{HashMap, HashSet};
@@ -27,7 +28,7 @@ use kitchen_core::host::Host;
 use kitchen_core::summaries;
 use kitchen_symbols::Symbol;
 
-use crate::engine::{Engine, Tab, Workspace};
+use crate::engine::{Engine, MenuRow, Shown, View};
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::theme;
 use crate::ui::widgets;
@@ -110,6 +111,9 @@ enum PickerKind {
     Defs(Vec<Loc>),
     /// Like `Defs`, with 1-based raw columns (from plugins / git grep).
     RawLocs(Vec<Loc>),
+    /// ⌘⇧S: the menu the rows came from (None: no plugin answered yet) and
+    /// each row's view, the worktree row included.
+    Views { menu: Option<Arc<Vec<MenuRow>>>, views: Vec<(View, Shown)> },
 }
 
 pub struct Viewer {
@@ -209,10 +213,14 @@ pub struct Viewer {
     asks: Vec<ask::Ask>,
     ask_seq: u64,
     answerer: ask::Answerer,
+    /// When ⌘⇧S last asked the plugins for the PR menu (until it changes).
+    asked: Option<std::time::Instant>,
 }
 
 impl Viewer {
-    pub fn new(engine: &Arc<Engine>, ws: &Workspace, tab: &Tab) -> Self {
+    /// A viewer of the tab's own worktree (the app goes through `at` and its cache).
+    #[cfg(test)]
+    pub fn new(engine: &Arc<Engine>, ws: &crate::engine::Workspace, tab: &crate::engine::Tab) -> Self {
         Self::at(engine, ws.host(), &tab.row.id, tab.row.worktree.clone(), tab.diff_base(ws))
     }
 
@@ -284,6 +292,7 @@ impl Viewer {
             asks: Vec::new(),
             ask_seq: 0,
             answerer: kitchen_core::ask::answer,
+            asked: None,
         };
         v.load_file_list(false);
         v
@@ -1064,6 +1073,7 @@ impl Viewer {
                     self.ensure_loaded(&p);
                 }
             }
+            PanelCmd::ViewMenu => self.open_view_menu(),
             PanelCmd::Open { path, line, diff } => {
                 if let Some(d) = diff {
                     self.diff = d;
@@ -1111,6 +1121,7 @@ impl Viewer {
         self.check_fresh();
         self.check_changes();
         self.refresh_overlay();
+        self.refresh_view_menu(ui.ctx());
         // The base may only become known after the file was opened.
         if let (true, Some(p)) = (self.diff, self.current.clone()) {
             self.ensure_base(&p);
@@ -1151,6 +1162,12 @@ impl Viewer {
             ui.add_space(theme::SPACE_S);
             if widgets::flat_button(ui, "File list", self.show_files).on_hover_text("Show / hide the file list  ⌘B").clicked_by(egui::PointerButton::Primary) {
                 self.show_files = !self.show_files;
+            }
+            // Which of the tab's PRs is on screen; a click switches.
+            if let Some(label) = self.shown_entry_label() {
+                if widgets::flat_button(ui, &label, false).on_hover_text("Switch PR  ⌘⇧S").clicked_by(egui::PointerButton::Primary) {
+                    self.open_view_menu();
+                }
             }
         });
         ui.painter().hline(header.x_range(), header.bottom() - 0.5, egui::Stroke::new(1.0, theme::BORDER));
@@ -1212,6 +1229,12 @@ impl Viewer {
                 }
                 Some((PickerKind::Defs(locs), _)) => self.record_and_go(locs[i].clone()),
                 Some((PickerKind::RawLocs(locs), _)) => self.record_and_go_raw(locs[i].clone()),
+                Some((PickerKind::Views { mut views, .. }, _)) => {
+                    let (view, at) = views.swap_remove(i);
+                    if at != self.shown() {
+                        cx.view = Some(view);
+                    }
+                }
                 None => {}
             },
         }
@@ -2177,7 +2200,7 @@ end)"#,
         let mut v = Viewer::new(&engine, &w, &w.tabs[0]);
         let frame = |v: &mut Viewer, events: Vec<egui::Event>| {
             let mut out = ctx.run_ui(egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), ..Default::default() }, |ui| {
-                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false };
+                let mut cx = PanelCtx { engine: &engine, focused: true, clicked: false, view: None };
                 v.ui(ui, &mut cx);
             });
             out.textures_delta.clear();

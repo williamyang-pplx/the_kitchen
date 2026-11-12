@@ -91,26 +91,30 @@ impl Harness {
         Viewer::new(&self.engine, &w, &w.tabs[0])
     }
 
-    pub fn frame_with(&self, v: &mut Viewer, events: Vec<egui::Event>) {
+    /// One frame with `events`; the view a PR menu pick handed the window, if any.
+    pub fn frame_with(&self, v: &mut Viewer, events: Vec<egui::Event>) -> Option<crate::engine::View> {
         let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), events, ..Default::default() };
+        let mut picked = None;
         let mut out = self.ctx.run_ui(input, |ui| {
-            let mut cx = PanelCtx { engine: &self.engine, focused: true, clicked: false };
+            let mut cx = PanelCtx { engine: &self.engine, focused: true, clicked: false, view: None };
             v.ui(ui, &mut cx);
+            picked = cx.view.take();
         });
         out.textures_delta.clear();
+        picked
     }
 
     pub fn frame(&self, v: &mut Viewer) {
-        self.frame_with(v, Vec::new());
+        let _ = self.frame_with(v, Vec::new());
     }
 
     pub fn text(&self, v: &mut Viewer, text: &str) {
-        self.frame_with(v, vec![egui::Event::Text(text.into())]);
+        let _ = self.frame_with(v, vec![egui::Event::Text(text.into())]);
     }
 
     pub fn key(&self, v: &mut Viewer, key: egui::Key) {
         let ev = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
-        self.frame_with(v, vec![ev]);
+        let _ = self.frame_with(v, vec![ev]);
     }
 
     /// Frames until `done` (background reads land between them).

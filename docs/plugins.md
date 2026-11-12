@@ -64,9 +64,9 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 10)
+## API (level 11)
 
-Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -254,6 +254,31 @@ A link (a URL or `owner/repo#N`) typed into ⌘⇧P goes to every plugin's
 return). Fetch and checkout run in one round trip on the workspace's host (a
 new worktree takes over a spare); the tab's viewer then shows that worktree,
 with `ctx.viewer.worktree` set to it. See `plugins/github/init.lua`.
+
+```lua
+kitchen.on("views", function(ev)   -- ⌘⇧S: the tab's command ctx, plus ev.prs (the lines
+                                    -- of its $KITCHEN_PRS_FILE) and ev.branch (checked out, or nil)
+  kitchen.views {
+    tab = ev.tab,
+    entries = {
+      { section = "main ← william/a", label = "#12 add retries", detail = "1/2",
+        view = { rev = "refs/kitchen/pr/12", name = "kitchen-pr-12", fetch = { … }, base = "origin/main" } },
+      { section = "main ← william/a", label = "#13 use them", detail = "2/2 · live",
+        view = { base = "origin/william/a" } },   -- no rev: the tab's own worktree
+    },
+  }
+end)
+```
+
+⌘⇧S opens the tab's PR menu and sends `views` to every listener. A
+listener answers with `kitchen.views`: the tab's whole menu, replacing the
+last one (an open menu updates in place). Each entry's `view` takes
+`kitchen.view`'s fields without `tab`. Rows with the same `section` go
+together under that header. The kitchen adds a last row for the tab's
+worktree against its diff base, unless an entry already shows exactly that.
+Picking a row shows it. A view the tab showed before comes back at once
+from the viewer cache, and its checkout is then refreshed (the viewer is
+rebuilt if HEAD moved).
 
 ### Comments
 

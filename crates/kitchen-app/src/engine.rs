@@ -95,6 +95,7 @@ fn tab_env(ws: &WorkspaceRow, tab: &TabRow, host: &Host) -> Vec<(String, String)
     ];
     env.extend(local_socket_env(host));
     env.push((kitchen_proto::ENV_PLAN_FILE.to_string(), tab.plan_file()));
+    env.push((kitchen_proto::ENV_PRS_FILE.to_string(), tab.prs_file()));
     env
 }
 
@@ -106,9 +107,12 @@ pub enum UiCommand {
     /// The tab's viewer shows plugin renderings (`kitchen.render.show`; `None` toggles).
     Render { tab_id: String, on: Option<bool> },
     ReloadPlan { tab_id: String },
-    /// Drop the tab's viewer (its worktree moved), or replace it with one on
-    /// `view` = (worktree, diff base) (`kitchen.view`).
-    ResetViewer { tab_id: String, view: Option<(String, String)> },
+    /// Show `view` in the tab's viewer (a cached viewer of it, or a new one),
+    /// unless the UI has since shown a view with a later `seq`.
+    ShowViewer { tab_id: String, view: Shown, seq: u64 },
+    /// `worktree` moved under the tab's viewers of it (shown or cached):
+    /// rebuild them at the same file and line.
+    ReloadViewer { tab_id: String, worktree: String },
     Screenshot { path: String, reply: std::sync::mpsc::Sender<Result<(), String>> },
     /// Feed input events to the window (`kitchenctl debug keys`).
     Keys(Vec<egui::Event>),
@@ -126,6 +130,8 @@ pub struct State {
     pub workspaces: Vec<Workspace>,
     pub selected: Option<String>,
     pub toasts: Vec<Toast>,
+    /// PR menus by tab id (`kitchen.views`); not persisted.
+    pub views: std::collections::HashMap<String, Arc<Vec<MenuRow>>>,
 }
 
 /// Options for a new tab (from ⌘T, plugins or `kitchenctl tab new`).
@@ -148,19 +154,57 @@ pub struct NewTab {
     pub focus: Option<bool>,
 }
 
+/// What a viewer shows: (worktree, diff base). Also the viewer cache key.
+pub type Shown = (String, String);
+
 /// What `kitchen.view` shows in a tab's viewer instead of the tab's worktree.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct View {
     pub tab: String,
-    /// Checked out detached in `<repo>-<name>`. None: the tab's own worktree again.
+    #[serde(flatten)]
+    pub at: ViewAt,
+}
+
+/// Where a view points: a rev checked out in `<repo>-<name>`, or (no rev) the
+/// tab's own worktree, and what it diffs against.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct ViewAt {
+    /// Checked out detached in `<repo>-<name>`. None: the tab's own worktree.
     pub rev: Option<String>,
     pub name: Option<String>,
     /// Refspecs fetched from origin first (same round trip as the checkout).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
     pub fetch: Vec<String>,
     /// What the viewer diffs against (default `origin/<default>`).
     pub base: Option<String>,
 }
+
+/// One row of a tab's PR menu (⌘⇧S), from `kitchen.views`.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ViewEntry {
+    /// Header the row sits under ("main ← william/a", "Reviewing").
+    #[serde(default)]
+    pub section: String,
+    /// e.g. "#123 add retries"
+    pub label: String,
+    /// Dimmed, e.g. "2/3 · william/a ← william/b · +40 −3 · live"
+    #[serde(default)]
+    pub detail: String,
+    pub view: ViewAt,
+}
+
+/// `kitchen.views{tab, entries}`: a tab's whole PR menu, replacing the last.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ViewSet {
+    pub tab: String,
+    #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
+    pub entries: Vec<ViewEntry>,
+}
+
+/// A menu row and the (worktree, base) it shows. A whole menu is one
+/// `Arc<Vec<MenuRow>>`: readers clone the Arc, and a new menu is told apart
+/// by `Arc::ptr_eq`.
+pub type MenuRow = (ViewEntry, Shown);
 
 /// Releases a key from [`Engine::opening`] when its checkout is done.
 struct OpeningGuard<'a> {
@@ -188,6 +232,9 @@ pub struct Engine {
     /// Tabs closed since launch, newest last: ⌘⇧T reopens them.
     closed: Mutex<Vec<TabRow>>,
     plugins: std::sync::OnceLock<Arc<crate::plugins::PluginHost>>,
+    /// Numbers each viewer switch, so the UI drops a `ShowViewer` that a later
+    /// switch overtook.
+    view_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -215,6 +262,7 @@ impl Engine {
             fresh_sessions: Mutex::new(Default::default()),
             opening: Mutex::new(Default::default()),
             closed: Mutex::new(Vec::new()),
+            view_seq: Default::default(),
             plugins: std::sync::OnceLock::new(),
         }))
     }
@@ -674,6 +722,8 @@ impl Engine {
         self.db().delete_workspace(id)?;
         let mut st = self.state();
         st.workspaces.retain(|w| w.row.id != id);
+        let State { workspaces, views, .. } = &mut *st;
+        views.retain(|tab, _| workspaces.iter().any(|w| w.tabs.iter().any(|t| &t.row.id == tab)));
         if st.selected.as_deref() == Some(id) {
             st.selected = st.workspaces.first().map(|w| w.row.id.clone());
         }
@@ -886,7 +936,7 @@ impl Engine {
         let (wt, moved) = Repo::new(&ws.host(), &ws.row.repo_path).checkout_worktree(&tab.row.worktree, to, fetch)?;
         self.refill_spare(&ws.row.id, false);
         if moved {
-            self.push_ui(UiCommand::ResetViewer { tab_id: tab.row.id.clone(), view: None });
+            self.push_ui(UiCommand::ReloadViewer { tab_id: tab.row.id.clone(), worktree: tab.row.worktree.clone() });
             self.toast(format!("{} updated to {}", tab.row.title, &wt.head[..wt.head.len().min(10)]));
         }
         if opts.focus.unwrap_or(true) {
@@ -895,31 +945,141 @@ impl Engine {
         Ok(tab.row.clone())
     }
 
-    /// Show `v` in its tab's viewer: `v.rev` checked out detached in the
+    /// The (worktree, base) `v` shows: `<repo>-<slug(name)>` for a rev, else
+    /// the tab's worktree; the base is `v.at.base` or the tab's diff base.
+    /// No I/O, so the UI uses it to look up its viewer cache. Every
+    /// `ShowViewer` carries this value (never git's spelling of the path), so
+    /// cache keys and menu rows match. None: no such tab, or a rev without a
+    /// name.
+    pub fn shown_by(&self, v: &View) -> Option<Shown> {
+        let (ws, tab) = self.find_tab(&v.tab)?;
+        let worktree = match &v.at.rev {
+            Some(_) => {
+                let name = v.at.name.as_deref().filter(|n| !n.is_empty())?;
+                Repo::new(&ws.host(), &ws.row.repo_path).sibling_path(&slugify(name, 60))
+            }
+            None => tab.row.worktree.clone(),
+        };
+        Some((worktree, v.at.base.clone().unwrap_or_else(|| tab.diff_base(&ws))))
+    }
+
+    /// A fresh number for a switch of a tab's viewer (later switches win).
+    pub fn next_view_seq(&self) -> u64 {
+        self.view_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// Show `v` in its tab's viewer: `v.at.rev` checked out detached in the
     /// sibling worktree `<repo>-<name>` (taking over a spare when new), or the
-    /// tab's own worktree. Blocking; call from a background thread.
-    pub fn view(self: &Arc<Self>, v: View) -> Result<()> {
-        let (ws, tab) = self.find_tab(&v.tab).context("no such tab")?;
-        let base = v.base.unwrap_or_else(|| tab.diff_base(&ws));
-        let Some(rev) = v.rev else {
-            self.push_ui(UiCommand::ResetViewer { tab_id: v.tab, view: Some((tab.row.worktree, base)) });
+    /// tab's own worktree. `seq` is the switch's number, taken by the UI when
+    /// the row was picked; plugin calls pass None and get one here. Blocking;
+    /// call from a background thread.
+    pub fn view(self: &Arc<Self>, v: View, seq: Option<u64>) -> Result<()> {
+        let seq = seq.unwrap_or_else(|| self.next_view_seq());
+        let (ws, _) = self.find_tab(&v.tab).context("no such tab")?;
+        let Some(rev) = v.at.rev.clone() else {
+            let shown = self.shown_by(&v).context("no such tab")?;
+            self.push_ui(UiCommand::ShowViewer { tab_id: v.tab, view: shown, seq });
             return Ok(());
         };
-        let Some(name) = v.name.filter(|n| !n.is_empty()) else { bail!("kitchen.view needs a name with a rev") };
-        let host = ws.host();
-        let repo = Repo::new(&host, &ws.row.repo_path);
-        let path = repo.sibling_path(&slugify(&name, 60));
+        let shown = self.shown_by(&v).context("kitchen.view needs a name with a rev")?;
+        self.checkout_view(&ws, &shown.0, &rev, &v.at.fetch)?;
+        self.push_ui(UiCommand::ShowViewer { tab_id: v.tab, view: shown, seq });
+        Ok(())
+    }
+
+    /// A view the UI already shows from its cache: fetch and check out its rev
+    /// again, and rebuild its viewers only if HEAD moved. No-op without a rev.
+    /// (A failure is toasted by `spawn`; the cached view stays up.)
+    pub fn refresh_view(self: &Arc<Self>, v: View) -> Result<()> {
+        let (Some(rev), Some((ws, _))) = (v.at.rev.clone(), self.find_tab(&v.tab)) else { return Ok(()) };
+        let Some((worktree, _)) = self.shown_by(&v) else { return Ok(()) };
+        if self.checkout_view(&ws, &worktree, &rev, &v.at.fetch)? {
+            self.push_ui(UiCommand::ReloadViewer { tab_id: v.tab, worktree });
+        }
+        Ok(())
+    }
+
+    /// Check `rev` out detached at `path` beside `ws`'s repo, after any other
+    /// checkout of that path finished. Whether HEAD moved.
+    fn checkout_view(self: &Arc<Self>, ws: &Workspace, path: &str, rev: &str, fetch: &[String]) -> Result<bool> {
         let key = format!("open:{}:{path}", ws.row.id);
-        if !self.opening.lock().unwrap().insert(key.clone()) {
-            bail!("{path} is already being opened");
+        // A refresh, or the same row picked twice: wait for it, then this
+        // checkout is quick and its caller still shows its own view.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !self.opening.lock().unwrap().insert(key.clone()) {
+            ensure!(std::time::Instant::now() < deadline, "{path} is still being opened");
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let _guard = OpeningGuard { engine: self, key };
-        let checked = repo.checkout_worktree(&path, Checkout::Detached(&rev), &v.fetch);
+        let host = ws.host();
+        let checked = Repo::new(&host, &ws.row.repo_path).checkout_worktree(path, Checkout::Detached(rev), fetch);
         // The checkout may have taken over a spare (even if it failed after).
         self.refill_spare(&ws.row.id, false);
-        let (wt, _) = checked?;
-        self.push_ui(UiCommand::ResetViewer { tab_id: v.tab, view: Some((wt.path, base)) });
+        Ok(checked?.1)
+    }
+
+    /// ⌘⇧S: on a background thread, read the tab's PR list and checked-out
+    /// branch, then emit `views` with the tab's command ctx plus `viewer` (the
+    /// viewer's context), `prs` and `branch`. Whether some plugin listens (the
+    /// menu then waits for an answer).
+    pub fn ask_views(self: &Arc<Self>, tab_id: &str, viewer: serde_json::Value) -> bool {
+        if !self.plugins().is_some_and(|p| !p.listeners("views").is_empty()) {
+            return false;
+        }
+        let tab_id = tab_id.to_string();
+        self.spawn("views", move |e| {
+            // An unreadable list still asks: the plugin's answer ends the wait.
+            let (prs, branch) = e.read_prs(&tab_id).unwrap_or_default();
+            let mut ev = crate::plugins::command_context(e, &tab_id, Some(viewer));
+            ev["prs"] = prs.into();
+            ev["branch"] = branch.into();
+            if let Some(p) = e.plugins() {
+                p.emit("views", ev);
+            }
+            Ok(())
+        });
+        true
+    }
+
+    /// The tab's PR list (its non-blank lines, trimmed; none without the
+    /// file) and the branch checked out in its worktree (None when detached),
+    /// in one round trip on its host. Blocking.
+    fn read_prs(&self, tab_id: &str) -> Result<(Vec<String>, Option<String>)> {
+        let (ws, tab) = self.find_tab(tab_id).context("no such tab")?;
+        let script = format!(
+            "cat {} 2>/dev/null; printf '\\036'; git -C {} symbolic-ref --short -q HEAD || true",
+            shell_quote(&tab.row.prs_file()),
+            shell_quote(&tab.row.worktree)
+        );
+        let out = ws.host().sh_ok(&script, None)?;
+        let (list, branch) = out.split_once('\u{1e}').unwrap_or((&out, ""));
+        let prs = list.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+        Ok((prs, Some(branch.trim().to_string()).filter(|b| !b.is_empty())))
+    }
+
+    /// Replace `set.tab`'s PR menu (`kitchen.views`), resolving what each row
+    /// shows. The tab is looked up again under the lock that stores the menu,
+    /// so a menu can't outlive its tab.
+    pub fn set_views(&self, set: ViewSet) -> Result<()> {
+        let rows: Vec<MenuRow> = set
+            .entries
+            .into_iter()
+            .filter_map(|e| {
+                let shown = self.shown_by(&View { tab: set.tab.clone(), at: e.view.clone() })?;
+                Some((e, shown))
+            })
+            .collect();
+        let mut st = self.state();
+        ensure!(st.workspaces.iter().any(|w| w.tabs.iter().any(|t| t.row.id == set.tab)), "no such tab: {}", set.tab);
+        st.views.insert(set.tab, Arc::new(rows));
+        drop(st);
+        self.repaint();
         Ok(())
+    }
+
+    /// The tab's PR menu, if a plugin has filled it.
+    pub fn views_of(&self, tab_id: &str) -> Option<Arc<Vec<MenuRow>>> {
+        self.state().views.get(tab_id).cloned()
     }
 
     pub fn select_tab(&self, tab_id: &str) {
@@ -1023,6 +1183,7 @@ impl Engine {
                 w.selected_tab = w.tabs.get(idx.min(w.tabs.len().saturating_sub(1))).map(|t| t.row.id.clone());
             }
         }
+        st.views.remove(tab_id);
         drop(st);
         self.repaint();
         Ok(())
@@ -1341,30 +1502,9 @@ fn local_socket_env(host: &Host) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
-    /// A view checks its rev out beside the repo (once) and points the tab's
-    /// viewer there; without a rev, back at the tab's own worktree.
-    #[test]
-    fn view_checks_out_a_rev_beside_the_repo() {
-        let repo = crate::test_util::TestRepo::new("echo 1 > a");
-        repo.sh("git checkout -qb pr && echo 2 > a && git commit -qam pr && git checkout -q main");
-        let (_ctx, engine) = crate::test_util::engine("local", &repo.path(), &["t"]);
-        let view = |rev: Option<&str>| View { tab: "t".into(), rev: rev.map(String::from), name: Some("kitchen-pr-7".into()), fetch: vec![], base: Some("main".into()) };
-        let shown = |e: &Engine| {
-            e.take_ui_commands().into_iter().find_map(|c| match c {
-                UiCommand::ResetViewer { tab_id, view } if tab_id == "t" => view,
-                _ => None,
-            })
-        };
-        engine.view(view(Some("pr"))).unwrap();
-        let (wt, base) = shown(&engine).unwrap();
-        assert!(wt.ends_with("-kitchen-pr-7") && base == "main", "{wt} {base}");
-        assert_eq!(std::fs::read_to_string(format!("{wt}/a")).unwrap(), "2\n");
-        engine.view(view(Some("pr"))).unwrap();
-        assert_eq!(shown(&engine).unwrap().0, wt, "the same worktree again");
-        engine.view(View { rev: None, name: None, base: None, ..view(None) }).unwrap();
-        assert_eq!(shown(&engine), Some((repo.path(), "origin/main".into())));
-        assert!(engine.view(View { name: None, ..view(Some("pr")) }).is_err(), "a rev needs a name");
-        // The siblings (the view's, and the spare its checkout refilled).
+    /// Removes the siblings a test's views created (the view's, and the spare
+    /// its checkout refilled) once the refill is done.
+    fn remove_siblings(engine: &Engine, repo: &crate::test_util::TestRepo) {
         while engine.opening.lock().unwrap().iter().any(|k| k.starts_with("spares:")) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -1374,6 +1514,100 @@ mod tests {
                 let _ = std::fs::remove_dir_all(d.path());
             }
         }
+    }
+
+    /// A view checks its rev out beside the repo (once) and points the tab's
+    /// viewer there, numbered so later switches win; without a rev, back at
+    /// the tab's own worktree. A refresh only reloads when HEAD moved.
+    #[test]
+    fn view_checks_out_a_rev_beside_the_repo() {
+        let repo = crate::test_util::TestRepo::new("echo 1 > a");
+        repo.sh("git checkout -qb pr && echo 2 > a && git commit -qam pr && git checkout -q main");
+        let (_ctx, engine) = crate::test_util::engine("local", &repo.path(), &["t"]);
+        let at = |rev: Option<&str>| ViewAt { rev: rev.map(String::from), name: Some("kitchen-pr-7".into()), fetch: vec![], base: Some("main".into()) };
+        let view = |rev: Option<&str>| View { tab: "t".into(), at: at(rev) };
+        let shown = |e: &Engine| -> Vec<(Shown, u64)> {
+            e.take_ui_commands()
+                .into_iter()
+                .filter_map(|c| match c {
+                    UiCommand::ShowViewer { tab_id, view, seq } if tab_id == "t" => Some((view, seq)),
+                    _ => None,
+                })
+                .collect()
+        };
+        engine.view(view(Some("pr")), None).unwrap();
+        let got = shown(&engine);
+        let ((wt, base), first) = got[0].clone();
+        assert_eq!(got.len(), 1);
+        assert!(wt.ends_with("-kitchen-pr-7") && base == "main", "{wt} {base}");
+        assert_eq!(Some((wt.clone(), base)), engine.shown_by(&view(Some("pr"))), "the cache key the UI computes");
+        assert_eq!(std::fs::read_to_string(format!("{wt}/a")).unwrap(), "2\n");
+        engine.view(view(Some("pr")), Some(first + 10)).unwrap();
+        assert_eq!(shown(&engine), vec![((wt.clone(), "main".into()), first + 10)], "the same worktree again, with the caller's number");
+        assert!(engine.next_view_seq() > first, "numbers only go up");
+
+        // A refresh of an unchanged rev pushes nothing; once it moved, a reload.
+        engine.refresh_view(view(Some("pr"))).unwrap();
+        assert!(engine.take_ui_commands().is_empty());
+        repo.sh("git checkout -q pr && echo 3 > a && git commit -qam pr2 && git checkout -q main");
+        engine.refresh_view(view(Some("pr"))).unwrap();
+        let cmds = engine.take_ui_commands();
+        assert!(matches!(&cmds[..], [UiCommand::ReloadViewer { tab_id, worktree }] if tab_id == "t" && *worktree == wt), "{cmds:?}");
+        engine.refresh_view(view(None)).unwrap();
+        assert!(engine.take_ui_commands().is_empty(), "nothing to refresh without a rev");
+
+        engine.view(View { tab: "t".into(), at: ViewAt::default() }, None).unwrap();
+        assert_eq!(shown(&engine)[0].0, (repo.path(), "origin/main".into()));
+        let nameless = View { tab: "t".into(), at: ViewAt { name: None, ..at(Some("pr")) } };
+        assert_eq!(engine.shown_by(&nameless), None);
+        assert!(engine.view(nameless, None).is_err(), "a rev needs a name");
+        remove_siblings(&engine, &repo);
+    }
+
+    /// `kitchen.views` rows resolve to what they show; a closed tab's menu goes.
+    #[test]
+    fn set_views_resolves_what_each_entry_shows() {
+        let (_ctx, engine) = crate::test_util::engine("local", "/r/repo", &["t", "u"]);
+        let set: ViewSet = serde_json::from_value(serde_json::json!({
+            "tab": "t",
+            "entries": [
+                { "section": "main ← a", "label": "#7 a", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "fetch": {}, "base": "origin/main" } },
+                { "section": "main ← a", "label": "#8 b", "detail": "live", "view": { "base": "origin/a" } },
+                { "label": "#9", "view": {} },
+            ],
+        }))
+        .unwrap();
+        assert!(set.entries[0].view.fetch.is_empty(), "an empty Lua table is an empty list");
+        engine.set_views(set).unwrap();
+        let menu = engine.views_of("t").unwrap();
+        let shows: Vec<Shown> = menu.iter().map(|(_, s)| s.clone()).collect();
+        assert_eq!(
+            shows,
+            vec![
+                ("/r/repo-kitchen-pr-7".into(), "origin/main".into()),
+                ("/r/repo".into(), "origin/a".into()),
+                ("/r/repo".into(), "origin/main".into()),
+            ]
+        );
+        let empty: ViewSet = serde_json::from_value(serde_json::json!({ "tab": "t", "entries": {} })).unwrap();
+        engine.set_views(empty).unwrap();
+        let again = engine.views_of("t").unwrap();
+        assert!(again.is_empty() && !Arc::ptr_eq(&menu, &again), "a new menu, told apart by its Arc");
+        assert!(engine.set_views(ViewSet { tab: "nope".into(), entries: vec![] }).is_err());
+        engine.close_tab("t").unwrap();
+        assert!(engine.views_of("t").is_none(), "the menu goes with its tab");
+    }
+
+    /// ⌘⇧S reads the tab's PR list and checked-out branch on its host.
+    #[test]
+    fn read_prs_reads_the_list_and_branch() {
+        let repo = crate::test_util::TestRepo::new("echo 1 > a");
+        let (_ctx, engine) = crate::test_util::engine("local", &repo.path(), &["t"]);
+        assert_eq!(engine.read_prs("t").unwrap(), (vec![], Some("main".into())), "no list yet");
+        repo.sh("mkdir -p .kitchen/tabs/t && printf '12\\n\\n  #13 \\n' > .kitchen/tabs/t/prs");
+        assert_eq!(engine.read_prs("t").unwrap(), (vec!["12".into(), "#13".into()], Some("main".into())));
+        repo.sh("git checkout -q --detach");
+        assert_eq!(engine.read_prs("t").unwrap().1, None, "detached: no branch, and no error");
     }
 
     #[test]

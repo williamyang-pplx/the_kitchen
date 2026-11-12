@@ -38,6 +38,8 @@ pub enum PanelCmd {
     /// Open a file (from `kitchenctl viewer open`), or browse a folder if
     /// `path` ends in `/`.
     Open { path: Option<String>, line: Option<usize>, diff: Option<bool> },
+    /// ⌘⇧S: open (or close) the viewer's PR menu.
+    ViewMenu,
 }
 
 pub struct PanelCtx<'a> {
@@ -46,4 +48,6 @@ pub struct PanelCtx<'a> {
     pub focused: bool,
     /// Set by the panel when the user clicked into it (moves focus there).
     pub clicked: bool,
+    /// Set by the viewer when a PR menu row is picked; the window shows it.
+    pub view: Option<crate::engine::View>,
 }

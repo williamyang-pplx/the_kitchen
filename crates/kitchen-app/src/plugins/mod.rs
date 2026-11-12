@@ -32,12 +32,13 @@ use keys::Chord;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 10;
+pub const API_LEVEL: u32 = 11;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
 /// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
-/// or hidden).
-pub const EMITTED: &[&str] = &["open", "comment", "dashboard"];
+/// or hidden), `views` (⌘⇧S wants the tab's PR menu: the tab's command ctx
+/// plus `prs`, the lines of its PR list, and `branch`, the one checked out).
+pub const EMITTED: &[&str] = &["open", "comment", "dashboard", "views"];
 /// File text above this is not handed to plugins (`ev.text()` returns nil).
 pub const MAX_TEXT: usize = 2 * 1024 * 1024;
 

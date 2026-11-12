@@ -18,6 +18,8 @@ pub const ENV_SOCKET: &str = "KITCHEN_SOCKET_PATH";
 pub const ENV_WORKSPACE: &str = "KITCHEN_WORKSPACE_ID";
 pub const ENV_TAB: &str = "KITCHEN_TAB_ID";
 pub const ENV_PLAN_FILE: &str = "KITCHEN_PLAN_FILE";
+/// The tab's list of its PRs, one per line (a number or a link); the ⌘⇧S menu shows them.
+pub const ENV_PRS_FILE: &str = "KITCHEN_PRS_FILE";
 /// Rev the tab's changes are measured against (diff with `git diff $(git merge-base HEAD $KITCHEN_DIFF_BASE)`).
 pub const ENV_DIFF_BASE: &str = "KITCHEN_DIFF_BASE";
 

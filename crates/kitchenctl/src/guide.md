@@ -13,7 +13,7 @@ kitchenctl --json identify     # same, as JSON
 ```
 
 Environment in every kitchen tab: `KITCHEN_WORKSPACE_ID`, `KITCHEN_TAB_ID`,
-`KITCHEN_PLAN_FILE`, `KITCHEN_DIFF_BASE`. Commands default to *your*
+`KITCHEN_PLAN_FILE`, `KITCHEN_PRS_FILE`, `KITCHEN_DIFF_BASE`. Commands default to *your*
 workspace and tab.
 
 ## Model
@@ -73,6 +73,14 @@ Every PR starts with a plan. When you were started with a task:
    `kitchenctl plan resolve <id>` for each comment you addressed, then
    `kitchenctl plan ready` again.
 4. Do not implement until William approves the plan.
+
+## Your PRs
+
+Keep `$KITCHEN_PRS_FILE` (`.kitchen/tabs/<tab id>/prs` in the worktree)
+listing every PR this tab opened, one per line: its number or its link. List a
+stack's PRs bottom first. Add a PR right after `gh pr create`, and drop it if
+it is closed without merging. William's ⌘⇧S menu in the viewer shows exactly
+these PRs, one section per stack.
 
 ## Plugins and viewer diagnostics
 

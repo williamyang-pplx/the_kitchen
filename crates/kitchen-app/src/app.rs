@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use egui::{Align, Color32, Key, Layout, Modifiers, RichText, Sense, Ui};
 
 use crate::attach;
-use crate::engine::{Engine, Tab, UiCommand, Workspace};
+use crate::engine::{Engine, Shown, Tab, UiCommand, View, Workspace};
+use crate::viewer::Viewer;
 use crate::keymap::{self, Action};
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::terminal::{TermSession, TerminalView};
@@ -55,7 +56,15 @@ pub struct KitchenApp {
     side_shown: HashSet<String>,
     /// The side panel per tab id; no entry = none opened yet.
     sides: HashMap<String, SideKind>,
-    viewers: HashMap<String, crate::viewer::Viewer>,
+    /// Every viewer a tab has shown, by (tab, (worktree, base)), kept until
+    /// the tab closes: showing one again (⌘⇧S) brings back its cursor,
+    /// folds and loaded files.
+    viewers: HashMap<(String, Shown), Viewer>,
+    /// What each tab's viewer shows now (absent: its worktree vs its diff base).
+    shown: HashMap<String, Shown>,
+    /// The latest switch per tab (`Engine::next_view_seq`): an older
+    /// `ShowViewer` is dropped, so a slow checkout can't take the screen back.
+    view_seqs: HashMap<String, u64>,
     plans: HashMap<String, crate::plan_view::PlanView>,
     dialog: Option<Dialog>,
     screenshots: Vec<(String, Sender<Result<(), String>>)>,
@@ -100,6 +109,8 @@ impl KitchenApp {
             side_shown: HashSet::new(),
             sides: HashMap::new(),
             viewers: HashMap::new(),
+            shown: HashMap::new(),
+            view_seqs: HashMap::new(),
             plans: HashMap::new(),
             dialog: None,
             shortcuts: false,
@@ -198,16 +209,16 @@ impl KitchenApp {
                     self.open_side_for(&tab_id, SideKind::Plan);
                     self.panel_command_for(&tab_id, SideKind::Plan, PanelCmd::Reload);
                 }
-                UiCommand::ResetViewer { tab_id, view: None } => {
-                    self.viewers.remove(&tab_id);
+                UiCommand::ShowViewer { tab_id, view, seq } => {
+                    if self.view_seqs.get(&tab_id).is_some_and(|&last| seq < last) {
+                        continue; // a later switch won
+                    }
+                    self.view_seqs.insert(tab_id.clone(), seq);
+                    self.show_viewer(&tab_id, view);
                 }
-                UiCommand::ResetViewer { tab_id, view: Some((worktree, base)) } => {
-                    let Some((ws, _)) = self.engine.find_tab(&tab_id) else { continue };
-                    self.viewers.insert(tab_id.clone(), crate::viewer::Viewer::at(&self.engine, ws.host(), &tab_id, worktree, base));
-                    self.open_side_for(&tab_id, SideKind::Viewer);
-                }
+                UiCommand::ReloadViewer { tab_id, worktree } => self.reload_viewers(&tab_id, &worktree),
                 UiCommand::Render { tab_id, on } => {
-                    if let Some(v) = self.viewers.get_mut(&tab_id) {
+                    if let Some(v) = self.viewer_key(&tab_id).and_then(|k| self.viewers.get_mut(&k)) {
                         v.command(PanelCmd::Render(on), &self.engine);
                     }
                 }
@@ -231,11 +242,7 @@ impl KitchenApp {
     fn panel_command_for(&mut self, tab_id: &str, kind: SideKind, cmd: PanelCmd) {
         let Some((ws, tab)) = self.engine.find_tab(tab_id) else { return };
         match kind {
-            SideKind::Viewer => self
-                .viewers
-                .entry(tab_id.to_string())
-                .or_insert_with(|| crate::viewer::Viewer::new(&self.engine, &ws, &tab))
-                .command(cmd, &self.engine),
+            SideKind::Viewer => tab_viewer(&mut self.viewers, &self.shown, &self.engine, &ws, &tab).command(cmd, &self.engine),
             SideKind::Plan => self
                 .plans
                 .entry(tab_id.to_string())
@@ -261,6 +268,14 @@ impl KitchenApp {
             Action::NextFile => self.side_command(PanelCmd::NextFile),
             Action::PrevFile => self.side_command(PanelCmd::PrevFile),
             Action::Palette => self.open_palette(),
+            // From the terminal too: the viewer opens with the menu up.
+            Action::ViewMenu => {
+                if !self.viewer_focused() {
+                    self.set_side(SideKind::Viewer);
+                    self.set_focus(Focus::Side);
+                }
+                self.side_command(PanelCmd::ViewMenu);
+            }
             Action::Shortcuts => self.shortcuts = !self.shortcuts,
             Action::Plugin(_) => {} // resolved in `ui` against the registry snapshot
             Action::PrevTab => {
@@ -437,6 +452,63 @@ impl KitchenApp {
         }
     }
 
+    /// The cache key of the viewer `tab_id` shows: `shown[tab]`, else its
+    /// worktree vs its diff base. Creates nothing.
+    fn viewer_key(&self, tab_id: &str) -> Option<(String, Shown)> {
+        let shown = match self.shown.get(tab_id) {
+            Some(s) => s.clone(),
+            None => {
+                let (ws, tab) = self.engine.find_tab(tab_id)?;
+                (tab.row.worktree.clone(), tab.diff_base(&ws))
+            }
+        };
+        Some((tab_id.to_string(), shown))
+    }
+
+    /// Point `tab_id`'s viewer at `view` (a cached viewer of it, or a new
+    /// one) and open the tab's viewer side.
+    fn show_viewer(&mut self, tab_id: &str, view: Shown) {
+        let Some((ws, _)) = self.engine.find_tab(tab_id) else { return };
+        let engine = &self.engine;
+        self.viewers
+            .entry((tab_id.to_string(), view.clone()))
+            .or_insert_with(|| Viewer::at(engine, ws.host(), tab_id, view.0.clone(), view.1.clone()));
+        self.shown.insert(tab_id.to_string(), view);
+        self.open_side_for(tab_id, SideKind::Viewer);
+    }
+
+    /// A row picked in the PR menu. A cached view shows now and its checkout
+    /// is refreshed behind it; any other is checked out first, as
+    /// `kitchen.view` does. Either way this switch's number is taken now, so
+    /// an older switch still checking out can't take the screen back.
+    fn choose_view(&mut self, v: View) {
+        let Some(shown) = self.engine.shown_by(&v) else { return };
+        let seq = self.engine.next_view_seq();
+        self.view_seqs.insert(v.tab.clone(), seq);
+        if self.viewers.contains_key(&(v.tab.clone(), shown.clone())) {
+            self.show_viewer(&v.tab.clone(), shown);
+            self.engine.spawn("refresh view", move |e| e.refresh_view(v));
+        } else {
+            self.engine.spawn("view", move |e| e.view(v, Some(seq)));
+        }
+    }
+
+    /// `worktree` moved: rebuild `tab_id`'s viewers of it (shown or cached),
+    /// each with its base, reopened at its file and line.
+    fn reload_viewers(&mut self, tab_id: &str, worktree: &str) {
+        let Some((ws, _)) = self.engine.find_tab(tab_id) else { return };
+        let keys: Vec<(String, Shown)> = self.viewers.keys().filter(|(t, (w, _))| t == tab_id && w == worktree).cloned().collect();
+        for key in keys {
+            let Some(old) = self.viewers.remove(&key) else { continue };
+            let (path, line, diff) = old.location();
+            let mut v = Viewer::at(&self.engine, ws.host(), tab_id, key.1.0.clone(), key.1.1.clone());
+            if path.is_some() {
+                v.command(PanelCmd::Open { path, line, diff: Some(diff) }, &self.engine);
+            }
+            self.viewers.insert(key, v);
+        }
+    }
+
     /// Open `kind` on `tab_id`; it takes the keyboard only if that tab is
     /// the selected one.
     fn open_side_for(&mut self, tab_id: &str, kind: SideKind) {
@@ -455,7 +527,7 @@ impl KitchenApp {
             return (Some(reg), Vec::new());
         }
         let here = self.plugin_context();
-        let ft = if here == When::Viewer { self.selected_tab_id().and_then(|t| self.viewers.get(&t)).and_then(|v| v.current_filetype()) } else { None };
+        let ft = if here == When::Viewer { self.selected_tab_id().and_then(|t| self.viewer_key(&t)).and_then(|k| self.viewers.get(&k)).and_then(|v| v.current_filetype()) } else { None };
         let mut chords: Vec<(usize, crate::plugins::keys::Chord, bool)> = reg
             .chords
             .iter()
@@ -470,7 +542,7 @@ impl KitchenApp {
     fn run_plugin_command(&mut self, command: &str) {
         let Some(p) = self.engine.plugins().cloned() else { return };
         let tab = self.selected_tab_id().unwrap_or_default();
-        let viewer = self.viewers.get(&tab).map(|v| v.context());
+        let viewer = self.viewer_key(&tab).and_then(|k| self.viewers.get(&k)).map(|v| v.context());
         let ctx = crate::plugins::command_context(&self.engine, &tab, viewer);
         if let Err(e) = p.invoke(command, ctx, false) {
             self.engine.toast_err(format!("{e:#}"));
@@ -926,13 +998,9 @@ impl KitchenApp {
     fn side_area(&mut self, ui: &mut Ui, ws: &Workspace, tab: Option<&Tab>) {
         let focused = self.focus() == Focus::Side && self.dialog.is_none() && self.palette.is_none();
         let kind = self.side().unwrap_or(SideKind::Viewer);
-        let mut cx = PanelCtx { engine: &self.engine, focused, clicked: false };
+        let mut cx = PanelCtx { engine: &self.engine, focused, clicked: false, view: None };
         match (kind, tab) {
-            (SideKind::Viewer, Some(tab)) => self
-                .viewers
-                .entry(tab.row.id.clone())
-                .or_insert_with(|| crate::viewer::Viewer::new(&self.engine, ws, tab))
-                .ui(ui, &mut cx),
+            (SideKind::Viewer, Some(tab)) => tab_viewer(&mut self.viewers, &self.shown, &self.engine, ws, tab).ui(ui, &mut cx),
             (SideKind::Plan, Some(tab)) => self
                 .plans
                 .entry(tab.row.id.clone())
@@ -940,8 +1008,12 @@ impl KitchenApp {
                 .ui(ui, &mut cx),
             (_, None) => centered_note(ui, "open a tab first (⌘T or ⌘I)", theme::SUBTLE),
         }
-        if cx.clicked {
+        let (clicked, picked) = (cx.clicked, cx.view.take());
+        if clicked {
             self.set_focus(Focus::Side);
+        }
+        if let Some(v) = picked {
+            self.choose_view(v);
         }
     }
 
@@ -977,7 +1049,9 @@ impl KitchenApp {
         let live: std::collections::HashSet<String> =
             self.engine.workspaces().iter().flat_map(|w| w.tabs.iter().map(|t| t.row.id.clone())).collect();
         self.slots.retain(|id, _| live.contains(id));
-        self.viewers.retain(|id, _| live.contains(id));
+        self.viewers.retain(|(id, _), _| live.contains(id));
+        self.shown.retain(|id, _| live.contains(id));
+        self.view_seqs.retain(|id, _| live.contains(id));
         self.plans.retain(|id, _| live.contains(id));
         self.sides.retain(|id, _| live.contains(id));
         self.side_shown.retain(|id| live.contains(id));
@@ -1199,6 +1273,7 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("⌘B", "show / hide the file list"),
                 ("⌘⇧H  ⌘⇧L", "file list ↔ code"),
                 ("⌘⇧J  ⌘⇧K", "next / previous changed file"),
+                ("⌘⇧S", "switch between the tab's PRs"),
                 ("⌘⇧A", "ask about the line or selection"),
                 ("⌘O", "outline"),
                 ("]c  [c", "next / previous change"),
@@ -1236,6 +1311,14 @@ fn write_png(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
 
 #[allow(dead_code)]
 fn _assert_modifiers(_: Modifiers) {}
+
+/// The viewer `tab` shows, created on its worktree and diff base if none. A
+/// free function over just the fields it needs, so a caller can keep
+/// `&self.engine` borrowed for a `PanelCtx`.
+fn tab_viewer<'a>(viewers: &'a mut HashMap<(String, Shown), Viewer>, shown: &HashMap<String, Shown>, engine: &Arc<Engine>, ws: &Workspace, tab: &Tab) -> &'a mut Viewer {
+    let key = shown.get(&tab.row.id).cloned().unwrap_or_else(|| (tab.row.worktree.clone(), tab.diff_base(ws)));
+    viewers.entry((tab.row.id.clone(), key.clone())).or_insert_with(|| Viewer::at(engine, ws.host(), &tab.row.id, key.0, key.1))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1392,5 +1475,63 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(got, want);
+    }
+
+    /// The viewer cache: a cached view comes back as it was, a switch
+    /// overtaken by a later one is dropped, a moved worktree rebuilds its
+    /// viewers with their bases, and ⌘⇧S from the terminal opens the menu.
+    #[test]
+    fn viewer_cache_switches_back_and_drops_late_views() {
+        let repo = TestRepo::new("echo 1 > a");
+        let (ctx, engine) = test_util::engine("local", &repo.path(), &["t"]);
+        let mut app = KitchenApp::new(engine.clone());
+        let wt = repo.path();
+        let (a, b): (Shown, Shown) = ((wt.clone(), "origin/a".into()), (wt.clone(), "origin/b".into()));
+        let rev_less = |base: &str| View { tab: "t".into(), at: crate::engine::ViewAt { base: Some(base.into()), ..Default::default() } };
+        let opened = |app: &KitchenApp, key: &Shown| app.viewers.get(&("t".to_string(), key.clone())).and_then(|v| v.location().0);
+
+        // Numbers come from the engine, as the UI's and the engine's switches do.
+        let (s1, s2) = (engine.next_view_seq(), engine.next_view_seq());
+        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: a.clone(), seq: s1 });
+        app.handle_ui_commands(&ctx);
+        app.panel_command_for("t", SideKind::Viewer, PanelCmd::Open { path: Some("a".into()), line: Some(1), diff: Some(false) });
+        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: b.clone(), seq: s2 });
+        app.handle_ui_commands(&ctx);
+        assert_eq!(app.shown.get("t"), Some(&b));
+
+        // Back to a, from the cache: the same viewer, its file still open.
+        app.choose_view(rev_less("origin/a"));
+        assert_eq!(app.shown.get("t"), Some(&a));
+        assert_eq!(opened(&app, &a).as_deref(), Some("a"));
+        // b's switch was overtaken.
+        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: b.clone(), seq: s2 });
+        app.handle_ui_commands(&ctx);
+        assert_eq!(app.shown.get("t"), Some(&a), "a late ShowViewer is dropped");
+
+        // An uncached row: numbered at the pick, shown when the engine answers.
+        app.choose_view(rev_less("origin/c"));
+        let c: Shown = (wt.clone(), "origin/c".into());
+        for _ in 0..200 {
+            app.handle_ui_commands(&ctx);
+            if app.shown.get("t") == Some(&c) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.shown.get("t"), Some(&c));
+
+        // The worktree moved: its viewers are rebuilt, each with its base and file.
+        app.reload_viewers("t", &wt);
+        assert_eq!(opened(&app, &a).as_deref(), Some("a"), "rebuilt at its file");
+        assert!(app.viewers.contains_key(&("t".to_string(), a.clone())), "with its base");
+        assert_eq!(app.viewer_key("t"), Some(("t".to_string(), c.clone())));
+        app.shown.clear();
+        assert_eq!(app.viewer_key("t"), Some(("t".to_string(), (wt.clone(), "origin/main".into()))), "default: worktree vs diff base");
+
+        // ⌘⇧S from the terminal: the viewer, with the menu up.
+        app.set_focus(Focus::Terminal);
+        app.run_action(Action::ViewMenu);
+        assert_eq!(app.focus(), Focus::Side);
+        assert!(app.viewer_key("t").and_then(|k| app.viewers.get(&k)).is_some_and(|v| v.menu_open()));
     }
 }

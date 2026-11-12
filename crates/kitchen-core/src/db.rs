@@ -129,6 +129,11 @@ impl TabRow {
     pub fn plan_file(&self) -> String {
         crate::plan::plan_file_for(&self.worktree, &self.id)
     }
+
+    /// Where the tab's agent lists its PRs.
+    pub fn prs_file(&self) -> String {
+        crate::plan::prs_file_for(&self.worktree, &self.id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

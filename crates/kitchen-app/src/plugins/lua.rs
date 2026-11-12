@@ -699,8 +699,20 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
             let v: crate::engine::View =
                 serde_json::from_value(to_json(lua, Value::Table(spec))?).map_err(|e| mlua::Error::runtime(format!("kitchen.view: {e}")))?;
             let Some(e) = c.host.engine() else { return Ok(()) };
-            e.spawn("view", move |e| e.view(v));
+            e.spawn("view", move |e| e.view(v, None));
             Ok(())
+        })?,
+    )?;
+
+    // PR menus: the rows ⌘⇧S lists for a tab (see docs/plugins.md "Views").
+    let c = cx.clone();
+    k.set(
+        "views",
+        lua.create_function(move |lua, spec: Table| {
+            let set: crate::engine::ViewSet =
+                serde_json::from_value(to_json(lua, Value::Table(spec))?).map_err(|e| mlua::Error::runtime(format!("kitchen.views: {e}")))?;
+            let Some(e) = c.host.engine() else { return Ok(()) };
+            e.set_views(set).map_err(|e| mlua::Error::runtime(format!("kitchen.views: {e:#}")))
         })?,
     )?;
 

@@ -23,6 +23,11 @@ pub fn plan_file_for(worktree: &str, tab_id: &str) -> String {
     format!("{}/{}/plan.md", worktree.trim_end_matches('/'), tab_dir(tab_id))
 }
 
+/// Where the tab's agent lists the PRs it opened (`$KITCHEN_PRS_FILE`).
+pub fn prs_file_for(worktree: &str, tab_id: &str) -> String {
+    format!("{}/{}/prs", worktree.trim_end_matches('/'), tab_dir(tab_id))
+}
+
 /// Claude Code's plan mode writes the tab's plans here when kitchen launches
 /// it with this as `plansDirectory` (relative to the worktree, which it must
 /// be inside).
