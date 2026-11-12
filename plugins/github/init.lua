@@ -4,7 +4,8 @@
 -- review comments under their lines; ⌘M … ⌘Enter posts a comment (or a
 -- reply, on a line that has one) to the PR. Each PR viewed gets a ⌘⇧P entry
 -- (github.pr_<N>) to show it again; github.own_changes shows the tab's own
--- worktree again.
+-- worktree again. ⌘⇧S lists the PRs in the tab's $KITCHEN_PRS_FILE, one
+-- section per stack, then the PRs opened in the tab with ⌘⇧P.
 
 local M = {}
 
@@ -17,6 +18,9 @@ local JQ = ".[] | {id, in_reply_to_id, path, line, original_line, start_line, si
 -- The PRs whose worktrees the viewer has shown, by "<host>:<worktree path>"
 -- (a repo can be a workspace both here and on a devbox).
 local prs = {} -- key → { slug, n, threads, at, files = {path → file}, drafts = {path → items} }
+
+-- PRs opened with ⌘⇧P, by tab id: { [tab] = { n, … } } (in memory; a reload forgets them).
+local viewed = {}
 
 -- "https://github.com/o/r/pull/12/changes", "github.com/o/r/pull/12", "o/r#12"
 function M.parse(text)
@@ -90,6 +94,10 @@ local open
 -- Show PR `slug#n` in tab `tab` of workspace `ws`, and add it to ⌘⇧P.
 local function show(ws, tab, slug, n)
   kitchen.notify("opening " .. slug .. "#" .. n .. "…")
+  viewed[tab] = viewed[tab] or {}
+  if not M.contains(viewed[tab], n) then
+    table.insert(viewed[tab], n)
+  end
   gh({ "pr", "view", tostring(n), "-R", slug, "--json", "title,baseRefName,state,mergeCommit" }, function(res)
     local ok, info = pcall(kitchen.json.decode, res.code == 0 and res.stdout or "")
     if not (ok and type(info) == "table") then
@@ -123,6 +131,183 @@ function open(ev)
   end
 end
 kitchen.on("open", open)
+
+-- The PR menu (⌘⇧S) ----------------------------------------------------
+
+function M.contains(list, x)
+  for _, y in ipairs(list) do
+    if y == x then
+      return true
+    end
+  end
+  return false
+end
+
+-- PR numbers in `lines` (the tab's PR list) that belong to `slug`: "123",
+-- "#123", a PR link or "o/r#123". Others are skipped; first occurrence wins.
+function M.list(lines, slug)
+  local out = {}
+  for _, line in ipairs(lines or {}) do
+    local n = tonumber(line:match("^%s*#?(%d+)%s*$"))
+    if not n then
+      local s, m = M.parse(line)
+      n = s and s:lower() == slug:lower() and m or nil
+    end
+    if n and not M.contains(out, n) then
+      table.insert(out, n)
+    end
+  end
+  return out
+end
+
+local FIELDS = "number title state headRefName baseRefName additions deletions mergeCommit { oid }"
+
+-- One GraphQL query for PRs `ns` of `slug`, each aliased p<N>.
+function M.query(slug, ns)
+  local owner, name = slug:match("^([^/]+)/(.+)$")
+  local parts = {}
+  for _, n in ipairs(ns) do
+    table.insert(parts, ("p%d: pullRequest(number: %d) { %s }"):format(n, n, FIELDS))
+  end
+  return ('query { repository(owner: "%s", name: "%s") { %s } }'):format(owner, name, table.concat(parts, " "))
+end
+
+-- One menu row for PR `p` (a GraphQL node) under `section`. The open PR whose
+-- head is `branch` (checked out in the tab's worktree) is live: that worktree
+-- against its parent; every other PR is M.view's kitchen-pr-<N> checkout, so
+-- its review comments and ⌘M work there.
+local function row(tab, p, section, place, branch, dflt)
+  local live = p.state == "OPEN" and p.headRefName == branch
+  local detail = { p.baseRefName .. " ← " .. p.headRefName, ("+%d −%d"):format(p.additions or 0, p.deletions or 0) }
+  if place then
+    table.insert(detail, 1, place)
+  end
+  if live then
+    table.insert(detail, "live")
+  elseif p.state ~= "OPEN" then
+    table.insert(detail, p.state:lower())
+  end
+  local view = live and { base = "origin/" .. p.baseRefName } or M.view(tab, p.number, p, dflt)
+  view.tab = nil
+  return { section = section, label = "#" .. p.number .. " " .. (p.title or ""), detail = table.concat(detail, " · "), view = view }
+end
+
+-- Menu entries: the stacks among `listed` (GraphQL nodes, in list order),
+-- then `reviewing`. A stack is the PRs linked base → head, bottom first,
+-- children in list order, under "<bottom base> ← <bottom head>"; stacks come
+-- in the order of their first PR in the list. A cycle is cut where the walk
+-- meets a PR it placed.
+function M.entries(tab, listed, reviewing, branch, dflt)
+  local heads, children, order = {}, {}, {}
+  for i, p in ipairs(listed) do
+    heads[p.headRefName] = true
+    children[p.baseRefName] = children[p.baseRefName] or {}
+    table.insert(children[p.baseRefName], p)
+    order[p.number] = i
+  end
+  local placed, stacks = {}, {}
+  local function walk(root)
+    local stack = {}
+    local function go(p)
+      if placed[p.number] then
+        return
+      end
+      placed[p.number] = true
+      table.insert(stack, p)
+      for _, c in ipairs(children[p.headRefName] or {}) do
+        go(c)
+      end
+    end
+    go(root)
+    table.insert(stacks, stack)
+  end
+  for _, p in ipairs(listed) do
+    if not heads[p.baseRefName] then
+      walk(p)
+    end
+  end
+  for _, p in ipairs(listed) do
+    if not placed[p.number] then
+      walk(p) -- a cycle: no PR of it is a root
+    end
+  end
+  local function first(stack)
+    local min = math.huge
+    for _, p in ipairs(stack) do
+      min = math.min(min, order[p.number])
+    end
+    return min
+  end
+  table.sort(stacks, function(a, b)
+    return first(a) < first(b)
+  end)
+  local out = {}
+  for _, stack in ipairs(stacks) do
+    local section = stack[1].baseRefName .. " ← " .. stack[1].headRefName
+    for i, p in ipairs(stack) do
+      table.insert(out, row(tab, p, section, i .. "/" .. #stack, branch, dflt))
+    end
+  end
+  for _, p in ipairs(reviewing) do
+    table.insert(out, row(tab, p, "Reviewing", nil, nil, dflt))
+  end
+  return out
+end
+
+-- ⌘⇧S: the tab's PR list, plus its ⌘⇧P PRs, into kitchen.views. Every path
+-- ends in kitchen.views, so the menu stops saying "loading PRs…".
+local function menu(ev)
+  local function done(entries)
+    kitchen.views({ tab = ev.tab, entries = entries })
+  end
+  local ws
+  for _, w in ipairs(kitchen.workspaces()) do
+    if w.id == ev.workspace then
+      ws = w
+    end
+  end
+  if not (ws and ws.github_slug) then
+    return done({})
+  end
+  local slug = ws.github_slug
+  local ns = M.list(ev.prs, slug)
+  local rv = {}
+  for _, n in ipairs(viewed[ev.tab] or {}) do
+    if not M.contains(ns, n) then
+      table.insert(rv, n)
+    end
+  end
+  local all = {}
+  for _, list in ipairs({ ns, rv }) do
+    for _, n in ipairs(list) do
+      table.insert(all, n)
+    end
+  end
+  if #all == 0 then
+    return done({})
+  end
+  gh({ "api", "graphql", "-f", "query=" .. M.query(slug, all) }, function(res)
+    -- gh exits 1 when one alias fails (a wrong number) but still prints the rest.
+    local ok, body = pcall(kitchen.json.decode, res.stdout or "")
+    local repo = ok and type(body) == "table" and type(body.data) == "table" and body.data.repository
+    if type(repo) ~= "table" then
+      kitchen.notify("couldn't read the tab's PRs: " .. why(res), "warn")
+      return done({})
+    end
+    local function nodes(list)
+      local out = {}
+      for _, n in ipairs(list) do
+        local p = repo["p" .. n]
+        if type(p) == "table" then
+          table.insert(out, p)
+        end
+      end
+      return out
+    end
+    done(M.entries(ev.tab, nodes(ns), nodes(rv), ev.branch, ws.default_branch or "main"))
+  end)
+end
+kitchen.on("views", menu)
 
 -- Review comments ---------------------------------------------------------
 

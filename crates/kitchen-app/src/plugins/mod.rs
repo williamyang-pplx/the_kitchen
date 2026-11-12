@@ -1005,6 +1005,46 @@ mod tests {
         assert_eq!(file_level[11], "body=**L12**: `x = 1`\n\nhm");
     }
 
+    /// github ⌘⇧S: the tab's PR list parsed, one GraphQL query, and the
+    /// stacks among the PRs as menu sections (the checked-out one live).
+    #[test]
+    fn github_plugin_menu() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        lua.load("kitchen = { on = function() end, command = function() end, config = {}, json = {} }").exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
+        let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
+        let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
+        let val = |j: serde_json::Value| lua.to_value(&j).unwrap();
+
+        let lines = val(serde_json::json!(["12", " #13 ", "https://github.com/O/r/pull/14/files", "x/y#15", "junk", "12", "o/r#16"]));
+        assert_eq!(to_json(m.get::<mlua::Function>("list").unwrap().call((lines, "o/r")).unwrap()), serde_json::json!([12, 13, 14, 16]));
+        let q: String = m.get::<mlua::Function>("query").unwrap().call(("o/r", val(serde_json::json!([12, 13])))).unwrap();
+        assert!(q.starts_with(r#"query { repository(owner: "o", name: "r") { p12: pullRequest(number: 12) {"#) && q.contains("p13: pullRequest(number: 13)"), "{q}");
+
+        let pr = |n: u64, base: &str, head: &str, state: &str| serde_json::json!({ "number": n, "title": format!("t{n}"), "state": state, "baseRefName": base, "headRefName": head, "additions": 1, "deletions": 0 });
+        // Two stacks (main ← a ← b, and main ← c), listed out of order; a cycle; a reviewed PR.
+        let listed = val(serde_json::json!([pr(2, "a", "b", "OPEN"), pr(3, "main", "c", "OPEN"), pr(1, "main", "a", "OPEN"), pr(5, "y", "x", "OPEN"), pr(6, "x", "y", "OPEN")]));
+        let reviewing = val(serde_json::json!([pr(9, "main", "bo/fix", "MERGED")]));
+        let e = to_json(m.get::<mlua::Function>("entries").unwrap().call(("t1", listed, reviewing, "b", "main")).unwrap());
+        let rows: Vec<(&str, &str, &str)> = e.as_array().unwrap().iter().map(|r| (r["section"].as_str().unwrap(), r["label"].as_str().unwrap(), r["detail"].as_str().unwrap())).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("main ← a", "#1 t1", "1/2 · main ← a · +1 −0"),
+                ("main ← a", "#2 t2", "2/2 · a ← b · +1 −0 · live"),
+                ("main ← c", "#3 t3", "1/1 · main ← c · +1 −0"),
+                ("y ← x", "#5 t5", "1/2 · y ← x · +1 −0"),
+                ("y ← x", "#6 t6", "2/2 · x ← y · +1 −0"),
+                ("Reviewing", "#9 t9", "main ← bo/fix · +1 −0 · merged"),
+            ]
+        );
+        // The live row is the tab's worktree against its parent; the others are checkouts.
+        assert_eq!(e[1]["view"], serde_json::json!({ "base": "origin/a" }));
+        assert_eq!((e[0]["view"]["name"].as_str(), e[0]["view"]["base"].as_str(), e[0]["view"].get("tab")), (Some("kitchen-pr-1"), Some("origin/main"), None));
+        assert_eq!(e[5]["view"]["name"], "kitchen-pr-9");
+    }
+
     fn prune_module(lua: &mlua::Lua) -> mlua::Table {
         lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/prune-worktrees/init.lua");
