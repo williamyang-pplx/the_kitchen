@@ -32,7 +32,7 @@ use keys::Chord;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 11;
+pub const API_LEVEL: u32 = 12;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
 /// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
@@ -991,13 +991,15 @@ mod tests {
             ]))
             .unwrap();
         let threads: mlua::Value = m.get::<mlua::Function>("threads").unwrap().call(list).unwrap();
-        let items = to_json(m.get::<mlua::Function>("items").unwrap().call((threads, "a.py")).unwrap());
+        let items = to_json(m.get::<mlua::Function>("items").unwrap().call((threads, "a.py", "o/r")).unwrap());
         assert_eq!(items.as_array().unwrap().len(), 2, "the reply joins its thread; b.py is elsewhere");
         assert_eq!(items[0]["id"], "1");
         assert_eq!(items[0]["line"], 40);
         assert_eq!(items[0]["side"], "new");
         assert_eq!(items[0]["title"], "@al · L40 · 2026-10-01 · 1 reply");
-        assert_eq!(items[0]["body"], "use a set\n\n↳ @bo: agreed");
+        assert_eq!(items[0]["body"], "use a set");
+        assert_eq!(items[0]["replies"], serde_json::json!([{ "title": "@bo · 2026-10-02", "body": "agreed" }]), "each reply under its own header");
+        assert_eq!(items[0]["repo"], "o/r");
         assert_eq!((items[1]["line"].clone(), items[1]["dim"].clone()), (serde_json::Value::Null, serde_json::json!(true)), "outdated: file level, faded");
         let post: mlua::Function = m.get("post_args").unwrap();
         let ev = lua.to_value(&serde_json::json!({ "path": "a.py", "line": 12, "side": "old", "start_line": 10, "start_side": "new", "text": "hm", "quote": "x = 1\ny = 2" })).unwrap();
@@ -1053,27 +1055,30 @@ mod tests {
     }
 
     /// github ⌘⇧D: a PR's description as the page the viewer renders, its
-    /// HTML (which the renderer would print) turned into Markdown.
+    /// body prepared by `kitchen.markdown.github` for the PR's repo.
     #[test]
     fn github_plugin_description() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
-        lua.load("kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {} }").exec().unwrap();
+        lua.load(
+            r#"kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {},
+                markdown = { github = function(s, o) if s == "" then return s end return "[" .. o.repo .. "]" .. s end } }"#,
+        )
+        .exec()
+        .unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
-        let md: mlua::Function = m.get("github_markdown").unwrap();
-        let body = "Fixes it.\r\n<!-- template: say why -->\r\n\r\n\r\n\r\n<details><summary> Logs </summary>\n\n```\nok\n```\n</details>\nline<br>next\n![shot](https://x/y.png) <img width=\"10\" src=\"https://x/z.png\">";
-        let got: String = md.call(body).unwrap();
-        assert_eq!(got, "Fixes it.\n\n**▸ Logs**\n\n```\nok\n```\n\nline  \nnext\n[image: shot](https://x/y.png) [image](https://x/z.png)");
-        let info = lua
-            .to_value(&serde_json::json!({ "number": 12, "title": "Add retries", "author": { "login": "al" }, "state": "OPEN", "isDraft": true,
-                "baseRefName": "main", "headRefName": "al/retry", "additions": 40, "deletions": 3, "url": "https://github.com/o/r/pull/12", "body": "" }))
-            .unwrap();
-        let page: String = m.get::<mlua::Function>("description").unwrap().call(info).unwrap();
+        let description: mlua::Function = m.get("description").unwrap();
+        let mut info = serde_json::json!({ "number": 12, "title": "Add retries", "author": { "login": "al" }, "state": "OPEN", "isDraft": true,
+            "baseRefName": "main", "headRefName": "al/retry", "additions": 40, "deletions": 3, "url": "https://github.com/o/r/pull/12", "body": "" });
+        let page: String = description.call(lua.to_value(&info).unwrap()).unwrap();
         assert_eq!(
             page,
             "# Add retries\n\n**#12** · @al · draft · `main` ← `al/retry` · +40 −3\n\n[https://github.com/o/r/pull/12](https://github.com/o/r/pull/12)\n\n---\n\n_No description provided._\n"
         );
+        info["body"] = "Fixes #3.".into();
+        let page: String = description.call(lua.to_value(&info).unwrap()).unwrap();
+        assert!(page.ends_with("---\n\n[o/r]Fixes #3.\n"), "the body goes through kitchen.markdown.github for the PR's repo: {page}");
     }
 
     fn prune_module(lua: &mlua::Lua) -> mlua::Table {
@@ -1935,6 +1940,7 @@ kitchen.keymap("viewer", "<leader>h", "demo.hello")
 local ok, err = pcall(kitchen.keymap, "cmd+w", "demo.hello")
 assert(not ok and tostring(err):find("built%-in"), "built-in chords are refused: " .. tostring(err))
 kitchen.command("spin", function() while true do end end)
+kitchen.command("md", function() kitchen.notify(kitchen.markdown.github("x <br> y #3", { repo = "o/r" })) end)
 kitchen.on("file_opened", function(ev)
   local text = ev.text()
   local items = {}
@@ -1957,7 +1963,7 @@ end)
         let host = host_with(&engine, vec![root.clone()]);
         wait(&|| host.registry().viewer_maps.len() == 1);
         let reg = host.registry();
-        assert_eq!(reg.commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["demo.hello", "demo.spin"]);
+        assert_eq!(reg.commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["demo.hello", "demo.spin", "demo.md"]);
         assert_eq!(reg.chords.len(), 1);
         assert_eq!(reg.viewer_maps[0].keys, "h");
 
@@ -1978,10 +1984,14 @@ end)
         wait(&|| engine.state().toasts.iter().any(|t| t.text.contains("HI W")));
         assert!(engine.state().toasts.iter().any(|t| t.text.contains("budget")));
         assert!(host.invoke("demo.hello", serde_json::json!({}), true).is_err(), "not remote-callable");
+        // kitchen.markdown.github is the viewer's own.
+        host.invoke("demo.md", serde_json::json!({}), false).unwrap();
+        let want = crate::viewer::markdown::github("x <br> y #3", Some("o/r"));
+        wait(&|| engine.state().toasts.iter().any(|t| t.text == want));
 
         // Reload: registrations and decorations are rebuilt from scratch.
         host.reload(Some("demo")).unwrap();
-        wait(&|| host.decor.get(&key).is_some() && host.registry().commands.len() == 2);
+        wait(&|| host.decor.get(&key).is_some() && host.registry().commands.len() == 3);
         assert_eq!(host.list()[0].status, Status::Running);
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -250,3 +250,22 @@ about LSP:
   as they are. And a view's `have` skips its fetch (4 s) when GitHub's head
   and base commits are already here. Git already fetches a diff's or a
   checkout's missing contents in one batch, so the kitchen doesn't.
+
+## Level 12 (2026-11-12): one Markdown renderer
+
+* Every card (comments, ⌘⇧A answers, plan comments) and every `markdown`
+  render row is drawn by `viewer/markdown.rs`: egui_commonmark for prose,
+  the viewer's highlighter for top-level code, so a comment looks like a
+  rendered `.md` file. Cards used to know only fences and backticks.
+* GitHub's flavour is prepared in Rust (`github`), not in each plugin. The
+  edits come from pulldown-cmark's events with egui_commonmark's own parser
+  options, so code is never rewritten and both agree on what is code and
+  what is a link. Plugins reach it as `kitchen.markdown.github` for text
+  they write to files, where a whole-document pass can see HTML comments
+  that span paragraphs.
+* Threads send replies as data, not as text: a prefix like `↳ @bo:` broke a
+  reply that started with a list or a fence.
+* Links open on ⌘-click only, so a plain click still moves the cursor. The
+  Markdown widgets are enabled only while ⌘ is held. egui's `OpenUrl` is
+  taken out of the frame's output and sent to `Link::Url` (eframe is built
+  without `links`).

@@ -2183,7 +2183,8 @@ end)"#,
             plug.join("init.lua"),
             r#"kitchen.on("comment", function(ev)
   local body = ev.text .. "|" .. ev.side .. ":" .. ev.line .. "|" .. tostring(ev.start_line) .. "|" .. (ev.reply_to or "-")
-  kitchen.comments.set(ev.file, { { id = "c1", line = ev.line, side = ev.side, title = "@me", body = body } })
+  kitchen.comments.set(ev.file, { { id = "c1", line = ev.line, side = ev.side, title = "@me", body = body,
+    repo = "o/r", replies = { { title = "@bo", body = "+1" } } } })
 end)"#,
         )
         .unwrap();
@@ -2206,6 +2207,7 @@ end)"#,
         let (block, id) = v.comment_blocks().remove(0);
         assert_eq!((block.after, id.as_deref()), (Some(v.vim.line), Some("c1")));
         assert_eq!(block.body, "why?|old:2|nil|-");
+        assert_eq!((block.repo.as_deref(), block.path.as_deref(), block.replies[0].body.as_str()), (Some("o/r"), Some("a.py"), "+1"), "a thread's card");
         // ⌘M on the commented row replies to it.
         v.command(PanelCmd::Comment, engine);
         assert!(v.editor.as_ref().unwrap().label.starts_with("Reply to @me"));

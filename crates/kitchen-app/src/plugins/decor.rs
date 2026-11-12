@@ -516,6 +516,10 @@ mod tests {
         assert!(s.get(&key()).is_none());
         let c = parse_comments(serde_json::json!([{ "id": "7", "line": 3, "side": "old", "title": "@a", "body": "hi" }, { "body": "file-level" }])).unwrap();
         assert_eq!((c[0].side, c[1].line, c[1].side), (Side::Old, None, Side::New));
+        assert!(c[0].replies.is_empty() && c[0].repo.is_none());
+        // Replies from Lua: a list, or `{}` when there are none.
+        let t = parse_comments(serde_json::json!([{ "body": "a", "repo": "o/r", "replies": [{ "title": "@bo", "body": "b" }] }, { "body": "c", "replies": {} }])).unwrap();
+        assert_eq!((t[0].repo.as_deref(), t[0].replies[0].title.as_str(), t[1].replies.len()), (Some("o/r"), "@bo", 0));
         s.set_comments(&key(), "github", c);
         s.set_diagnostics(&key(), "github", vec![diag(1)], None);
         s.clear(Some(&key()), "github", Some(Kind::Diagnostics));

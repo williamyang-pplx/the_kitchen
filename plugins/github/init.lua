@@ -340,8 +340,9 @@ function M.threads(list)
   return roots
 end
 
--- Threads on `path` as kitchen.comments items.
-function M.items(threads, path)
+-- Threads on `path` as kitchen.comments items: the root as the card, each
+-- reply under its own header, and `slug` for the #12 / @al / SHA links.
+function M.items(threads, path, slug)
   local out = {}
   for _, t in ipairs(threads) do
     local c = t.root
@@ -356,16 +357,18 @@ function M.items(threads, path)
       if #t.replies > 0 then
         title = title .. " · " .. #t.replies .. (#t.replies == 1 and " reply" or " replies")
       end
-      local body = { c.body or "" }
+      local replies = {}
       for _, r in ipairs(t.replies) do
-        table.insert(body, "↳ @" .. (r.user or "?") .. ": " .. (r.body or ""))
+        table.insert(replies, { title = "@" .. (r.user or "?") .. " · " .. (r.created_at or ""):sub(1, 10), body = r.body or "" })
       end
       table.insert(out, {
         id = tostring(c.id),
         line = (not outdated) and c.line or nil,
         side = c.side == "LEFT" and "old" or "new",
         title = title,
-        body = table.concat(body, "\n\n"),
+        body = c.body or "",
+        replies = replies,
+        repo = slug,
         dim = outdated,
       })
     end
@@ -399,7 +402,7 @@ end
 
 local function render(pr)
   for path, file in pairs(pr.files) do
-    local items = pr.threads and M.items(pr.threads, path) or {}
+    local items = pr.threads and M.items(pr.threads, path, pr.slug) or {}
     for _, d in ipairs(pr.drafts[path] or {}) do
       table.insert(items, d)
     end
@@ -454,7 +457,7 @@ kitchen.on("comment", function(ev)
     return
   end
   pr.files[ev.path] = ev.file
-  local draft = { line = ev.line, side = ev.side, title = "posting to #" .. pr.n .. "…", body = ev.text, dim = true }
+  local draft = { line = ev.line, side = ev.side, title = "posting to #" .. pr.n .. "…", body = ev.text, repo = pr.slug, dim = true }
   pr.drafts[ev.path] = pr.drafts[ev.path] or {}
   table.insert(pr.drafts[ev.path], draft)
   render(pr)
@@ -519,27 +522,9 @@ local function description_path(n)
   return ".kitchen/pr-" .. n .. ".md"
 end
 
--- `body` (GitHub-flavored Markdown) for the viewer's renderer, which prints
--- HTML as text: drop HTML comments (PR templates' hints, hidden on GitHub),
--- open <details> with its summary as a bold line, <br> as line breaks, and
--- images (which it can't load) as links.
-function M.github_markdown(body)
-  local s = (body or ""):gsub("\r\n", "\n")
-  s = s:gsub("<!%-%-.-%-%->", "")
-  s = s:gsub("<summary[^>]*>(.-)</summary>", function(text)
-    return "\n**▸ " .. (text:gsub("^%s+", ""):gsub("%s+$", "")) .. "**\n"
-  end)
-  s = s:gsub("</?details[^>]*>", "")
-  s = s:gsub("<br%s*/?>", "  \n")
-  s = s:gsub("<img[^>]-src=\"([^\"]+)\"[^>]*>", "[image](%1)")
-  s = s:gsub("!%[([^%]]*)%]%(([^%)]+)%)", function(alt, src)
-    return "[image" .. (alt ~= "" and ": " .. alt or "") .. "](" .. src .. ")"
-  end)
-  return (s:gsub("\n\n\n+", "\n\n"))
-end
-
 -- The description page for PR `info` (gh's JSON): title, a line of facts,
--- then the body.
+-- then the body as GitHub shows it (its #12, @al and SHAs linked to the
+-- PR's repo, which its URL names).
 function M.description(info)
   local state = info.isDraft and "draft" or (info.state or ""):lower()
   local facts = {
@@ -555,7 +540,7 @@ function M.description(info)
       table.insert(line, facts[i])
     end
   end
-  local body = M.github_markdown(info.body)
+  local body = kitchen.markdown.github(info.body or "", { repo = M.parse(info.url or "") })
   if not body:find("%S") then
     body = "_No description provided._"
   end
