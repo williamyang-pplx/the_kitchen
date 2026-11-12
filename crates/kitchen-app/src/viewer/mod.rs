@@ -12,6 +12,7 @@ mod changes_tree;
 pub mod code_view;
 pub mod doc;
 pub mod highlight;
+pub mod markdown;
 mod nav;
 pub mod picker;
 mod plugin_glue;
@@ -29,6 +30,7 @@ use kitchen_core::summaries;
 use kitchen_symbols::Symbol;
 
 use crate::engine::{Engine, MenuRow, Shown, View};
+use crate::links::Link;
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::theme;
 use crate::ui::widgets;
@@ -1310,6 +1312,9 @@ impl Viewer {
             if out.clicked {
                 cx.clicked = true;
                 self.list_focus = false;
+            }
+            for url in out.urls {
+                self.engine.open_link(&self.tab_id, Link::Url(url));
             }
             if out.cancel_editor {
                 self.editor = None;

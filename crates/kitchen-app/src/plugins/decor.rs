@@ -115,11 +115,28 @@ pub struct Comment {
     pub side: Side,
     #[serde(default)]
     pub title: String,
+    /// Markdown (GitHub-flavored).
     #[serde(default)]
     pub body: String,
     /// Drawn faded (outdated, resolved, pending).
     #[serde(default)]
     pub dim: bool,
+    /// Later comments of the thread, each under its own header.
+    #[serde(default, deserialize_with = "list_or_empty_table")]
+    pub replies: Vec<Reply>,
+    /// `owner/repo`: `#12`, `@al` and commit SHAs in the text link there.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// One reply in a comment thread.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Reply {
+    /// Its header, e.g. `@bo · 2026-10-02`.
+    pub title: String,
+    /// Markdown.
+    pub body: String,
 }
 
 /// One row of a plugin's rendering of a file (`kitchen.render`, e.g. the

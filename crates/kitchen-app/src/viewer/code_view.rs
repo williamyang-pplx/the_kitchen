@@ -2,27 +2,24 @@
 //! the plan reviewer. It paints a [`Doc`], inline blocks (plan
 //! comments) and an optional comment editor, and turns plain
 //! keys into [`Vim`] motions while focused. Rendered rows (`kitchen.render`)
-//! are drawn in a proportional font and wrap instead of scrolling sideways;
-//! a row with Markdown source is drawn by egui_commonmark.
+//! are drawn in a proportional font and wrap instead of scrolling sideways.
+//! A row with Markdown source and every card's text are drawn by
+//! [`markdown::draw`], as GitHub would show them.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Instant;
 
 use egui::text::{CCursor, LayoutJob, TextFormat};
 use egui::{Color32, CornerRadius, FontId, Galley, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use super::doc::{Doc, Fold, LineKind};
 use super::highlight::group_color;
+use super::markdown::{self, CODE_BG};
 use super::vim::{Vim, VimAction, VimKey, Viewport};
-use crate::plugins::decor::{RenderRow, RenderSpan};
+use crate::plugins::decor::{RenderRow, RenderSpan, Reply};
 use crate::theme;
-
-/// Background of rendered code (blocks and inline).
-const CODE_BG: Color32 = Color32::from_rgb(0x24, 0x28, 0x3b);
-/// Body text of rendered Markdown; bold and headings are `theme::TEXT`.
-const PROSE: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
 
 /// Where a row's text was drawn, for clicks.
 enum Hit {
@@ -47,9 +44,9 @@ pub struct ViewState {
     pub rows: usize,
     /// Cursor row at the end of the last frame: a change means the cursor moved.
     last_line: Option<usize>,
-    /// Heights of Markdown rows by doc row, for the doc length, width and font
-    /// size in `md_key`; painting refreshes them, a new key clears them.
-    md_heights: HashMap<usize, f32>,
+    /// Heights measured invisibly, for the doc length, width and font size
+    /// in `md_key`; painting refreshes them, a new key clears them.
+    heights: Heights,
     md_key: (usize, u32, u32),
     /// Height of the open comment field, measured as it was last painted (it
     /// grows with its text); `None` until it is painted.
@@ -64,6 +61,15 @@ impl ViewState {
     }
 }
 
+/// Measured heights: Markdown rows by doc row, cards by `card_key`. Cards
+/// no longer shown are dropped every frame (a thinking card's text changes
+/// every second).
+#[derive(Debug, Default, Clone)]
+struct Heights {
+    rows: HashMap<usize, f32>,
+    cards: HashMap<u64, f32>,
+}
+
 /// Heights in pixels of one doc row's unit, measured as it is painted.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Extent {
@@ -76,16 +82,23 @@ struct Extent {
 }
 
 /// A note drawn under a line.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Block {
     /// Doc index it follows; `None` = above the first line (file-level).
     pub after: Option<usize>,
     pub title: String,
+    /// Markdown.
     pub body: String,
     pub color: Color32,
     pub dim: bool,
     /// A ⌘⇧A answer: `title` is the question, drawn as the card's heading.
     pub question: bool,
+    /// Later comments of its thread, each under its own header.
+    pub replies: Vec<Reply>,
+    /// `owner/repo` that `#12`, `@al` and SHAs in the text link to.
+    pub repo: Option<String>,
+    /// The file the card is on, for suggestion blocks.
+    pub path: Option<String>,
 }
 
 impl Block {
@@ -97,7 +110,7 @@ impl Block {
             Some(Ok(t)) => (t.clone(), theme::PURPLE, false),
             Some(Err(e)) => (e.clone(), theme::RED, false),
         };
-        Block { after: Some(after), title: question.to_string(), body, color, dim, question: true }
+        Block { after: Some(after), title: question.to_string(), body, color, dim, question: true, ..Default::default() }
     }
 }
 
@@ -144,6 +157,8 @@ pub struct Output {
     pub cancel_editor: bool,
     /// Enter pressed in a question field.
     pub submit_editor: bool,
+    /// Links ⌘-clicked in rendered Markdown, to open with `Link::Url`.
+    pub urls: Vec<String>,
 }
 
 pub struct CodeView<'a> {
@@ -170,21 +185,14 @@ const EDITOR_HEIGHT: f32 = 118.0;
 const BLOCK_TOP: f32 = 4.0;
 const BLOCK_GAP: f32 = 12.0;
 const EDITOR_GAP: f32 = 12.0;
-/// Inside a card: padding around its text, around a code block's text, and
-/// between its parts.
+/// Inside a card: padding around its text, and between its parts.
 const CARD_PAD_X: f32 = 12.0;
 const CARD_PAD_Y: f32 = 8.0;
-const CODE_PAD: f32 = 6.0;
 const PART_GAP: f32 = 6.0;
 /// Widest a card gets, in code columns: prose wider than this is hard to read.
 const CARD_COLS: f32 = 100.0;
-/// Code in a card: fenced blocks on a panel darker than the card, inline
-/// spans on a lighter pill.
+/// Behind code in a card: darker than the card.
 const CARD_CODE_BG: Color32 = theme::BG;
-const CARD_INLINE_BG: Color32 = theme::HOVER;
-/// Room an inline code pill takes on either side of its text.
-const PILL_PAD_X: f32 = 4.0;
-const PILL_PAD_Y: f32 = 1.0;
 
 /// What painting and measuring share: the frame's metrics and inputs. Built
 /// once per frame in `show`.
@@ -220,8 +228,8 @@ impl Geometry<'_> {
         match line.render.as_deref() {
             Some(r) if r.markdown.is_some() => {
                 let at = Pos2::new(self.text_x + cw * 0.8 + r.indent as f32 * cw * 2.0, y + 3.0);
-                let md = r.markdown.as_deref().unwrap_or_default();
-                let h = draw_markdown(ui, rect, at, rect.right() - at.x - 16.0, md, font_size, self.id.with(("md", idx)), paint);
+                let text = markdown::Text { src: r.markdown.as_deref().unwrap_or_default(), repo: None, path: None, size: font_size + 1.0, dim: false, code_bg: CODE_BG };
+                let h = markdown::draw(ui, &text, at, rect.right() - at.x - 16.0, rect, self.id.with(("md", idx)), paint);
                 (None, at, (h + 8.0).max(self.row_h))
             }
             Some(r) => {
@@ -246,24 +254,28 @@ impl Geometry<'_> {
     }
 
     /// Height of the blocks drawn after `after`, with their gaps.
-    fn blocks_height(&self, ui: &Ui, after: Option<usize>) -> f32 {
-        self.blocks.iter().filter(|b| b.after == after).map(|b| layout_block(ui, b, self.block_width, self.font_size).height + BLOCK_GAP).sum()
+    fn blocks_height(&self, ui: &mut Ui, after: Option<usize>, heights: &mut Heights) -> f32 {
+        let mut h = 0.0;
+        for (i, b) in self.blocks.iter().enumerate().filter(|(_, b)| b.after == after) {
+            h += card_height(ui, b, self.block_width, self.font_size, self.id.with(("card", i)), heights) + BLOCK_GAP;
+        }
+        h
     }
 
-    /// Row `idx`'s extent. A Markdown row's height comes from `md_heights`
+    /// Row `idx`'s extent. A Markdown row's height comes from `heights`
     /// when known; otherwise it is measured invisibly and stored.
-    fn extent(&self, ui: &mut Ui, idx: usize, md_heights: &mut HashMap<usize, f32>) -> Extent {
-        let lead = if idx == 0 { self.blocks_height(ui, None) } else { 0.0 };
+    fn extent(&self, ui: &mut Ui, idx: usize, heights: &mut Heights) -> Extent {
+        let lead = if idx == 0 { self.blocks_height(ui, None, heights) } else { 0.0 };
         let render = self.doc.lines[idx].render.as_deref();
         let markdown = render.is_some_and(|r| r.markdown.is_some());
-        let row = match md_heights.get(&idx).filter(|_| markdown) {
+        let row = match heights.rows.get(&idx).filter(|_| markdown) {
             Some(h) => *h,
             // A text (or fold) row is always one row tall.
             None if render.is_none() => self.row_h,
             None => {
                 let h = self.layout_row(ui, idx, self.rect.top(), 0, false).2;
                 if markdown {
-                    md_heights.insert(idx, h);
+                    heights.rows.insert(idx, h);
                 }
                 h
             }
@@ -272,7 +284,8 @@ impl Geometry<'_> {
             Some((end, h)) if end == idx => h + EDITOR_GAP,
             _ => 0.0,
         };
-        Extent { lead, row, unit: lead + row + field + self.blocks_height(ui, Some(idx)) }
+        let below = self.blocks_height(ui, Some(idx), heights);
+        Extent { lead, row, unit: lead + row + field + below }
     }
 }
 
@@ -290,7 +303,7 @@ impl CodeView<'_> {
         state.rows = ((height / row_h).floor() as usize).max(1);
         let md_key = (n, rect.width().to_bits(), font_size.to_bits());
         if state.md_key != md_key {
-            state.md_heights.clear();
+            state.heights = Heights::default();
             state.md_key = md_key;
         }
 
@@ -307,6 +320,8 @@ impl CodeView<'_> {
         let text_x = rect.left() + gutter + 6.0;
         let visible_cols = (((rect.right() - text_x) / cw).floor() as usize).max(8);
         let block_width = (rect.width() - gutter - 24.0).min(CARD_COLS * cw + CARD_PAD_X * 2.0);
+        let shown: HashSet<u64> = blocks.iter().map(|b| card_key(b, block_width)).collect();
+        state.heights.cards.retain(|k, _| shown.contains(k));
         if editor.is_none() {
             state.editor_h = None;
         }
@@ -337,7 +352,7 @@ impl CodeView<'_> {
                         VimAction::ScrollBy(d) => state.scroll_to((state.top as isize + d).clamp(0, n as isize - 1) as usize),
                         VimAction::Center | VimAction::Top | VimAction::Bottom => {
                             let cur = vim.line.min(n - 1);
-                            let mut ext = |i| geo.extent(ui, i, &mut state.md_heights);
+                            let mut ext = |i| geo.extent(ui, i, &mut state.heights);
                             let row = ext(cur).row;
                             let y = match a {
                                 VimAction::Center => (height - row) / 2.0,
@@ -359,7 +374,7 @@ impl CodeView<'_> {
             dy = ui.input(|i| i.smooth_scroll_delta.y);
             dx = ui.input(|i| i.smooth_scroll_delta.x);
         }
-        (state.top, state.offset) = scroll_px(state.top, state.offset, -dy, height, n, &mut |i| geo.extent(ui, i, &mut state.md_heights));
+        (state.top, state.offset) = scroll_px(state.top, state.offset, -dy, height, n, &mut |i| geo.extent(ui, i, &mut state.heights));
         if dx.abs() > 4.0 {
             state.left = (state.left as isize - (dx / cw) as isize).max(0) as usize;
         }
@@ -371,7 +386,7 @@ impl CodeView<'_> {
             let view_moved = (state.top, state.offset) != before;
             let just_opened = editor.as_deref().filter(|ed| ed.needs_focus);
             let cursor_moved = state.last_line != Some(vim.line) || just_opened.is_some();
-            let mut ext = |i| geo.extent(ui, i, &mut state.md_heights);
+            let mut ext = |i| geo.extent(ui, i, &mut state.heights);
             let rows = rows_in_view(state.top, state.offset, height, n, &mut ext);
             if view_moved && !cursor_moved {
                 let line = nearest_visible(&rows, cur, height);
@@ -416,17 +431,20 @@ impl CodeView<'_> {
         let mut row_hits: Vec<(Rect, usize, Hit)> = Vec::new();
         let mut editor_rect: Option<Rect> = None;
 
-        let draw_blocks = |after: Option<usize>, y: &mut f32, ui: &mut Ui| {
-            for b in blocks.iter().filter(|b| b.after == after) {
+        let draw_blocks = |after: Option<usize>, y: &mut f32, ui: &mut Ui, heights: &mut Heights| {
+            for (i, b) in blocks.iter().enumerate().filter(|(_, b)| b.after == after) {
                 if *y > rect.bottom() {
                     break;
                 }
-                *y += draw_block(ui, &painter, b, Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP), block_width, font_size) + BLOCK_GAP;
+                let card_id = id.with(("card", i));
+                let h = card_height(ui, b, block_width, font_size, card_id, heights);
+                draw_card(ui, Some(&painter), b, Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP), block_width, font_size, card_id, h);
+                *y += h + BLOCK_GAP;
             }
         };
 
         if state.top == 0 {
-            draw_blocks(None, &mut y, ui);
+            draw_blocks(None, &mut y, ui, &mut state.heights);
         }
         for idx in state.top..n {
             if y > rect.bottom() {
@@ -442,7 +460,7 @@ impl CodeView<'_> {
             // Layout first: a rendered row wraps, so it may be taller than a text row.
             let (galley, text_pos, row_height) = geo.layout_row(ui, idx, y, state.left, true);
             if rendered.is_some_and(|r| r.markdown.is_some()) {
-                state.md_heights.insert(idx, row_height);
+                state.heights.rows.insert(idx, row_height);
             }
             let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_height));
             row_hits.push((
@@ -582,7 +600,7 @@ impl CodeView<'_> {
             if field == Some(false) {
                 place_field(&mut y);
             }
-            draw_blocks(Some(idx), &mut y, ui);
+            draw_blocks(Some(idx), &mut y, ui, &mut state.heights);
             if field == Some(true) {
                 place_field(&mut y);
             }
@@ -650,6 +668,7 @@ impl CodeView<'_> {
         }
         state.last_line = Some(vim.line);
         ui.advance_cursor_after_rect(rect);
+        out.urls = markdown::drain_open_urls(ui.ctx());
         out
     }
 }
@@ -851,279 +870,84 @@ fn render_job(r: &RenderRow, text: &str, syntax: &[(std::ops::Range<usize>, Colo
     job
 }
 
-/// Draws Markdown `md` at `at`, `width` wide, clipped to `clip`; returns its
-/// height. Its widgets are disabled, so a click lands on the row (cursor, ⌘M)
-/// and keys stay with vim. `paint: false` lays it out invisibly, to measure.
+/// Card `b`'s height at `width`: measured invisibly once, then from `heights`.
+fn card_height(ui: &mut Ui, b: &Block, width: f32, font_size: f32, id: egui::Id, heights: &mut Heights) -> f32 {
+    let key = card_key(b, width);
+    if let Some(h) = heights.cards.get(&key) {
+        return *h;
+    }
+    let h = draw_card(ui, None, b, ui.max_rect().min, width, font_size, id, 0.0);
+    heights.cards.insert(key, h);
+    h
+}
+
+/// What a card's height depends on: its text, its kind and the width
+/// (`dim` only fades it).
+fn card_key(b: &Block, width: f32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (&b.title, &b.body, &b.repo, &b.path, b.question, width.to_bits()).hash(&mut h);
+    for r in &b.replies {
+        (&r.title, &r.body).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Paints card `b` at `at`, `height` tall, with `painter`; without one it
+/// only lays the card out. Returns its laid-out height. Comments carry a
+/// small colored title (who, which lines, state), a question is the heading
+/// of its answer; then the body, and each reply under a faint rule and its
+/// own header, all as Markdown.
 #[allow(clippy::too_many_arguments)]
-fn draw_markdown(ui: &mut Ui, clip: Rect, at: Pos2, width: f32, md: &str, font_size: f32, id: egui::Id, paint: bool) -> f32 {
-    let cache = ui.data_mut(|d| d.get_temp_mut_or_default::<Arc<Mutex<CommonMarkCache>>>(egui::Id::new("commonmark")).clone());
-    let max = Rect::from_min_size(at, Vec2::new(width.max(80.0), f32::INFINITY));
-    let mut builder = egui::UiBuilder::new().max_rect(max).layout(egui::Layout::top_down(egui::Align::Min));
-    // The measuring copy gets its own ids, so it never clashes with the painted one.
-    builder = if paint { builder.id_salt(id) } else { builder.id_salt(id.with("measure")).invisible() };
-    let mut child = ui.new_child(builder);
-    child.set_clip_rect(clip.intersect(ui.clip_rect()));
-    child.set_style(markdown_style(ui.style(), font_size));
-    child.disable();
-    CommonMarkViewer::new().show(&mut child, &mut cache.lock().unwrap_or_else(|e| e.into_inner()), md);
-    child.min_rect().height()
-}
-
-/// Fonts and colors for rendered Markdown at the viewer's `font_size`.
-fn markdown_style(base: &egui::Style, font_size: f32) -> egui::Style {
-    use egui::TextStyle;
-    let mut s = base.clone();
-    let body = font_size + 1.0;
-    s.text_styles = [
-        (TextStyle::Small, theme::ui_font(body * 0.85)),
-        (TextStyle::Body, theme::ui_font(body)),
-        (TextStyle::Button, theme::ui_font(body)),
-        (TextStyle::Heading, theme::ui_font_bold(body * 2.0)),
-        (TextStyle::Monospace, FontId::monospace(font_size * 0.95)),
-    ]
-    .into();
-    let v = &mut s.visuals;
-    // Text colors come from the widget visuals: plain text dimmer than
-    // bold and headings (egui draws `strong` as a brighter color).
-    v.override_text_color = None;
-    v.widgets.noninteractive.fg_stroke.color = PROSE;
-    v.widgets.inactive.fg_stroke.color = PROSE;
-    v.widgets.active.fg_stroke.color = theme::TEXT;
-    v.code_bg_color = CODE_BG;
-    v.extreme_bg_color = CODE_BG;
-    // Disabled only so it takes no input; drawn at full strength.
-    v.disabled_alpha = 1.0;
-    s.spacing.item_spacing.y = 5.0;
-    s
-}
-
-/// A card laid out, shared by painting and measuring. Offsets are from
-/// the card's top.
-struct CardLayout {
-    title: Arc<Galley>,
-    /// "Esc closes", right of a question's title.
-    hint: Option<Arc<Galley>>,
-    /// Where a question's divider goes.
-    divider_y: Option<f32>,
-    /// The body, top to bottom, with each part's offset.
-    parts: Vec<(Part, f32)>,
-    height: f32,
-}
-
-/// A piece of a card's body.
-enum Part {
-    /// Text, with the pills behind its inline code (relative to the galley).
-    Prose(Arc<Galley>, Vec<Rect>),
-    /// A fenced block, drawn on a panel.
-    Code(Arc<Galley>),
-}
-
-/// Lays out card `b` at `width`. Comments carry a small colored title (who,
-/// which lines, state); a question is the heading of its answer. Code in
-/// the body, fenced or in backticks, is set in monospace.
-fn layout_block(ui: &Ui, b: &Block, width: f32, font_size: f32) -> CardLayout {
+fn draw_card(ui: &mut Ui, painter: Option<&egui::Painter>, b: &Block, at: Pos2, width: f32, font_size: f32, id: egui::Id, height: f32) -> f32 {
     let inner = width - CARD_PAD_X * 2.0;
-    let text_color = if b.dim { theme::SUBTLE } else { theme::TEXT };
+    let (left, right) = (at.x + CARD_PAD_X, at.x + width - CARD_PAD_X);
+    if let Some(p) = painter {
+        // Faded cards (thinking, resolved) still sit a step above the background.
+        let r = Rect::from_min_size(at, Vec2::new(width, height));
+        p.rect_filled(r, 5.0, if b.dim { theme::HOVER } else { theme::SELECTED });
+        p.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, height)), 2.0, b.color);
+    }
     let hint = b.question.then(|| ui.fonts_mut(|f| f.layout_no_wrap("Esc closes".into(), theme::ui_font(font_size - 2.0), theme::SUBTLE)));
     let hint_w = hint.as_ref().map_or(0.0, |h| h.size().x + CARD_PAD_X);
     let (title_font, title_color) = if b.question { (theme::ui_font_semibold(font_size), theme::TEXT) } else { (theme::ui_font(font_size - 1.5), b.color) };
     let title = ui.fonts_mut(|f| f.layout(b.title.clone(), title_font, title_color, inner - hint_w));
-    let mut y = CARD_PAD_Y + title.size().y;
-    let divider_y = b.question.then(|| {
-        y += PART_GAP;
-        let at = y;
-        y += 1.0 + PART_GAP;
-        at
-    });
-    y += if b.question { 0.0 } else { 2.0 };
-    let mut parts = Vec::new();
-    for (code, text) in split_fences(&b.body) {
-        if code {
-            let galley = ui.fonts_mut(|f| f.layout(text, FontId::monospace(font_size * 0.92), text_color, inner - CODE_PAD * 2.0));
-            y += CODE_PAD;
-            let h = galley.size().y;
-            parts.push((Part::Code(galley), y));
-            y += h + CODE_PAD + PART_GAP;
-        } else {
-            let size = font_size - 0.5;
-            let (plain, code) = (theme::ui_font(size), FontId::monospace(size * 0.95));
-            // How far below the prose's baseline code's would sit.
-            let lift = (baseline(ui, &plain) - baseline(ui, &code)).max(0.0);
-            let (job, spans) = prose_job(&text, plain, code, lift, text_color, inner);
-            let galley = ui.fonts_mut(|f| f.layout_job(job));
-            let h = galley.size().y;
-            let pills = pills(&galley, &spans);
-            parts.push((Part::Prose(galley, pills), y));
-            y += h + PART_GAP;
+    let mut y = at.y + CARD_PAD_Y + title.size().y;
+    if let Some(p) = painter {
+        let first_row = title.rows.first().map_or(0.0, |row| row.height());
+        if let Some(hint) = hint {
+            let hy = at.y + CARD_PAD_Y + (first_row - hint.size().y) / 2.0;
+            p.galley(Pos2::new(right - hint.size().x, hy), hint, theme::SUBTLE);
         }
+        p.galley(Pos2::new(left, at.y + CARD_PAD_Y), title, theme::TEXT);
     }
-    let height = if parts.is_empty() { y } else { y - PART_GAP } + CARD_PAD_Y;
-    CardLayout { title, hint, divider_y, parts, height }
-}
-
-/// `text` cut at its ``` and ~~~ fences into runs of prose (`false`) and
-/// code (`true`, without the fence lines and the fence's indent). Blank
-/// lines around a run are dropped; an unclosed fence runs to the end.
-fn split_fences(text: &str) -> Vec<(bool, String)> {
-    let mut out = Vec::new();
-    let mut push = |code: bool, lines: &mut Vec<&str>| {
-        let run = lines.join("\n");
-        let run = if code { run.trim_matches('\n').to_string() } else { run.trim().to_string() };
-        if !run.is_empty() {
-            out.push((code, run));
+    let rule = |y: &mut f32| {
+        *y += PART_GAP;
+        if let Some(p) = painter {
+            p.hline(left..=right, *y, Stroke::new(1.0, theme::FAINT));
         }
-        lines.clear();
+        *y += 1.0 + PART_GAP;
     };
-    // The open fence's marker and indent.
-    let mut fence: Option<(&str, usize)> = None;
-    let mut lines: Vec<&str> = Vec::new();
-    for line in text.lines() {
-        let t = line.trim_start_matches(' ');
-        let indent = line.len() - t.len();
-        match fence {
-            None => match ["```", "~~~"].into_iter().find(|m| t.starts_with(m)) {
-                Some(m) => {
-                    push(false, &mut lines);
-                    fence = Some((m, indent));
-                }
-                None => lines.push(line),
-            },
-            Some((m, _)) if t.starts_with(m) && t.trim_end().chars().all(|c| m.starts_with(c)) => {
-                push(true, &mut lines);
-                fence = None;
-            }
-            Some((_, n)) => lines.push(&line[indent.min(n)..]),
+    if b.question {
+        rule(&mut y);
+    } else {
+        y += 2.0;
+    }
+    let clip = painter.map_or_else(|| ui.clip_rect(), |p| p.clip_rect());
+    let text = |src| markdown::Text { src, repo: b.repo.as_deref(), path: b.path.as_deref(), size: font_size - 0.5, dim: b.dim, code_bg: CARD_CODE_BG };
+    if !b.body.trim().is_empty() {
+        y += markdown::draw(ui, &text(&b.body), Pos2::new(left, y), inner, clip, id.with("body"), painter.is_some());
+    }
+    for (i, r) in b.replies.iter().enumerate() {
+        rule(&mut y);
+        let header = ui.fonts_mut(|f| f.layout(r.title.clone(), theme::ui_font(font_size - 1.5), theme::SUBTLE, inner));
+        let header_h = header.size().y;
+        if let Some(p) = painter {
+            p.galley(Pos2::new(left, y), header, theme::SUBTLE);
         }
+        y += header_h + 2.0;
+        y += markdown::draw(ui, &text(&r.body), Pos2::new(left, y), inner, clip, id.with(("reply", i)), painter.is_some());
     }
-    push(fence.is_some(), &mut lines);
-    out
-}
-
-/// Distance from the top of a row of `font` to its baseline.
-fn baseline(ui: &Ui, font: &FontId) -> f32 {
-    let galley = ui.fonts_mut(|f| f.layout_no_wrap("x".into(), font.clone(), Color32::WHITE));
-    galley.rows.first().and_then(|r| r.row.glyphs.first()).map_or(0.0, |g| g.pos.y)
-}
-
-/// Prose in `plain` with its `backtick` spans in `code`, and the spans'
-/// character ranges in the job's text (for their pills). `lift` is how much
-/// higher code's baseline sits than the prose's in a row of its own.
-fn prose_job(text: &str, plain: FontId, code: FontId, lift: f32, color: Color32, wrap: f32) -> (LayoutJob, Vec<std::ops::Range<usize>>) {
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = wrap;
-    let line_height = plain.size * 1.45;
-    let plain = TextFormat { font_id: plain, color, line_height: Some(line_height), ..Default::default() };
-    // Prose sits at the top of its tall row. Code is bottom-aligned in a row
-    // `lift` shorter than the prose's, which puts it on the same baseline.
-    let code = TextFormat { font_id: code, line_height: Some(line_height - lift), valign: egui::Align::BOTTOM, ..plain.clone() };
-    let mut spans = Vec::new();
-    let mut chars = 0;
-    // The text after a code span needs room for its pill.
-    let mut after_code = false;
-    let mut push = |job: &mut LayoutJob, text: &str, format: &TextFormat, lead: f32| {
-        job.append(text, lead, format.clone());
-        let start = chars;
-        chars += text.chars().count();
-        start..chars
-    };
-    let mut rest = text;
-    while let Some(open) = rest.find('`') {
-        let after = &rest[open + 1..];
-        let before = &rest[..open];
-        let lead = if after_code { pill_room(before.chars().next()) } else { 0.0 };
-        match after.find(['`', '\n']) {
-            Some(len) if len > 0 && after[len..].starts_with('`') => {
-                push(&mut job, before, &plain, lead);
-                // At the start of a line the pill reaches into the margin, as
-                // it does on a wrapped line (egui drops room at a wrap).
-                let lead = match before.chars().next_back().or(after_code.then_some('`')) {
-                    None | Some('\n') => 0.0,
-                    prev => pill_room(prev),
-                };
-                spans.push(push(&mut job, &after[..len], &code, lead));
-                after_code = true;
-                rest = &after[len + 1..];
-            }
-            // An unpaired backtick stays as it is.
-            _ => {
-                push(&mut job, &rest[..open + 1], &plain, lead);
-                after_code = false;
-                rest = after;
-            }
-        }
-    }
-    let lead = if after_code { pill_room(rest.chars().next()) } else { 0.0 };
-    push(&mut job, rest, &plain, lead);
-    (job, spans)
-}
-
-/// Space between a pill's text and the character `next` to it: a space
-/// already parts them (as does the end of the text), punctuation sits a
-/// little clear of the pill's edge.
-fn pill_room(next: Option<char>) -> f32 {
-    match next {
-        None | Some(' ' | '\n' | '\t') => PILL_PAD_X,
-        Some(_) => PILL_PAD_X + 2.0,
-    }
-}
-
-/// The pills behind `galley`'s code `spans` (character ranges), one per row
-/// a span covers, relative to the galley.
-fn pills(galley: &Galley, spans: &[std::ops::Range<usize>]) -> Vec<Rect> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for row in &galley.rows {
-        let glyphs = &row.row.glyphs;
-        for s in spans {
-            let (lo, hi) = (s.start.max(start), s.end.min(start + glyphs.len()));
-            if lo >= hi {
-                continue;
-            }
-            let (first, last) = (&glyphs[lo - start], &glyphs[hi - 1 - start]);
-            let top = row.pos.y + first.pos.y - first.font_face_ascent;
-            let min = Pos2::new(row.pos.x + first.pos.x - PILL_PAD_X, top - PILL_PAD_Y);
-            let max = Pos2::new(row.pos.x + last.pos.x + last.advance_width + PILL_PAD_X, top + first.font_face_height + PILL_PAD_Y);
-            out.push(Rect::from_min_max(min, max));
-        }
-        start += glyphs.len() + usize::from(row.ends_with_newline);
-    }
-    out
-}
-
-fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32, font_size: f32) -> f32 {
-    let l = layout_block(ui, b, width, font_size);
-    let r = Rect::from_min_size(at, Vec2::new(width, l.height));
-    // Faded cards (thinking, resolved) still sit a step above the background.
-    painter.rect_filled(r, 5.0, if b.dim { theme::HOVER } else { theme::SELECTED });
-    painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, l.height)), 2.0, b.color);
-    let left = r.left() + CARD_PAD_X;
-    let first_row = l.title.rows.first().map_or(0.0, |row| row.height());
-    painter.galley(Pos2::new(left, r.top() + CARD_PAD_Y), l.title, theme::TEXT);
-    if let Some(hint) = l.hint {
-        let y = r.top() + CARD_PAD_Y + (first_row - hint.size().y) / 2.0;
-        painter.galley(Pos2::new(r.right() - CARD_PAD_X - hint.size().x, y), hint, theme::SUBTLE);
-    }
-    if let Some(dy) = l.divider_y {
-        painter.hline(left..=r.right() - CARD_PAD_X, r.top() + dy, Stroke::new(1.0, theme::FAINT));
-    }
-    for (part, dy) in l.parts {
-        let at = Pos2::new(left, r.top() + dy);
-        match part {
-            Part::Code(galley) => {
-                let panel = Rect::from_min_size(Pos2::new(left, at.y - CODE_PAD), Vec2::new(width - CARD_PAD_X * 2.0, galley.size().y + CODE_PAD * 2.0));
-                painter.rect_filled(panel, 6.0, CARD_CODE_BG);
-                painter.galley(at + Vec2::new(CODE_PAD, 0.0), galley, theme::TEXT);
-            }
-            Part::Prose(galley, pills) => {
-                for pill in pills {
-                    let pill = pill.translate(at.to_vec2());
-                    painter.rect_filled(pill, pill.height() / 2.0, CARD_INLINE_BG);
-                }
-                painter.galley(at, galley, theme::TEXT);
-            }
-        }
-    }
-    l.height
+    y + CARD_PAD_Y - at.y
 }
 
 /// This frame's plain keys as vim keys (Cmd chords were consumed upstream).
@@ -1246,37 +1070,6 @@ mod tests {
         let rows = rows_in_view(1, 10.0, H, N, &mut ext);
         assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2, 3]);
         assert_eq!(rows[0].1, -10.0);
-    }
-
-    #[test]
-    fn split_fences_cuts_code_out_of_prose() {
-        let body = "Both are colors:\n\n  ```rust\n  const A: u8 = 1;\n    nested();\n  ```\n\nSo use `A`.\n```\nunclosed";
-        assert_eq!(
-            split_fences(body),
-            vec![
-                (false, "Both are colors:".to_string()),
-                (true, "const A: u8 = 1;\n  nested();".to_string()),
-                (false, "So use `A`.".to_string()),
-                (true, "unclosed".to_string()),
-            ]
-        );
-        assert_eq!(split_fences("plain\n\ntext"), vec![(false, "plain\n\ntext".to_string())]);
-        // A fence line with text after the marks inside code does not close it.
-        assert_eq!(split_fences("~~~\n```inner\n~~~"), vec![(true, "```inner".to_string())]);
-    }
-
-    #[test]
-    fn prose_job_sets_backtick_spans_in_monospace() {
-        // A backtick with no partner on its line stays as it is.
-        let (job, spans) = prose_job("use `row_at` here\nlone ` tick\n`a\nb`", theme::ui_font(12.0), FontId::monospace(12.0), 1.0, theme::TEXT, 400.0);
-        assert_eq!(spans, vec![4..10], "row_at, in characters of the job's text");
-        let runs: Vec<(&str, bool)> = job
-            .sections
-            .iter()
-            .map(|s| (&job.text[s.byte_range.start.0..s.byte_range.end.0], s.format.font_id.family == egui::FontFamily::Monospace))
-            .filter(|(t, _)| !t.is_empty())
-            .collect();
-        assert_eq!(runs, vec![("use ", false), ("row_at", true), (" here\nlone ` tick\n`a\nb`", false)]);
     }
 
     #[test]

@@ -252,7 +252,17 @@ impl Viewer {
                     let side = if c.side == Side::Old { "base " } else { "" };
                     title.push_str(&format!(" · {side}L{n}"));
                 }
-                let block = Block { after: row, title, body: c.body.clone(), color: theme::CYAN, dim: c.dim, question: false };
+                let block = Block {
+                    after: row,
+                    title,
+                    body: c.body.clone(),
+                    color: theme::CYAN,
+                    dim: c.dim,
+                    replies: c.replies.clone(),
+                    repo: c.repo.clone(),
+                    path: Some(path.clone()),
+                    ..Default::default()
+                };
                 (block, c.id.clone())
             })
             .collect()
