@@ -438,7 +438,13 @@ impl CodeView<'_> {
                 }
                 let card_id = id.with(("card", i));
                 let h = card_height(ui, b, block_width, font_size, card_id, heights);
-                draw_card(ui, Some(&painter), b, Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP), block_width, font_size, card_id, h);
+                let painted = draw_card(ui, Some(&painter), b, Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP), block_width, font_size, card_id, h);
+                // Painting refreshes the height: a table (an egui grid) settles its
+                // size over a frame or two.
+                if (painted - h).abs() > 0.5 {
+                    heights.cards.insert(card_key(b, block_width), painted);
+                    ui.ctx().request_repaint();
+                }
                 *y += h + BLOCK_GAP;
             }
         };
