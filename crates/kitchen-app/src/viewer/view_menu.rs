@@ -81,8 +81,9 @@ impl Viewer {
         self.picker = Some((PickerKind::Views { menu, views: rows.views }, picker));
     }
 
-    /// An open menu follows `kitchen.views`, and stops saying "loading"
-    /// once a plugin answered or `ASK_TIMEOUT` passed.
+    /// An open menu follows `kitchen.views` (keeping a cursor the user
+    /// moved on its row), and stops saying "loading" once a plugin answered
+    /// or `ASK_TIMEOUT` passed.
     pub(super) fn refresh_view_menu(&mut self, ctx: &egui::Context) {
         if !matches!(self.picker, Some((PickerKind::Views { .. }, _))) {
             return;
@@ -97,8 +98,17 @@ impl Viewer {
             self.asked = None;
             let rows = self.view_menu_rows(latest.as_ref());
             if let Some((PickerKind::Views { menu, views }, picker)) = &mut self.picker {
+                // A cursor the user moved stays on its row (the menu may have
+                // arrived while they were moving); otherwise it follows the
+                // row on screen.
+                let keep = if picker.moved {
+                    let at = picker.selected_item().and_then(|i| views.get(i)).map(|(_, at)| at);
+                    at.and_then(|at| rows.views.iter().position(|(_, a)| a == at))
+                } else {
+                    rows.current
+                };
                 picker.set_menu(rows.items, rows.sections);
-                if let Some(i) = rows.current {
+                if let Some(i) = keep {
                     picker.select(i);
                 }
                 *menu = latest;
@@ -190,6 +200,56 @@ mod tests {
         assert!(v.menu_open());
         v.command(PanelCmd::ViewMenu, &h.engine);
         assert!(!v.menu_open(), "⌘⇧S again closes it");
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    fn cursor(v: &Viewer) -> String {
+        match &v.picker {
+            Some((PickerKind::Views { .. }, p)) => p.items[p.selected_item().unwrap()].0.clone(),
+            _ => panic!("no PR menu"),
+        }
+    }
+
+    /// The plugin's menu arrives a second or two after ⌘⇧S: a cursor the
+    /// user already moved stays on its row (by what it shows, though the
+    /// rows moved); one they didn't move goes to the row on screen.
+    #[test]
+    fn a_late_menu_keeps_the_cursor_the_user_moved() {
+        let h = Harness::new(TestRepo::new("echo 1 > a"));
+        let pr = |n: u32| serde_json::json!({ "section": "main ← a", "label": format!("#{n}"), "view": { "rev": format!("refs/kitchen/pr/{n}"), "name": format!("kitchen-pr-{n}") } });
+        set(&h, serde_json::json!([pr(7), pr(8)]));
+        let mut v = h.viewer();
+        v.command(PanelCmd::ViewMenu, &h.engine);
+        h.frame(&mut v);
+        assert_eq!(cursor(&v), "● worktree");
+        h.frame_with(&mut v, vec![key(egui::Key::K)]);
+        assert_eq!(cursor(&v), "#8");
+        set(&h, serde_json::json!([pr(6), pr(7), pr(8)]));
+        h.frame(&mut v);
+        assert_eq!(cursor(&v), "#8", "the plugin's answer doesn't take the cursor back");
+
+        v.command(PanelCmd::ViewMenu, &h.engine);
+        v.command(PanelCmd::ViewMenu, &h.engine);
+        h.frame(&mut v);
+        set(&h, serde_json::json!([pr(7)]));
+        h.frame(&mut v);
+        assert_eq!(cursor(&v), "● worktree", "an unmoved cursor follows the row on screen");
+    }
+
+    /// Picking the row on screen says it is on screen, rather than closing
+    /// as if a switch had failed.
+    #[test]
+    fn picking_the_shown_row_says_so() {
+        let h = Harness::new(TestRepo::new("echo 1 > a"));
+        let mut v = h.viewer();
+        v.command(PanelCmd::ViewMenu, &h.engine);
+        h.frame(&mut v);
+        assert!(h.frame_with(&mut v, vec![key(egui::Key::Enter)]).is_none(), "nothing to switch to");
+        assert!(!v.menu_open());
+        assert_eq!(v.status.as_ref().map(|(s, _)| s.as_str()), Some("this view is already on screen"));
     }
 
     /// The header names the row on screen and its place in its stack.

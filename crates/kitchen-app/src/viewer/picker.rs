@@ -44,6 +44,8 @@ pub struct Picker {
     menu: bool,
     /// Menu mode: (first item index, header) of each section.
     sections: Vec<(usize, String)>,
+    /// The user moved the cursor (j/k, arrows) since the picker opened.
+    pub(crate) moved: bool,
 }
 
 struct Term {
@@ -204,6 +206,7 @@ impl Picker {
             loading_note: "loading files…".into(),
             menu: false,
             sections: Vec::new(),
+            moved: false,
         };
         p.refilter();
         p
@@ -216,6 +219,11 @@ impl Picker {
         p.menu = true;
         p.sections = sections;
         p
+    }
+
+    /// The item under the cursor.
+    pub fn selected_item(&self) -> Option<usize> {
+        self.filtered.get(self.selected).map(|(i, _)| *i)
     }
 
     /// Put the cursor on item `item`, if it is listed.
@@ -293,6 +301,7 @@ impl Picker {
             if let Some((i, _)) = digit.and_then(|d| self.filtered.get(d)) {
                 return PickerResult::Chosen(*i);
             }
+            self.moved |= up || down;
             if up {
                 self.selected = self.selected.saturating_sub(1);
             }

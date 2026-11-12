@@ -1238,6 +1238,10 @@ impl Viewer {
                     let (view, at) = views.swap_remove(i);
                     if at != self.shown() {
                         cx.view = Some(view);
+                    } else {
+                        // Say so, or picking it looks like a switch that failed.
+                        let name = self.shown_entry_label().map(|l| l.split(" · ").next().unwrap_or(&l).to_string());
+                        self.status = Some((format!("{} is already on screen", name.as_deref().unwrap_or("this view")), false));
                     }
                 }
                 None => {}
