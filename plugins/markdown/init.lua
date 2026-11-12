@@ -1,8 +1,8 @@
 -- markdown: ⌘⇧V in the viewer shows Markdown files rendered, and back.
 -- Every open .md file is rendered up front (lua/markdown.lua) so the toggle
--- is instant. Each row keeps the source lines it came from: ⌘M on a row
--- comments on those lines (a paragraph: its whole range), and review
--- comments show under the row that holds their line.
+-- is instant: the whole document is one row the viewer's renderer draws in
+-- one pass. ⌘M on it comments on the document's lines, and review comments
+-- show under it; ⌘⇧V back to the text comments on single lines.
 local markdown = require("markdown")
 
 local function render(ev)

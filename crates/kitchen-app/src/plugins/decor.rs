@@ -263,7 +263,12 @@ pub fn parse_comments(v: serde_json::Value) -> Result<Vec<Comment>, String> {
 }
 
 pub fn parse_render(v: serde_json::Value) -> Result<Vec<RenderRow>, String> {
-    let serde_json::Value::Array(items) = v else { return Err("render rows must be a list".into()) };
+    let items = match v {
+        serde_json::Value::Array(items) => items,
+        // An empty Lua table arrives as `{}`.
+        serde_json::Value::Object(m) if m.is_empty() => Vec::new(),
+        _ => return Err("render rows must be a list".into()),
+    };
     items
         .into_iter()
         .enumerate()

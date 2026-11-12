@@ -120,6 +120,29 @@ pub fn group_color(group: &str) -> Option<Color32> {
     color
 }
 
+/// A code fence's language (`python`, `rs`, `sh`, …) as the file
+/// extension syntect looks grammars up by (`py`, `rs`, `sh`).
+pub fn fence_extension(lang: &str) -> Option<String> {
+    syntaxes().find_syntax_by_token(lang).and_then(|s| s.file_extensions.first().cloned())
+}
+
+/// [`GROUPS`] as a TextMate theme (`.tmTheme`) on `background`: the
+/// viewer's colors for renderers that take a theme file (egui_commonmark).
+pub fn tm_theme(name: &str, background: Color32) -> String {
+    let hex = |c: Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>name</key><string>{name}</string><key>settings</key><array>\
+         <dict><key>settings</key><dict><key>background</key><string>{}</string><key>foreground</key><string>{}</string></dict></dict>",
+        hex(background),
+        hex(crate::theme::TEXT)
+    );
+    for (_, scopes, v) in GROUPS {
+        out.push_str(&format!("<dict><key>scope</key><string>{scopes}</string><key>settings</key><dict><key>foreground</key><string>{}</string></dict></dict>", hex(rgb(*v))));
+    }
+    out.push_str("</array></dict></plist>\n");
+    out
+}
+
 /// [`GROUPS`] as a syntect theme.
 fn theme() -> &'static Theme {
     static T: OnceLock<Theme> = OnceLock::new();

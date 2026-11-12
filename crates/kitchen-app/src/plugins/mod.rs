@@ -904,8 +904,8 @@ mod tests {
         host
     }
 
-    /// markdown: every source line in exactly one row; prose as Markdown
-    /// blocks, top-level code a row per line.
+    /// markdown: the document is one Markdown row for the renderer, front
+    /// matter a code row per line above it; every line in exactly one row.
     #[test]
     fn markdown_plugin_rows() {
         use mlua::LuaSerdeExt;
@@ -917,30 +917,21 @@ mod tests {
             let v: serde_json::Value = lua.from_value(f.call(text).unwrap()).unwrap();
             decor::parse_render(v).unwrap()
         };
-        let text = "---\ntitle: x\n---\n# Title *é*\nSome **bold** and a [link][x],\nmore.\n\n\n- one\n  more of one\n\n  ```sh\n  ls\n  ```\n- [x] done\n  1. nested\n\n> quoted\n>\n> _it_\n\n```rust\nfn f() {\n\tx\n}\n```\n\n| a | b |\n|---|:-:|\n| `1` | two |\n\nSetext\n---\n\n    indented code\n\n[x]: http://x\n";
+        let text = "---\ntitle: x\n---\n# Title\n\n- one\n- two\n\n```rust\nfn f() {}\n```\n";
         let rows = rows_of(text);
-        let n = text.lines().count();
-        let mut owner = vec![0; n + 1];
+        let mut owner = vec![0; text.lines().count() + 1];
         for r in &rows {
             for l in r.line..=r.last_line() {
                 owner[l] += 1;
             }
         }
         assert!(owner[1..].iter().all(|&c| c == 1), "each line in one row: {owner:?}");
-        let find = |line: usize| rows.iter().find(|r| r.line == line).unwrap();
-        let md = |line: usize| (find(line).markdown.clone().unwrap_or_default(), find(line).last_line());
-        assert_eq!((find(1).block.as_deref(), find(2).text.as_str()), (Some("code"), "title: x"), "front matter is code");
-        assert_eq!((find(2).lang.as_deref(), find(24).lang.as_deref(), find(22).lang.as_deref()), (Some("yaml"), Some("rust"), None), "code rows carry their language");
-        assert_eq!(md(4), ("# Title *é*".into(), 4), "a heading is its own block");
-        assert_eq!(md(5), ("Some **bold** and a [link][x],\nmore.\n\n[x]: http://x".into(), 8), "link definitions go along; blank lines join");
-        assert_eq!(md(9).1, 14, "an item keeps its indented paragraph and code");
-        assert!(md(9).0.ends_with("  ```") && md(15).0.starts_with("- [x] done\n  1. nested"), "each top-level item is a block");
-        assert_eq!(md(18), ("> quoted\n>\n> _it_".into(), 21));
-        assert_eq!((find(22).text.as_str(), find(22).block.as_deref(), find(24).text.as_str()), ("rust", Some("code"), "    x"), "fenced code: a row per line");
-        assert_eq!(md(28).1, 31, "a table is one block");
-        assert_eq!(md(32), ("Setext\n---".into(), 34));
-        assert_eq!((find(35).text.as_str(), find(35).block.as_deref()), ("indented code", Some("code")));
-        assert_eq!((find(36).text.as_str(), find(36).block.as_deref()), ("", None), "a blank line after code is a gap");
+        assert_eq!((rows[0].block.as_deref(), rows[1].text.as_str(), rows[1].lang.as_deref()), (Some("code"), "title: x", Some("yaml")), "front matter is code");
+        let doc = rows.last().unwrap();
+        assert_eq!((doc.line, doc.last_line()), (4, 11));
+        assert_eq!(doc.markdown.as_deref(), Some("# Title\n\n- one\n- two\n\n```rust\nfn f() {}\n```"), "the rest, whole, for one pass");
+        assert_eq!(rows_of("one line").len(), 1);
+        assert!(rows_of("").is_empty());
     }
 
     /// github: PR links, the view of a PR, its comment threads and post arguments.
@@ -1805,7 +1796,7 @@ end)
         host.file_loaded(md.clone(), Arc::from("# Hi\n\ntext\n"), false);
         let mv = content_hash("# Hi\n\ntext\n");
         wait(&|| host.decor.get(&md).is_some_and(|d| d.render(&mv).is_some()));
-        assert_eq!(host.decor.get(&md).unwrap().render(&mv).unwrap()[0].markdown.as_deref(), Some("# Hi"));
+        assert_eq!(host.decor.get(&md).unwrap().render(&mv).unwrap()[0].markdown.as_deref(), Some("# Hi\n\ntext"));
         assert!(host.registry().chords.iter().any(|c| c.command == "markdown.toggle" && c.chord.label() == "⇧⌘V"));
         if std::process::Command::new("ruff").arg("--version").output().is_ok() {
             wait(&|| host.decor.get(&key).is_some_and(|d| !d.diagnostics(&v).is_empty()));

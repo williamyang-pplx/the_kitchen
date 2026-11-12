@@ -254,9 +254,20 @@ about LSP:
 ## Level 12 (2026-11-12): one Markdown renderer
 
 * Every card (comments, ⌘⇧A answers, plan comments) and every `markdown`
-  render row is drawn by `viewer/markdown.rs`: egui_commonmark for prose,
-  the viewer's highlighter for top-level code, so a comment looks like a
-  rendered `.md` file. Cards used to know only fences and backticks.
+  render row is drawn by `viewer/markdown.rs`, and egui_commonmark lays all
+  of it out in one pass, code included: its syntect highlighting gets the
+  viewer's colors as a generated `.tmTheme`, and fences name their grammar
+  by extension (`python` → `py`). Cards used to know only fences and
+  backticks.
+* The markdown plugin renders a file as one row, not a row per block: per
+  block, our row layout set the spacing between blocks (list items spaced
+  like paragraphs, markers off their text), and code was our own rows. The
+  price is that ⌘M in the rendered view covers the whole document; the text
+  view still comments on single lines. A row taller than the view scrolls
+  by pixels under the motion keys.
+* egui_commonmark centers list markers in a row `interact_size.y` tall
+  while text sits at the row's top, so that height is set to one text row.
+  It marks bold by color only, so bold is brighter than body text.
 * GitHub's flavour is prepared in Rust (`github`), not in each plugin. The
   edits come from pulldown-cmark's events with egui_commonmark's own parser
   options, so code is never rewritten and both agree on what is code and

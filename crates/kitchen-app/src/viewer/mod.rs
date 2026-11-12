@@ -2144,27 +2144,19 @@ end)"#,
         v.command(PanelCmd::Render(None), engine);
         h.settle(&mut v, &|v| v.render_shown.is_some());
         let rows: Vec<(LineKind, Option<usize>, &str, bool)> = v.doc.lines.iter().map(|l| (l.kind, l.new_no, l.text.as_str(), l.render.is_some())).collect();
-        assert_eq!(
-            rows,
-            vec![
-                (LineKind::Normal, Some(1), "# T", true),
-                (LineKind::Removed, None, "old para", false),
-                (LineKind::Added, Some(3), "line *one* line two", true),
-            ]
-        );
-        assert!(v.doc.lines[0].covers_new(2), "the blank line joins the heading's row");
-        // ⌘M on the paragraph comments on both of its lines.
+        assert_eq!(rows, vec![(LineKind::Added, Some(1), "# T  line *one* line two", true), (LineKind::Removed, None, "old para", false)], "the document is one row");
+        // ⌘M on it comments on all of its lines.
         v.place_cursor(4, 0);
-        assert_eq!(v.vim.line, 2, "line 4 is in the paragraph's row");
+        assert_eq!(v.vim.line, 0, "line 4 is in the document's row");
         v.command(PanelCmd::Comment, engine);
-        assert!(v.editor.as_ref().unwrap().label.starts_with("Comment on lines 3–4"));
+        assert!(v.editor.as_ref().unwrap().label.starts_with("Comment on lines 1–4"));
         h.frame(&mut v);
         h.text(&mut v, "nice");
         v.command(PanelCmd::Submit, engine);
         h.frame(&mut v);
         h.settle(&mut v, &|v| !v.comment_blocks().is_empty());
         let (block, _) = v.comment_blocks().remove(0);
-        assert_eq!((block.after, block.body.as_str()), (Some(2), "nice|new:4|3|line *one*\nline two"), "the source lines are quoted");
+        assert_eq!((block.after, block.body.as_str()), (Some(0), "nice|new:4|1|# T\n\nline *one*\nline two"), "the source lines are quoted");
         // Back to text: the comment stays on its line.
         v.command(PanelCmd::Render(None), engine);
         h.settle(&mut v, &|v| v.render_shown.is_none() && v.doc.lines.iter().all(|l| l.render.is_none()));

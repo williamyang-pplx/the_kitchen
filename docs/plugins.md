@@ -311,9 +311,9 @@ end)
   decorations, each call replaces the plugin's set for that file.
 * `body` and each reply's `body` are GitHub-flavored Markdown, drawn the
   way GitHub shows them and the way a rendered `.md` file looks (one
-  renderer for both). Top-level code fences are highlighted by the
-  language they name, and a ```` ```suggestion ```` as the file's
-  language. HTML becomes Markdown (comments hidden, `<details>` opened),
+  renderer for both, egui_commonmark, in one pass). Code fences are
+  highlighted by the language they name, in the viewer's colors, and a
+  ```` ```suggestion ```` as the file's language. HTML becomes Markdown (comments hidden, `<details>` opened),
   images are links, and bare URLs are linked. With `repo`, `#12`, `o/r#12`,
   `@user` and commit SHAs link to it too. ⌘-click opens a link, and a plain
   click still moves the cursor. Each reply is drawn under a rule and its
@@ -368,9 +368,10 @@ its lines is, and removed lines stay between the rows.
 ⌘M on a row comments on its source lines: `start_line` is the first line
 of the first row, and `line` is the last line of the last row. `quote`
 holds the source text. A comment shows under the row that holds its line.
-`plugins/markdown` renders `.md` files this way and binds ⌘⇧V: a
-`markdown` row per heading, paragraph, table, quote and top-level list item,
-and a code row per line of top-level code.
+A row taller than the viewer scrolls under j/k, ⌃d/⌃u, ⌃f/⌃b and gg/G
+until its edge shows. `plugins/markdown` renders `.md` files this way and
+binds ⌘⇧V: the whole document is one `markdown` row, so egui_commonmark
+lays it out in one pass (YAML front matter stays a code row per line).
 
 ### Timers
 

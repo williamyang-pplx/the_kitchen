@@ -1,31 +1,27 @@
 //! Markdown as the viewer draws it, in cards (review comments, ⌘⇧A
-//! answers, plan comments) and in the markdown plugin's rows. `github`
-//! turns GitHub's flavour into what egui_commonmark draws; `segments` cuts
-//! top-level code out for the viewer's highlighter; `draw` paints both.
+//! answers, plan comments) and in the markdown plugin's rendering of a
+//! file. egui_commonmark lays out and draws all of it, code included, in
+//! one pass; `github` first turns GitHub's flavour into what it draws.
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, Pos2, Rect, Sense, Ui, Vec2};
+use egui::{Color32, FontId, Pos2, Rect, Ui, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use regex::{Captures, Regex};
 
-use super::doc::expand_tabs;
-use super::highlight::{self, Spans};
+use super::highlight;
 use crate::theme;
 
 /// Background of code in rendered Markdown rows, fenced and inline.
 pub const CODE_BG: Color32 = Color32::from_rgb(0x24, 0x28, 0x3b);
-/// Body text; bold and headings are `theme::TEXT`.
+/// Body text.
 pub const PROSE: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
-/// Room around a code panel's text.
-const CODE_PAD: f32 = 6.0;
-/// Highlighted snippets kept before the cache is emptied.
-const SPANS_MAX: usize = 256;
+/// Bold text and headings: egui_commonmark marks them by color only, so
+/// they need to stand out from `PROSE`.
+const STRONG: Color32 = Color32::from_rgb(0xf0, 0xf3, 0xff);
 /// What egui_commonmark parses with (`parser_options` in
 /// egui_commonmark_backend 0.25), so both see the same blocks and links.
 const OPTIONS: Options = Options::ENABLE_TABLES
@@ -47,91 +43,6 @@ pub struct Text<'a> {
     pub dim: bool,
     /// Behind code, fenced and inline.
     pub code_bg: Color32,
-}
-
-/// A run of the source: prose for egui_commonmark, or top-level code.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Segment {
-    /// Markdown, with the document's link definitions appended when it uses `]`.
-    Prose(String),
-    /// A fenced or indented block's text, without the fence lines.
-    Code { lang: String, text: String, suggestion: bool },
-}
-
-/// `src` cut into prose and the code blocks at its top level; code inside a
-/// list item or quote stays in the prose. Blank prose is dropped.
-pub fn segments(src: &str) -> Vec<Segment> {
-    let mut iter = Parser::new_ext(src, OPTIONS).into_offset_iter();
-    // (block range, lang, text) of each top-level code block.
-    let mut blocks: Vec<(Range<usize>, String, String)> = Vec::new();
-    let mut depth = 0usize;
-    let mut code: Option<(Range<usize>, String, String)> = None;
-    for (event, range) in iter.by_ref() {
-        match event {
-            Event::Start(tag) => {
-                if let (0, Tag::CodeBlock(kind)) = (depth, &tag) {
-                    let lang = match kind {
-                        CodeBlockKind::Fenced(info) => info.split_whitespace().next().unwrap_or("").to_string(),
-                        CodeBlockKind::Indented => String::new(),
-                    };
-                    code = Some((range, lang, String::new()));
-                }
-                depth += 1;
-            }
-            Event::End(_) => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    if let Some(c) = code.take() {
-                        blocks.push(c);
-                    }
-                }
-            }
-            Event::Text(t) => {
-                if let Some(c) = code.as_mut() {
-                    c.2.push_str(&t);
-                }
-            }
-            _ => {}
-        }
-    }
-    let defs: Vec<&str> = iter.reference_definitions().iter().filter_map(|(_, d)| src.get(d.span.clone())).map(str::trim).collect();
-    let mut out = Vec::new();
-    let prose = |text: &str, out: &mut Vec<Segment>| {
-        let text = trim_blank_lines(text);
-        if text.is_empty() {
-            return;
-        }
-        let mut text = text.to_string();
-        if !defs.is_empty() && text.contains(']') {
-            text.push_str("\n\n");
-            text.push_str(&defs.join("\n"));
-        }
-        out.push(Segment::Prose(text));
-    };
-    let mut at = 0;
-    for (range, lang, text) in blocks {
-        prose(&src[at..range.start.max(at)], &mut out);
-        let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
-        let suggestion = lang == "suggestion";
-        out.push(Segment::Code { lang, text, suggestion });
-        at = range.end;
-    }
-    prose(&src[at.min(src.len())..], &mut out);
-    out
-}
-
-/// `text` without its leading blank lines and trailing whitespace (a
-/// first line's indent is kept: it may be meaningful).
-fn trim_blank_lines(text: &str) -> &str {
-    let text = text.trim_end();
-    let mut start = 0;
-    for line in text.split_inclusive('\n') {
-        if !line.trim().is_empty() {
-            break;
-        }
-        start += line.len();
-    }
-    &text[start..]
 }
 
 /// GitHub-flavored `src` as egui_commonmark should draw it, as on GitHub:
@@ -389,117 +300,84 @@ fn text_edit(text: &str, repo: Option<&str>) -> String {
     out
 }
 
+/// `src` with each fence's language as the file extension
+/// egui_commonmark finds its grammar by (`python` → `py`), and a
+/// ```` ```suggestion ```` highlighted as `path` under a "Suggested change"
+/// line, as GitHub shows one.
+fn fences(src: &str, path: Option<&str>) -> String {
+    let path_ext = path.and_then(|p| std::path::Path::new(p).extension()).map(|e| e.to_string_lossy().into_owned());
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    for (event, range) in Parser::new_ext(src, OPTIONS).into_offset_iter() {
+        let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) = event else { continue };
+        let Some(lang) = info.split_whitespace().next() else { continue };
+        let suggestion = lang == "suggestion";
+        let ext = if suggestion { path_ext.clone().unwrap_or_default() } else { highlight::fence_extension(lang).unwrap_or_else(|| lang.to_string()) };
+        // The info string sits on the fence's first line, after the marks.
+        let line_end = src[range.start..].find('\n').map_or(src.len(), |i| range.start + i);
+        let Some(at) = src[range.start..line_end].find(lang).map(|i| range.start + i) else { continue };
+        if ext != lang {
+            edits.push((at..at + lang.len(), ext));
+        }
+        let line_start = src[..range.start].rfind('\n').map_or(0, |i| i + 1);
+        if suggestion && src[line_start..range.start].trim().is_empty() {
+            edits.push((range.start..range.start, "*Suggested change*\n\n".to_string() + &src[line_start..range.start]));
+        }
+    }
+    edits.sort_by_key(|(r, _)| r.start);
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut last = 0;
+    for (r, new) in edits {
+        out.push_str(&src[last..r.start]);
+        out.push_str(&new);
+        last = r.end;
+    }
+    out.push_str(&src[last..]);
+    out
+}
+
+/// egui_commonmark's cache (its grammars and themes), with the names of
+/// the viewer themes added to it, shared by every draw.
+#[derive(Default)]
+struct Renderer {
+    cache: CommonMarkCache,
+    themes: HashSet<String>,
+}
+
 /// Draws `text` at `at`, `width` wide, clipped to `clip`; returns its height.
-/// Its widgets are disabled unless ⌘ is held, so a plain click lands on the
-/// row (cursor, ⌘M) and keys stay with vim; ⌘-click opens a link (see
-/// `drain_open_urls`). `paint: false` lays it out invisibly, to measure.
-#[allow(clippy::too_many_arguments)]
+/// egui_commonmark lays it all out. Its widgets are disabled unless ⌘ is
+/// held, so a plain click lands on the row (cursor, ⌘M) and keys stay with
+/// vim; ⌘-click opens a link (see `drain_open_urls`). `paint: false` lays it
+/// out invisibly, to measure.
 pub fn draw(ui: &mut Ui, text: &Text, at: Pos2, width: f32, clip: Rect, id: egui::Id, paint: bool) -> f32 {
-    let segments = segments(&github(text.src, text.repo));
-    let cache = ui.data_mut(|d| d.get_temp_mut_or_default::<Arc<Mutex<CommonMarkCache>>>(egui::Id::new("commonmark")).clone());
+    let src = fences(&github(text.src, text.repo), text.path);
+    let renderer = ui.data_mut(|d| d.get_temp_mut_or_default::<Arc<Mutex<Renderer>>>(egui::Id::new("markdown renderer")).clone());
+    let mut renderer = renderer.lock().unwrap_or_else(|e| e.into_inner());
+    // Code takes the viewer's colors, on the background it sits on.
+    let bg = text.code_bg;
+    let theme_name = format!("kitchen-{:02x}{:02x}{:02x}", bg.r(), bg.g(), bg.b());
+    if renderer.themes.insert(theme_name.clone()) {
+        if let Err(e) = renderer.cache.add_syntax_theme_from_bytes(theme_name.clone(), highlight::tm_theme(&theme_name, bg).as_bytes()) {
+            log::warn!("markdown code theme: {e}");
+        }
+    }
     let max = Rect::from_min_size(at, Vec2::new(width.max(80.0), f32::INFINITY));
     let mut builder = egui::UiBuilder::new().max_rect(max).layout(egui::Layout::top_down(egui::Align::Min));
     // The measuring copy gets its own ids, so it never clashes with the painted one.
     builder = if paint { builder.id_salt(id) } else { builder.id_salt(id.with("measure")).invisible() };
     let mut child = ui.new_child(builder);
     child.set_clip_rect(clip.intersect(ui.clip_rect()));
-    child.set_style(markdown_style(ui.style(), text));
+    child.set_style(markdown_style(ui, text));
     if !(paint && ui.input(|i| i.modifiers.command)) {
         child.disable();
     }
-    for (i, segment) in segments.iter().enumerate() {
-        match segment {
-            Segment::Prose(md) => {
-                child.push_id(i, |ui| CommonMarkViewer::new().show(ui, &mut cache.lock().unwrap_or_else(|e| e.into_inner()), md));
-            }
-            Segment::Code { lang, text: code, suggestion } => {
-                let spans = if text.dim { None } else { code_spans(&child, lang, text.path, *suggestion, code) };
-                code_panel(&mut child, code, spans.as_deref(), *suggestion, text);
-            }
-        }
-    }
+    CommonMarkViewer::new().syntax_theme_dark(&theme_name).syntax_theme_light(&theme_name).show(&mut child, &mut renderer.cache, &src);
     child.min_rect().height()
 }
 
-/// A code segment: a "Suggested change" line over a suggestion, then the
-/// code in monospace on a panel, colored by `spans`, wrapped at the width.
-fn code_panel(ui: &mut Ui, code: &str, spans: Option<&Spans>, suggestion: bool, text: &Text) {
-    let base = if text.dim { theme::SUBTLE } else { PROSE };
-    if suggestion {
-        ui.label(egui::RichText::new("Suggested change").font(theme::ui_font(text.size - 1.5)).color(theme::SUBTLE));
-    }
-    let font = FontId::monospace(text.size * 0.88);
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = (ui.available_width() - CODE_PAD * 2.0).max(40.0);
-    let format = |color| TextFormat { font_id: font.clone(), color, ..Default::default() };
-    for (i, line) in code.lines().enumerate() {
-        if i > 0 {
-            job.append("\n", 0.0, format(base));
-        }
-        let line = expand_tabs(line);
-        let empty = Vec::new();
-        let line_spans = spans.and_then(|s| s.get(i)).unwrap_or(&empty);
-        let mut cuts = vec![0, line.len()];
-        for (r, _) in line_spans {
-            cuts.extend([r.start.min(line.len()), r.end.min(line.len())]);
-        }
-        cuts.sort_unstable();
-        cuts.dedup();
-        for w in cuts.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if a >= b || !line.is_char_boundary(a) || !line.is_char_boundary(b) {
-                continue;
-            }
-            let color = line_spans.iter().rev().find(|(r, _)| r.start <= a && r.end >= b).map_or(base, |(_, c)| *c);
-            job.append(&line[a..b], 0.0, format(color));
-        }
-    }
-    if job.text.is_empty() {
-        job.append("", 0.0, format(base));
-    }
-    let galley = ui.fonts_mut(|f| f.layout_job(job));
-    let size = Vec2::new(ui.available_width(), galley.size().y + CODE_PAD * 2.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    if ui.is_rect_visible(rect) {
-        ui.painter().rect_filled(rect, 6.0, text.code_bg);
-        ui.painter().galley(rect.min + Vec2::splat(CODE_PAD), galley, base);
-    }
-}
-
-type SpanCache = Arc<Mutex<HashMap<u64, Option<Arc<Spans>>>>>;
-
-/// Highlight spans for a code segment, cached in egui's temp data by
-/// language and text: a suggestion is highlighted as `path`, other code by
-/// its fence's language; no language, no colors (as on GitHub).
-fn code_spans(ui: &Ui, lang: &str, path: Option<&str>, suggestion: bool, code: &str) -> Option<Arc<Spans>> {
-    let path = path.filter(|_| suggestion);
-    if path.is_none() && (lang.is_empty() || suggestion) {
-        return None;
-    }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (lang, path, code).hash(&mut h);
-    let key = h.finish();
-    let cache = ui.data_mut(|d| d.get_temp_mut_or_default::<SpanCache>(egui::Id::new("markdown spans")).clone());
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(spans) = cache.get(&key) {
-        return spans.clone();
-    }
-    if cache.len() >= SPANS_MAX {
-        cache.clear();
-    }
-    let spans = match path {
-        Some(p) => highlight::highlight(p, code),
-        None => highlight::highlight_lang(lang, code),
-    }
-    .map(Arc::new);
-    cache.insert(key, spans.clone());
-    spans
-}
-
 /// Fonts and colors for Markdown at `text.size`, faded when `text.dim`.
-fn markdown_style(base: &egui::Style, text: &Text) -> egui::Style {
+fn markdown_style(ui: &Ui, text: &Text) -> egui::Style {
     use egui::TextStyle;
-    let mut s = base.clone();
+    let mut s = ui.style().as_ref().clone();
     let body = text.size;
     s.text_styles = [
         (TextStyle::Small, theme::ui_font(body * 0.85)),
@@ -509,7 +387,7 @@ fn markdown_style(base: &egui::Style, text: &Text) -> egui::Style {
         (TextStyle::Monospace, FontId::monospace(body * 0.88)),
     ]
     .into();
-    let (prose, strong) = if text.dim { (theme::SUBTLE, theme::MUTED) } else { (PROSE, theme::TEXT) };
+    let (prose, strong) = if text.dim { (theme::SUBTLE, theme::MUTED) } else { (PROSE, STRONG) };
     let v = &mut s.visuals;
     // Text colors come from the widget visuals: plain text dimmer than
     // bold and headings (egui draws `strong` as a brighter color).
@@ -522,6 +400,10 @@ fn markdown_style(base: &egui::Style, text: &Text) -> egui::Style {
     // Disabled only so it takes no input; drawn at full strength.
     v.disabled_alpha = 1.0;
     s.spacing.item_spacing.y = 5.0;
+    // egui_commonmark lays a line out as a wrapped row of widgets, its list
+    // markers centered in the row: a row as tall as the text keeps a marker
+    // level with the text beside it (egui's default is a button's height).
+    s.spacing.interact_size.y = ui.fonts_mut(|f| f.row_height(&theme::ui_font(body)));
     // With ⌘ held a click opens a link instead of selecting text.
     s.interaction.selectable_labels = false;
     s
@@ -551,30 +433,13 @@ pub fn drain_open_urls(ctx: &egui::Context) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn code(lang: &str, text: &str) -> Segment {
-        Segment::Code { lang: lang.into(), text: text.into(), suggestion: lang == "suggestion" }
-    }
-
-    fn prose(text: &str) -> Segment {
-        Segment::Prose(text.into())
-    }
-
     #[test]
-    fn segments_cut_top_level_code() {
-        let src = "Both are colors:\n\n```rust\nconst A: u8 = 1;\n  nested();\n```\n\nSo use `A`.\n";
-        assert_eq!(segments(src), vec![prose("Both are colors:"), code("rust", "const A: u8 = 1;\n  nested();"), prose("So use `A`.")]);
-        // Code in a list item or a quote is the renderer's.
-        let nested = "- item\n\n  ```\n  x\n  ```\n\n> ```\n> y\n> ```";
-        assert_eq!(segments(nested), vec![prose(nested)]);
-        assert_eq!(segments("text\n\n    indented\n"), vec![prose("text"), code("", "indented")]);
-        assert_eq!(segments("```suggestion\nfixed();\n```"), vec![code("suggestion", "fixed();")]);
-        assert_eq!(segments("a\n```py\nunclosed"), vec![prose("a"), code("py", "unclosed")]);
-        assert_eq!(segments("~~~\n```inner\n~~~"), vec![code("", "```inner")], "a fence line inside code doesn't close it");
-        assert_eq!(segments("plain\n\ntext"), vec![prose("plain\n\ntext")]);
-        // Link definitions go along with each prose segment that may use them.
-        let refs = segments("see [x][r]\n\n```\nc\n```\n\nand [y][r]\n\n[r]: https://x.y \"T\"");
-        assert_eq!(refs[0], prose("see [x][r]\n\n[r]: https://x.y \"T\""));
-        assert!(matches!(&refs[2], Segment::Prose(p) if p.starts_with("and [y][r]") && p.ends_with("[r]: https://x.y \"T\"")));
+    fn fences_name_grammars_by_extension() {
+        assert_eq!(fences("```python\nx = 1\n```", None), "```py\nx = 1\n```");
+        assert_eq!(fences("~~~rust title\nfn f() {}\n~~~", None), "~~~rs title\nfn f() {}\n~~~");
+        assert_eq!(fences("```\nplain\n```", None), "```\nplain\n```", "no language: plain, as on GitHub");
+        assert_eq!(fences("a\n\n```suggestion\nfix()\n```", Some("src/a.py")), "a\n\n*Suggested change*\n\n```py\nfix()\n```");
+        assert_eq!(fences("`python` inline", None), "`python` inline");
     }
 
     #[test]

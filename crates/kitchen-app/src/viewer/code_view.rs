@@ -44,6 +44,8 @@ pub struct ViewState {
     pub rows: usize,
     /// Cursor row at the end of the last frame: a change means the cursor moved.
     last_line: Option<usize>,
+    /// A `g` held back while scrolling a tall row: `gg` goes to its top.
+    g_pending: bool,
     /// Heights measured invisibly, for the doc length, width and font size
     /// in `md_key`; painting refreshes them, a new key clears them.
     heights: Heights,
@@ -344,7 +346,53 @@ impl CodeView<'_> {
 
         // ---- keys -> vim
         if focused && !editor_focused && n > 0 {
+            let mut keys = Vec::new();
             for key in collect_keys(ui) {
+                // A row taller than the view (a whole rendered document)
+                // scrolls under the motion keys until its edge shows.
+                let cur = vim.line.min(n - 1);
+                let row = rows_in_view(state.top, state.offset, height, n, &mut |i| geo.extent(ui, i, &mut state.heights)).into_iter().find(|r| r.0 == cur);
+                let delta = row.filter(|r| r.2 > height).and_then(|(_, top, h)| {
+                    let (at_top, at_bottom) = (top >= -0.5, top + h <= height + 0.5);
+                    let held_g = std::mem::take(&mut state.g_pending);
+                    let d = match key {
+                        VimKey::Char('j') | VimKey::Down => row_h * 2.0,
+                        VimKey::Char('k') | VimKey::Up => -row_h * 2.0,
+                        VimKey::Ctrl('e') => row_h,
+                        VimKey::Ctrl('y') => -row_h,
+                        VimKey::Ctrl('d') => height / 2.0,
+                        VimKey::Ctrl('u') => -height / 2.0,
+                        VimKey::Ctrl('f') | VimKey::PageDown => height,
+                        VimKey::Ctrl('b') | VimKey::PageUp => -height,
+                        VimKey::Char('G') => h,
+                        VimKey::Char('g') if held_g => -h,
+                        VimKey::Char('g') => {
+                            state.g_pending = true;
+                            return Some(0.0);
+                        }
+                        _ => {
+                            if held_g {
+                                keys.push(VimKey::Char('g'));
+                            }
+                            return None;
+                        }
+                    };
+                    // At the row's edge the motion leaves it, as on any row.
+                    if (d > 0.0 && at_bottom) || (d < 0.0 && at_top) {
+                        if held_g {
+                            keys.push(VimKey::Char('g'));
+                        }
+                        return None;
+                    }
+                    // No further than the row's edges.
+                    Some(d.clamp(top.min(0.0), (top + h - height).max(0.0)))
+                });
+                match delta {
+                    Some(d) => (state.top, state.offset) = scroll_px(state.top, state.offset, d, height, n, &mut |i| geo.extent(ui, i, &mut state.heights)),
+                    None => keys.push(key),
+                }
+            }
+            for key in keys.drain(..) {
                 let acts = vim.key(key, &lines, Viewport { top: state.top, rows: state.rows });
                 for a in acts {
                     match a {
