@@ -37,9 +37,11 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   (`claude -p --resume <id> --fork-session` on the tab's host), so the answer
   has the agent's context, model and tools, and the agent never sees it. It
   may not edit files. Tabs without a session ask `ask_model` (sonnet). Enter
-  sends the question and the answer shows under the line; ⌘⇧A on that line
-  again asks a follow-up in the same thread (the fork is kept, in
-  `~/.claude/projects/-kitchen-asks/`), and Esc on it closes the thread. Tabs without changes open on a folder view
+  sends the question and the answer shows under the line, with a follow-up
+  field under it (when the cursor is still there) that asks in the same
+  thread; the fork is kept in `~/.claude/projects/-kitchen-asks/`. Esc in the
+  field closes it and ⌘⇧A on the asked lines opens it again; Esc on them
+  closes the thread. Tabs without changes open on a folder view
   (`aster/`, set by `viewer_default_dirs`). Vim
   navigation (`-` up a folder, Enter opens), an fzf-style ⌘P file finder (in the viewer)
   (space-separated terms, smart case), diff/plain mode, jump-to-definition and an
@@ -124,7 +126,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘⇧R | rename the current workspace |
 | ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins); paste a PR link to review it |
 | ⌘M | comment on the cursor line / selection (viewer, viewing a PR: posted to the PR on GitHub; on a commented line: a reply) |
-| ⌘⇧A | in the viewer or plan: ask the agent about the cursor line / selection (Enter asks; the answer shows under the line; ⌘⇧A there again follows up, Esc on it closes the thread) |
+| ⌘⇧A | in the viewer or plan: ask the agent about the cursor line / selection (Enter asks; the answer shows under the line with a follow-up field; ⌘⇧A there reopens the field, Esc on the line closes the thread) |
 | ⌘Enter | submit comment (plan: send comments to agent) |
 | ⌘D | workspace dashboard; in the viewer or plan: toggle diff / plain file |
 | ⌘O | toggle outline (collapsed) mode |

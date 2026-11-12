@@ -315,7 +315,7 @@ impl Viewer {
         };
         self.reply_to = thread.and_then(|(_, id)| id);
         self.list_focus = false;
-        self.editor = Some(Editor { start, end, text: String::new(), label: format!("{what} — ⌘Enter sends it to {} · Esc cancels", who.join(", ")), needs_focus: true, ask: false });
+        self.editor = Some(Editor { start, end, text: String::new(), label: format!("{what} — ⌘Enter sends it to {} · Esc cancels", who.join(", ")), needs_focus: true, ask: false, follow_up: false });
     }
 
     /// Hand the comment field to the `comment` listeners.

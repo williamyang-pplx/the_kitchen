@@ -216,6 +216,8 @@ pub struct Viewer {
     ask_seq: u64,
     /// The thread the open question field follows up on.
     follow_up: Option<u64>,
+    /// A thread that just answered: its follow-up field may open.
+    offered: Option<u64>,
     answerer: crate::ask_thread::Answerer,
     /// When ⌘⇧S last asked the plugins for the PR menu (until it changes).
     asked: Option<std::time::Instant>,
@@ -297,6 +299,7 @@ impl Viewer {
             submit_pending: false,
             asks: Vec::new(),
             follow_up: None,
+            offered: None,
             ask_seq: 0,
             answerer: kitchen_core::ask::ask,
             asked: None,
@@ -1283,13 +1286,14 @@ impl Viewer {
             code_ui.centered_and_justified(|ui| ui.label(RichText::new(text).color(theme::DIM)));
         } else {
             let focused = cx.focused && self.picker.is_none() && !self.list_focus;
+            self.offer_follow_up(focused);
             if focused && self.editor.is_none() {
                 self.leader_keys(&mut code_ui);
             }
             let comments = self.comment_blocks();
             let blocks: Vec<code_view::Block> = comments.into_iter().map(|(b, _)| b).chain(self.ask_blocks()).collect();
             let overlay = self.overlay.as_ref().filter(|o| !self.browsing && !self.outline && self.current.as_deref() == Some(o.path.as_str())).map(|o| &o.overlay);
-            let out = CodeView {
+            let mut out = CodeView {
                 doc: &self.doc,
                 vim: &mut self.vim,
                 state: &mut self.view,
@@ -1309,6 +1313,9 @@ impl Viewer {
             }
             if out.cancel_editor {
                 self.editor = None;
+                // egui drops the field's focus on that Esc, so vim saw it
+                // too: it must not also close the thread under the field.
+                out.actions.retain(|a| !matches!(a, VimAction::Escape));
             }
             if std::mem::take(&mut self.submit_pending) || out.submit_editor {
                 if self.editor.as_ref().is_some_and(|e| e.ask) {
@@ -2236,17 +2243,30 @@ end)"#,
         // Mixed sides: about the last line, in the current file.
         assert_eq!(b.body, "sonnet|false|a.py:2-2|false|b\nB|why?");
         assert!(b.title.starts_with("why?"));
-        // ⌘⇧A on its line follows up in the thread's session (a uuid).
-        v.command(PanelCmd::Ask, engine);
-        assert!(v.editor.as_ref().is_some_and(|e| e.label.starts_with("Follow up on “why?”")), "{:?}", v.editor.as_ref().map(|e| &e.label));
+        // The answer opens a follow-up field under the thread; it asks in
+        // the thread's session (a uuid).
+        let follow_up = |v: &Viewer| v.editor.as_ref().filter(|e| e.ask && e.follow_up && e.end == row && e.label.starts_with("Follow up on “why?”")).is_some();
+        assert!(follow_up(&v), "{:?}", v.editor.as_ref().map(|e| &e.label));
         h.frame(&mut v);
         h.text(&mut v, "and B?");
         h.key(&mut v, egui::Key::Enter);
+        assert!(v.editor.is_none(), "submitted");
         h.settle(&mut v, &|v| v.ask_blocks().len() == 2 && v.ask_blocks().iter().all(|b| !b.dim));
         let b = v.ask_blocks().remove(1);
         assert_eq!((b.after, b.title.as_str(), b.body.as_str()), (Some(row), "↳ and B?", "36|and B?"));
-        // Esc elsewhere keeps the thread; Esc on its line closes it.
+        // Esc closes the field, ⌘⇧A on the thread's line opens it again.
+        h.settle(&mut v, &follow_up);
+        h.key(&mut v, egui::Key::Escape);
+        assert!(v.editor.is_none() && v.ask_blocks().len() == 2, "Esc in the field keeps the thread");
+        v.command(PanelCmd::Ask, engine);
+        assert!(follow_up(&v));
+        h.key(&mut v, egui::Key::Escape);
+        // An answer that lands while the cursor is elsewhere opens nothing.
         v.place_cursor(1, 0);
+        v.offered = v.asks.first().map(|a| a.thread.id);
+        h.frame(&mut v);
+        assert!(v.editor.is_none());
+        // Esc elsewhere keeps the thread; Esc on its line closes it.
         h.key(&mut v, egui::Key::Escape);
         assert_eq!(v.ask_blocks().len(), 2);
         // Elsewhere ⌘⇧A asks a new question.

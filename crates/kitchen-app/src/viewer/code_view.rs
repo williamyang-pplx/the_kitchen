@@ -132,6 +132,8 @@ pub struct Editor {
     pub needs_focus: bool,
     /// A ⌘⇧A question: Enter submits it (⇧Enter: a new line).
     pub ask: bool,
+    /// A ⌘⇧A follow-up: drawn under the line's cards (the thread), not above them.
+    pub follow_up: bool,
 }
 
 #[derive(Debug, Default)]
@@ -380,7 +382,9 @@ impl CodeView<'_> {
                 let (idx, need) = match just_opened {
                     Some(ed) => {
                         let i = ed.end.min(n - 1);
-                        (i, ext(i).row + editor_h + EDITOR_GAP)
+                        let e = ext(i);
+                        // A follow-up field is under the thread: show the thread too.
+                        (i, if ed.follow_up { e.unit - e.lead } else { e.row + editor_h + EDITOR_GAP })
                     }
                     None => (cur, ext(cur).row),
                 };
@@ -568,14 +572,20 @@ impl CodeView<'_> {
             }
             y += row_height;
             // The comment field goes right under its line, above the line's
-            // blocks (a long thread would push it out of view).
-            if let Some(ed) = editor.as_deref() {
-                if ed.end == idx {
-                    editor_rect = Some(Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, y + BLOCK_TOP), Vec2::new(block_width, editor_h)));
-                    y += editor_h + EDITOR_GAP;
-                }
+            // blocks (a long thread would push it out of view); a follow-up
+            // field under them, like the next message of the thread.
+            let field = editor.as_deref().filter(|ed| ed.end == idx).map(|ed| ed.follow_up);
+            let mut place_field = |y: &mut f32| {
+                editor_rect = Some(Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP), Vec2::new(block_width, editor_h)));
+                *y += editor_h + EDITOR_GAP;
+            };
+            if field == Some(false) {
+                place_field(&mut y);
             }
             draw_blocks(Some(idx), &mut y, ui);
+            if field == Some(true) {
+                place_field(&mut y);
+            }
         }
         if n == 0 {
             painter.text(Pos2::new(text_x, rect.top() + 8.0), egui::Align2::LEFT_TOP, "(empty)", font.clone(), theme::DIM);

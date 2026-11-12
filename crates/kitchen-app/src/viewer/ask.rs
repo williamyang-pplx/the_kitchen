@@ -1,8 +1,8 @@
 //! ⌘⇧A: ask the tab's agent (a fork of its session, see `kitchen_core::ask`)
 //! about the cursor line or selection. The question field opens under the
 //! lines like a ⌘M comment; the answers are drawn there as cards until Esc
-//! on their line closes them. ⌘⇧A on the line again asks a follow-up in the
-//! same thread. Answers are not stored.
+//! on their lines closes them, with a follow-up field under them (see
+//! `ask_thread`). Answers are not stored.
 
 use kitchen_core::ask;
 
@@ -13,15 +13,16 @@ use crate::plugins::decor::Side;
 
 pub(super) struct Ask {
     path: String,
-    /// The last asked line: the answers go under it.
+    /// The asked lines' numbers (on `side`); the answers go under the last.
     side: Side,
+    first: usize,
     line: usize,
-    thread: Thread,
+    pub(super) thread: Thread,
 }
 
 impl Viewer {
     /// ⌘⇧A: a question field under the cursor line or visual selection. On
-    /// a line with answers (and no selection), a follow-up to the last.
+    /// a thread's lines (and no selection), a follow-up to the last thread.
     pub(super) fn start_ask(&mut self) {
         if self.browsing || self.outline || !self.current.as_ref().is_some_and(|p| self.files.contains_key(p)) {
             self.status = Some(("open a file to ask about it".into(), false));
@@ -30,9 +31,8 @@ impl Viewer {
         self.reply_to = None;
         self.list_focus = false;
         self.follow_up = self.vim.visual_lines().is_none().then(|| self.asks_on_cursor().last().copied()).flatten();
-        if let Some(a) = self.follow_up.and_then(|id| self.asks.iter().find(|a| a.thread.id == id)) {
-            let label = format!("Follow up on “{}” — Enter asks · Esc cancels", a.thread.question());
-            self.editor = Some(Editor { start: self.vim.line, end: self.vim.line, text: String::new(), label, needs_focus: true, ask: true });
+        if let Some(id) = self.follow_up {
+            self.open_follow_up(id);
             return;
         }
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
@@ -40,7 +40,7 @@ impl Viewer {
         let what = if end > start || last > first { format!("lines {first}–{last}") } else { format!("line {last}") };
         let who = self.engine.find_tab(&self.tab_id).map_or_else(|| self.engine.settings().ask_model, |_| "the agent".into());
         let label = format!("Ask {who} about {what} — Enter asks · Esc cancels");
-        self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true });
+        self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true, follow_up: false });
     }
 
     /// Send the question field to the model; its card shows "thinking… Ns" until it answers.
@@ -76,7 +76,7 @@ impl Viewer {
         let quote = self.quote(&path, ed.start, ed.end);
         self.ask_seq += 1;
         let id = self.ask_seq;
-        self.asks.push(Ask { path: path.clone(), side, line, thread: Thread::new(id, &text) });
+        self.asks.push(Ask { path: path.clone(), side, first, line, thread: Thread::new(id, &text) });
         self.vim.anchor = None;
         let model = self.engine.settings().ask_model;
         let tab = self.engine.find_tab(&self.tab_id).map(|(_, t)| t.row);
@@ -93,9 +93,37 @@ impl Viewer {
 
     pub(super) fn finish_ask(&mut self, ans: crate::ask_thread::Answer) {
         match self.asks.iter_mut().find(|a| a.thread.id == ans.id) {
-            Some(a) => a.thread.finish(ans.asker, ans.result),
+            Some(a) => {
+                if ans.result.is_ok() {
+                    self.offered = Some(ans.id);
+                }
+                a.thread.finish(ans.asker, ans.result);
+            }
             // Closed while it was being answered.
             None => crate::ask_thread::discard(ans),
+        }
+    }
+
+    /// The follow-up field of thread `id`, under its cards.
+    fn open_follow_up(&mut self, id: u64) {
+        let Some(a) = self.asks.iter().find(|a| a.thread.id == id) else { return };
+        if let Some(why) = a.thread.blocked() {
+            self.status = Some((why.into(), true));
+            return;
+        }
+        let Some(row) = self.row_at(a.side, a.line) else { return };
+        self.follow_up = Some(id);
+        self.editor = Some(a.thread.editor(row));
+    }
+
+    /// A thread just answered: open its follow-up field if William is still
+    /// on its lines in this viewer (`focused`) and writing nothing else.
+    pub(super) fn offer_follow_up(&mut self, focused: bool) {
+        let Some(id) = self.offered.take() else { return };
+        if focused && self.editor.is_none() && self.vim.anchor.is_none() && self.asks_on_cursor().contains(&id) {
+            self.open_follow_up(id);
+        } else {
+            self.status = Some(("answered · ⌘⇧A on its lines follows up · Esc there closes it".into(), false));
         }
     }
 
@@ -110,14 +138,19 @@ impl Viewer {
             .collect()
     }
 
-    /// The threads under the cursor line, oldest first.
+    /// The threads about the cursor line, oldest first.
     fn asks_on_cursor(&self) -> Vec<u64> {
         let Some(path) = self.current.as_ref() else { return Vec::new() };
-        let row = Some(self.vim.line);
-        self.asks.iter().filter(|a| &a.path == path && self.row_at(a.side, a.line) == row).map(|a| a.thread.id).collect()
+        let cur = self.vim.line;
+        self.asks
+            .iter()
+            .filter(|a| &a.path == path)
+            .filter(|a| self.row_at(a.side, a.line).is_some_and(|last| (self.row_at(a.side, a.first).unwrap_or(last)..=last).contains(&cur)))
+            .map(|a| a.thread.id)
+            .collect()
     }
 
-    /// Esc: close the threads under the cursor line.
+    /// Esc: close the threads about the cursor line.
     pub(super) fn close_asks(&mut self) {
         let shut = self.asks_on_cursor();
         let (closed, kept) = std::mem::take(&mut self.asks).into_iter().partition(|a| shut.contains(&a.thread.id));
