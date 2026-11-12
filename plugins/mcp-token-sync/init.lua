@@ -18,7 +18,11 @@
 -- Python script that merges it into ~/.claude/.credentials.json (matched by
 -- serverName, written to a temp file and renamed, mode 600). It writes only
 -- when something changed, so Claude's mtime watch fires only on a real
--- change. After a write, `claude mcp get <server>` on the box checks it.
+-- change. It also clears the server from Claude's needs-auth cache there,
+-- which would otherwise keep new sessions from trying the token. After a
+-- write, `claude mcp get <server>` on the box checks it (that command ignores
+-- the cache). A devbox workspace that opens is pushed to within 10 s, not at
+-- the next pass.
 --
 -- Token values never reach a log, a toast or the dashboard.
 
@@ -137,6 +141,14 @@ end
 --   * when anything changed: a temp file in ~/.claude (mode 600), fsync,
 --     os.replace over the file; the temp file goes if any step fails.
 --     Nothing changed: the file (and its mtime) is left alone.
+-- Then it drops each server from ~/.claude/mcp-needs-auth-cache.json
+-- ({ "<server name>": { timestamp, ... } }), the same way, and prints
+-- "cleared <name>". A claude run that found no token (box setup's `claude
+-- mcp list`, before the first push) leaves an entry there, and for up to
+-- 4 hours every new Claude session then skips the server without trying the
+-- token. A cache that is missing or not a JSON object is left alone: Claude
+-- reads it as empty. Only sessions started after this see the change; a
+-- running session needs /mcp → reconnect.
 -- A level-2 long bracket, so Python's `]]` can't end the Lua string.
 M.MERGE_PY = [==[
 import json, os, sys, tempfile
@@ -144,6 +156,22 @@ import json, os, sys, tempfile
 want = json.load(sys.stdin)["servers"]
 d = os.path.expanduser("~/.claude")
 path = os.path.join(d, ".credentials.json")
+cache_path = os.path.join(d, "mcp-needs-auth-cache.json")
+
+def write(path, obj):
+    os.makedirs(d, 0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
 try:
     with open(path) as f:
         store = json.load(f)
@@ -166,18 +194,20 @@ for s in want:
         print("updated", s["name"])
 
 if changed:
-    os.makedirs(d, 0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".credentials.json.")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(store, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    write(path, store)
+
+try:
+    with open(cache_path) as f:
+        cache = json.load(f)
+except (OSError, ValueError):
+    cache = None
+if isinstance(cache, dict):
+    cleared = [s["name"] for s in want if s["name"] in cache]
+    for name in cleared:
+        del cache[name]
+        print("cleared", name)
+    if cleared:
+        write(cache_path, cache)
 ]==]
 
 -- run_sync with kitchen.config.path on the PATH: claude lives there on the
@@ -268,6 +298,9 @@ local function push(host, stdin, names)
     updated[name] = true
     kitchen.log("[" .. host .. "]", "updated", name)
   end
+  for name in (res.stdout or ""):gmatch("cleared ([^\r\n]+)") do
+    kitchen.log("[" .. host .. "]", "cleared the needs-auth mark of", name)
+  end
   for _, name in ipairs(names) do
     if updated[name] or warned["box:" .. host .. ":" .. name] then
       check_box(host, name)
@@ -276,12 +309,16 @@ local function push(host, stdin, names)
 end
 
 local manual = false -- the next pass was asked for with mcp-token-sync.run
+local tried = {} -- host → true once a pass of this load has started with it
 
 -- One pass (see the header). Returns the dashboard stats and per-workspace
 -- stats { [ws_id] = { pushed = 1 } or { failed = "…" } }.
 local function pass()
   local was_manual = manual
   manual = false
+  for _, host in ipairs((M.hosts(kitchen.workspaces()))) do
+    tried[host] = true
+  end
   local names = type(kitchen.config.servers) == "table" and kitchen.config.servers or {}
   if #names == 0 then
     return { servers = 0 }, {}
@@ -352,6 +389,21 @@ local timer = kitchen.every("pass", math.max(1, tonumber(kitchen.config.interval
   desc = "push the mac's MCP OAuth tokens (no refresh tokens) to every devbox",
   first_delay = 30,
 })
+
+-- A newly opened devbox workspace gets its tokens within NEW_HOST_POLL
+-- seconds, not at the next pass: a tab opened there before them would come up
+-- logged out. Each host counts once per load (so a box that can't be reached
+-- doesn't start a pass every tick), and a reload counts every host as new.
+local NEW_HOST_POLL = 10
+kitchen.every("new-hosts", NEW_HOST_POLL, function()
+  for _, host in ipairs((M.hosts(kitchen.workspaces()))) do
+    if not tried[host] then
+      timer:run() -- false while a pass runs; then the next tick asks again
+      return { new_host = host }
+    end
+  end
+  return {}
+end, { desc = "start a pass when a devbox workspace opens", first_delay = 45 }) -- after the first pass's 30 s
 
 kitchen.command("run", function()
   manual = true

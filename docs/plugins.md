@@ -46,8 +46,10 @@ down to `target_gb`; the output bases of removed worktrees always go),
 download.pull` and its `~/outbox/` is rsynced to `~/Downloads/devbox/<host>/`
 on the mac) and `mcp-token-sync` (every 5 minutes, copies the mac's MCP
 OAuth tokens for the `servers` it lists, without refresh tokens, into
-`~/.claude/.credentials.json` on every devbox with an open workspace; Claude
-on the mac stays the only one that refreshes). `install.sh` links `ruff`,
+`~/.claude/.credentials.json` on every devbox with an open workspace, and
+clears those servers from Claude's needs-auth cache there; a newly opened
+devbox workspace is pushed to within 10 seconds; Claude on the mac stays the
+only one that refreshes). `install.sh` links `ruff`,
 `python`, `todo`, `github`, `markdown`, `prune-worktrees`, `bazel-cache`,
 `dashboard`, `download` and `mcp-token-sync` into `~/.kitchen/plugins/`.
 

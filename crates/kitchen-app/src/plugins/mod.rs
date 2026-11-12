@@ -1609,7 +1609,7 @@ mod tests {
 
     /// mcp-token-sync: MERGE_PY against a temp HOME — creates the file (600),
     /// keeps other keys, matches by serverName, writes only on change, never
-    /// clobbers a broken file.
+    /// clobbers a broken file; then clears the server from the needs-auth cache.
     #[test]
     fn mcp_token_sync_merge_script_on_a_temp_home() {
         use std::io::Write;
@@ -1676,6 +1676,26 @@ mod tests {
         }
         let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(left, [".credentials.json"], "no temp files left");
+
+        // Claude's needs-auth cache: the pushed server's mark goes, others stay.
+        let cache = dir.join("mcp-needs-auth-cache.json");
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::write(&cache, serde_json::json!({ "plugin:slack:slack": { "timestamp": 1 }, "linear": { "timestamp": 2 } }).to_string()).unwrap();
+        assert_eq!(run(&payload), (true, "updated plugin:slack:slack\ncleared plugin:slack:slack\n".into()));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&cache).unwrap()).unwrap(), serde_json::json!({ "linear": { "timestamp": 2 } }));
+        std::fs::write(&cache, serde_json::json!({ "plugin:slack:slack": { "timestamp": 3 } }).to_string()).unwrap();
+        assert_eq!(run(&payload), (true, "cleared plugin:slack:slack\n".into()), "cleared though the token is unchanged");
+        let before = std::fs::metadata(&cache).unwrap();
+        assert_eq!(run(&payload), (true, String::new()), "no mark: nothing printed");
+        assert_eq!(std::fs::metadata(&cache).unwrap().ino(), before.ino(), "no mark: not rewritten");
+        for broken in ["{not json", "[]", ""] {
+            std::fs::write(&cache, broken).unwrap();
+            assert_eq!(run(&payload), (true, String::new()), "{broken:?}: the token still goes");
+            assert_eq!(std::fs::read_to_string(&cache).unwrap(), broken, "{broken:?}: left alone");
+        }
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, [".credentials.json", "mcp-needs-auth-cache.json"], "no temp files left");
         let _ = std::fs::remove_dir_all(&home);
     }
 
