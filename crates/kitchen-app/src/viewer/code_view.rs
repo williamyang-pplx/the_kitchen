@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use egui::text::{CCursor, LayoutJob, TextFormat};
 use egui::{Color32, CornerRadius, FontId, Galley, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
@@ -50,6 +51,9 @@ pub struct ViewState {
     /// size in `md_key`; painting refreshes them, a new key clears them.
     md_heights: HashMap<usize, f32>,
     md_key: (usize, u32, u32),
+    /// Height of the open comment field, measured as it was last painted (it
+    /// grows with its text); `None` until it is painted.
+    editor_h: Option<f32>,
 }
 
 impl ViewState {
@@ -80,6 +84,21 @@ pub struct Block {
     pub body: String,
     pub color: Color32,
     pub dim: bool,
+    /// A ⌘⇧A answer: `title` is the question, drawn as the card's heading.
+    pub question: bool,
+}
+
+impl Block {
+    /// A ⌘⇧A question under row `after`, with its answer (`None` while the
+    /// model thinks; the card counts the seconds since `asked`).
+    pub fn answer(after: usize, question: &str, answer: Option<&Result<String, String>>, asked: Instant) -> Block {
+        let (body, color, dim) = match answer {
+            None => (format!("thinking… {}s", asked.elapsed().as_secs()), theme::PURPLE, true),
+            Some(Ok(t)) => (t.clone(), theme::PURPLE, false),
+            Some(Err(e)) => (e.clone(), theme::RED, false),
+        };
+        Block { after: Some(after), title: question.to_string(), body, color, dim, question: true }
+    }
 }
 
 /// Plugin decorations for one display line, in display (tab-expanded) byte
@@ -143,18 +162,32 @@ pub struct CodeView<'a> {
     pub id: egui::Id,
 }
 
+/// Comment field height before it is first painted: its label and four rows.
 const EDITOR_HEIGHT: f32 = 118.0;
-/// Space under a block, and under the comment field.
-const BLOCK_GAP: f32 = 6.0;
-const EDITOR_GAP: f32 = 8.0;
+/// Space above a card or the comment field, and under it.
+const BLOCK_TOP: f32 = 4.0;
+const BLOCK_GAP: f32 = 12.0;
+const EDITOR_GAP: f32 = 12.0;
+/// Inside a card: padding around its text, around a code block's text, and
+/// between its parts.
+const CARD_PAD_X: f32 = 12.0;
+const CARD_PAD_Y: f32 = 8.0;
+const CODE_PAD: f32 = 6.0;
+const PART_GAP: f32 = 6.0;
+/// Widest a card gets, in code columns: prose wider than this is hard to read.
+const CARD_COLS: f32 = 100.0;
+/// Code in a card: fenced blocks on a panel darker than the card, inline
+/// spans a little lighter.
+const CARD_CODE_BG: Color32 = theme::BG;
+const CARD_INLINE_BG: Color32 = theme::HOVER;
 
 /// What painting and measuring share: the frame's metrics and inputs. Built
 /// once per frame in `show`.
 struct Geometry<'a> {
     doc: &'a Doc,
     blocks: &'a [Block],
-    /// Doc row the comment field sits under.
-    editor_end: Option<usize>,
+    /// Doc row the comment field sits under, and the field's height.
+    editor: Option<(usize, f32)>,
     font: FontId,
     font_size: f32,
     cw: f32,
@@ -209,7 +242,7 @@ impl Geometry<'_> {
 
     /// Height of the blocks drawn after `after`, with their gaps.
     fn blocks_height(&self, ui: &Ui, after: Option<usize>) -> f32 {
-        self.blocks.iter().filter(|b| b.after == after).map(|b| layout_block(ui, b, self.block_width).2 + BLOCK_GAP).sum()
+        self.blocks.iter().filter(|b| b.after == after).map(|b| layout_block(ui, b, self.block_width, self.font_size).height + BLOCK_GAP).sum()
     }
 
     /// Row `idx`'s extent. A Markdown row's height comes from `md_heights`
@@ -230,7 +263,10 @@ impl Geometry<'_> {
                 h
             }
         };
-        let field = if self.editor_end == Some(idx) { EDITOR_HEIGHT + EDITOR_GAP } else { 0.0 };
+        let field = match self.editor {
+            Some((end, h)) if end == idx => h + EDITOR_GAP,
+            _ => 0.0,
+        };
         Extent { lead, row, unit: lead + row + field + self.blocks_height(ui, Some(idx)) }
     }
 }
@@ -265,11 +301,15 @@ impl CodeView<'_> {
         let gutter = sign_w + if two_gutters { one_gutter * 2.0 } else { one_gutter };
         let text_x = rect.left() + gutter + 6.0;
         let visible_cols = (((rect.right() - text_x) / cw).floor() as usize).max(8);
-        let block_width = rect.width() - gutter - 24.0;
+        let block_width = (rect.width() - gutter - 24.0).min(CARD_COLS * cw + CARD_PAD_X * 2.0);
+        if editor.is_none() {
+            state.editor_h = None;
+        }
+        let editor_h = state.editor_h.unwrap_or(EDITOR_HEIGHT);
         let geo = Geometry {
             doc,
             blocks,
-            editor_end: editor.as_deref().map(|ed| ed.end),
+            editor: editor.as_deref().map(|ed| (ed.end, editor_h)),
             font: font.clone(),
             font_size,
             cw,
@@ -337,7 +377,7 @@ impl CodeView<'_> {
                 let (idx, need) = match just_opened {
                     Some(ed) => {
                         let i = ed.end.min(n - 1);
-                        (i, ext(i).row + EDITOR_HEIGHT + EDITOR_GAP)
+                        (i, ext(i).row + editor_h + EDITOR_GAP)
                     }
                     None => (cur, ext(cur).row),
                 };
@@ -374,7 +414,7 @@ impl CodeView<'_> {
                 if *y > rect.bottom() {
                     break;
                 }
-                *y += draw_block(ui, &painter, b, Pos2::new(rect.left() + gutter + 10.0, *y + 2.0), block_width) + BLOCK_GAP;
+                *y += draw_block(ui, &painter, b, Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP), block_width, font_size) + BLOCK_GAP;
             }
         };
 
@@ -528,8 +568,8 @@ impl CodeView<'_> {
             // blocks (a long thread would push it out of view).
             if let Some(ed) = editor.as_deref() {
                 if ed.end == idx {
-                    editor_rect = Some(Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, y + 2.0), Vec2::new(block_width, EDITOR_HEIGHT)));
-                    y += EDITOR_HEIGHT + EDITOR_GAP;
+                    editor_rect = Some(Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, y + BLOCK_TOP), Vec2::new(block_width, editor_h)));
+                    y += editor_h + EDITOR_GAP;
                 }
             }
             draw_blocks(Some(idx), &mut y, ui);
@@ -544,17 +584,17 @@ impl CodeView<'_> {
         if let Some(ed) = editor.as_deref_mut() {
             let er = editor_rect
                 .filter(|er| er.intersects(rect))
-                .or_else(|| editor_focused.then(|| Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, rect.bottom() + 10.0), Vec2::new(block_width, EDITOR_HEIGHT))));
+                .or_else(|| editor_focused.then(|| Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, rect.bottom() + 10.0), Vec2::new(block_width, editor_h))));
             if let Some(er) = er {
                 painter.rect_filled(er.expand(3.0), 5.0, theme::PANEL);
                 painter.rect_stroke(er.expand(3.0), 5.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Outside);
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(er));
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
-                child.label(egui::RichText::new(&ed.label).size(11.0).color(theme::ACCENT));
+                child.label(egui::RichText::new(&ed.label).font(theme::ui_font(font_size - 1.0)).color(theme::ACCENT));
                 let te = egui::TextEdit::multiline(&mut ed.text)
                     .id(editor_id)
-                    .hint_text(if ed.ask { "Ask about this code…   Enter ask · ⇧Enter new line · Esc cancel" } else { "Write a comment…   ⌘Enter submit · Esc cancel" })
-                    .desired_rows(4)
+                    .hint_text(if ed.ask { "Ask about this code…" } else { "Write a comment…" })
+                    .desired_rows(3)
                     .desired_width(er.width())
                     .font(FontId::proportional(font_size))
                     .background_color(theme::BG)
@@ -565,6 +605,12 @@ impl CodeView<'_> {
                     out.submit_editor = true;
                 }
                 let r = child.add(te);
+                // The field grows with its text: the rows below move down next frame.
+                let h = child.min_rect().height();
+                if state.editor_h != Some(h) {
+                    state.editor_h = Some(h);
+                    ui.ctx().request_repaint();
+                }
                 if ed.needs_focus {
                     r.request_focus();
                     ed.needs_focus = false;
@@ -838,26 +884,157 @@ fn markdown_style(base: &egui::Style, font_size: f32) -> egui::Style {
     s
 }
 
-/// A block's title and body galleys and its height, shared by painting and
-/// measuring.
-fn layout_block(ui: &Ui, b: &Block, width: f32) -> (Arc<Galley>, Arc<Galley>, f32) {
-    let text_color = if b.dim { theme::DIM } else { theme::TEXT };
-    let title = ui.fonts_mut(|f| f.layout(b.title.clone(), FontId::proportional(11.5), b.color, width - 16.0));
-    let body = ui.fonts_mut(|f| f.layout(b.body.clone(), FontId::proportional(12.5), text_color, width - 16.0));
-    let h = title.size().y + body.size().y + 12.0;
-    (title, body, h)
+/// A card laid out, shared by painting and measuring. Offsets are from
+/// the card's top.
+struct CardLayout {
+    title: Arc<Galley>,
+    /// "Esc closes", right of a question's title.
+    hint: Option<Arc<Galley>>,
+    /// Where a question's divider goes.
+    divider_y: Option<f32>,
+    /// The body, top to bottom: prose, or a fenced code block (`true`,
+    /// drawn on a panel), with its offset.
+    parts: Vec<(Arc<Galley>, bool, f32)>,
+    height: f32,
 }
 
-fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32) -> f32 {
-    let text_color = if b.dim { theme::DIM } else { theme::TEXT };
-    let (title, body, h) = layout_block(ui, b, width);
-    let r = Rect::from_min_size(at, Vec2::new(width, h));
-    painter.rect_filled(r, 5.0, if b.dim { theme::PANEL } else { theme::SELECTED });
-    painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, h)), 2.0, b.color);
-    let th = title.size().y;
-    painter.galley(at + Vec2::new(10.0, 5.0), title, b.color);
-    painter.galley(at + Vec2::new(10.0, 7.0 + th), body, text_color);
-    h
+/// Lays out card `b` at `width`. Comments carry a small colored title (who,
+/// which lines, state); a question is the heading of its answer. Code in
+/// the body, fenced or in backticks, is set in monospace.
+fn layout_block(ui: &Ui, b: &Block, width: f32, font_size: f32) -> CardLayout {
+    let inner = width - CARD_PAD_X * 2.0;
+    let text_color = if b.dim { theme::SUBTLE } else { theme::TEXT };
+    let hint = b.question.then(|| ui.fonts_mut(|f| f.layout_no_wrap("Esc closes".into(), theme::ui_font(font_size - 2.0), theme::SUBTLE)));
+    let hint_w = hint.as_ref().map_or(0.0, |h| h.size().x + CARD_PAD_X);
+    let (title_font, title_color) = if b.question { (theme::ui_font_semibold(font_size), theme::TEXT) } else { (theme::ui_font(font_size - 1.5), b.color) };
+    let title = ui.fonts_mut(|f| f.layout(b.title.clone(), title_font, title_color, inner - hint_w));
+    let mut y = CARD_PAD_Y + title.size().y;
+    let divider_y = b.question.then(|| {
+        y += PART_GAP;
+        let at = y;
+        y += 1.0 + PART_GAP;
+        at
+    });
+    y += if b.question { 0.0 } else { 2.0 };
+    let mut parts = Vec::new();
+    for (code, text) in split_fences(&b.body) {
+        if code {
+            let galley = ui.fonts_mut(|f| f.layout(text, FontId::monospace(font_size * 0.92), text_color, inner - CODE_PAD * 2.0));
+            y += CODE_PAD;
+            let h = galley.size().y;
+            parts.push((galley, true, y));
+            y += h + CODE_PAD + PART_GAP;
+        } else {
+            let galley = ui.fonts_mut(|f| f.layout_job(prose_job(&text, font_size - 0.5, text_color, inner)));
+            let h = galley.size().y;
+            parts.push((galley, false, y));
+            y += h + PART_GAP;
+        }
+    }
+    let height = if parts.is_empty() { y } else { y - PART_GAP } + CARD_PAD_Y;
+    CardLayout { title, hint, divider_y, parts, height }
+}
+
+/// `text` cut at its ``` and ~~~ fences into runs of prose (`false`) and
+/// code (`true`, without the fence lines and the fence's indent). Blank
+/// lines around a run are dropped; an unclosed fence runs to the end.
+fn split_fences(text: &str) -> Vec<(bool, String)> {
+    let mut out = Vec::new();
+    let mut push = |code: bool, lines: &mut Vec<&str>| {
+        let run = lines.join("\n");
+        let run = if code { run.trim_matches('\n').to_string() } else { run.trim().to_string() };
+        if !run.is_empty() {
+            out.push((code, run));
+        }
+        lines.clear();
+    };
+    // The open fence's marker and indent.
+    let mut fence: Option<(&str, usize)> = None;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start_matches(' ');
+        let indent = line.len() - t.len();
+        match fence {
+            None => match ["```", "~~~"].into_iter().find(|m| t.starts_with(m)) {
+                Some(m) => {
+                    push(false, &mut lines);
+                    fence = Some((m, indent));
+                }
+                None => lines.push(line),
+            },
+            Some((m, _)) if t.starts_with(m) && t.trim_end().chars().all(|c| m.starts_with(c)) => {
+                push(true, &mut lines);
+                fence = None;
+            }
+            Some((_, n)) => lines.push(&line[indent.min(n)..]),
+        }
+    }
+    push(fence.is_some(), &mut lines);
+    out
+}
+
+/// Prose with its `backtick` spans in monospace on a dark background.
+fn prose_job(text: &str, size: f32, color: Color32, wrap: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap;
+    let plain = TextFormat { font_id: theme::ui_font(size), color, line_height: Some(size * 1.45), ..Default::default() };
+    // Its own (shorter) row height, so the background hugs the glyphs. Prose
+    // keeps its extra leading under the glyphs, so top-aligned code at about
+    // the same ascent sits on the prose's baseline.
+    let code = TextFormat {
+        font_id: FontId::monospace(size * 0.95),
+        background: CARD_INLINE_BG,
+        line_height: None,
+        valign: egui::Align::TOP,
+        ..plain.clone()
+    };
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        match after.find(['`', '\n']) {
+            Some(len) if len > 0 && after[len..].starts_with('`') => {
+                job.append(&rest[..open], 0.0, plain.clone());
+                job.append(&after[..len], 0.0, code.clone());
+                rest = &after[len + 1..];
+            }
+            // An unpaired backtick stays as it is.
+            _ => {
+                job.append(&rest[..open + 1], 0.0, plain.clone());
+                rest = after;
+            }
+        }
+    }
+    job.append(rest, 0.0, plain);
+    job
+}
+
+fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32, font_size: f32) -> f32 {
+    let l = layout_block(ui, b, width, font_size);
+    let r = Rect::from_min_size(at, Vec2::new(width, l.height));
+    // Faded cards (thinking, resolved) still sit a step above the background.
+    painter.rect_filled(r, 5.0, if b.dim { theme::HOVER } else { theme::SELECTED });
+    painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, l.height)), 2.0, b.color);
+    let left = r.left() + CARD_PAD_X;
+    let first_row = l.title.rows.first().map_or(0.0, |row| row.height());
+    painter.galley(Pos2::new(left, r.top() + CARD_PAD_Y), l.title, theme::TEXT);
+    if let Some(hint) = l.hint {
+        let y = r.top() + CARD_PAD_Y + (first_row - hint.size().y) / 2.0;
+        painter.galley(Pos2::new(r.right() - CARD_PAD_X - hint.size().x, y), hint, theme::SUBTLE);
+    }
+    if let Some(dy) = l.divider_y {
+        painter.hline(left..=r.right() - CARD_PAD_X, r.top() + dy, Stroke::new(1.0, theme::FAINT));
+    }
+    for (galley, code, dy) in l.parts {
+        let y = r.top() + dy;
+        if code {
+            let panel = Rect::from_min_size(Pos2::new(left, y - CODE_PAD), Vec2::new(width - CARD_PAD_X * 2.0, galley.size().y + CODE_PAD * 2.0));
+            painter.rect_filled(panel, 4.0, CARD_CODE_BG);
+            painter.galley(Pos2::new(left + CODE_PAD, y), galley, theme::TEXT);
+        } else {
+            painter.galley(Pos2::new(left, y), galley, theme::TEXT);
+        }
+    }
+    l.height
 }
 
 /// This frame's plain keys as vim keys (Cmd chords were consumed upstream).
@@ -980,6 +1157,36 @@ mod tests {
         let rows = rows_in_view(1, 10.0, H, N, &mut ext);
         assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2, 3]);
         assert_eq!(rows[0].1, -10.0);
+    }
+
+    #[test]
+    fn split_fences_cuts_code_out_of_prose() {
+        let body = "Both are colors:\n\n  ```rust\n  const A: u8 = 1;\n    nested();\n  ```\n\nSo use `A`.\n```\nunclosed";
+        assert_eq!(
+            split_fences(body),
+            vec![
+                (false, "Both are colors:".to_string()),
+                (true, "const A: u8 = 1;\n  nested();".to_string()),
+                (false, "So use `A`.".to_string()),
+                (true, "unclosed".to_string()),
+            ]
+        );
+        assert_eq!(split_fences("plain\n\ntext"), vec![(false, "plain\n\ntext".to_string())]);
+        // A fence line with text after the marks inside code does not close it.
+        assert_eq!(split_fences("~~~\n```inner\n~~~"), vec![(true, "```inner".to_string())]);
+    }
+
+    #[test]
+    fn prose_job_sets_backtick_spans_in_monospace() {
+        // A backtick with no partner on its line stays as it is.
+        let job = prose_job("use `row_at` here\nlone ` tick\n`a\nb`", 12.0, theme::TEXT, 400.0);
+        let runs: Vec<(&str, bool)> = job
+            .sections
+            .iter()
+            .map(|s| (&job.text[s.byte_range.start.0..s.byte_range.end.0], s.format.font_id.family == egui::FontFamily::Monospace))
+            .filter(|(t, _)| !t.is_empty())
+            .collect();
+        assert_eq!(runs, vec![("use ", false), ("row_at", true), (" here\nlone ` tick\n`a\nb`", false)]);
     }
 
     #[test]

@@ -2174,7 +2174,7 @@ end)"#,
         assert!(v.editor.is_none(), "submitted");
         let row = v.vim.line;
         assert_eq!(v.doc.lines[row].text, "B");
-        assert_eq!(v.ask_blocks().first().map(|b| (b.after, b.body.as_str())), Some((Some(row), "thinking…")));
+        assert_eq!(v.ask_blocks().first().map(|b| (b.after, b.body.as_str())), Some((Some(row), "thinking… 0s")));
         h.settle(&mut v, &|v| v.ask_blocks().first().is_some_and(|b| !b.dim));
         let b = v.ask_blocks().remove(0);
         // Mixed sides: about the last line, in the current file.

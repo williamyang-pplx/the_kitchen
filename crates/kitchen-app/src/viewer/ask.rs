@@ -2,13 +2,14 @@
 //! field opens under the lines like a ⌘M comment; the answer is drawn there
 //! as a block until Esc on its line closes it. Answers are not stored.
 
+use std::time::{Duration, Instant};
+
 use kitchen_core::ask;
 use kitchen_core::host::Host;
 
 use super::code_view::{Block, Editor};
 use super::{Msg, Viewer};
 use crate::plugins::decor::Side;
-use crate::theme;
 
 /// Answers a question (the model; a fake in tests): (model, cwd, question).
 pub(super) type Answerer = fn(&str, Option<&str>, &ask::Question) -> anyhow::Result<String>;
@@ -20,6 +21,7 @@ pub(super) struct Ask {
     side: Side,
     line: usize,
     question: String,
+    asked: Instant,
     /// `None` while the model is answering.
     answer: Option<Result<String, String>>,
 }
@@ -41,7 +43,7 @@ impl Viewer {
         self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true });
     }
 
-    /// Send the question field to the model; its block shows "thinking…" until it answers.
+    /// Send the question field to the model; its block shows "thinking… Ns" until it answers.
     pub(super) fn submit_ask(&mut self) {
         let Some(ed) = self.editor.take() else { return };
         let text = ed.text.trim().to_string();
@@ -60,7 +62,7 @@ impl Viewer {
         let quote = self.quote(&path, ed.start, ed.end);
         self.ask_seq += 1;
         let id = self.ask_seq;
-        self.asks.push(Ask { id, path: path.clone(), side, line, question: text.clone(), answer: None });
+        self.asks.push(Ask { id, path: path.clone(), side, line, question: text.clone(), asked: Instant::now(), answer: None });
         self.vim.anchor = None;
         let model = self.engine.settings().ask_model;
         // On this mac the model may read the rest of the repo.
@@ -85,18 +87,14 @@ impl Viewer {
     /// The open file's questions, as blocks under their lines.
     pub(super) fn ask_blocks(&self) -> Vec<Block> {
         let Some(path) = self.current.as_ref().filter(|_| !self.browsing && !self.outline) else { return Vec::new() };
+        if self.asks.iter().any(|a| a.answer.is_none()) {
+            // The thinking card counts seconds.
+            self.engine.ctx.request_repaint_after(Duration::from_millis(500));
+        }
         self.asks
             .iter()
             .filter(|a| &a.path == path)
-            .filter_map(|a| {
-                let after = self.row_at(a.side, a.line)?;
-                let (body, color, dim) = match &a.answer {
-                    None => ("thinking…".to_string(), theme::PURPLE, true),
-                    Some(Ok(t)) => (t.clone(), theme::PURPLE, false),
-                    Some(Err(e)) => (e.clone(), theme::RED, false),
-                };
-                Some(Block { after: Some(after), title: format!("{} · Esc closes", a.question), body, color, dim })
-            })
+            .filter_map(|a| Some(Block::answer(self.row_at(a.side, a.line)?, &a.question, a.answer.as_ref(), a.asked)))
             .collect()
     }
 

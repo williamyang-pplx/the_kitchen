@@ -41,6 +41,7 @@ struct PlanAsk {
     /// Doc index of the last asked line: the answer goes under it.
     line: usize,
     question: String,
+    asked: Instant,
     /// `None` while the model is answering.
     answer: Option<Result<String, String>>,
 }
@@ -175,6 +176,10 @@ impl PlanView {
     }
 
     fn blocks(&self) -> Vec<Block> {
+        if self.asks.iter().any(|a| a.answer.is_none()) {
+            // The thinking card counts seconds.
+            self.engine.ctx.request_repaint_after(Duration::from_millis(500));
+        }
         let last = self.doc.lines.len().saturating_sub(1);
         self.comments
             .iter()
@@ -189,16 +194,9 @@ impl PlanView {
                     _ => format!("L{}", c.line),
                 };
                 let at = (c.end_line.unwrap_or(c.line).max(1) as usize - 1).min(last);
-                Block { after: Some(at), title: format!("comment #{} · {lines} · {label}", c.id), body: c.body.clone(), color, dim }
+                Block { after: Some(at), title: format!("comment #{} · {lines} · {label}", c.id), body: c.body.clone(), color, dim, question: false }
             })
-            .chain(self.asks.iter().map(|a| {
-                let (body, color, dim) = match &a.answer {
-                    None => ("thinking…".to_string(), theme::PURPLE, true),
-                    Some(Ok(t)) => (t.clone(), theme::PURPLE, false),
-                    Some(Err(e)) => (e.clone(), theme::RED, false),
-                };
-                Block { after: Some(a.line.min(last)), title: format!("{} · Esc closes", a.question), body, color, dim }
-            }))
+            .chain(self.asks.iter().map(|a| Block::answer(a.line.min(last), &a.question, a.answer.as_ref(), a.asked)))
             .collect()
     }
 
@@ -216,7 +214,7 @@ impl PlanView {
     }
 
     /// Send the question field to the model, with the plan and the agent's
-    /// planning session; its block shows "thinking…" until it answers.
+    /// planning session; its block shows "thinking… Ns" until it answers.
     fn submit_ask(&mut self) {
         let Some(ed) = self.editor.take() else { return };
         let text = ed.text.trim().to_string();
@@ -226,7 +224,7 @@ impl PlanView {
         }
         self.ask_seq += 1;
         let id = self.ask_seq;
-        self.asks.push(PlanAsk { id, line: ed.end, question: text.clone(), answer: None });
+        self.asks.push(PlanAsk { id, line: ed.end, question: text.clone(), asked: Instant::now(), answer: None });
         self.vim.anchor = None;
         let quote = self.doc.lines.get(ed.start..=ed.end).unwrap_or_default().iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
         let plan_text = self.text.clone().unwrap_or_default();
@@ -499,7 +497,7 @@ mod tests {
         frame(&ctx, &engine, &mut p, key(egui::Key::Enter));
         assert!(p.editor.is_none(), "submitted");
         let ask = |p: &PlanView| p.blocks().into_iter().find(|b| b.title.starts_with("why LRU?"));
-        assert_eq!(ask(&p).map(|b| (b.after, b.body)), Some((Some(2), "thinking…".into())));
+        assert_eq!(ask(&p).map(|b| (b.after, b.body)), Some((Some(2), "thinking… 0s".into())));
         settle(&ctx, &engine, &mut p, &|p| ask(p).is_some_and(|b| !b.dim));
         assert_eq!(ask(&p).unwrap().body, "sonnet|true|2-3|## F1 cache\nuse an LRU|3|why LRU?");
         // Esc elsewhere keeps it; Esc on its line closes it.
