@@ -23,7 +23,7 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
 - **A tab's PRs**: the tab's agent lists the PRs it opened in
   `.kitchen/tabs/<tab>/prs` (`$KITCHEN_PRS_FILE`, one number or link per
   line). ⌘⇧S shows them in a menu, one section per stack, then the PRs opened
-  here with ⌘⇧P, then the tab's own worktree; j/k or 1–9 and Enter show one.
+  here with ⌘⇧P, then the tab's own worktree; j/k and Enter show one.
   Every viewer the tab showed is kept, so switching back is instant (cursor,
   folds and open file as you left them). While a PR is checked out and its
   files load, the viewer shows a frying pan tossing an egg.
@@ -106,7 +106,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘H / ⌘L | previous / next tab |
 | ⌘⇧J / ⌘⇧K | in the viewer: next / previous changed file |
 | ⌘⇧D | in the viewer: the shown PR's description, rendered as on GitHub (title, author, state, base ← head); again, back to where you were |
-| ⌘⇧S | PR menu: the PRs the tab's agent listed, one section per stack, plus those opened with ⌘⇧P (j/k or 1–9, Enter shows, Esc closes); from a terminal it opens the viewer first |
+| ⌘⇧S | PR menu: the PRs the tab's agent listed, one section per stack, plus those opened with ⌘⇧P (j/k, Enter shows, Esc closes); from a terminal it opens the viewer first |
 | ⌘⇧H / ⌘⇧L | in the viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
 | ⌘T | new tab — own worktree + branch (a purple tab) |
 | ⌘I | new tab in the workspace's main checkout — no worktree or branch, for quick tasks that need no PR (tabs share it; a yellow tab) |

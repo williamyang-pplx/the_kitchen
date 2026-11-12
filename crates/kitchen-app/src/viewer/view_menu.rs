@@ -168,7 +168,7 @@ mod tests {
     }
 
     /// ⌘⇧S lists the tab's entries and its worktree, with the cursor on what
-    /// is shown; it follows a new menu; a digit hands that row's view to the
+    /// is shown; it follows a new menu; Enter hands the row's view to the
     /// window; ⌘⇧S again closes it.
     #[test]
     fn view_menu_lists_entries_and_marks_the_shown_one() {
@@ -192,8 +192,10 @@ mod tests {
         h.frame(&mut v);
         assert_eq!(rows(&v), vec!["#7 a", "#8 b", "#9 c", "● worktree"], "an open menu follows kitchen.views");
 
-        let key = egui::Event::Key { key: egui::Key::Num1, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
-        let picked = h.frame_with(&mut v, vec![key]).expect("a view for the window");
+        for _ in 0..3 {
+            h.frame_with(&mut v, vec![key(egui::Key::K)]);
+        }
+        let picked = h.frame_with(&mut v, vec![key(egui::Key::Enter)]).expect("a view for the window");
         assert_eq!(picked.at.name.as_deref(), Some("kitchen-pr-7"));
         assert!(!v.menu_open());
         v.command(PanelCmd::ViewMenu, &h.engine);

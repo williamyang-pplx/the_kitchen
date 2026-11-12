@@ -1,6 +1,6 @@
 //! Fuzzy picker overlay: files (⌘P in the viewer) and definition candidates.
 //! In menu mode (the ⌘⇧S PR menu) it is a short list under section headers,
-//! moved through with j/k or picked by row number, with no query field.
+//! moved through with j/k, its rows numbered, with no query field.
 //!
 //! Matching is fzf-like: the query is split on whitespace and every term must
 //! match. A term matches as a substring when it can (strongly preferred,
@@ -39,8 +39,8 @@ pub struct Picker {
     pub loading: bool,
     /// Shown while `loading`.
     pub loading_note: String,
-    /// Menu mode: no query field; j/k and arrows move, 1–9 pick that row,
-    /// Enter picks, Esc closes. Items keep their order.
+    /// Menu mode: no query field; j/k and arrows move, Enter picks, Esc
+    /// closes. Items keep their order, numbered.
     menu: bool,
     /// Menu mode: (first item index, header) of each section.
     sections: Vec<(usize, String)>,
@@ -278,7 +278,7 @@ impl Picker {
                     }
                 });
             }
-            let (up, down, enter, esc, digit) = ui.input_mut(|i| {
+            let (up, down, enter, esc) = ui.input_mut(|i| {
                 let ctrl = egui::Modifiers::CTRL;
                 let none = egui::Modifiers::NONE;
                 let keys = (
@@ -286,20 +286,16 @@ impl Picker {
                     i.consume_key(none, Key::ArrowDown) || i.consume_key(ctrl, Key::J) || i.consume_key(ctrl, Key::N) || (menu && i.consume_key(none, Key::J)),
                     i.consume_key(none, Key::Enter),
                     i.consume_key(none, Key::Escape),
-                    if menu { DIGITS.iter().position(|k| i.consume_key(none, *k)) } else { None },
                 );
                 if menu {
-                    // The keys' text too, or the viewer's vim reads "3" as a
-                    // count once the menu closes this frame.
+                    // The keys' text too, or the viewer's vim reads a "j" typed
+                    // in the frame the menu closes.
                     i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
                 }
                 keys
             });
             if esc {
                 return PickerResult::Cancelled;
-            }
-            if let Some((i, _)) = digit.and_then(|d| self.filtered.get(d)) {
-                return PickerResult::Chosen(*i);
             }
             self.moved |= up || down;
             if up {
@@ -368,7 +364,7 @@ impl Picker {
                                 ui.label(crate::ui::widgets::section_label(header, theme::DIM));
                             });
                         }
-                        let job = if self.menu { numbered(row, label, sel) } else { highlighted(label, pos, sel) };
+                        let job = if self.menu { numbered(row, self.filtered.len(), label, sel) } else { highlighted(label, pos, sel) };
                         let resp = picker_row(ui, sel, job, detail);
                         if sel {
                             resp.scroll_to_me(None);
@@ -395,7 +391,7 @@ impl Picker {
             egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 7, bottom: 8 }).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if self.menu {
-                        crate::ui::widgets::key_hints(ui, &[("j/k", "select"), ("1–9", "jump"), ("⏎", "show"), ("esc", "close")]);
+                        crate::ui::widgets::key_hints(ui, &[("j/k", "select"), ("⏎", "show"), ("esc", "close")]);
                         return;
                     }
                     crate::ui::widgets::key_hints(ui, &[("↑↓", "select"), ("⏎", "open"), ("esc", "close")]);
@@ -437,14 +433,12 @@ fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, d
     resp
 }
 
-/// Keys that pick menu rows 1–9.
-const DIGITS: [Key; 9] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
-
-/// A menu row: its number (1–9, the key that picks it) and its label, plain.
-fn numbered(row: usize, label: &str, selected: bool) -> egui::text::LayoutJob {
+/// Row `row` of a menu of `rows`: its number, right-aligned to the widest
+/// so the labels line up, and its label, plain.
+fn numbered(row: usize, rows: usize, label: &str, selected: bool) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let font = egui::FontId::monospace(12.5);
-    let number = if row < DIGITS.len() { format!("{}  ", row + 1) } else { "   ".into() };
+    let number = format!("{:>w$}  ", row + 1, w = rows.to_string().len());
     job.append(&number, 0.0, egui::TextFormat { font_id: font.clone(), color: theme::DIM, ..Default::default() });
     job.append(label, 0.0, egui::TextFormat { font_id: font, color: if selected { theme::TEXT } else { theme::MUTED }, ..Default::default() });
     job
@@ -521,9 +515,9 @@ mod tests {
         assert_eq!(pos, vec![10, 11, 12, 13]);
     }
 
-    /// The PR menu: j/k move, a digit picks its row (and its text never
-    /// reaches the viewer), Esc closes, a new menu keeps the cursor's row,
-    /// and a focused text field gives the keyboard up.
+    /// The PR menu: j/k move (their text never reaches the viewer), Enter
+    /// picks, Esc closes, a new menu keeps the cursor's row, and a focused
+    /// text field gives the keyboard up.
     #[test]
     fn menu_keys_move_pick_and_cancel() {
         let ctx = egui::Context::default();
@@ -548,15 +542,26 @@ mod tests {
         }
         assert_eq!(p.selected, 1);
         assert!(!ctx.memory(|m| m.has_focus(field)), "an open ⌘M draft doesn't get the keys");
-        let (r, left) = frame(&mut p, vec![key(egui::Key::Num3), egui::Event::Text("3".into())]);
+        let (r, left) = frame(&mut p, vec![key(egui::Key::J), egui::Event::Text("j".into()), key(egui::Key::Enter)]);
         assert!(matches!(r, PickerResult::Chosen(2)));
-        assert!(!left.iter().any(|e| matches!(e, egui::Event::Text(_))), "vim never reads the 3 as a count");
-        assert!(matches!(frame(&mut p, vec![key(egui::Key::Num9)]).0, PickerResult::Open), "no row 9");
+        assert!(!left.iter().any(|e| matches!(e, egui::Event::Text(_))), "vim never reads the j");
+        assert!(matches!(frame(&mut p, vec![key(egui::Key::Num1)]).0, PickerResult::Open), "digits don't pick");
         p.selected = 3;
         p.set_menu(items(3), vec![(0, "main ← a".into())]);
         assert_eq!(p.selected, 2, "clamped to the new rows");
         assert_eq!(p.items[p.filtered[0].0].0, "#0", "items keep their order");
         assert!(matches!(frame(&mut p, vec![key(egui::Key::Escape)]).0, PickerResult::Cancelled));
+    }
+
+    /// Every menu row is numbered, 10 and up too, right-aligned so the
+    /// labels line up.
+    #[test]
+    fn menu_rows_past_nine_are_numbered() {
+        let text = |row, rows| numbered(row, rows, "#7 a", false).text;
+        assert_eq!(text(0, 12), " 1  #7 a");
+        assert_eq!(text(9, 12), "10  #7 a");
+        assert_eq!(text(11, 12), "12  #7 a");
+        assert_eq!(text(2, 3), "3  #7 a", "no padding under 10 rows");
     }
 
     #[test]

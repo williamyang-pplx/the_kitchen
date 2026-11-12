@@ -229,7 +229,7 @@ about LSP:
   no git history says reliably which branches a tab made (a reused spare
   brings its reflog along; `git branch` leaves no trace of the worktree).
 * `views` event + `kitchen.views{tab, entries}`: the core owns ⌘⇧S, the menu
-  (a picker in menu mode: sections, j/k, 1–9), the header button and the
+  (a picker in menu mode: sections, j/k, numbered rows), the header button and the
   viewer cache. Plugins only say what the rows are; GitHub knowledge stays in
   the github plugin. The core reads the list and the checked-out branch in
   one round trip and hands both over, so plugins don't need the tab dir.
