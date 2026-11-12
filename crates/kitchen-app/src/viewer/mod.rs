@@ -43,6 +43,8 @@ use vim::{Vim, VimAction};
 const MAX_SUMMARY_SYMBOLS: usize = 80;
 /// Tracked-file lists kept by [`tracked_files`] (agi: ~14 MB each).
 const TREES_KEPT: usize = 4;
+/// A file read longer than this shows the frying pan instead of text.
+const COOK_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
 
 struct FileData {
     text: String,
@@ -215,6 +217,8 @@ pub struct Viewer {
     answerer: ask::Answerer,
     /// When ⌘⇧S last asked the plugins for the PR menu (until it changes).
     asked: Option<std::time::Instant>,
+    /// Since when the code area has been waiting for files.
+    loading_since: Option<std::time::Instant>,
 }
 
 impl Viewer {
@@ -293,6 +297,7 @@ impl Viewer {
             ask_seq: 0,
             answerer: kitchen_core::ask::answer,
             asked: None,
+            loading_since: None,
         };
         v.load_file_list(false);
         v
@@ -1239,17 +1244,35 @@ impl Viewer {
             },
         }
         self.rebuild_doc();
+        // (text, still loading)
         let placeholder = match (&self.current, &self.files_state) {
-            (_, None) if self.browsing => Some("loading files…".to_string()),
-            (_, Some(Err(e))) if self.browsing => Some(format!("cannot list files: {e}")),
+            (_, None) if self.browsing => Some(("loading files…".to_string(), true)),
+            (_, Some(Err(e))) if self.browsing => Some((format!("cannot list files: {e}"), false)),
             _ if self.browsing => None,
-            (None, _) => Some("⌘P to open a file".into()),
-            (Some(p), _) if !self.files.contains_key(p) => {
-                Some(self.load_errors.get(p).map(|e| format!("cannot read {p}: {e}")).unwrap_or_else(|| format!("loading {p}…")))
-            }
+            (None, _) => Some(("⌘P to open a file".into(), false)),
+            (Some(p), _) if !self.files.contains_key(p) => Some(match self.load_errors.get(p) {
+                Some(e) => (format!("cannot read {p}: {e}"), false),
+                None => (format!("loading {p}…"), true),
+            }),
             _ => None,
         };
-        if let Some(text) = placeholder {
+        // The frying pan while a new viewer lists its files (it picks up
+        // where a PR switch's pan left off), and for a file read once it
+        // passes COOK_AFTER, so quick reads don't flash it.
+        let loading = placeholder.as_ref().is_some_and(|(_, l)| *l);
+        let since = *self.loading_since.get_or_insert_with(std::time::Instant::now);
+        if !loading {
+            self.loading_since = None;
+        }
+        if let Some((text, true)) = &placeholder
+            && (self.files_state.is_none() || since.elapsed() >= COOK_AFTER)
+        {
+            let caption = self.shown_entry_label().map(|l| format!("cooking {}…", l.split(" · ").next().unwrap_or(&l))).unwrap_or_else(|| text.clone());
+            crate::ui::cooking::cooking(&mut code_ui, &caption);
+        } else if let Some((text, loading)) = placeholder {
+            if loading {
+                ui.ctx().request_repaint_after(COOK_AFTER);
+            }
             code_ui.centered_and_justified(|ui| ui.label(RichText::new(text).color(theme::DIM)));
         } else {
             let focused = cx.focused && self.picker.is_none() && !self.list_focus;

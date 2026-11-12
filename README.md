@@ -25,7 +25,8 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   line). ⌘⇧S shows them in a menu, one section per stack, then the PRs opened
   here with ⌘⇧P, then the tab's own worktree; j/k or 1–9 and Enter show one.
   Every viewer the tab showed is kept, so switching back is instant (cursor,
-  folds and open file as you left them).
+  folds and open file as you left them). While a PR is checked out and its
+  files load, the viewer shows a frying pan tossing an egg.
 - File viewer. With changes (a PR, or a tab after the agent's
   edits, followed live) ⌘. opens straight on the first changed file's diff,
   next to a tree of just the changed files: j/k in the tree, or ⌘⇧J/⌘⇧K and

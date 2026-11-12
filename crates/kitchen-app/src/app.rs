@@ -65,6 +65,9 @@ pub struct KitchenApp {
     /// The latest switch per tab (`Engine::next_view_seq`): an older
     /// `ShowViewer` is dropped, so a slow checkout can't take the screen back.
     view_seqs: HashMap<String, u64>,
+    /// A PR menu pick being checked out, by tab: (its name, the switch's
+    /// number). Its viewer shows the frying pan until the view arrives.
+    switching: HashMap<String, (String, u64)>,
     plans: HashMap<String, crate::plan_view::PlanView>,
     dialog: Option<Dialog>,
     screenshots: Vec<(String, Sender<Result<(), String>>)>,
@@ -111,6 +114,7 @@ impl KitchenApp {
             viewers: HashMap::new(),
             shown: HashMap::new(),
             view_seqs: HashMap::new(),
+            switching: HashMap::new(),
             plans: HashMap::new(),
             dialog: None,
             shortcuts: false,
@@ -214,7 +218,15 @@ impl KitchenApp {
                         continue; // a later switch won
                     }
                     self.view_seqs.insert(tab_id.clone(), seq);
+                    if self.switching.get(&tab_id).is_some_and(|(_, s)| seq >= *s) {
+                        self.switching.remove(&tab_id);
+                    }
                     self.show_viewer(&tab_id, view);
+                }
+                UiCommand::ViewFailed { tab_id, seq } => {
+                    if self.switching.get(&tab_id).is_some_and(|(_, s)| *s == seq) {
+                        self.switching.remove(&tab_id);
+                    }
                 }
                 UiCommand::ReloadViewer { tab_id, worktree } => self.reload_viewers(&tab_id, &worktree),
                 UiCommand::Render { tab_id, on } => {
@@ -486,10 +498,17 @@ impl KitchenApp {
         let seq = self.engine.next_view_seq();
         self.view_seqs.insert(v.tab.clone(), seq);
         if self.viewers.contains_key(&(v.tab.clone(), shown.clone())) {
+            self.switching.remove(&v.tab);
             self.show_viewer(&v.tab.clone(), shown);
             self.engine.spawn("refresh view", move |e| e.refresh_view(v));
         } else {
-            self.engine.spawn("view", move |e| e.view(v, Some(seq)));
+            // The PR's name for the frying pan's caption, from its menu row.
+            let name = self.engine.views_of(&v.tab).and_then(|m| m.iter().find(|(_, s)| *s == shown).map(|(e, _)| e.label.split_whitespace().next().unwrap_or(&e.label).to_string()));
+            self.switching.insert(v.tab.clone(), (name.unwrap_or_else(|| "the view".into()), seq));
+            let tab = v.tab.clone();
+            self.engine.spawn("view", move |e| {
+                e.view(v, Some(seq)).inspect_err(|_| e.push_ui(UiCommand::ViewFailed { tab_id: tab, seq }))
+            });
         }
     }
 
@@ -1008,6 +1027,15 @@ impl KitchenApp {
                 .ui(ui, &mut cx),
             (_, None) => centered_note(ui, "open a tab first (⌘T or ⌘I)", theme::SUBTLE),
         }
+        // A PR being checked out: the frying pan over the viewer (the PR
+        // menu, a foreground overlay, still opens above it).
+        if let (SideKind::Viewer, Some((name, _))) = (kind, tab.and_then(|t| self.switching.get(&t.row.id))) {
+            let rect = ui.max_rect();
+            let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("cooking"));
+            let mut cover = ui.new_child(egui::UiBuilder::new().max_rect(rect).layer_id(layer));
+            cover.painter().rect_filled(rect, 0.0, theme::BG);
+            crate::ui::cooking::cooking(&mut cover, &format!("cooking {name}…"));
+        }
         let (clicked, picked) = (cx.clicked, cx.view.take());
         if clicked {
             self.set_focus(Focus::Side);
@@ -1052,6 +1080,7 @@ impl KitchenApp {
         self.viewers.retain(|(id, _), _| live.contains(id));
         self.shown.retain(|id, _| live.contains(id));
         self.view_seqs.retain(|id, _| live.contains(id));
+        self.switching.retain(|id, _| live.contains(id));
         self.plans.retain(|id, _| live.contains(id));
         self.sides.retain(|id, _| live.contains(id));
         self.side_shown.retain(|id| live.contains(id));
@@ -1508,8 +1537,10 @@ mod tests {
         app.handle_ui_commands(&ctx);
         assert_eq!(app.shown.get("t"), Some(&a), "a late ShowViewer is dropped");
 
-        // An uncached row: numbered at the pick, shown when the engine answers.
+        // An uncached row: numbered at the pick, cooking until the engine
+        // answers, then shown.
         app.choose_view(rev_less("origin/c"));
+        assert!(app.switching.contains_key("t"), "the frying pan while it checks out");
         let c: Shown = (wt.clone(), "origin/c".into());
         for _ in 0..200 {
             app.handle_ui_commands(&ctx);
@@ -1519,6 +1550,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(app.shown.get("t"), Some(&c));
+        assert!(!app.switching.contains_key("t"), "done cooking");
+        // A switch that fails stops cooking too (the error is toasted).
+        let missing = View { tab: "t".into(), at: crate::engine::ViewAt { rev: Some("refs/nope".into()), name: Some("kitchen-pr-0".into()), ..Default::default() } };
+        app.choose_view(missing);
+        assert!(app.switching.contains_key("t"));
+        for _ in 0..200 {
+            app.handle_ui_commands(&ctx);
+            if !app.switching.contains_key("t") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.switching.contains_key("t"), "a failed switch stops cooking");
+        assert_eq!(app.shown.get("t"), Some(&c), "and leaves the view as it was");
+        test_util::remove_siblings(&engine, &repo);
 
         // The worktree moved: its viewers are rebuilt, each with its base and file.
         app.reload_viewers("t", &wt);

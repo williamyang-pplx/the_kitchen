@@ -113,6 +113,8 @@ pub enum UiCommand {
     /// `worktree` moved under the tab's viewers of it (shown or cached):
     /// rebuild them at the same file and line.
     ReloadViewer { tab_id: String, worktree: String },
+    /// The switch numbered `seq` failed (already toasted): stop showing it as loading.
+    ViewFailed { tab_id: String, seq: u64 },
     Screenshot { path: String, reply: std::sync::mpsc::Sender<Result<(), String>> },
     /// Feed input events to the window (`kitchenctl debug keys`).
     Keys(Vec<egui::Event>),
@@ -983,6 +985,12 @@ impl Engine {
         Some((worktree, v.at.base.clone().unwrap_or_else(|| tab.diff_base(&ws))))
     }
 
+    /// A spare refill is running (tests wait for it before cleaning up).
+    #[cfg(test)]
+    pub fn refilling_spares(&self) -> bool {
+        self.opening.lock().unwrap().iter().any(|k| k.starts_with("spares:"))
+    }
+
     /// A fresh number for a switch of a tab's viewer (later switches win).
     pub fn next_view_seq(&self) -> u64 {
         self.view_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
@@ -1523,20 +1531,6 @@ fn local_socket_env(host: &Host) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
-    /// Removes the siblings a test's views created (the view's, and the spare
-    /// its checkout refilled) once the refill is done.
-    fn remove_siblings(engine: &Engine, repo: &crate::test_util::TestRepo) {
-        while engine.opening.lock().unwrap().iter().any(|k| k.starts_with("spares:")) {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let prefix = format!("{}-", repo.dir.file_name().unwrap().to_string_lossy());
-        for d in std::fs::read_dir(repo.dir.parent().unwrap()).unwrap().flatten() {
-            if d.file_name().to_string_lossy().starts_with(&prefix) {
-                let _ = std::fs::remove_dir_all(d.path());
-            }
-        }
-    }
-
     /// A view checks its rev out beside the repo (once) and points the tab's
     /// viewer there, numbered so later switches win; without a rev, back at
     /// the tab's own worktree. A refresh only reloads when HEAD moved.
@@ -1589,7 +1583,7 @@ mod tests {
         let nameless = View { tab: "t".into(), at: ViewAt { name: None, ..at(Some("pr")) } };
         assert_eq!(engine.shown_by(&nameless), None);
         assert!(engine.view(nameless, None).is_err(), "a rev needs a name");
-        remove_siblings(&engine, &repo);
+        crate::test_util::remove_siblings(&engine, &repo);
     }
 
     /// `kitchen.views` rows resolve to what they show; a closed tab's menu goes.

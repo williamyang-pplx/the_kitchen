@@ -55,6 +55,20 @@ impl Drop for TestRepo {
     }
 }
 
+/// Removes the siblings a test's views created beside `repo` (a view's
+/// checkout, the spares its refill made) once the refill is done.
+pub fn remove_siblings(engine: &Engine, repo: &TestRepo) {
+    while engine.refilling_spares() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let prefix = format!("{}-", repo.dir.file_name().unwrap().to_string_lossy());
+    for d in std::fs::read_dir(repo.dir.parent().unwrap()).unwrap().flatten() {
+        if d.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_dir_all(d.path());
+        }
+    }
+}
+
 /// An engine with one workspace `w` on `host` at `wt`, with a tab per id
 /// in `tabs` (all on `wt`).
 pub fn engine(host: &str, wt: &str, tabs: &[&str]) -> (egui::Context, Arc<Engine>) {
