@@ -1,8 +1,8 @@
 //! Plan reviewer (⌘⇧I): the tab's low-level plan as a vim-navigable
 //! document with inline comments. ⌘M comments on the cursor line or visual
 //! selection, ⌘Enter submits it; ⌘Enter with no comment open sends every
-//! open comment to the tab's agent in one message. ⌘⇧A asks the model a
-//! question about the lines, with the agent's planning session as context;
+//! open comment to the tab's agent in one message. ⌘⇧A asks the planning
+//! agent (a fork of its session) a question about the lines;
 //! the answer shows under them until Esc on their line. The file is re-read
 //! every couple of seconds so the agent's revisions show up live.
 
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use egui::{RichText, Ui};
 use kitchen_core::db::PlanComment;
 use kitchen_core::host::Host;
-use kitchen_core::{ask, plan, trace};
+use kitchen_core::{ask, plan};
 
 use crate::engine::{Engine, Tab, Workspace};
 use crate::panels::{PanelCmd, PanelCtx};
@@ -32,8 +32,8 @@ enum Msg {
     Answer { id: u64, result: Result<String, String> },
 }
 
-/// Answers a plan question (the model; a fake in tests): (model, cwd, question).
-type Answerer = fn(&str, Option<&str>, &ask::PlanQuestion) -> anyhow::Result<String>;
+/// Answers a plan question (the model; a fake in tests).
+type Answerer = fn(&ask::Asker, &ask::PlanQuestion) -> anyhow::Result<String>;
 
 /// A ⌘⇧A question and, once the model replies, its answer.
 struct PlanAsk {
@@ -208,13 +208,13 @@ impl PlanView {
         }
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
         let what = if end > start { format!("lines {}–{}", start + 1, end + 1) } else { format!("line {}", start + 1) };
-        let model = self.engine.settings().ask_model;
-        let label = format!("Ask {model} about {what} (with the planning session as context) — Enter asks · Esc cancels");
+        let who = self.engine.find_tab(&self.tab_id).map_or_else(|| self.engine.settings().ask_model, |_| "the planning agent".into());
+        let label = format!("Ask {who} about {what} — Enter asks · Esc cancels");
         self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true });
     }
 
-    /// Send the question field to the model, with the plan and the agent's
-    /// planning session; its block shows "thinking… Ns" until it answers.
+    /// Send the question field, with the plan, to a fork of the planning
+    /// agent's session; its block shows "thinking… Ns" until it answers.
     fn submit_ask(&mut self) {
         let Some(ed) = self.editor.take() else { return };
         let text = ed.text.trim().to_string();
@@ -230,14 +230,13 @@ impl PlanView {
         let plan_text = self.text.clone().unwrap_or_default();
         let path = self.plan.as_ref().map(|d| d.path.clone()).unwrap_or_else(|| plan::plan_file_for(&self.worktree, &self.tab_id));
         let model = self.engine.settings().ask_model;
-        // On this mac the model may read the rest of the repo.
-        let cwd = matches!(self.host, Host::Local).then(|| self.worktree.clone());
+        let tab = self.engine.find_tab(&self.tab_id).map(|(_, t)| t.row);
         let (host, wt, tx, ctx, answer) = (self.host.clone(), self.worktree.clone(), self.tx.clone(), self.engine.ctx.clone(), self.answerer);
         let (first, last) = (ed.start + 1, ed.end + 1);
         std::thread::spawn(move || {
-            let session = trace::latest_transcript(&host, &wt).map(|t| trace::condense(&t, ask::MAX_TRACE)).filter(|t| !t.is_empty());
-            let q = ask::PlanQuestion { path: &path, first, last, quote: &quote, plan: &plan_text, trace: session.as_deref(), text: &text };
-            let result = answer(&model, cwd.as_deref(), &q).map_err(|e| format!("{e:#}"));
+            let asker = ask::Asker::for_tab(host, tab.as_ref(), &wt, &model);
+            let q = ask::PlanQuestion { path: &path, first, last, quote: &quote, plan: &plan_text, text: &text };
+            let result = answer(&asker, &q).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Answer { id, result });
             ctx.request_repaint();
         });
@@ -486,12 +485,12 @@ mod tests {
         let (ctx, engine) = engine("local", &repo.path(), &["t"]);
         let w = engine.workspaces()[0].clone();
         let mut p = PlanView::new(&engine, &w, &w.tabs[0]);
-        p.answerer = |model, cwd, q| Ok(format!("{model}|{}|{}-{}|{}|{}|{}", cwd.is_some(), q.first, q.last, q.quote, q.plan.lines().count(), q.text));
+        p.answerer = |a, q| Ok(format!("{}|{}|{}-{}|{}|{}|{}", a.model, a.session.is_some(), q.first, q.last, q.quote, q.plan.lines().count(), q.text));
         settle(&ctx, &engine, &mut p, &|p| p.doc.lines.len() == 3);
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("jV".into())]);
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("j".into())]);
         p.command(PanelCmd::Ask, &engine);
-        assert!(p.editor.as_ref().is_some_and(|e| e.ask && e.label.starts_with("Ask sonnet about lines 2–3")), "{:?}", p.editor.as_ref().map(|e| &e.label));
+        assert!(p.editor.as_ref().is_some_and(|e| e.ask && e.label.starts_with("Ask the planning agent about lines 2–3")), "{:?}", p.editor.as_ref().map(|e| &e.label));
         frame(&ctx, &engine, &mut p, Vec::new());
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("why LRU?".into())]);
         frame(&ctx, &engine, &mut p, key(egui::Key::Enter));
@@ -499,7 +498,7 @@ mod tests {
         let ask = |p: &PlanView| p.blocks().into_iter().find(|b| b.title.starts_with("why LRU?"));
         assert_eq!(ask(&p).map(|b| (b.after, b.body)), Some((Some(2), "thinking… 0s".into())));
         settle(&ctx, &engine, &mut p, &|p| ask(p).is_some_and(|b| !b.dim));
-        assert_eq!(ask(&p).unwrap().body, "sonnet|true|2-3|## F1 cache\nuse an LRU|3|why LRU?");
+        assert_eq!(ask(&p).unwrap().body, "sonnet|false|2-3|## F1 cache\nuse an LRU|3|why LRU?");
         // Esc elsewhere keeps it; Esc on its line closes it.
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("k".into())]);
         frame(&ctx, &engine, &mut p, key(egui::Key::Escape));

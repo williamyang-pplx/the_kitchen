@@ -11,7 +11,7 @@ use crate::engine::Engine;
 pub enum PanelCmd {
     /// ⌘M: open a comment field on the cursor line / visual selection.
     Comment,
-    /// ⌘⇧A in the viewer: ask the model about the cursor line / selection.
+    /// ⌘⇧A in the viewer: ask the agent about the cursor line / selection.
     Ask,
     /// ⌘Enter: submit the open comment field (or the panel's primary action).
     Submit,

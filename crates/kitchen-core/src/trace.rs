@@ -1,19 +1,14 @@
-//! What a tab's agent did, read back from its Claude Code session
-//! transcript (`~/.claude/projects/<worktree>/<session>.jsonl` on the tab's
-//! host) and cut down to plain text another model can read as context.
+//! A tab agent's Claude Code session, found from its transcripts
+//! (`~/.claude/projects/<worktree>/<session>.jsonl` on the tab's host), so
+//! a ⌘⇧A question can go to a fork of it.
 
 use serde_json::Value;
 
 use crate::host::Host;
+use crate::util::shell_quote;
 
-/// Most transcript bytes fetched from the host: the tail, where the latest
-/// planning round is.
-const MAX_FETCH: usize = 32_000_000;
-
-/// Longest text kept from one message, tool input and tool result.
-const MAX_TEXT: usize = 4_000;
-const MAX_TOOL_INPUT: usize = 300;
-const MAX_TOOL_RESULT: usize = 600;
+/// Most transcript bytes searched for the agent's latest reply.
+const MODEL_TAIL: usize = 4_000_000;
 
 /// Claude Code's folder name for a project: the path with every character
 /// that is not a letter or digit replaced by `-`.
@@ -21,92 +16,56 @@ pub fn project_dir_name(worktree: &str) -> String {
     worktree.trim_end_matches('/').chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
-/// The tail of the newest session transcript of the agent working in
-/// `worktree`, as raw JSONL. `None` if there is none.
-pub fn latest_transcript(host: &Host, worktree: &str) -> Option<String> {
-    let script = format!(
-        "f=$(ls -t \"$HOME/.claude/projects/{dir}\"/*.jsonl 2>/dev/null | head -1); [ -n \"$f\" ] && tail -c {MAX_FETCH} \"$f\"",
+/// An agent's Claude Code session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Session {
+    pub id: String,
+    /// The model of its latest reply (`None`: no reply found).
+    pub model: Option<String>,
+}
+
+/// The session of the agent working in `worktree`: `reported` (the id its
+/// Stop hook last reported) if its transcript is there, else the newest
+/// one. `None` if there is none. Blocking: one host round trip.
+pub fn agent_session(host: &Host, worktree: &str, reported: Option<&str>) -> Option<Session> {
+    let out = host.sh_bytes_ok(&session_script(worktree, reported), None).ok()?;
+    parse_session(&String::from_utf8_lossy(&out))
+}
+
+/// Prints the session's id, then the reply lines of its tail (the model is
+/// in the last one). Fails if there is no session.
+fn session_script(worktree: &str, reported: Option<&str>) -> String {
+    format!(
+        "d=\"$HOME/.claude/projects/{dir}\"; f=\"$d\"/{id}.jsonl; \
+         [ -f \"$f\" ] || f=$(ls -t \"$d\"/*.jsonl 2>/dev/null | head -1); \
+         [ -f \"$f\" ] && {{ basename \"$f\" .jsonl; tail -c {MODEL_TAIL} \"$f\" | grep -F '\"type\":\"assistant\"' | tail -n 20; }}",
         dir = project_dir_name(worktree),
-    );
-    let out = host.sh_bytes_ok(&script, None).ok()?;
-    let text = String::from_utf8_lossy(&out).into_owned();
-    (!text.trim().is_empty()).then_some(text)
+        id = shell_quote(reported.unwrap_or_default()),
+    )
 }
 
-/// The conversation in a transcript, one entry per message, tool call and
-/// tool result, at most `max` bytes. The first prompt (the task) is always
-/// kept; past the budget, the oldest entries after it are dropped.
-pub fn condense(jsonl: &str, max: usize) -> String {
-    let entries: Vec<String> = jsonl.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).flat_map(|e| entries(&e)).collect();
-    let Some((first, rest)) = entries.split_first() else { return String::new() };
-    let mut size = first.len();
-    let mut tail = Vec::new();
-    for e in rest.iter().rev() {
-        if size + e.len() + 1 > max {
-            break;
-        }
-        size += e.len() + 1;
-        tail.push(e.as_str());
+/// The output of [`agent_session`]'s script: the session id, then
+/// transcript lines.
+fn parse_session(out: &str) -> Option<Session> {
+    let mut lines = out.lines();
+    let id = lines.next()?.trim().to_string();
+    if id.is_empty() {
+        return None;
     }
-    let mut out = first.clone();
-    if tail.len() < rest.len() {
-        out.push_str("\n[… earlier entries omitted …]");
-    }
-    for e in tail.iter().rev() {
-        out.push('\n');
-        out.push_str(e);
-    }
-    out
-}
-
-/// The readable entries of one transcript line. Kitchen bookkeeping,
-/// expanded skill text (`isMeta`), subagent turns and thinking are skipped.
-fn entries(e: &Value) -> Vec<String> {
-    let role = e["type"].as_str().unwrap_or_default();
-    if !matches!(role, "user" | "assistant") || e["isMeta"] == true || e["isSidechain"] == true {
-        return Vec::new();
-    }
-    let who = if role == "user" { "William" } else { "agent" };
-    match &e["message"]["content"] {
-        Value::String(s) => vec![format!("[{who}] {}", clip(s.trim(), MAX_TEXT))],
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|b| match b["type"].as_str()? {
-                "text" => Some(format!("[{who}] {}", clip(b["text"].as_str()?.trim(), MAX_TEXT))),
-                "tool_use" => Some(format!("[agent → {}] {}", b["name"].as_str()?, clip(&b["input"].to_string(), MAX_TOOL_INPUT))),
-                "tool_result" => Some(format!("[tool result] {}", clip(result_text(&b["content"]).trim(), MAX_TOOL_RESULT))),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn result_text(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
-        _ => String::new(),
-    }
-}
-
-/// `s` cut to at most `max` bytes (on a char boundary), marked when cut.
-fn clip(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let end = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
-    format!("{}… [{} more bytes]", &s[..end], s.len() - end)
+    let model = lines
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["type"] == "assistant" && e["isSidechain"] != true)
+        .filter_map(|e| e["message"]["model"].as_str().map(String::from))
+        // `<synthetic>`: Claude Code's own messages (API errors).
+        .filter(|m| !m.starts_with('<'))
+        .last();
+    Some(Session { id, model })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn jsonl(lines: &[Value]) -> String {
-        lines.iter().map(|l| l.to_string() + "\n").collect()
-    }
 
     #[test]
     fn project_dir_matches_claude_code() {
@@ -115,37 +74,32 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_conversation_and_skips_the_rest() {
-        let t = jsonl(&[
-            json!({"type": "permission-mode", "permissionMode": "default"}),
-            json!({"type": "user", "message": {"role": "user", "content": "/low-level-plan add a cache"}}),
-            json!({"type": "user", "isMeta": true, "message": {"content": "skill body"}}),
-            json!({"type": "assistant", "message": {"content": [
-                {"type": "thinking", "thinking": "hmm"},
-                {"type": "text", "text": "Reading the code."},
-                {"type": "tool_use", "name": "Read", "input": {"file_path": "/w/src/a.rs"}},
-            ]}}),
-            json!({"type": "user", "message": {"content": [{"type": "tool_result", "content": [{"type": "text", "text": "fn a() {}"}]}]}}),
-            json!({"type": "assistant", "isSidechain": true, "message": {"content": [{"type": "text", "text": "subagent"}]}}),
-        ]) + "not json\n";
-        assert_eq!(
-            condense(&t, 10_000),
-            "[William] /low-level-plan add a cache\n[agent] Reading the code.\n[agent → Read] {\"file_path\":\"/w/src/a.rs\"}\n[tool result] fn a() {}"
-        );
+    fn the_session_has_the_latest_real_model() {
+        let reply = |model: &str| json!({"type": "assistant", "message": {"model": model, "content": []}}).to_string();
+        let sub = json!({"type": "assistant", "isSidechain": true, "message": {"model": "claude-haiku-5-5"}}).to_string();
+        let out = format!("0b7e-41\n{{\"partial\n{}\n{}\n{}\n{sub}\n", reply("claude-sonnet-5-5"), reply("claude-opus-5-5"), reply("<synthetic>"));
+        assert_eq!(parse_session(&out), Some(Session { id: "0b7e-41".into(), model: Some("claude-opus-5-5".into()) }));
+        assert_eq!(parse_session("0b7e-41\n"), Some(Session { id: "0b7e-41".into(), model: None }));
+        assert_eq!(parse_session(""), None);
     }
 
     #[test]
-    fn over_budget_keeps_the_task_and_the_latest() {
-        let msg = |role: &str, text: &str| json!({"type": role, "message": {"content": text}});
-        let t = jsonl(&[msg("user", "task"), msg("assistant", "old"), msg("assistant", "mid"), msg("user", "new")]);
-        assert_eq!(condense(&t, 30), "[William] task\n[… earlier entries omitted …]\n[William] new");
-        assert_eq!(condense("", 30), "");
-    }
-
-    #[test]
-    fn clip_marks_the_cut() {
-        assert_eq!(clip("abcdef", 10), "abcdef");
-        assert_eq!(clip("abcdef", 3), "abc… [3 more bytes]");
-        assert_eq!(clip("ééé", 3), "é… [4 more bytes]");
+    fn finds_the_reported_session_then_the_newest() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude/projects").join(project_dir_name("/w/repo"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reply = json!({"type": "assistant", "message": {"model": "claude-opus-5-5"}}).to_string();
+        std::fs::write(dir.join("old.jsonl"), format!("{reply}\n")).unwrap();
+        std::fs::write(dir.join("new.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(dir.join("new.jsonl")).unwrap().set_modified(later).unwrap();
+        let found = |worktree, reported| {
+            let out = std::process::Command::new("sh").arg("-c").arg(session_script(worktree, reported)).env("HOME", home.path()).output().unwrap();
+            parse_session(&String::from_utf8_lossy(&out.stdout)).filter(|_| out.status.success())
+        };
+        assert_eq!(found("/w/repo", Some("old")), Some(Session { id: "old".into(), model: Some("claude-opus-5-5".into()) }));
+        assert_eq!(found("/w/repo", Some("gone")).map(|s| s.id), Some("new".into()));
+        assert_eq!(found("/w/repo", None).map(|s| s.id), Some("new".into()));
+        assert_eq!(found("/w/other", None), None);
     }
 }

@@ -1,18 +1,18 @@
-//! ⌘⇧A: ask the model about the cursor line or selection. The question
-//! field opens under the lines like a ⌘M comment; the answer is drawn there
-//! as a block until Esc on its line closes it. Answers are not stored.
+//! ⌘⇧A: ask the tab's agent (a fork of its session, see `kitchen_core::ask`)
+//! about the cursor line or selection. The question field opens under the
+//! lines like a ⌘M comment; the answer is drawn there as a block until Esc
+//! on its line closes it. Answers are not stored.
 
 use std::time::{Duration, Instant};
 
 use kitchen_core::ask;
-use kitchen_core::host::Host;
 
 use super::code_view::{Block, Editor};
 use super::{Msg, Viewer};
 use crate::plugins::decor::Side;
 
-/// Answers a question (the model; a fake in tests): (model, cwd, question).
-pub(super) type Answerer = fn(&str, Option<&str>, &ask::Question) -> anyhow::Result<String>;
+/// Answers a question (the model; a fake in tests).
+pub(super) type Answerer = fn(&ask::Asker, &ask::Question) -> anyhow::Result<String>;
 
 pub(super) struct Ask {
     id: u64,
@@ -36,10 +36,10 @@ impl Viewer {
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
         let (first, last) = (self.row_line(start, false).1.unwrap_or(start + 1), self.row_line(end, true).1.unwrap_or(end + 1));
         let what = if end > start || last > first { format!("lines {first}–{last}") } else { format!("line {last}") };
-        let model = self.engine.settings().ask_model;
+        let who = self.engine.find_tab(&self.tab_id).map_or_else(|| self.engine.settings().ask_model, |_| "the agent".into());
         self.reply_to = None;
         self.list_focus = false;
-        let label = format!("Ask {model} about {what} — Enter asks · Esc cancels");
+        let label = format!("Ask {who} about {what} — Enter asks · Esc cancels");
         self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true });
     }
 
@@ -65,13 +65,13 @@ impl Viewer {
         self.asks.push(Ask { id, path: path.clone(), side, line, question: text.clone(), asked: Instant::now(), answer: None });
         self.vim.anchor = None;
         let model = self.engine.settings().ask_model;
-        // On this mac the model may read the rest of the repo.
-        let cwd = matches!(self.host, Host::Local).then(|| self.worktree.clone());
-        let (tx, ctx, answer) = (self.tx.clone(), self.engine.ctx.clone(), self.answerer);
+        let tab = self.engine.find_tab(&self.tab_id).map(|(_, t)| t.row);
+        let (host, root, tx, ctx, answer) = (self.host.clone(), self.worktree.clone(), self.tx.clone(), self.engine.ctx.clone(), self.answerer);
         std::thread::spawn(move || {
+            let asker = ask::Asker::for_tab(host, tab.as_ref(), &root, &model);
             let source = source.unwrap_or_default();
-            let q = ask::Question { path: &path, first, last: line, base: side == Side::Old, quote: &quote, source: &source, text: &text };
-            let result = answer(&model, cwd.as_deref(), &q).map_err(|e| format!("{e:#}"));
+            let q = ask::Question { root: &root, path: &path, first, last: line, base: side == Side::Old, quote: &quote, source: &source, text: &text };
+            let result = answer(&asker, &q).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Answer { id, result });
             ctx.request_repaint();
         });

@@ -2208,14 +2208,14 @@ end)"#,
         h.repo.sh("printf 'a\\nB\\nc\\n' > a.py && git commit -qam change");
         let engine = &h.engine;
         let mut v = h.viewer();
-        v.answerer = |model, cwd, q| Ok(format!("{model}|{}|{}:{}-{}|{}|{}|{}", cwd.is_some(), q.path, q.first, q.last, q.base, q.quote, q.text));
+        v.answerer = |a, q| Ok(format!("{}|{}|{}:{}-{}|{}|{}|{}", a.model, a.session.is_some(), q.path, q.first, q.last, q.base, q.quote, q.text));
         h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none());
         // The first change starts with the removed `b`; V takes the added `B` too.
         assert_eq!(v.doc.lines[v.vim.line].text, "b");
         h.text(&mut v, "V");
         h.text(&mut v, "j");
         v.command(PanelCmd::Ask, engine);
-        assert!(v.editor.as_ref().is_some_and(|e| e.ask && e.label.starts_with("Ask sonnet about lines")), "{:?}", v.editor.as_ref().map(|e| &e.label));
+        assert!(v.editor.as_ref().is_some_and(|e| e.ask && e.label.starts_with("Ask the agent about lines")), "{:?}", v.editor.as_ref().map(|e| &e.label));
         h.frame(&mut v);
         h.text(&mut v, "why?");
         // Enter asks (⌘Enter would too).
@@ -2227,7 +2227,7 @@ end)"#,
         h.settle(&mut v, &|v| v.ask_blocks().first().is_some_and(|b| !b.dim));
         let b = v.ask_blocks().remove(0);
         // Mixed sides: about the last line, in the current file.
-        assert_eq!(b.body, "sonnet|true|a.py:2-2|false|b\nB|why?");
+        assert_eq!(b.body, "sonnet|false|a.py:2-2|false|b\nB|why?");
         assert!(b.title.starts_with("why?"));
         // Esc elsewhere keeps it; Esc on its line closes it.
         v.place_cursor(1, 0);

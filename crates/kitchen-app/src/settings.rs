@@ -16,7 +16,7 @@ pub struct Settings {
     pub dotfiles_remote_dir: String,
     /// Model used for outline summaries (`claude -p --model <this>`).
     pub summary_model: String,
-    /// Model that answers ⌘⇧A questions in the viewer.
+    /// Model that answers ⌘⇧A questions in tabs without an agent session.
     pub ask_model: String,
     pub font_size: f32,
     /// Folders the viewer opens at when a tab has no changes (first that exists).

@@ -1312,7 +1312,7 @@ const SHORTCUTS: [&[ShortcutGroup]; 2] = [
                 ("-", "parent folder"),
             ],
         ),
-        ("Comments", &[("⌘M", "comment on the line or selection"), ("⌘⇧A", "plan: ask, with the planning session"), ("⌘⏎", "submit (plan: send all to the agent)")]),
+        ("Comments", &[("⌘M", "comment on the line or selection"), ("⌘⇧A", "plan: ask the planning agent"), ("⌘⏎", "submit (plan: send all to the agent)")]),
     ],
 ];
 

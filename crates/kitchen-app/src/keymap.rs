@@ -30,7 +30,7 @@
 //! | ⌘⇧R         | rename the current workspace                  |
 //! | ⌘⇧P         | command palette (plugin commands)             |
 //! | ⌘M          | comment on the cursor line / selection        |
-//! | ⌘⇧A         | viewer / plan: ask the model about the line   |
+//! | ⌘⇧A         | viewer / plan: ask the agent about the line   |
 //! | ⌘Enter      | submit comment (plan: send comments to agent) |
 //! | ⌘D          | dashboard (focused side panel: diff / plain)  |
 //! | ⌘O          | toggle outline (collapsed) mode               |
@@ -67,7 +67,7 @@ pub enum Action {
     RenameTab,
     RenameWorkspace,
     Comment,
-    /// Viewer: ⌘⇧A asks the model about the cursor line / selection.
+    /// Viewer: ⌘⇧A asks the agent about the cursor line / selection.
     Ask,
     Submit,
     /// ⌘D: diff / plain in a focused side panel, else the workspace dashboard.
