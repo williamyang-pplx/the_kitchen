@@ -1684,6 +1684,279 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    fn shipyard_token_sync_module(lua: &mlua::Lua) -> mlua::Table {
+        lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/shipyard-token-sync/init.lua");
+        lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap()
+    }
+
+    /// Runs `python3 -c script` with `stdin` and the given environment
+    /// (`None` removes a variable): (success, stdout).
+    fn run_python(script: &str, stdin: &serde_json::Value, env: &[(&str, Option<&std::path::Path>)]) -> (bool, String) {
+        use std::io::Write;
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c").arg(script).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        for (k, v) in env {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        let mut c = cmd.spawn().unwrap();
+        c.stdin.take().unwrap().write_all(stdin.to_string().as_bytes()).unwrap();
+        let out = c.wait_with_output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn unix_now() -> i64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64
+    }
+
+    /// shipyard-token-sync: the payload carries only the access token's
+    /// fields and only tokens with time left; what is worth a toast.
+    #[test]
+    fn shipyard_token_sync_payload_and_problems() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        let m = shipyard_token_sync_module(&lua);
+        let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
+        let val = |j: serde_json::Value| lua.to_value(&j).unwrap();
+        let f = |name: &str| m.get::<mlua::Function>(name).unwrap();
+
+        let label: String = f("label").call("https://shipyard.prod.p.perplexity.ai/").unwrap();
+        assert_eq!(label, "shipyard.prod.p.perplexity.ai");
+
+        let now = 1_000_000;
+        let entry = |tok: &str, exp: i64| serde_json::json!({ "access_token": tok, "expires_at": exp, "issuer": "https://okta", "client_id": "cid", "refresh_token": "ref-leak" });
+        let report = val(serde_json::json!({ "servers": [
+            { "key": "https://live", "expires_at": now + 3000, "entry": entry("t1", now + 3000) },
+            { "key": "https://soon", "expires_at": now + 60, "entry": entry("t2", now + 60) },
+            { "key": "https://forever", "entry": { "access_token": "t3" } },
+            { "key": "https://empty", "entry": { "access_token": "" } },
+            { "key": "https://raced", "entry": {} },
+        ] }));
+        let payload = to_json(f("payload").call((report, now)).unwrap());
+        assert_eq!(
+            payload,
+            serde_json::json!({ "servers": [
+                { "key": "https://live", "entry": { "access_token": "t1", "expires_at": now + 3000, "issuer": "https://okta", "client_id": "cid" } },
+                { "key": "https://forever", "entry": { "access_token": "t3" } },
+            ] }),
+            "no refresh token; a token with a minute or less left, or none, stays home"
+        );
+
+        let problem = |row: serde_json::Value, login_exp: Option<i64>| -> Option<String> { f("problem").call((val(row), login_exp, now, 7)).unwrap() };
+        let ok = serde_json::json!({ "key": "https://s", "expires_at": now + 3000 });
+        assert_eq!(problem(ok.clone(), None), None);
+        assert_eq!(problem(ok.clone(), Some(now + 8 * 86400)), None, "more than warn_days left");
+        assert_eq!(problem(ok.clone(), Some(1_500_000)), Some("s: the mac's Shipyard login ends 1970-01-18 08:40 UTC; run bin/shipyard auth login on the mac before then".into()));
+        assert_eq!(problem(serde_json::json!({ "key": "https://s", "expires_at": now + 30, "error": "HTTP 503" }), None), None, "still valid: retried next pass");
+        assert_eq!(
+            problem(serde_json::json!({ "key": "https://s", "expires_at": now - 1, "error": "HTTP 503" }), None),
+            Some("s: the mac's Shipyard token expired and refreshing failed (HTTP 503); run bin/shipyard auth login on the mac".into())
+        );
+        assert_eq!(
+            problem(serde_json::json!({ "key": "https://s", "expires_at": now + 3000, "login_active": false }), Some(now + 86400 * 30)),
+            Some("s: the mac's Shipyard login has ended; run bin/shipyard auth login on the mac".into())
+        );
+    }
+
+    /// shipyard-token-sync: MERGE_PY against a temp HOME — creates the file
+    /// (600) in ~/.config or $XDG_CONFIG_HOME, writes only a token that lasts
+    /// longer, keeps the box's own refresh token, never clobbers a broken file.
+    #[test]
+    fn shipyard_token_sync_merge_script_on_a_temp_home() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let lua = mlua::Lua::new();
+        let script: String = shipyard_token_sync_module(&lua).get("MERGE_PY").unwrap();
+        let home = std::env::temp_dir().join(format!("kt-shipyard-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (dir, file) = (home.join(".config/shipyard"), home.join(".config/shipyard/tokens.json"));
+        let run = |payload: &serde_json::Value| run_python(&script, payload, &[("HOME", Some(&home)), ("XDG_CONFIG_HOME", None)]);
+        let read = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap() };
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let key = "https://shipyard.prod.p.perplexity.ai";
+        let entry = |tok: &str, exp: i64| serde_json::json!({ "access_token": tok, "expires_at": exp, "issuer": "https://okta", "client_id": "cid" });
+        let payload = |e: &serde_json::Value| serde_json::json!({ "servers": [{ "key": key, "entry": e }] });
+
+        let mac = entry("mac-1", 2000);
+        assert_eq!(run(&payload(&mac)), (true, format!("updated {key}\n")), "no ~/.config/shipyard yet");
+        assert_eq!((mode(&dir), mode(&file)), (0o700, 0o600));
+        assert_eq!(read(), serde_json::json!({ "servers": { key: mac } }));
+        let before = std::fs::metadata(&file).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(run(&payload(&mac)), (true, String::new()), "unchanged: nothing printed");
+        let after = std::fs::metadata(&file).unwrap();
+        assert_eq!((after.ino(), after.mtime_nsec()), (before.ino(), before.mtime_nsec()), "unchanged: not rewritten");
+
+        // The box's own login: its refresh token stays, other servers and keys stay.
+        let boxed = serde_json::json!({
+            "servers": {
+                key: { "access_token": "box-1", "expires_at": 1000, "issuer": "https://okta", "client_id": "cid", "refresh_token": "box-ref" },
+                "https://shipyard.testing": { "access_token": "t", "refresh_token": "r" },
+            },
+            "extra": 1,
+        });
+        std::fs::write(&file, boxed.to_string()).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(run(&payload(&mac)), (true, format!("updated {key}\n")));
+        let mut kept = mac.clone();
+        kept["refresh_token"] = "box-ref".into();
+        assert_eq!(read(), serde_json::json!({ "servers": { key: kept, "https://shipyard.testing": { "access_token": "t", "refresh_token": "r" } }, "extra": 1 }));
+        assert_eq!(mode(&file), 0o600, "a 644 file comes back 600");
+        assert_eq!(run(&payload(&entry("mac-0", 1500))), (true, String::new()), "the box's token lasts longer: left alone");
+
+        // A refresh token minted for another client is not carried over.
+        std::fs::write(&file, serde_json::json!({ "servers": { key: { "access_token": "x", "expires_at": 1, "issuer": "https://okta", "client_id": "other", "refresh_token": "r" } } }).to_string()).unwrap();
+        assert_eq!(run(&payload(&mac)), (true, format!("updated {key}\n")));
+        assert_eq!(read(), serde_json::json!({ "servers": { key: mac } }));
+
+        // A legacy flat file: bin/shipyard discards it, so does the merge.
+        std::fs::write(&file, r#"{"access_token": "legacy", "expires_at": 9999999999}"#).unwrap();
+        assert_eq!(run(&payload(&mac)), (true, format!("updated {key}\n")));
+        assert_eq!(read(), serde_json::json!({ "servers": { key: mac } }));
+
+        for broken in ["{not json", r#"{"servers": []}"#, "[]", ""] {
+            std::fs::write(&file, broken).unwrap();
+            assert!(!run(&payload(&mac)).0, "{broken:?}: fails");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), broken, "{broken:?}: left alone");
+        }
+        let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["tokens.json"], "no temp files left");
+
+        let xdg = home.join("xdg");
+        let (ok, _) = run_python(&script, &payload(&mac), &[("HOME", Some(&home)), ("XDG_CONFIG_HOME", Some(&xdg))]);
+        assert!(ok && xdg.join("shipyard/tokens.json").exists(), "$XDG_CONFIG_HOME wins, as in Go's os.UserConfigDir");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// shipyard-token-sync: MAC_PY against a fake Okta — refreshes only near
+    /// expiry, with bin/shipyard's form; writes the rotated refresh token back
+    /// (600) and keeps it out of the report; asks introspection when the login
+    /// ends; a failed refresh leaves the file alone.
+    #[test]
+    fn shipyard_token_sync_mac_script_against_a_fake_okta() {
+        use mlua::LuaSerdeExt;
+        use std::io::BufRead;
+        use std::os::unix::fs::PermissionsExt;
+        let lua = mlua::Lua::new();
+        let script: String = shipyard_token_sync_module(&lua).get("MAC_PY").unwrap();
+        let root = std::env::temp_dir().join(format!("kt-okta-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (file, log) = (root.join("tokens.json"), root.join("requests.jsonl"));
+        let okta = r#"
+import http.server, json, sys, urllib.parse
+log = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def do_GET(self):
+        base = "http://127.0.0.1:%d" % self.server.server_port
+        self.reply(200, {"token_endpoint": base + "/token", "introspection_endpoint": base + "/introspect"})
+    def do_POST(self):
+        form = dict(urllib.parse.parse_qsl(self.rfile.read(int(self.headers["Content-Length"])).decode()))
+        with open(log, "a") as f:
+            f.write(json.dumps({"path": self.path, "form": form}) + "\n")
+        if self.path == "/token":
+            if form.get("refresh_token") == "dead":
+                return self.reply(400, {"error": "invalid_grant", "error_description": "The refresh token is invalid or expired."})
+            if form.get("refresh_token") == "race":  # bin/shipyard refreshes at the same time
+                with open(sys.argv[2]) as f:
+                    store = json.load(f)
+                store["servers"]["https://a"] = dict(store["servers"]["https://a"], access_token="acc-cli", refresh_token="ref-cli", expires_at=9999999999)
+                with open(sys.argv[2], "w") as f:
+                    json.dump(store, f)
+            return self.reply(200, {"access_token": "acc-new", "refresh_token": "ref-new", "expires_in": 3600})
+        self.reply(200, {"active": form.get("token") != "dead", "exp": 2000000000})
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(s.server_port, flush=True)
+s.serve_forever()
+"#;
+        let mut server = std::process::Command::new("python3").arg("-c").arg(okta).arg(&log).arg(&file).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut port = String::new();
+        std::io::BufReader::new(server.stdout.take().unwrap()).read_line(&mut port).unwrap();
+        let issuer = format!("http://127.0.0.1:{}", port.trim());
+        let requests = || -> Vec<serde_json::Value> {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        };
+        let run = |introspect: bool| -> (bool, serde_json::Value, String) {
+            let (ok, out) = run_python(&script, &serde_json::json!({ "path": file, "window": 900, "introspect": introspect }), &[]);
+            (ok, serde_json::from_str(&out).unwrap_or_default(), out)
+        };
+
+        let now = unix_now();
+        let token = |acc: &str, refresh: &str, exp: i64| serde_json::json!({ "access_token": acc, "refresh_token": refresh, "expires_at": exp, "issuer": issuer, "client_id": "cid" });
+        std::fs::write(&file, serde_json::json!({ "servers": { "https://a": token("acc-old", "ref-old", now + 60), "https://b": token("acc-b", "ref-b", now + 7200) }, "other": 1 }).to_string()).unwrap();
+        let (ok, report, out) = run(false);
+        assert!(ok, "{out}");
+        assert!(!out.contains("ref-"), "no refresh token in the report: {out}");
+        let rows = report["servers"].as_array().unwrap();
+        let a_exp = rows[0]["expires_at"].as_i64().unwrap();
+        assert!((now + 3590..now + 3610).contains(&a_exp), "{a_exp}");
+        assert_eq!(
+            report,
+            serde_json::json!({ "servers": [
+                { "key": "https://a", "expires_at": a_exp, "refreshed": true, "login_active": true, "login_expires_at": 2000000000,
+                  "entry": { "access_token": "acc-new", "expires_at": a_exp, "issuer": issuer, "client_id": "cid" } },
+                { "key": "https://b", "expires_at": now + 7200, "entry": { "access_token": "acc-b", "expires_at": now + 7200, "issuer": issuer, "client_id": "cid" } },
+            ] }),
+            "a is in the window: refreshed, then introspected; b is not touched"
+        );
+        assert_eq!(
+            requests(),
+            [
+                serde_json::json!({ "path": "/token", "form": { "grant_type": "refresh_token", "refresh_token": "ref-old", "client_id": "cid", "scope": "openid email profile groups offline_access" } }),
+                serde_json::json!({ "path": "/introspect", "form": { "token": "ref-new", "token_type_hint": "refresh_token", "client_id": "cid" } }),
+            ]
+        );
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(written, serde_json::json!({ "servers": { "https://a": token("acc-new", "ref-new", a_exp), "https://b": token("acc-b", "ref-b", now + 7200) }, "other": 1 }), "the rotated refresh token is kept");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        let left: Vec<String> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["tokens.json"], "no temp files left");
+
+        let (ok, report, _) = run(true);
+        assert!(ok && report["servers"].as_array().unwrap().iter().all(|r| r["login_active"] == true && r.get("refreshed").is_none()));
+        assert_eq!(requests().iter().map(|r| r["path"].as_str().unwrap().to_string()).collect::<Vec<_>>(), ["/introspect", "/introspect"], "introspect asked: no refresh");
+
+        // bin/shipyard refreshed while the plugin did: the file's token wins.
+        std::fs::write(&file, serde_json::json!({ "servers": { "https://a": token("acc-old", "race", now + 60) } }).to_string()).unwrap();
+        let (ok, report, _) = run(false);
+        assert!(ok);
+        assert_eq!(
+            report,
+            serde_json::json!({ "servers": [{ "key": "https://a", "expires_at": 9999999999i64, "entry": { "access_token": "acc-cli", "expires_at": 9999999999i64, "issuer": issuer, "client_id": "cid" } }] }),
+            "not marked refreshed, so not introspected"
+        );
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(written["servers"]["https://a"]["refresh_token"], "ref-cli");
+        assert_eq!(requests().len(), 1, "the refresh only");
+
+        // Okta refuses the refresh: the error, no token, the file left alone.
+        let dead = serde_json::json!({ "servers": { "https://a": token("acc-old", "dead", now - 10) } }).to_string();
+        std::fs::write(&file, &dead).unwrap();
+        let (ok, report, _) = run(true);
+        assert!(ok);
+        assert_eq!(report["servers"][0]["error"], "HTTP 400 invalid_grant The refresh token is invalid or expired.");
+        assert_eq!(report["servers"][0]["login_active"], false);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), dead);
+        let problem: Option<String> = shipyard_token_sync_module(&lua).get::<mlua::Function>("problem").unwrap().call((lua.to_value(&report["servers"][0]).unwrap(), mlua::Nil, now, 7)).unwrap();
+        assert_eq!(problem.as_deref(), Some("a: the mac's Shipyard login has ended; run bin/shipyard auth login on the mac"));
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(run(false).1, serde_json::json!({ "missing": true }));
+        let _ = server.kill();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `kitchen.every` runs on schedule and records its runs (stats, errors,
     /// SQLite); `t:run()` starts one now; a reload never overlaps a run that is
     /// still going. `kitchen.dashboard` sections follow the dashboard event.
@@ -1765,7 +2038,7 @@ end)
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 11 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        wait(&|| host.list().len() == 12 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);

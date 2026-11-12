@@ -1,0 +1,17 @@
+name = "shipyard-token-sync"
+version = "0.1.0"
+description = "Every few minutes, refresh the mac's Shipyard (Okta) login and push its access token (no refresh token) to every devbox with an open workspace, so bin/shipyard there needs no login"
+api = 10
+
+[config]
+# Minutes between passes (at least 1).
+interval_minutes = 5
+# The mac refreshes a token with this many minutes or less left. Okta's
+# access tokens last an hour; keep this above interval_minutes plus a few
+# minutes, so a box always gets a token with time left before the next pass.
+refresh_minutes = 15
+# Warn this many days before the mac's login ends. Okta ends it 90 days after
+# `bin/shipyard auth login`; refreshing does not extend it.
+warn_days = 7
+# bin/shipyard's token file on the mac (Go's os.UserConfigDir on macOS).
+mac_tokens = "~/Library/Application Support/shipyard/tokens.json"
