@@ -2,35 +2,28 @@
 //! the plan reviewer. It paints a [`Doc`], inline blocks (plan
 //! comments) and an optional comment editor, and turns plain
 //! keys into [`Vim`] motions while focused. Rendered rows (`kitchen.render`)
-//! are drawn in a proportional font and wrap instead of scrolling sideways.
-//! A row with Markdown source and every card's text are rendered as GitHub
-//! renders them, by WebKit off screen ([`crate::web`]), and drawn as images.
+//! and every card's text are Markdown, rendered as GitHub renders it, by
+//! WebKit off screen ([`crate::web`]), and drawn as images.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 
-use egui::text::{CCursor, LayoutJob, TextFormat};
+use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, CornerRadius, FontId, Galley, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
 use super::doc::{Doc, Fold, LineKind};
-use super::highlight::group_color;
 use super::vim::{Vim, VimAction, VimKey, Viewport};
-use crate::plugins::decor::{RenderRow, RenderSpan, Reply};
+use crate::plugins::decor::Reply;
 use crate::theme;
 use crate::web;
-
-/// Background of rendered code (blocks and inline).
-const CODE_BG: Color32 = Color32::from_rgb(0x24, 0x28, 0x3b);
 
 /// Where a row's text was drawn, for clicks.
 enum Hit {
     /// Monospace text at the view's column grid.
     Text,
-    /// A rendered row's galley, drawn at the position.
-    Galley(Pos2, Arc<Galley>),
-    /// Markdown: the row as a whole.
+    /// A rendered row, as a whole.
     Block,
 }
 
@@ -233,9 +226,10 @@ impl Geometry<'_> {
         let (rect, cw, font_size) = (self.rect, self.cw, self.font_size);
         let line = &self.doc.lines[idx];
         match line.render.as_deref() {
-            Some(r) if r.markdown.is_some() => {
-                let at = Pos2::new(self.text_x + cw * 0.8 + r.indent as f32 * cw * 2.0, y + 3.0);
-                let part = web::Part { header: None, markdown: r.markdown.as_deref().unwrap_or_default() };
+            Some(r) => {
+                // Clear of the diff's +/- marker.
+                let at = Pos2::new(self.text_x + cw * 0.8, y + 3.0);
+                let part = web::Part { header: None, markdown: &r.markdown };
                 let look = web::Look { size: font_size + 1.0, dim: false };
                 let mut links = Vec::new();
                 let h = web::show(&ui.painter_at(rect), paint, &[part], self.repo, &look, at, rect.right() - at.x - 16.0, &mut links);
@@ -243,17 +237,6 @@ impl Geometry<'_> {
                     self.links.borrow_mut().extend(links);
                 }
                 (None, at, (h + 8.0).max(self.row_h))
-            }
-            Some(r) => {
-                let quote = if r.block.as_deref() == Some("quote") { cw * 1.5 } else { 0.0 };
-                // Clear of the diff's +/- marker.
-                let x = self.text_x + cw * 0.8 + r.indent as f32 * cw * 2.0 + quote;
-                let job = render_job(r, &line.text, &line.spans, font_size, (rect.right() - x - 16.0).max(cw * 8.0));
-                let galley = ui.fonts_mut(|f| f.layout_job(job));
-                // Room above a heading.
-                let pad = (r.size.unwrap_or(1.0) - 1.0).max(0.0) * font_size * 0.8;
-                let h = (galley.size().y + 2.0 + pad).max(self.row_h);
-                (Some(galley), Pos2::new(x, y + 1.0 + pad), h)
             }
             None => {
                 let job = match &line.fold {
@@ -275,17 +258,14 @@ impl Geometry<'_> {
     /// when known; otherwise it is measured invisibly and stored.
     fn extent(&self, ui: &mut Ui, idx: usize, heights: &mut Heights) -> Extent {
         let lead = if idx == 0 { self.blocks_height(ui, None, heights) } else { 0.0 };
-        let render = self.doc.lines[idx].render.as_deref();
-        let markdown = render.is_some_and(|r| r.markdown.is_some());
+        let markdown = self.doc.lines[idx].render.is_some();
         let row = match heights.rows.get(&idx).filter(|_| markdown) {
             Some(h) => *h,
             // A text (or fold) row is always one row tall.
-            None if render.is_none() => self.row_h,
+            None if !markdown => self.row_h,
             None => {
                 let h = self.layout_row(ui, idx, self.rect.top(), 0, false).2;
-                if markdown {
-                    heights.rows.insert(idx, h);
-                }
+                heights.rows.insert(idx, h);
                 h
             }
         };
@@ -521,18 +501,14 @@ impl CodeView<'_> {
             let mut under_shapes: Vec<Shape> = Vec::new();
             // Layout first: a rendered row wraps, so it may be taller than a text row.
             let (galley, text_pos, row_height) = geo.layout_row(ui, idx, y, state.left, true);
-            if rendered.is_some_and(|r| r.markdown.is_some()) {
+            if rendered.is_some() {
                 state.heights.rows.insert(idx, row_height);
             }
             let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_height));
             row_hits.push((
                 row,
                 idx,
-                match (&galley, rendered) {
-                    (_, None) => Hit::Text,
-                    (Some(g), Some(_)) => Hit::Galley(text_pos, g.clone()),
-                    (None, Some(_)) => Hit::Block,
-                },
+                if rendered.is_some() { Hit::Block } else { Hit::Text },
             ));
             let bg = match line.kind {
                 LineKind::Added => Some(theme::ADDED_BG),
@@ -547,19 +523,6 @@ impl CodeView<'_> {
             }
             if line.fold.is_some() {
                 under_shapes.push(Shape::rect_filled(row, CornerRadius::ZERO, theme::PANEL));
-            }
-            match rendered.and_then(|r| r.block.as_deref()) {
-                Some("code") => {
-                    let r = Rect::from_min_max(Pos2::new(text_pos.x - 6.0, y), Pos2::new(rect.right() - 10.0, y + row_height));
-                    under_shapes.push(Shape::rect_filled(r, CornerRadius::ZERO, CODE_BG));
-                }
-                Some("quote") => {
-                    under_shapes.push(Shape::rect_filled(Rect::from_min_size(Pos2::new(text_pos.x - cw * 1.2, y), Vec2::new(3.0, row_height)), CornerRadius::ZERO, theme::DIM));
-                }
-                Some("rule") => {
-                    painter.hline(text_pos.x..=rect.right() - 16.0, y + row_height / 2.0, Stroke::new(1.0, theme::BORDER));
-                }
-                _ => {}
             }
             if idx == vim.line {
                 under_shapes.push(Shape::rect_filled(row, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0x7a, 0xa2, 0xf7, 18)));
@@ -617,7 +580,7 @@ impl CodeView<'_> {
                 painter.text(Pos2::new(rect.left() + 3.0, ty), egui::Align2::LEFT_TOP, c, FontId::monospace(font_size - 1.0), color);
             }
             // Text (a Markdown row drew its own).
-            if let Some(g) = galley.as_ref().filter(|_| rendered.is_none_or(|r| r.block.as_deref() != Some("rule"))) {
+            if let Some(g) = galley.as_ref() {
                 painter.galley(text_pos, g.clone(), theme::TEXT);
             }
             let after_x = text_x + (line.text.chars().count().saturating_sub(state.left) + 2) as f32 * cw;
@@ -628,15 +591,9 @@ impl CodeView<'_> {
             } else if let Some((text, color)) = over.and_then(|o| o.virt.as_ref()) {
                 painter.text(Pos2::new(after_x, y + 1.0), egui::Align2::LEFT_TOP, text, FontId::proportional(font_size - 0.5), color.gamma_multiply(0.75));
             }
-            // Cursor: a bar in a rendered row (beside a Markdown row), a block in a text row.
+            // Cursor: a bar beside a rendered row, a block in a text row.
             if idx == vim.line && rendered.is_some() {
-                let bar = match &galley {
-                    Some(g) => {
-                        let at = g.pos_from_cursor(CCursor::new(vim.col)).translate(text_pos.to_vec2());
-                        Rect::from_min_size(at.min, Vec2::new(2.0, at.height().max(ch)))
-                    }
-                    None => Rect::from_min_size(Pos2::new(text_pos.x - 7.0, y + 3.0), Vec2::new(2.0, row_height - 6.0)),
-                };
+                let bar = Rect::from_min_size(Pos2::new(text_pos.x - 7.0, y + 3.0), Vec2::new(2.0, row_height - 6.0));
                 painter.rect_filled(bar, CornerRadius::ZERO, if focused && !editor_focused { theme::TEXT.gamma_multiply(0.9) } else { theme::DIM });
             } else if idx == vim.line && vim.col >= state.left {
                 let x = text_x + (vim.col - state.left) as f32 * cw;
@@ -724,7 +681,6 @@ impl CodeView<'_> {
             } else if let Some(pos) = resp.interact_pointer_pos() {
                 if let Some((_, idx, hit)) = row_hits.iter().find(|(r, ..)| r.contains(pos)) {
                     let col = match hit {
-                        Hit::Galley(at, galley) => galley.cursor_from_pos(pos - *at).index.0,
                         Hit::Block => 0,
                         Hit::Text => (((pos.x - text_x) / cw).max(0.0) as usize) + state.left,
                     };
@@ -867,70 +823,6 @@ fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId, over: Option
         let color = ospans.iter().rev().find(|(r, _)| covers(r)).or_else(|| line.spans.iter().rev().find(|(r, _)| covers(r))).map(|(_, c)| *c).unwrap_or(base);
         let underline = ounder.iter().rev().find(|(r, _)| covers(r)).map(|(_, c)| Stroke::new(1.5, *c)).unwrap_or(Stroke::NONE);
         job.append(&text[a..b], 0.0, TextFormat { font_id: font.clone(), color, underline, ..Default::default() });
-    }
-    job
-}
-
-/// Layout for a rendered row: proportional text (monospace in code) in the
-/// row's and its spans' styles, wrapped at `wrap`. `syntax` colors (byte
-/// ranges) show where no span sets a color.
-fn render_job(r: &RenderRow, text: &str, syntax: &[(std::ops::Range<usize>, Color32)], font_size: f32, wrap: f32) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = wrap;
-    let size = font_size * r.size.unwrap_or(1.0).clamp(0.5, 3.0);
-    let (code_block, quote) = (r.block.as_deref() == Some("code"), r.block.as_deref() == Some("quote"));
-    let base = r.group.as_deref().and_then(group_color).unwrap_or(if quote { theme::MUTED } else { theme::TEXT });
-    // 1-based character columns → byte offsets.
-    let offsets: Vec<usize> = text.char_indices().map(|(b, _)| b).chain([text.len()]).collect();
-    let byte = |col: usize| offsets[col.saturating_sub(1).min(offsets.len() - 1)];
-    let spans: Vec<(std::ops::Range<usize>, &RenderSpan)> = r.spans.iter().map(|s| (byte(s.col)..s.end_col.map_or(text.len(), byte), s)).collect();
-    let mut cuts = vec![0, text.len()];
-    for range in spans.iter().map(|(r, _)| r).chain(syntax.iter().map(|(r, _)| r)) {
-        cuts.extend([range.start.min(text.len()), range.end.min(text.len())]);
-    }
-    cuts.sort_unstable();
-    cuts.dedup();
-    let plain = if code_block { FontId::monospace(size) } else if r.bold { theme::ui_font_bold(size) } else { theme::ui_font(size) };
-    if text.is_empty() {
-        // Still one row of the row's font, for its height and the cursor.
-        job.append("", 0.0, TextFormat { font_id: plain, color: base, ..Default::default() });
-        return job;
-    }
-    for w in cuts.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        if a >= b || !text.is_char_boundary(a) || !text.is_char_boundary(b) {
-            continue;
-        }
-        let on: Vec<&RenderSpan> = spans.iter().filter(|(range, _)| range.start <= a && range.end >= b).map(|(_, s)| *s).collect();
-        let any = |f: fn(&RenderSpan) -> bool| on.iter().any(|s| f(s));
-        let code = !code_block && any(|s| s.code);
-        let font_id = if code {
-            FontId::monospace(size * 0.9)
-        } else if !code_block && any(|s| s.bold) {
-            theme::ui_font_bold(size)
-        } else {
-            plain.clone()
-        };
-        let color = on
-            .iter()
-            .rev()
-            .find_map(|s| s.group.as_deref().and_then(group_color))
-            .or_else(|| syntax.iter().rev().find(|(range, _)| range.start <= a && range.end >= b).map(|(_, c)| *c))
-            .unwrap_or(base);
-        let stroke = |yes: bool| if yes { Stroke::new(1.0, color) } else { Stroke::NONE };
-        job.append(
-            &text[a..b],
-            0.0,
-            TextFormat {
-                font_id,
-                color,
-                background: if code { CODE_BG } else { Color32::TRANSPARENT },
-                italics: quote || any(|s| s.italic),
-                underline: stroke(any(|s| s.underline)),
-                strikethrough: stroke(any(|s| s.strike)),
-                ..Default::default()
-            },
-        );
     }
     job
 }

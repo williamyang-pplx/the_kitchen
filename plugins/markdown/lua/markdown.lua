@@ -1,8 +1,7 @@
--- Markdown → kitchen.render rows. The whole document is one row, rendered
--- in one pass as GitHub renders it (the viewer's WebKit pages), so its
--- spacing, lists and code are GitHub's. YAML front matter, which
--- GitHub shows as a table and CommonMark would misread, stays a code row
--- per line above it. A comment on the document lands on its last line.
+-- Markdown → kitchen.render rows: the whole document as one row, rendered
+-- in one pass as GitHub renders it. YAML front matter, which GitHub shows
+-- as a table and CommonMark would misread, becomes a `yaml` code block.
+-- A comment on the document lands on its last line.
 
 local M = {}
 
@@ -13,25 +12,17 @@ function M.rows(text)
     lines[#lines + 1] = (l:gsub("\r$", ""))
   end
   if text:sub(-1) == "\n" then lines[#lines] = nil end
-  local out = {}
-  local n = 1
+  local n = #lines
+  local markdown = table.concat(lines, "\n")
   if lines[1] == "---" then
-    for e = 2, #lines do
+    for e = 2, n do
       if lines[e] == "---" or lines[e] == "..." then
-        out[#out + 1] = { line = 1, text = "", block = "code" }
-        for k = 2, e - 1 do
-          out[#out + 1] = { line = k, text = lines[k], block = "code", lang = "yaml" }
-        end
-        out[#out + 1] = { line = e, text = "", block = "code" }
-        n = e + 1
+        markdown = "```yaml\n" .. table.concat(lines, "\n", 2, e - 1) .. "\n```\n" .. table.concat(lines, "\n", e + 1, n)
         break
       end
     end
   end
-  if n <= #lines then
-    out[#out + 1] = { line = n, end_line = #lines > n and #lines or nil, markdown = table.concat(lines, "\n", n, #lines) }
-  end
-  return out
+  return { { line = 1, end_line = n > 1 and n or nil, markdown = markdown } }
 end
 
 return M

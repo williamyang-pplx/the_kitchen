@@ -203,16 +203,11 @@ impl Doc {
                 continue;
             }
             let r = &rows[i];
-            // One display row: no line breaks; tabs as one space keep the span
-            // columns. A Markdown row's text is its source, for search.
-            let src = if r.text.is_empty() { r.markdown.as_deref().unwrap_or("") } else { &r.text };
-            let text: String = src.chars().map(|c| if c == '\n' || c == '\t' { ' ' } else { c }).collect();
-            let mut row = r.clone();
-            row.text = text.clone();
+            // The row's text is its source on one line, for search.
+            let text: String = r.markdown.chars().map(|c| if c == '\n' || c == '\t' { ' ' } else { c }).collect();
             let kind = if added[i] { LineKind::Added } else { LineKind::Normal };
-            lines.push(DocLine { text, kind, old_no: None, new_no: Some(r.line), suffix: None, spans: Vec::new(), render: Some(Arc::new(row)), fold: None });
+            lines.push(DocLine { text, kind, old_no: None, new_no: Some(r.line), suffix: None, spans: Vec::new(), render: Some(Arc::new(r.clone())), fold: None });
         }
-        highlight_code_runs(&mut lines);
         Doc { lines }
     }
 
@@ -298,30 +293,6 @@ impl Doc {
     }
 }
 
-/// Syntax colors for each run of adjacent code rows of one language (a
-/// fenced block), unless a row brings its own spans.
-fn highlight_code_runs(lines: &mut [DocLine]) {
-    let lang = |l: &DocLine| l.render.as_ref().filter(|r| r.spans.is_empty()).and_then(|r| r.lang.clone());
-    let mut i = 0;
-    while i < lines.len() {
-        let Some(l) = lang(&lines[i]) else {
-            i += 1;
-            continue;
-        };
-        let mut e = i + 1;
-        while e < lines.len() && lang(&lines[e]).as_deref() == Some(l.as_str()) {
-            e += 1;
-        }
-        let text: Vec<&str> = lines[i..e].iter().map(|d| d.text.as_str()).collect();
-        if let Some(spans) = super::highlight::highlight_lang(&l, &text.join("\n")) {
-            for (d, s) in lines[i..e].iter_mut().zip(spans) {
-                d.spans = s;
-            }
-        }
-        i = e;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,7 +371,7 @@ mod tests {
     }
 
     fn row(line: usize, end_line: Option<usize>, text: &str) -> RenderRow {
-        RenderRow { line, end_line, text: text.into(), ..Default::default() }
+        RenderRow { line, end_line, markdown: text.into() }
     }
 
     #[test]
@@ -421,11 +392,6 @@ mod tests {
         let d = Doc::rendered(&diff, &[row(1, Some(2), "a B"), row(3, None, "c")]);
         let got: Vec<(LineKind, Option<usize>, &str)> = d.lines.iter().map(|l| (l.kind, l.new_no, l.text.as_str())).collect();
         assert_eq!(got, vec![(LineKind::Added, Some(1), "a B"), (LineKind::Removed, None, "b"), (LineKind::Normal, Some(3), "c")]);
-
-        // A fenced block's rows are highlighted together by their language.
-        let code = |line: usize, text: &str| RenderRow { line, text: text.into(), block: Some("code".into()), lang: Some("rust".into()), ..Default::default() };
-        let d = Doc::rendered(&Doc::plain("fn f() {\n}\n", None), &[code(1, "fn f() {"), code(2, "}")]);
-        assert!(!d.lines[0].spans.is_empty(), "`fn` is a keyword");
     }
 
     #[test]

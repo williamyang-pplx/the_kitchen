@@ -140,7 +140,8 @@ pub struct Reply {
 }
 
 /// One row of a plugin's rendering of a file (`kitchen.render`, e.g. the
-/// markdown plugin): styled text standing for source lines `line..=end_line`.
+/// markdown plugin): Markdown standing for source lines `line..=end_line`,
+/// rendered as GitHub renders it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderRow {
@@ -148,25 +149,8 @@ pub struct RenderRow {
     pub line: usize,
     /// Last source line, inclusive (`None` = just `line`).
     pub end_line: Option<usize>,
-    pub text: String,
-    /// Font size as a multiple of the viewer's (headings > 1).
-    pub size: Option<f32>,
-    pub bold: bool,
-    /// Color of the whole row: a highlight group or `#rrggbb`.
-    pub group: Option<String>,
-    /// `code` (monospace on a panel), `quote` (bar on the left) or `rule`
-    /// (a horizontal line instead of the text).
-    pub block: Option<String>,
-    /// Nesting depth (list items, quotes).
-    pub indent: usize,
-    /// A code row's language (a fence's info string, e.g. `rust`): runs of
-    /// rows with the same one are syntax highlighted together.
-    pub lang: Option<String>,
-    #[serde(deserialize_with = "list_or_empty_table")]
-    pub spans: Vec<RenderSpan>,
-    /// CommonMark source drawn by the viewer's Markdown renderer instead of
-    /// `text`, `spans` and the style keys.
-    pub markdown: Option<String>,
+    /// GitHub-flavored Markdown.
+    pub markdown: String,
 }
 
 /// A list, also from an empty Lua table (which arrives as `{}`).
@@ -181,21 +165,6 @@ impl RenderRow {
     pub fn last_line(&self) -> usize {
         self.end_line.unwrap_or(self.line).max(self.line)
     }
-}
-
-/// Styled characters `col..end_col` (1-based, exclusive) of a row's text.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RenderSpan {
-    pub col: usize,
-    pub end_col: Option<usize>,
-    pub bold: bool,
-    pub italic: bool,
-    /// Inline code: monospace on a panel.
-    pub code: bool,
-    pub strike: bool,
-    pub underline: bool,
-    pub group: Option<String>,
 }
 
 fn default_severity() -> Severity {
@@ -531,8 +500,9 @@ mod tests {
         assert_eq!(s.get(&key()).unwrap().comments().count(), 2, "clearing diagnostics keeps comments");
         s.clear(Some(&key()), "github", Some(Kind::Comments));
         assert!(s.get(&key()).is_none());
-        let rows = parse_render(serde_json::json!([{ "line": 1, "end_line": 2, "text": "Title", "size": 1.6, "spans": [{ "col": 1, "end_col": 3, "bold": true }] }])).unwrap();
-        assert_eq!((rows[0].last_line(), rows[0].spans[0].end_col), (2, Some(3)));
+        let rows = parse_render(serde_json::json!([{ "line": 1, "end_line": 2, "markdown": "# Title" }])).unwrap();
+        assert_eq!((rows[0].last_line(), rows[0].markdown.as_str()), (2, "# Title"));
+        assert!(parse_render(serde_json::json!({})).unwrap().is_empty(), "an empty Lua table");
         assert!(parse_render(serde_json::json!([{ "line": 0 }])).is_err());
         s.set_render(&key(), "markdown", rows, Some("v1".into()));
         let d = s.get(&key()).unwrap();

@@ -904,8 +904,7 @@ mod tests {
         host
     }
 
-    /// markdown: the document is one Markdown row for the renderer, front
-    /// matter a code row per line above it; every line in exactly one row.
+    /// markdown: the document is one Markdown row, front matter as a yaml block.
     #[test]
     fn markdown_plugin_rows() {
         use mlua::LuaSerdeExt;
@@ -917,20 +916,11 @@ mod tests {
             let v: serde_json::Value = lua.from_value(f.call(text).unwrap()).unwrap();
             decor::parse_render(v).unwrap()
         };
-        let text = "---\ntitle: x\n---\n# Title\n\n- one\n- two\n\n```rust\nfn f() {}\n```\n";
-        let rows = rows_of(text);
-        let mut owner = vec![0; text.lines().count() + 1];
-        for r in &rows {
-            for l in r.line..=r.last_line() {
-                owner[l] += 1;
-            }
-        }
-        assert!(owner[1..].iter().all(|&c| c == 1), "each line in one row: {owner:?}");
-        assert_eq!((rows[0].block.as_deref(), rows[1].text.as_str(), rows[1].lang.as_deref()), (Some("code"), "title: x", Some("yaml")), "front matter is code");
-        let doc = rows.last().unwrap();
-        assert_eq!((doc.line, doc.last_line()), (4, 11));
-        assert_eq!(doc.markdown.as_deref(), Some("# Title\n\n- one\n- two\n\n```rust\nfn f() {}\n```"), "the rest, whole, for one pass");
-        assert_eq!(rows_of("one line").len(), 1);
+        let rows = rows_of("---\ntitle: x\n---\n# Title\n\n- one\n");
+        assert_eq!(rows.len(), 1, "one row, for one pass");
+        assert_eq!((rows[0].line, rows[0].last_line()), (1, 6), "it stands for every line");
+        assert_eq!(rows[0].markdown, "```yaml\ntitle: x\n```\n# Title\n\n- one");
+        assert_eq!(rows_of("---\nno end").remove(0).markdown, "---\nno end", "not front matter");
         assert!(rows_of("").is_empty());
     }
 
@@ -1795,7 +1785,7 @@ end)
         host.file_loaded(md.clone(), Arc::from("# Hi\n\ntext\n"), false);
         let mv = content_hash("# Hi\n\ntext\n");
         wait(&|| host.decor.get(&md).is_some_and(|d| d.render(&mv).is_some()));
-        assert_eq!(host.decor.get(&md).unwrap().render(&mv).unwrap()[0].markdown.as_deref(), Some("# Hi\n\ntext"));
+        assert_eq!(host.decor.get(&md).unwrap().render(&mv).unwrap()[0].markdown, "# Hi\n\ntext");
         assert!(host.registry().chords.iter().any(|c| c.command == "markdown.toggle" && c.chord.label() == "⇧⌘V"));
         if std::process::Command::new("ruff").arg("--version").output().is_ok() {
             wait(&|| host.decor.get(&key).is_some_and(|d| !d.diagnostics(&v).is_empty()));

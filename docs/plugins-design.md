@@ -268,6 +268,9 @@ about LSP:
   cover egui's menus and take the wheel and keys from vim; images stack and
   scroll like any card. Links are hit-tested against rects the page reports.
   The cost: no text selection inside rendered Markdown.
+* Render rows are Markdown only: the styled rows of levels 9–10 (`text`,
+  `spans`, `size`, `block`, `lang`, …) had one user, the markdown plugin's
+  per-block rows, and their own drawing and code highlighting went with it.
 * The markdown plugin renders a file as one row, so the page's own spacing
   applies; ⌘M in the rendered view covers the whole document, the text view
   still comments on single lines. A row taller than the view scrolls by
