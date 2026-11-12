@@ -426,6 +426,7 @@ impl PlanView {
                 two_gutters: false,
                 relative: self.engine.settings().relative_line_numbers,
                 overlay: None,
+                repo: None,
                 id: egui::Id::new(("plan", &self.tab_id)),
             }
             .show(&mut body_ui);

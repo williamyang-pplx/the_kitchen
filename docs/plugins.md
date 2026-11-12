@@ -68,7 +68,7 @@ Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen
 
 ## API (level 12)
 
-Level 12: comment items take `replies` and `repo`, and `kitchen.markdown.github` prepares GitHub-flavored text (see "Comments"). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 12: comment items take `replies` and `repo` (see "Comments"). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -309,19 +309,13 @@ end)
   `side = "old"` numbers lines in the diff base (a removed line; only shown
   on a diff), `"new"` (default) in the current file. Like other
   decorations, each call replaces the plugin's set for that file.
-* `body` and each reply's `body` are GitHub-flavored Markdown, drawn the
-  way GitHub shows them and the way a rendered `.md` file looks (one
-  renderer for both, egui_commonmark, in one pass). Code fences are
-  highlighted by the language they name, in the viewer's colors, and a
-  ```` ```suggestion ```` as the file's language. HTML becomes Markdown (comments hidden, `<details>` opened),
-  images are links, and bare URLs are linked. With `repo`, `#12`, `o/r#12`,
-  `@user` and commit SHAs link to it too. ⌘-click opens a link, and a plain
-  click still moves the cursor. Each reply is drawn under a rule and its
-  `title`.
-* `kitchen.markdown.github(text, {repo = "o/r"})` returns `text` with that
-  preparation applied. Cards and Markdown rows already get it. Use it for
-  text a plugin writes to a file that a rendering shows: the github
-  plugin's ⌘⇧D description, whose HTML comments may span paragraphs.
+* `body` and each reply's `body` are GitHub-flavored Markdown, rendered as
+  GitHub renders them: with `repo`, by GitHub's own renderer (`gh api
+  markdown`, in that repo's context, so `#12`, `@user` and SHAs link), and
+  otherwise (or until GitHub answers, or offline) by comrak. GitHub's CSS
+  styles it and WebKit lays it out off screen; the viewer draws the image.
+  Each reply is drawn under its `title`. A click on a link opens it; any
+  other click moves the cursor.
 * ⌘M in the viewer opens a comment field under the cursor line (or the `V`
   selection); ⌘Enter hands it to every `comment` handler and closes it, Esc
   cancels. A removed line gives `side = "old"`. `start_line`/`start_side`
@@ -355,11 +349,10 @@ the font size), `bold`, `group` (a color, as for highlights), `indent`
 (nesting depth), and `block`: `code` (monospace on a panel), `quote` (bar on
 the left) or `rule` (a horizontal line). `lang` on code rows (a fence's
 info string or an extension) highlights each run of adjacent rows of that
-language together. A row with `markdown` (CommonMark with GitHub's tables,
-task lists and strikethrough) is drawn by the viewer's Markdown renderer
-(egui_commonmark), prepared as comments are (see "Comments"), instead of
-from `text` and its styles. Its links open on ⌘-click; a plain click picks
-the row. Span keys: `col`/`end_col`
+language together. A row with `markdown` is rendered as comments are
+(see "Comments"), in the workspace's GitHub repo, instead of from `text`
+and its styles; a click on a link opens it, any other click picks the row.
+Span keys: `col`/`end_col`
 (1-based characters of `text`, exclusive), `bold`, `italic`, `code`,
 `strike`, `underline`, `group`. With `version`, a rendering is shown only
 for the text it was made from. In a diff, a row is marked added when one of
@@ -370,8 +363,8 @@ of the first row, and `line` is the last line of the last row. `quote`
 holds the source text. A comment shows under the row that holds its line.
 A row taller than the viewer scrolls under j/k, ⌃d/⌃u, ⌃f/⌃b and gg/G
 until its edge shows. `plugins/markdown` renders `.md` files this way and
-binds ⌘⇧V: the whole document is one `markdown` row, so egui_commonmark
-lays it out in one pass (YAML front matter stays a code row per line).
+binds ⌘⇧V: the whole document is one `markdown` row, laid out in one pass
+as on GitHub (YAML front matter stays a code row per line).
 
 ### Timers
 

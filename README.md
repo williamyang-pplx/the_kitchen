@@ -33,7 +33,8 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   whole repo, ⌘B hides the list. On a PR its review comments show
   under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
   commented line) to the PR on GitHub. Comments and ⌘⇧A answers render as
-  Markdown, as on GitHub (⌘-click opens a link). ⌘⇧A asks the tab's agent about the cursor
+  Markdown, as GitHub renders them (GitHub's renderer and CSS, laid out by
+  WebKit). ⌘⇧A asks the tab's agent about the cursor
   line or selection: the question goes to a fork of its Claude Code session
   (`claude -p --resume <id> --fork-session` on the tab's host), so the answer
   has the agent's context, model and tools, and the agent never sees it. It

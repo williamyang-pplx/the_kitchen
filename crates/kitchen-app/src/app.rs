@@ -1095,9 +1095,11 @@ impl eframe::App for KitchenApp {
         keymap::unpaste_shift_v(raw_input, ctx.input(|i| i.modifiers));
     }
 
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
         let ctx = ui.ctx().clone();
+        // Rendered Markdown asked for last frame is laid out off screen (and drawn once ready).
+        crate::web::pump(frame, &ctx);
         self.poll_attach(&ctx);
         self.cmd_v = attach::take_cmd_v();
         self.handle_ui_commands(&ctx);

@@ -260,7 +260,6 @@ impl Viewer {
                     dim: c.dim,
                     replies: c.replies.clone(),
                     repo: c.repo.clone(),
-                    path: Some(path.clone()),
                     ..Default::default()
                 };
                 (block, c.id.clone())

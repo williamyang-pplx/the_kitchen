@@ -1,6 +1,6 @@
--- Markdown → kitchen.render rows. The whole document is one row, drawn in
--- one pass by the viewer's Markdown renderer (egui_commonmark), so its
--- spacing, lists and code are the renderer's. YAML front matter, which
+-- Markdown → kitchen.render rows. The whole document is one row, rendered
+-- in one pass as GitHub renders it (the viewer's WebKit pages), so its
+-- spacing, lists and code are GitHub's. YAML front matter, which
 -- GitHub shows as a table and CommonMark would misread, stays a code row
 -- per line above it. A comment on the document lands on its last line.
 

@@ -20,6 +20,7 @@ mod test_util;
 mod theme;
 mod ui;
 mod viewer;
+mod web;
 
 use std::sync::Arc;
 

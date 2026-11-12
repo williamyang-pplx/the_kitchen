@@ -523,8 +523,8 @@ local function description_path(n)
 end
 
 -- The description page for PR `info` (gh's JSON): title, a line of facts,
--- then the body as GitHub shows it (its #12, @al and SHAs linked to the
--- PR's repo, which its URL names).
+-- then the body. The viewer renders it as GitHub does, in the workspace's
+-- repo (its #12, @al and SHAs linked).
 function M.description(info)
   local state = info.isDraft and "draft" or (info.state or ""):lower()
   local facts = {
@@ -540,7 +540,7 @@ function M.description(info)
       table.insert(line, facts[i])
     end
   end
-  local body = kitchen.markdown.github(info.body or "", { repo = M.parse(info.url or "") })
+  local body = (info.body or ""):gsub("\r\n", "\n")
   if not body:find("%S") then
     body = "_No description provided._"
   end

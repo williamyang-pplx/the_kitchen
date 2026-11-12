@@ -1046,14 +1046,13 @@ mod tests {
     }
 
     /// github ⌘⇧D: a PR's description as the page the viewer renders, its
-    /// body prepared by `kitchen.markdown.github` for the PR's repo.
+    /// body as it is (the viewer renders it as GitHub does).
     #[test]
     fn github_plugin_description() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
         lua.load(
-            r#"kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {},
-                markdown = { github = function(s, o) if s == "" then return s end return "[" .. o.repo .. "]" .. s end } }"#,
+            r#"kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {} }"#,
         )
         .exec()
         .unwrap();
@@ -1067,9 +1066,9 @@ mod tests {
             page,
             "# Add retries\n\n**#12** · @al · draft · `main` ← `al/retry` · +40 −3\n\n[https://github.com/o/r/pull/12](https://github.com/o/r/pull/12)\n\n---\n\n_No description provided._\n"
         );
-        info["body"] = "Fixes #3.".into();
+        info["body"] = "Fixes #3.\r\n<!-- hint -->".into();
         let page: String = description.call(lua.to_value(&info).unwrap()).unwrap();
-        assert!(page.ends_with("---\n\n[o/r]Fixes #3.\n"), "the body goes through kitchen.markdown.github for the PR's repo: {page}");
+        assert!(page.ends_with("---\n\nFixes #3.\n<!-- hint -->\n"), "the body as GitHub has it: {page}");
     }
 
     fn prune_module(lua: &mlua::Lua) -> mlua::Table {
@@ -1931,7 +1930,6 @@ kitchen.keymap("viewer", "<leader>h", "demo.hello")
 local ok, err = pcall(kitchen.keymap, "cmd+w", "demo.hello")
 assert(not ok and tostring(err):find("built%-in"), "built-in chords are refused: " .. tostring(err))
 kitchen.command("spin", function() while true do end end)
-kitchen.command("md", function() kitchen.notify(kitchen.markdown.github("x <br> y #3", { repo = "o/r" })) end)
 kitchen.on("file_opened", function(ev)
   local text = ev.text()
   local items = {}
@@ -1954,7 +1952,7 @@ end)
         let host = host_with(&engine, vec![root.clone()]);
         wait(&|| host.registry().viewer_maps.len() == 1);
         let reg = host.registry();
-        assert_eq!(reg.commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["demo.hello", "demo.spin", "demo.md"]);
+        assert_eq!(reg.commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["demo.hello", "demo.spin"]);
         assert_eq!(reg.chords.len(), 1);
         assert_eq!(reg.viewer_maps[0].keys, "h");
 
@@ -1975,14 +1973,10 @@ end)
         wait(&|| engine.state().toasts.iter().any(|t| t.text.contains("HI W")));
         assert!(engine.state().toasts.iter().any(|t| t.text.contains("budget")));
         assert!(host.invoke("demo.hello", serde_json::json!({}), true).is_err(), "not remote-callable");
-        // kitchen.markdown.github is the viewer's own.
-        host.invoke("demo.md", serde_json::json!({}), false).unwrap();
-        let want = crate::viewer::markdown::github("x <br> y #3", Some("o/r"));
-        wait(&|| engine.state().toasts.iter().any(|t| t.text == want));
 
         // Reload: registrations and decorations are rebuilt from scratch.
         host.reload(Some("demo")).unwrap();
-        wait(&|| host.decor.get(&key).is_some() && host.registry().commands.len() == 3);
+        wait(&|| host.decor.get(&key).is_some() && host.registry().commands.len() == 2);
         assert_eq!(host.list()[0].status, Status::Running);
         let _ = std::fs::remove_dir_all(&root);
     }

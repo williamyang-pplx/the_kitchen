@@ -3,8 +3,8 @@
 //! comments) and an optional comment editor, and turns plain
 //! keys into [`Vim`] motions while focused. Rendered rows (`kitchen.render`)
 //! are drawn in a proportional font and wrap instead of scrolling sideways.
-//! A row with Markdown source and every card's text are drawn by
-//! [`markdown::draw`], as GitHub would show them.
+//! A row with Markdown source and every card's text are rendered as GitHub
+//! renders them, by WebKit off screen ([`crate::web`]), and drawn as images.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -16,10 +16,13 @@ use egui::{Color32, CornerRadius, FontId, Galley, Key, Modifiers, Pos2, Rect, Se
 
 use super::doc::{Doc, Fold, LineKind};
 use super::highlight::group_color;
-use super::markdown::{self, CODE_BG};
 use super::vim::{Vim, VimAction, VimKey, Viewport};
 use crate::plugins::decor::{RenderRow, RenderSpan, Reply};
 use crate::theme;
+use crate::web;
+
+/// Background of rendered code (blocks and inline).
+const CODE_BG: Color32 = Color32::from_rgb(0x24, 0x28, 0x3b);
 
 /// Where a row's text was drawn, for clicks.
 enum Hit {
@@ -99,8 +102,6 @@ pub struct Block {
     pub replies: Vec<Reply>,
     /// `owner/repo` that `#12`, `@al` and SHAs in the text link to.
     pub repo: Option<String>,
-    /// The file the card is on, for suggestion blocks.
-    pub path: Option<String>,
 }
 
 impl Block {
@@ -159,7 +160,7 @@ pub struct Output {
     pub cancel_editor: bool,
     /// Enter pressed in a question field.
     pub submit_editor: bool,
-    /// Links ⌘-clicked in rendered Markdown, to open with `Link::Url`.
+    /// Links clicked in rendered Markdown, to open with `Link::Url`.
     pub urls: Vec<String>,
 }
 
@@ -178,6 +179,9 @@ pub struct CodeView<'a> {
     pub relative: bool,
     /// Plugin highlights / diagnostics for the current file.
     pub overlay: Option<&'a Overlay>,
+    /// `owner/repo` the doc's rendered Markdown links `#12` and `@al` to
+    /// (GitHub renders it in that repo's context).
+    pub repo: Option<&'a str>,
     pub id: egui::Id,
 }
 
@@ -193,8 +197,6 @@ const CARD_PAD_Y: f32 = 8.0;
 const PART_GAP: f32 = 6.0;
 /// Widest a card gets, in code columns: prose wider than this is hard to read.
 const CARD_COLS: f32 = 100.0;
-/// Behind code in a card: darker than the card.
-const CARD_CODE_BG: Color32 = theme::BG;
 
 /// What painting and measuring share: the frame's metrics and inputs. Built
 /// once per frame in `show`.
@@ -211,7 +213,10 @@ struct Geometry<'a> {
     text_x: f32,
     block_width: f32,
     overlay: Option<&'a Overlay>,
-    id: egui::Id,
+    /// `owner/repo` the doc's rendered Markdown links `#12` and `@al` to.
+    repo: Option<&'a str>,
+    /// Links in rendered Markdown painted this frame, for clicks.
+    links: std::cell::RefCell<Vec<(Rect, String)>>,
 }
 
 impl Geometry<'_> {
@@ -230,8 +235,13 @@ impl Geometry<'_> {
         match line.render.as_deref() {
             Some(r) if r.markdown.is_some() => {
                 let at = Pos2::new(self.text_x + cw * 0.8 + r.indent as f32 * cw * 2.0, y + 3.0);
-                let text = markdown::Text { src: r.markdown.as_deref().unwrap_or_default(), repo: None, path: None, size: font_size + 1.0, dim: false, code_bg: CODE_BG };
-                let h = markdown::draw(ui, &text, at, rect.right() - at.x - 16.0, rect, self.id.with(("md", idx)), paint);
+                let part = web::Part { header: None, markdown: r.markdown.as_deref().unwrap_or_default() };
+                let look = web::Look { size: font_size + 1.0, dim: false };
+                let mut links = Vec::new();
+                let h = web::show(&ui.painter_at(rect), paint, &[part], self.repo, &look, at, rect.right() - at.x - 16.0, &mut links);
+                if paint {
+                    self.links.borrow_mut().extend(links);
+                }
                 (None, at, (h + 8.0).max(self.row_h))
             }
             Some(r) => {
@@ -257,11 +267,8 @@ impl Geometry<'_> {
 
     /// Height of the blocks drawn after `after`, with their gaps.
     fn blocks_height(&self, ui: &mut Ui, after: Option<usize>, heights: &mut Heights) -> f32 {
-        let mut h = 0.0;
-        for (i, b) in self.blocks.iter().enumerate().filter(|(_, b)| b.after == after) {
-            h += card_height(ui, b, self.block_width, self.font_size, self.id.with(("card", i)), heights) + BLOCK_GAP;
-        }
-        h
+        let painter = ui.painter();
+        self.blocks.iter().filter(|b| b.after == after).map(|b| card_height(painter, b, self.block_width, self.font_size, heights) + BLOCK_GAP).sum()
     }
 
     /// Row `idx`'s extent. A Markdown row's height comes from `heights`
@@ -293,7 +300,7 @@ impl Geometry<'_> {
 
 impl CodeView<'_> {
     pub fn show(self, ui: &mut Ui) -> Output {
-        let CodeView { doc, vim, state, blocks, mut editor, focused, font_size, two_gutters, relative, overlay, id } = self;
+        let CodeView { doc, vim, state, blocks, mut editor, focused, font_size, two_gutters, relative, overlay, repo, id } = self;
         let mut out = Output::default();
         let rect = ui.available_rect_before_wrap();
         let resp = ui.interact(rect, id.with("area"), Sense::click());
@@ -340,7 +347,8 @@ impl CodeView<'_> {
             text_x,
             block_width,
             overlay,
-            id,
+            repo,
+            links: Default::default(),
         };
         let before = (state.top, state.offset);
 
@@ -480,15 +488,15 @@ impl CodeView<'_> {
         let mut editor_rect: Option<Rect> = None;
 
         let draw_blocks = |after: Option<usize>, y: &mut f32, ui: &mut Ui, heights: &mut Heights| {
-            for (i, b) in blocks.iter().enumerate().filter(|(_, b)| b.after == after) {
+            for b in blocks.iter().filter(|b| b.after == after) {
                 if *y > rect.bottom() {
                     break;
                 }
-                let card_id = id.with(("card", i));
-                let h = card_height(ui, b, block_width, font_size, card_id, heights);
-                let painted = draw_card(ui, Some(&painter), b, Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP), block_width, font_size, card_id, h);
-                // Painting refreshes the height: a table (an egui grid) settles its
-                // size over a frame or two.
+                let h = card_height(&painter, b, block_width, font_size, heights);
+                let at = Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP);
+                let painted = draw_card(&painter, true, b, at, block_width, font_size, h, &mut geo.links.borrow_mut());
+                // Painting refreshes the height: the card's rendered image
+                // replaces its stand-in text when WebKit has made it.
                 if (painted - h).abs() > 0.5 {
                     heights.cards.insert(card_key(b, block_width), painted);
                     ui.ctx().request_repaint();
@@ -709,7 +717,11 @@ impl CodeView<'_> {
         // ---- mouse
         if resp.clicked_by(egui::PointerButton::Primary) {
             out.clicked = true;
-            if let Some(pos) = resp.interact_pointer_pos() {
+            let link = resp.interact_pointer_pos().and_then(|pos| geo.links.borrow().iter().find(|(r, _)| r.contains(pos)).map(|(_, href)| href.clone()));
+            if let Some(href) = link {
+                // A link in rendered Markdown opens; the cursor stays.
+                out.urls.push(href);
+            } else if let Some(pos) = resp.interact_pointer_pos() {
                 if let Some((_, idx, hit)) = row_hits.iter().find(|(r, ..)| r.contains(pos)) {
                     let col = match hit {
                         Hit::Galley(at, galley) => galley.cursor_from_pos(pos - *at).index.0,
@@ -722,7 +734,6 @@ impl CodeView<'_> {
         }
         state.last_line = Some(vim.line);
         ui.advance_cursor_after_rect(rect);
-        out.urls = markdown::drain_open_urls(ui.ctx());
         out
     }
 }
@@ -925,12 +936,12 @@ fn render_job(r: &RenderRow, text: &str, syntax: &[(std::ops::Range<usize>, Colo
 }
 
 /// Card `b`'s height at `width`: measured invisibly once, then from `heights`.
-fn card_height(ui: &mut Ui, b: &Block, width: f32, font_size: f32, id: egui::Id, heights: &mut Heights) -> f32 {
+fn card_height(painter: &egui::Painter, b: &Block, width: f32, font_size: f32, heights: &mut Heights) -> f32 {
     let key = card_key(b, width);
     if let Some(h) = heights.cards.get(&key) {
         return *h;
     }
-    let h = draw_card(ui, None, b, ui.max_rect().min, width, font_size, id, 0.0);
+    let h = draw_card(painter, false, b, painter.clip_rect().min, width, font_size, 0.0, &mut Vec::new());
     heights.cards.insert(key, h);
     h
 }
@@ -939,67 +950,58 @@ fn card_height(ui: &mut Ui, b: &Block, width: f32, font_size: f32, id: egui::Id,
 /// (`dim` only fades it).
 fn card_key(b: &Block, width: f32) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (&b.title, &b.body, &b.repo, &b.path, b.question, width.to_bits()).hash(&mut h);
+    (&b.title, &b.body, &b.repo, b.question, width.to_bits()).hash(&mut h);
     for r in &b.replies {
         (&r.title, &r.body).hash(&mut h);
     }
     h.finish()
 }
 
-/// Paints card `b` at `at`, `height` tall, with `painter`; without one it
-/// only lays the card out. Returns its laid-out height. Comments carry a
-/// small colored title (who, which lines, state), a question is the heading
-/// of its answer; then the body, and each reply under a faint rule and its
-/// own header, all as Markdown.
+/// Card `b` at `at`, `height` tall, painted with `painter` when `paint`
+/// (else only laid out); returns its laid-out height and adds its links.
+/// Comments carry a small colored title (who, which lines, state), a
+/// question is the heading of its answer; the body and each reply under its
+/// header are one page, rendered as GitHub renders it.
 #[allow(clippy::too_many_arguments)]
-fn draw_card(ui: &mut Ui, painter: Option<&egui::Painter>, b: &Block, at: Pos2, width: f32, font_size: f32, id: egui::Id, height: f32) -> f32 {
+fn draw_card(painter: &egui::Painter, paint: bool, b: &Block, at: Pos2, width: f32, font_size: f32, height: f32, links: &mut Vec<(Rect, String)>) -> f32 {
     let inner = width - CARD_PAD_X * 2.0;
     let (left, right) = (at.x + CARD_PAD_X, at.x + width - CARD_PAD_X);
-    if let Some(p) = painter {
+    if paint {
         // Faded cards (thinking, resolved) still sit a step above the background.
         let r = Rect::from_min_size(at, Vec2::new(width, height));
-        p.rect_filled(r, 5.0, if b.dim { theme::HOVER } else { theme::SELECTED });
-        p.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, height)), 2.0, b.color);
+        painter.rect_filled(r, 5.0, if b.dim { theme::HOVER } else { theme::SELECTED });
+        painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, height)), 2.0, b.color);
     }
-    let hint = b.question.then(|| ui.fonts_mut(|f| f.layout_no_wrap("Esc closes".into(), theme::ui_font(font_size - 2.0), theme::SUBTLE)));
+    let hint = b.question.then(|| painter.layout_no_wrap("Esc closes".into(), theme::ui_font(font_size - 2.0), theme::SUBTLE));
     let hint_w = hint.as_ref().map_or(0.0, |h| h.size().x + CARD_PAD_X);
     let (title_font, title_color) = if b.question { (theme::ui_font_semibold(font_size), theme::TEXT) } else { (theme::ui_font(font_size - 1.5), b.color) };
-    let title = ui.fonts_mut(|f| f.layout(b.title.clone(), title_font, title_color, inner - hint_w));
+    let title = painter.layout(b.title.clone(), title_font, title_color, inner - hint_w);
     let mut y = at.y + CARD_PAD_Y + title.size().y;
-    if let Some(p) = painter {
+    if paint {
         let first_row = title.rows.first().map_or(0.0, |row| row.height());
         if let Some(hint) = hint {
             let hy = at.y + CARD_PAD_Y + (first_row - hint.size().y) / 2.0;
-            p.galley(Pos2::new(right - hint.size().x, hy), hint, theme::SUBTLE);
+            painter.galley(Pos2::new(right - hint.size().x, hy), hint, theme::SUBTLE);
         }
-        p.galley(Pos2::new(left, at.y + CARD_PAD_Y), title, theme::TEXT);
+        painter.galley(Pos2::new(left, at.y + CARD_PAD_Y), title, theme::TEXT);
     }
-    let rule = |y: &mut f32| {
-        *y += PART_GAP;
-        if let Some(p) = painter {
-            p.hline(left..=right, *y, Stroke::new(1.0, theme::FAINT));
-        }
-        *y += 1.0 + PART_GAP;
-    };
     if b.question {
-        rule(&mut y);
-    } else {
-        y += 2.0;
-    }
-    let clip = painter.map_or_else(|| ui.clip_rect(), |p| p.clip_rect());
-    let text = |src| markdown::Text { src, repo: b.repo.as_deref(), path: b.path.as_deref(), size: font_size - 0.5, dim: b.dim, code_bg: CARD_CODE_BG };
-    if !b.body.trim().is_empty() {
-        y += markdown::draw(ui, &text(&b.body), Pos2::new(left, y), inner, clip, id.with("body"), painter.is_some());
-    }
-    for (i, r) in b.replies.iter().enumerate() {
-        rule(&mut y);
-        let header = ui.fonts_mut(|f| f.layout(r.title.clone(), theme::ui_font(font_size - 1.5), theme::SUBTLE, inner));
-        let header_h = header.size().y;
-        if let Some(p) = painter {
-            p.galley(Pos2::new(left, y), header, theme::SUBTLE);
+        y += PART_GAP;
+        if paint {
+            painter.hline(left..=right, y, Stroke::new(1.0, theme::FAINT));
         }
-        y += header_h + 2.0;
-        y += markdown::draw(ui, &text(&r.body), Pos2::new(left, y), inner, clip, id.with(("reply", i)), painter.is_some());
+        y += 1.0 + PART_GAP;
+    } else {
+        y += 4.0;
+    }
+    let mut parts = Vec::new();
+    if !b.body.trim().is_empty() {
+        parts.push(web::Part { header: None, markdown: &b.body });
+    }
+    parts.extend(b.replies.iter().map(|r| web::Part { header: Some(r.title.as_str()), markdown: &r.body }));
+    if !parts.is_empty() {
+        let look = web::Look { size: font_size, dim: b.dim };
+        y += web::show(painter, paint, &parts, b.repo.as_deref(), &look, Pos2::new(left, y), inner, links);
     }
     y + CARD_PAD_Y - at.y
 }

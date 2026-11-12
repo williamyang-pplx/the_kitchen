@@ -741,18 +741,6 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
     json.set("null", lua.null())?;
     k.set("json", json)?;
 
-    // kitchen.markdown.github(text, {repo = "o/r"}): GitHub-flavored text as
-    // the viewer draws it (for text a plugin writes to a file it renders).
-    let markdown = lua.create_table()?;
-    markdown.set(
-        "github",
-        lua.create_function(|_, (text, opts): (String, Option<Table>)| {
-            let repo = opts.map(|o| o.get::<Option<String>>("repo")).transpose()?.flatten();
-            Ok(crate::viewer::markdown::github(&text, repo.as_deref()))
-        })?,
-    )?;
-    k.set("markdown", markdown)?;
-
     lua.globals().set("kitchen", k)?;
     Ok(())
 }

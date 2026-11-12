@@ -12,7 +12,6 @@ mod changes_tree;
 pub mod code_view;
 pub mod doc;
 pub mod highlight;
-pub mod markdown;
 mod nav;
 pub mod picker;
 mod plugin_glue;
@@ -1295,6 +1294,8 @@ impl Viewer {
             let comments = self.comment_blocks();
             let blocks: Vec<code_view::Block> = comments.into_iter().map(|(b, _)| b).chain(self.ask_blocks()).collect();
             let overlay = self.overlay.as_ref().filter(|o| !self.browsing && !self.outline && self.current.as_deref() == Some(o.path.as_str())).map(|o| &o.overlay);
+            // GitHub renders the workspace's Markdown in its repo's context.
+            let repo = self.engine.find_tab(&self.tab_id).and_then(|(w, _)| w.row.github_slug);
             let mut out = CodeView {
                 doc: &self.doc,
                 vim: &mut self.vim,
@@ -1306,6 +1307,7 @@ impl Viewer {
                 two_gutters: self.diff && !self.outline && !self.browsing,
                 relative: cx.engine.settings().relative_line_numbers,
                 overlay,
+                repo: repo.as_deref(),
                 id: egui::Id::new(("viewer", &self.tab_id)),
             }
             .show(&mut code_ui);
@@ -2199,7 +2201,7 @@ end)"#,
         let (block, id) = v.comment_blocks().remove(0);
         assert_eq!((block.after, id.as_deref()), (Some(v.vim.line), Some("c1")));
         assert_eq!(block.body, "why?|old:2|nil|-");
-        assert_eq!((block.repo.as_deref(), block.path.as_deref(), block.replies[0].body.as_str()), (Some("o/r"), Some("a.py"), "+1"), "a thread's card");
+        assert_eq!((block.repo.as_deref(), block.replies[0].body.as_str()), (Some("o/r"), "+1"), "a thread's card");
         // ⌘M on the commented row replies to it.
         v.command(PanelCmd::Comment, engine);
         assert!(v.editor.as_ref().unwrap().label.starts_with("Reply to @me"));
