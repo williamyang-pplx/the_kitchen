@@ -177,9 +177,12 @@ const PART_GAP: f32 = 6.0;
 /// Widest a card gets, in code columns: prose wider than this is hard to read.
 const CARD_COLS: f32 = 100.0;
 /// Code in a card: fenced blocks on a panel darker than the card, inline
-/// spans a little lighter.
+/// spans on a lighter pill.
 const CARD_CODE_BG: Color32 = theme::BG;
 const CARD_INLINE_BG: Color32 = theme::HOVER;
+/// Room an inline code pill takes on either side of its text.
+const PILL_PAD_X: f32 = 4.0;
+const PILL_PAD_Y: f32 = 1.0;
 
 /// What painting and measuring share: the frame's metrics and inputs. Built
 /// once per frame in `show`.
@@ -892,10 +895,17 @@ struct CardLayout {
     hint: Option<Arc<Galley>>,
     /// Where a question's divider goes.
     divider_y: Option<f32>,
-    /// The body, top to bottom: prose, or a fenced code block (`true`,
-    /// drawn on a panel), with its offset.
-    parts: Vec<(Arc<Galley>, bool, f32)>,
+    /// The body, top to bottom, with each part's offset.
+    parts: Vec<(Part, f32)>,
     height: f32,
+}
+
+/// A piece of a card's body.
+enum Part {
+    /// Text, with the pills behind its inline code (relative to the galley).
+    Prose(Arc<Galley>, Vec<Rect>),
+    /// A fenced block, drawn on a panel.
+    Code(Arc<Galley>),
 }
 
 /// Lays out card `b` at `width`. Comments carry a small colored title (who,
@@ -922,12 +932,18 @@ fn layout_block(ui: &Ui, b: &Block, width: f32, font_size: f32) -> CardLayout {
             let galley = ui.fonts_mut(|f| f.layout(text, FontId::monospace(font_size * 0.92), text_color, inner - CODE_PAD * 2.0));
             y += CODE_PAD;
             let h = galley.size().y;
-            parts.push((galley, true, y));
+            parts.push((Part::Code(galley), y));
             y += h + CODE_PAD + PART_GAP;
         } else {
-            let galley = ui.fonts_mut(|f| f.layout_job(prose_job(&text, font_size - 0.5, text_color, inner)));
+            let size = font_size - 0.5;
+            let (plain, code) = (theme::ui_font(size), FontId::monospace(size * 0.95));
+            // How far below the prose's baseline code's would sit.
+            let lift = (baseline(ui, &plain) - baseline(ui, &code)).max(0.0);
+            let (job, spans) = prose_job(&text, plain, code, lift, text_color, inner);
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
             let h = galley.size().y;
-            parts.push((galley, false, y));
+            let pills = pills(&galley, &spans);
+            parts.push((Part::Prose(galley, pills), y));
             y += h + PART_GAP;
         }
     }
@@ -973,39 +989,95 @@ fn split_fences(text: &str) -> Vec<(bool, String)> {
     out
 }
 
-/// Prose with its `backtick` spans in monospace on a dark background.
-fn prose_job(text: &str, size: f32, color: Color32, wrap: f32) -> LayoutJob {
+/// Distance from the top of a row of `font` to its baseline.
+fn baseline(ui: &Ui, font: &FontId) -> f32 {
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap("x".into(), font.clone(), Color32::WHITE));
+    galley.rows.first().and_then(|r| r.row.glyphs.first()).map_or(0.0, |g| g.pos.y)
+}
+
+/// Prose in `plain` with its `backtick` spans in `code`, and the spans'
+/// character ranges in the job's text (for their pills). `lift` is how much
+/// higher code's baseline sits than the prose's in a row of its own.
+fn prose_job(text: &str, plain: FontId, code: FontId, lift: f32, color: Color32, wrap: f32) -> (LayoutJob, Vec<std::ops::Range<usize>>) {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap;
-    let plain = TextFormat { font_id: theme::ui_font(size), color, line_height: Some(size * 1.45), ..Default::default() };
-    // Its own (shorter) row height, so the background hugs the glyphs. Prose
-    // keeps its extra leading under the glyphs, so top-aligned code at about
-    // the same ascent sits on the prose's baseline.
-    let code = TextFormat {
-        font_id: FontId::monospace(size * 0.95),
-        background: CARD_INLINE_BG,
-        line_height: None,
-        valign: egui::Align::TOP,
-        ..plain.clone()
+    let line_height = plain.size * 1.45;
+    let plain = TextFormat { font_id: plain, color, line_height: Some(line_height), ..Default::default() };
+    // Prose sits at the top of its tall row. Code is bottom-aligned in a row
+    // `lift` shorter than the prose's, which puts it on the same baseline.
+    let code = TextFormat { font_id: code, line_height: Some(line_height - lift), valign: egui::Align::BOTTOM, ..plain.clone() };
+    let mut spans = Vec::new();
+    let mut chars = 0;
+    // The text after a code span needs room for its pill.
+    let mut after_code = false;
+    let mut push = |job: &mut LayoutJob, text: &str, format: &TextFormat, lead: f32| {
+        job.append(text, lead, format.clone());
+        let start = chars;
+        chars += text.chars().count();
+        start..chars
     };
     let mut rest = text;
     while let Some(open) = rest.find('`') {
         let after = &rest[open + 1..];
+        let before = &rest[..open];
+        let lead = if after_code { pill_room(before.chars().next()) } else { 0.0 };
         match after.find(['`', '\n']) {
             Some(len) if len > 0 && after[len..].starts_with('`') => {
-                job.append(&rest[..open], 0.0, plain.clone());
-                job.append(&after[..len], 0.0, code.clone());
+                push(&mut job, before, &plain, lead);
+                // At the start of a line the pill reaches into the margin, as
+                // it does on a wrapped line (egui drops room at a wrap).
+                let lead = match before.chars().next_back().or(after_code.then_some('`')) {
+                    None | Some('\n') => 0.0,
+                    prev => pill_room(prev),
+                };
+                spans.push(push(&mut job, &after[..len], &code, lead));
+                after_code = true;
                 rest = &after[len + 1..];
             }
             // An unpaired backtick stays as it is.
             _ => {
-                job.append(&rest[..open + 1], 0.0, plain.clone());
+                push(&mut job, &rest[..open + 1], &plain, lead);
+                after_code = false;
                 rest = after;
             }
         }
     }
-    job.append(rest, 0.0, plain);
-    job
+    let lead = if after_code { pill_room(rest.chars().next()) } else { 0.0 };
+    push(&mut job, rest, &plain, lead);
+    (job, spans)
+}
+
+/// Space between a pill's text and the character `next` to it: a space
+/// already parts them (as does the end of the text), punctuation sits a
+/// little clear of the pill's edge.
+fn pill_room(next: Option<char>) -> f32 {
+    match next {
+        None | Some(' ' | '\n' | '\t') => PILL_PAD_X,
+        Some(_) => PILL_PAD_X + 2.0,
+    }
+}
+
+/// The pills behind `galley`'s code `spans` (character ranges), one per row
+/// a span covers, relative to the galley.
+fn pills(galley: &Galley, spans: &[std::ops::Range<usize>]) -> Vec<Rect> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for row in &galley.rows {
+        let glyphs = &row.row.glyphs;
+        for s in spans {
+            let (lo, hi) = (s.start.max(start), s.end.min(start + glyphs.len()));
+            if lo >= hi {
+                continue;
+            }
+            let (first, last) = (&glyphs[lo - start], &glyphs[hi - 1 - start]);
+            let top = row.pos.y + first.pos.y - first.font_face_ascent;
+            let min = Pos2::new(row.pos.x + first.pos.x - PILL_PAD_X, top - PILL_PAD_Y);
+            let max = Pos2::new(row.pos.x + last.pos.x + last.advance_width + PILL_PAD_X, top + first.font_face_height + PILL_PAD_Y);
+            out.push(Rect::from_min_max(min, max));
+        }
+        start += glyphs.len() + usize::from(row.ends_with_newline);
+    }
+    out
 }
 
 fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32, font_size: f32) -> f32 {
@@ -1024,14 +1096,21 @@ fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32,
     if let Some(dy) = l.divider_y {
         painter.hline(left..=r.right() - CARD_PAD_X, r.top() + dy, Stroke::new(1.0, theme::FAINT));
     }
-    for (galley, code, dy) in l.parts {
-        let y = r.top() + dy;
-        if code {
-            let panel = Rect::from_min_size(Pos2::new(left, y - CODE_PAD), Vec2::new(width - CARD_PAD_X * 2.0, galley.size().y + CODE_PAD * 2.0));
-            painter.rect_filled(panel, 4.0, CARD_CODE_BG);
-            painter.galley(Pos2::new(left + CODE_PAD, y), galley, theme::TEXT);
-        } else {
-            painter.galley(Pos2::new(left, y), galley, theme::TEXT);
+    for (part, dy) in l.parts {
+        let at = Pos2::new(left, r.top() + dy);
+        match part {
+            Part::Code(galley) => {
+                let panel = Rect::from_min_size(Pos2::new(left, at.y - CODE_PAD), Vec2::new(width - CARD_PAD_X * 2.0, galley.size().y + CODE_PAD * 2.0));
+                painter.rect_filled(panel, 6.0, CARD_CODE_BG);
+                painter.galley(at + Vec2::new(CODE_PAD, 0.0), galley, theme::TEXT);
+            }
+            Part::Prose(galley, pills) => {
+                for pill in pills {
+                    let pill = pill.translate(at.to_vec2());
+                    painter.rect_filled(pill, pill.height() / 2.0, CARD_INLINE_BG);
+                }
+                painter.galley(at, galley, theme::TEXT);
+            }
         }
     }
     l.height
@@ -1179,7 +1258,8 @@ mod tests {
     #[test]
     fn prose_job_sets_backtick_spans_in_monospace() {
         // A backtick with no partner on its line stays as it is.
-        let job = prose_job("use `row_at` here\nlone ` tick\n`a\nb`", 12.0, theme::TEXT, 400.0);
+        let (job, spans) = prose_job("use `row_at` here\nlone ` tick\n`a\nb`", theme::ui_font(12.0), FontId::monospace(12.0), 1.0, theme::TEXT, 400.0);
+        assert_eq!(spans, vec![4..10], "row_at, in characters of the job's text");
         let runs: Vec<(&str, bool)> = job
             .sections
             .iter()
