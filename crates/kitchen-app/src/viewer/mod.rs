@@ -574,7 +574,7 @@ impl Viewer {
         self.doc_key = None;
         self.select_entry = select;
         self.vim.set_cursor(0, 0);
-        self.view.top = 0;
+        self.view.scroll_to(0);
     }
 
     /// `-`: up one folder (from a file: its folder).
@@ -756,7 +756,7 @@ impl Viewer {
                 let idx = sel.and_then(|s| self.entries.iter().position(|e| e.path == s)).unwrap_or(if self.dir.is_empty() { 0 } else { 1.min(self.entries.len().saturating_sub(1)) });
                 self.vim.set_cursor(idx, 0);
                 let rows = if self.view.rows == 0 { 30 } else { self.view.rows };
-                self.view.top = idx.saturating_sub(rows.saturating_sub(3));
+                self.view.scroll_to(idx.saturating_sub(rows.saturating_sub(3)));
             }
             return;
         }
@@ -937,7 +937,7 @@ impl Viewer {
         // rows is 0 before the first frame: assume a typical viewport.
         let rows = if self.view.rows == 0 { 30 } else { self.view.rows };
         if idx < self.view.top || idx >= self.view.top + rows {
-            self.view.top = idx.saturating_sub(rows / 3);
+            self.view.scroll_to(idx.saturating_sub(rows / 3));
         }
     }
 

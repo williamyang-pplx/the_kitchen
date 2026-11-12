@@ -5,6 +5,7 @@
 //! are drawn in a proportional font and wrap instead of scrolling sideways;
 //! a row with Markdown source is drawn by egui_commonmark.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use egui::text::{CCursor, LayoutJob, TextFormat};
@@ -35,11 +36,39 @@ enum Hit {
 /// Scroll position; owned by the panel so it survives frames.
 #[derive(Debug, Default, Clone)]
 pub struct ViewState {
-    pub top: usize,
+    /// First doc row whose unit (the row, its comment field and its blocks)
+    /// is on screen.
+    pub(super) top: usize,
+    /// Pixels of that unit scrolled above the view's top edge.
+    offset: f32,
     pub left: usize,
     /// Text rows that fit, from the last frame.
     pub rows: usize,
-    wheel: f32,
+    /// Cursor row at the end of the last frame: a change means the cursor moved.
+    last_line: Option<usize>,
+    /// Heights of Markdown rows by doc row, for the doc length, width and font
+    /// size in `md_key`; painting refreshes them, a new key clears them.
+    md_heights: HashMap<usize, f32>,
+    md_key: (usize, u32, u32),
+}
+
+impl ViewState {
+    /// Show row `top` at the view's top edge.
+    pub(super) fn scroll_to(&mut self, top: usize) {
+        self.top = top;
+        self.offset = 0.0;
+    }
+}
+
+/// Heights in pixels of one doc row's unit, measured as it is painted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Extent {
+    /// File-level blocks drawn above the row (row 0 only).
+    lead: f32,
+    /// The row itself.
+    row: f32,
+    /// lead + row + comment field + the row's blocks.
+    unit: f32,
 }
 
 /// A note drawn under a line.
@@ -115,6 +144,96 @@ pub struct CodeView<'a> {
 }
 
 const EDITOR_HEIGHT: f32 = 118.0;
+/// Space under a block, and under the comment field.
+const BLOCK_GAP: f32 = 6.0;
+const EDITOR_GAP: f32 = 8.0;
+
+/// What painting and measuring share: the frame's metrics and inputs. Built
+/// once per frame in `show`.
+struct Geometry<'a> {
+    doc: &'a Doc,
+    blocks: &'a [Block],
+    /// Doc row the comment field sits under.
+    editor_end: Option<usize>,
+    font: FontId,
+    font_size: f32,
+    cw: f32,
+    row_h: f32,
+    rect: Rect,
+    text_x: f32,
+    block_width: f32,
+    overlay: Option<&'a Overlay>,
+    id: egui::Id,
+}
+
+impl Geometry<'_> {
+    /// Plugin decorations of row `idx` (current-file lines only).
+    fn over(&self, idx: usize) -> Option<&LineOverlay> {
+        let line = &self.doc.lines[idx];
+        line.new_no.filter(|_| line.kind != LineKind::Removed).and_then(|n| self.overlay.and_then(|o| o.lines.get(&n)))
+    }
+
+    /// Lays out row `idx` with its top at `y`, scrolled `left` columns: its
+    /// galley (None for a Markdown row, which draws itself), where the text
+    /// goes, and its height. `paint: false` draws a Markdown row invisibly.
+    fn layout_row(&self, ui: &mut Ui, idx: usize, y: f32, left: usize, paint: bool) -> (Option<Arc<Galley>>, Pos2, f32) {
+        let (rect, cw, font_size) = (self.rect, self.cw, self.font_size);
+        let line = &self.doc.lines[idx];
+        match line.render.as_deref() {
+            Some(r) if r.markdown.is_some() => {
+                let at = Pos2::new(self.text_x + cw * 0.8 + r.indent as f32 * cw * 2.0, y + 3.0);
+                let md = r.markdown.as_deref().unwrap_or_default();
+                let h = draw_markdown(ui, rect, at, rect.right() - at.x - 16.0, md, font_size, self.id.with(("md", idx)), paint);
+                (None, at, (h + 8.0).max(self.row_h))
+            }
+            Some(r) => {
+                let quote = if r.block.as_deref() == Some("quote") { cw * 1.5 } else { 0.0 };
+                // Clear of the diff's +/- marker.
+                let x = self.text_x + cw * 0.8 + r.indent as f32 * cw * 2.0 + quote;
+                let job = render_job(r, &line.text, &line.spans, font_size, (rect.right() - x - 16.0).max(cw * 8.0));
+                let galley = ui.fonts_mut(|f| f.layout_job(job));
+                // Room above a heading.
+                let pad = (r.size.unwrap_or(1.0) - 1.0).max(0.0) * font_size * 0.8;
+                let h = (galley.size().y + 2.0 + pad).max(self.row_h);
+                (Some(galley), Pos2::new(x, y + 1.0 + pad), h)
+            }
+            None => {
+                let job = match &line.fold {
+                    Some(f) => LayoutJob::simple_singleline(fold_label(f), self.font.clone(), theme::SUBTLE),
+                    None => line_job(line, left, &self.font, self.over(idx)),
+                };
+                (Some(ui.fonts_mut(|f| f.layout_job(job))), Pos2::new(self.text_x, y + 1.0), self.row_h)
+            }
+        }
+    }
+
+    /// Height of the blocks drawn after `after`, with their gaps.
+    fn blocks_height(&self, ui: &Ui, after: Option<usize>) -> f32 {
+        self.blocks.iter().filter(|b| b.after == after).map(|b| layout_block(ui, b, self.block_width).2 + BLOCK_GAP).sum()
+    }
+
+    /// Row `idx`'s extent. A Markdown row's height comes from `md_heights`
+    /// when known; otherwise it is measured invisibly and stored.
+    fn extent(&self, ui: &mut Ui, idx: usize, md_heights: &mut HashMap<usize, f32>) -> Extent {
+        let lead = if idx == 0 { self.blocks_height(ui, None) } else { 0.0 };
+        let render = self.doc.lines[idx].render.as_deref();
+        let markdown = render.is_some_and(|r| r.markdown.is_some());
+        let row = match md_heights.get(&idx).filter(|_| markdown) {
+            Some(h) => *h,
+            // A text (or fold) row is always one row tall.
+            None if render.is_none() => self.row_h,
+            None => {
+                let h = self.layout_row(ui, idx, self.rect.top(), 0, false).2;
+                if markdown {
+                    md_heights.insert(idx, h);
+                }
+                h
+            }
+        };
+        let field = if self.editor_end == Some(idx) { EDITOR_HEIGHT + EDITOR_GAP } else { 0.0 };
+        Extent { lead, row, unit: lead + row + field + self.blocks_height(ui, Some(idx)) }
+    }
+}
 
 impl CodeView<'_> {
     pub fn show(self, ui: &mut Ui) -> Output {
@@ -126,56 +245,17 @@ impl CodeView<'_> {
         let (cw, ch) = ui.ctx().fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
         let row_h = ch + 2.0;
         let n = doc.lines.len();
-        state.rows = ((rect.height() / row_h).floor() as usize).max(1);
+        let height = rect.height();
+        state.rows = ((height / row_h).floor() as usize).max(1);
+        let md_key = (n, rect.width().to_bits(), font_size.to_bits());
+        if state.md_key != md_key {
+            state.md_heights.clear();
+            state.md_key = md_key;
+        }
 
         let editor_id = id.with("editor");
         let editor_focused = ui.memory(|m| m.has_focus(editor_id));
         let lines = doc.texts();
-
-        // ---- keys -> vim
-        if focused && !editor_focused && n > 0 {
-            for key in collect_keys(ui) {
-                let acts = vim.key(key, &lines, Viewport { top: state.top, rows: state.rows });
-                for a in acts {
-                    match a {
-                        VimAction::ScrollBy(d) => state.top = (state.top as isize + d).clamp(0, n.saturating_sub(1) as isize) as usize,
-                        VimAction::Center => state.top = vim.line.saturating_sub(state.rows / 2),
-                        VimAction::Top => state.top = vim.line,
-                        VimAction::Bottom => state.top = (vim.line + 1).saturating_sub(state.rows),
-                        other => out.actions.push(other),
-                    }
-                }
-            }
-        }
-
-        // ---- wheel
-        if resp.hovered() || resp.contains_pointer() {
-            let dy = ui.input(|i| i.smooth_scroll_delta.y);
-            let dx = ui.input(|i| i.smooth_scroll_delta.x);
-            state.wheel -= dy / row_h;
-            let whole = state.wheel.trunc() as isize;
-            if whole != 0 {
-                state.wheel -= whole as f32;
-                state.top = (state.top as isize + whole).clamp(0, n.saturating_sub(1) as isize) as usize;
-                // Keep the cursor inside the viewport, like vim does.
-                if vim.line < state.top {
-                    vim.set_cursor(state.top, vim.col);
-                } else if vim.line >= state.top + state.rows {
-                    vim.set_cursor(state.top + state.rows - 1, vim.col);
-                }
-            }
-            if dx.abs() > 4.0 {
-                state.left = (state.left as isize - (dx / cw) as isize).max(0) as usize;
-            }
-        }
-
-        // ---- keep cursor visible
-        if vim.line < state.top {
-            state.top = vim.line;
-        }
-        if vim.line >= state.top + state.rows {
-            state.top = vim.line + 1 - state.rows;
-        }
 
         let max_no = doc.lines.iter().filter_map(|l| l.new_no.max(l.old_no)).max().unwrap_or(1);
         let digits = max_no.to_string().len().max(3) as f32;
@@ -185,6 +265,88 @@ impl CodeView<'_> {
         let gutter = sign_w + if two_gutters { one_gutter * 2.0 } else { one_gutter };
         let text_x = rect.left() + gutter + 6.0;
         let visible_cols = (((rect.right() - text_x) / cw).floor() as usize).max(8);
+        let block_width = rect.width() - gutter - 24.0;
+        let geo = Geometry {
+            doc,
+            blocks,
+            editor_end: editor.as_deref().map(|ed| ed.end),
+            font: font.clone(),
+            font_size,
+            cw,
+            row_h,
+            rect,
+            text_x,
+            block_width,
+            overlay,
+            id,
+        };
+        let before = (state.top, state.offset);
+
+        // ---- keys -> vim
+        if focused && !editor_focused && n > 0 {
+            for key in collect_keys(ui) {
+                let acts = vim.key(key, &lines, Viewport { top: state.top, rows: state.rows });
+                for a in acts {
+                    match a {
+                        // Keys scroll by whole rows.
+                        VimAction::ScrollBy(d) => state.scroll_to((state.top as isize + d).clamp(0, n as isize - 1) as usize),
+                        VimAction::Center | VimAction::Top | VimAction::Bottom => {
+                            let cur = vim.line.min(n - 1);
+                            let mut ext = |i| geo.extent(ui, i, &mut state.md_heights);
+                            let row = ext(cur).row;
+                            let y = match a {
+                                VimAction::Center => (height - row) / 2.0,
+                                VimAction::Top => 0.0,
+                                _ => height - row,
+                            };
+                            (state.top, state.offset) = anchor(cur, y.max(0.0), &mut ext);
+                        }
+                        other => out.actions.push(other),
+                    }
+                }
+            }
+        }
+
+        // ---- wheel (pixels; egui already eases them). With a zero delta this
+        // still settles a unit that shrank or a doc that got shorter.
+        let (mut dy, mut dx) = (0.0, 0.0);
+        if resp.hovered() || resp.contains_pointer() {
+            dy = ui.input(|i| i.smooth_scroll_delta.y);
+            dx = ui.input(|i| i.smooth_scroll_delta.x);
+        }
+        (state.top, state.offset) = scroll_px(state.top, state.offset, -dy, height, n, &mut |i| geo.extent(ui, i, &mut state.md_heights));
+        if dx.abs() > 4.0 {
+            state.left = (state.left as isize - (dx / cw) as isize).max(0) as usize;
+        }
+
+        // ---- who leads: a moved (or lost) cursor pulls the view, a moved view
+        // pulls the cursor onto its nearest fully visible row.
+        if n > 0 {
+            let cur = vim.line.min(n - 1);
+            let view_moved = (state.top, state.offset) != before;
+            let just_opened = editor.as_deref().filter(|ed| ed.needs_focus);
+            let cursor_moved = state.last_line != Some(vim.line) || just_opened.is_some();
+            let mut ext = |i| geo.extent(ui, i, &mut state.md_heights);
+            let rows = rows_in_view(state.top, state.offset, height, n, &mut ext);
+            if view_moved && !cursor_moved {
+                let line = nearest_visible(&rows, cur, height);
+                if line != vim.line {
+                    vim.set_cursor(line, vim.col);
+                }
+            } else if cursor_moved || !rows.iter().any(|r| r.0 == cur) {
+                let (idx, need) = match just_opened {
+                    Some(ed) => {
+                        let i = ed.end.min(n - 1);
+                        (i, ext(i).row + EDITOR_HEIGHT + EDITOR_GAP)
+                    }
+                    None => (cur, ext(cur).row),
+                };
+                (state.top, state.offset) = follow(state.top, state.offset, height, n, idx, need, &mut ext);
+            }
+        } else {
+            (state.top, state.offset) = (0, 0.0);
+        }
+
         let cursor_rendered = doc.lines.get(vim.line).is_some_and(|l| l.render.is_some());
         if cursor_rendered {
             // Rendered rows wrap; they never scroll sideways.
@@ -197,16 +359,14 @@ impl CodeView<'_> {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::ZERO, theme::BG);
 
-
         let visual = vim.anchor.map(|(al, ac, linewise)| {
             let (s, e) = if (al, ac) <= (vim.line, vim.col) { ((al, ac), (vim.line, vim.col)) } else { ((vim.line, vim.col), (al, ac)) };
             (s, e, linewise)
         });
 
-        let mut y = rect.top();
+        // The top unit starts `offset` above the view; the painter clips it.
+        let mut y = rect.top() - state.offset;
         let mut row_hits: Vec<(Rect, usize, Hit)> = Vec::new();
-        let mut cursor_drawn = false;
-        let block_width = rect.width() - gutter - 24.0;
         let mut editor_rect: Option<Rect> = None;
 
         let draw_blocks = |after: Option<usize>, y: &mut f32, ui: &mut Ui| {
@@ -214,7 +374,7 @@ impl CodeView<'_> {
                 if *y > rect.bottom() {
                     break;
                 }
-                *y += draw_block(ui, &painter, b, Pos2::new(rect.left() + gutter + 10.0, *y + 2.0), block_width) + 6.0;
+                *y += draw_block(ui, &painter, b, Pos2::new(rect.left() + gutter + 10.0, *y + 2.0), block_width) + BLOCK_GAP;
             }
         };
 
@@ -222,43 +382,21 @@ impl CodeView<'_> {
             draw_blocks(None, &mut y, ui);
         }
         for idx in state.top..n {
-            if y + row_h > rect.bottom() + row_h {
+            if y > rect.bottom() {
                 break;
             }
             let line = &doc.lines[idx];
             let rendered = line.render.as_deref();
-            let over = line.new_no.filter(|_| line.kind != LineKind::Removed).and_then(|n| overlay.and_then(|o| o.lines.get(&n)));
+            let over = geo.over(idx);
             // Backgrounds go under the text, which a Markdown row draws while
             // it is laid out.
             let under = painter.add(Shape::Noop);
             let mut under_shapes: Vec<Shape> = Vec::new();
             // Layout first: a rendered row wraps, so it may be taller than a text row.
-            let (galley, text_pos, row_height) = match rendered {
-                Some(r) if r.markdown.is_some() => {
-                    let at = Pos2::new(text_x + cw * 0.8 + r.indent as f32 * cw * 2.0, y + 3.0);
-                    let md = r.markdown.as_deref().unwrap_or_default();
-                    let h = draw_markdown(ui, rect, at, rect.right() - at.x - 16.0, md, font_size, id.with(("md", idx)));
-                    (None, at, (h + 8.0).max(row_h))
-                }
-                Some(r) => {
-                    let quote = if r.block.as_deref() == Some("quote") { cw * 1.5 } else { 0.0 };
-                    // Clear of the diff's +/- marker.
-                    let x = text_x + cw * 0.8 + r.indent as f32 * cw * 2.0 + quote;
-                    let job = render_job(r, &line.text, &line.spans, font_size, (rect.right() - x - 16.0).max(cw * 8.0));
-                    let galley = ui.fonts_mut(|f| f.layout_job(job));
-                    // Room above a heading.
-                    let pad = (r.size.unwrap_or(1.0) - 1.0).max(0.0) * font_size * 0.8;
-                    let h = (galley.size().y + 2.0 + pad).max(row_h);
-                    (Some(galley), Pos2::new(x, y + 1.0 + pad), h)
-                }
-                None => {
-                    let job = match &line.fold {
-                        Some(f) => LayoutJob::simple_singleline(fold_label(f), font.clone(), theme::SUBTLE),
-                        None => line_job(line, state.left, &font, over),
-                    };
-                    (Some(ui.fonts_mut(|f| f.layout_job(job))), Pos2::new(text_x, y + 1.0), row_h)
-                }
-            };
+            let (galley, text_pos, row_height) = geo.layout_row(ui, idx, y, state.left, true);
+            if rendered.is_some_and(|r| r.markdown.is_some()) {
+                state.md_heights.insert(idx, row_height);
+            }
             let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_height));
             row_hits.push((
                 row,
@@ -373,8 +511,6 @@ impl CodeView<'_> {
                     None => Rect::from_min_size(Pos2::new(text_pos.x - 7.0, y + 3.0), Vec2::new(2.0, row_height - 6.0)),
                 };
                 painter.rect_filled(bar, CornerRadius::ZERO, if focused && !editor_focused { theme::TEXT.gamma_multiply(0.9) } else { theme::DIM });
-                // A row taller than the view counts as shown once it is at the top.
-                cursor_drawn = y + row_height <= rect.bottom() || idx == state.top;
             } else if idx == vim.line && vim.col >= state.left {
                 let x = text_x + (vim.col - state.left) as f32 * cw;
                 let r = Rect::from_min_size(Pos2::new(x, y + 1.0), Vec2::new(cw, ch));
@@ -386,7 +522,6 @@ impl CodeView<'_> {
                 } else {
                     painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, theme::DIM), egui::StrokeKind::Inside);
                 }
-                cursor_drawn = y + row_h <= rect.bottom();
             }
             y += row_height;
             // The comment field goes right under its line, above the line's
@@ -394,7 +529,7 @@ impl CodeView<'_> {
             if let Some(ed) = editor.as_deref() {
                 if ed.end == idx {
                     editor_rect = Some(Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, y + 2.0), Vec2::new(block_width, EDITOR_HEIGHT)));
-                    y += EDITOR_HEIGHT + 8.0;
+                    y += EDITOR_HEIGHT + EDITOR_GAP;
                 }
             }
             draw_blocks(Some(idx), &mut y, ui);
@@ -403,13 +538,18 @@ impl CodeView<'_> {
             painter.text(Pos2::new(text_x, rect.top() + 8.0), egui::Align2::LEFT_TOP, "(empty)", font.clone(), theme::DIM);
         }
 
-        // ---- editor
-        if let (Some(ed), Some(er)) = (editor.as_deref_mut(), editor_rect) {
-            let er = er.intersect(rect);
-            if er.height() > 30.0 {
+        // ---- editor: it slides under the edges like a block. A focused field
+        // scrolled out of view is still laid out (out of sight), since egui
+        // drops the focus of a widget that skips a frame.
+        if let Some(ed) = editor.as_deref_mut() {
+            let er = editor_rect
+                .filter(|er| er.intersects(rect))
+                .or_else(|| editor_focused.then(|| Rect::from_min_size(Pos2::new(rect.left() + gutter + 10.0, rect.bottom() + 10.0), Vec2::new(block_width, EDITOR_HEIGHT))));
+            if let Some(er) = er {
                 painter.rect_filled(er.expand(3.0), 5.0, theme::PANEL);
                 painter.rect_stroke(er.expand(3.0), 5.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Outside);
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(er));
+                child.set_clip_rect(rect.intersect(ui.clip_rect()));
                 child.label(egui::RichText::new(&ed.label).size(11.0).color(theme::ACCENT));
                 let te = egui::TextEdit::multiline(&mut ed.text)
                     .id(editor_id)
@@ -435,14 +575,6 @@ impl CodeView<'_> {
             }
         }
 
-        // ---- scroll correction when blocks pushed the cursor (or the
-        // comment field) below the fold
-        let editor_hidden = editor.as_deref().is_some_and(|ed| ed.end >= state.top && editor_rect.is_none_or(|r| r.bottom() > rect.bottom()));
-        if editor_hidden || (!cursor_drawn && vim.line >= state.top && n > 0 && editor.is_none()) {
-            state.top += 1;
-            ui.ctx().request_repaint();
-        }
-
         // ---- mouse
         if resp.clicked_by(egui::PointerButton::Primary) {
             out.clicked = true;
@@ -457,8 +589,107 @@ impl CodeView<'_> {
                 }
             }
         }
+        state.last_line = Some(vim.line);
         ui.advance_cursor_after_rect(rect);
         out
+    }
+}
+
+/// Moves the view `dy` pixels (down when positive) from `(top, offset)` and
+/// returns the new `(top, offset)`, with `offset` inside the top unit. Stops at
+/// the start, and at the end once the last row is at the top edge or its unit's
+/// end at the bottom edge, whichever scrolls further.
+fn scroll_px(top: usize, offset: f32, dy: f32, height: f32, n: usize, extent: &mut dyn FnMut(usize) -> Extent) -> (usize, f32) {
+    if n == 0 {
+        return (0, 0.0);
+    }
+    let (mut top, mut offset) = (top.min(n - 1), offset + dy);
+    while offset < 0.0 {
+        if top == 0 {
+            offset = 0.0;
+            break;
+        }
+        top -= 1;
+        offset += extent(top).unit;
+    }
+    while top + 1 < n {
+        let unit = extent(top).unit;
+        if offset < unit {
+            break;
+        }
+        offset -= unit;
+        top += 1;
+    }
+    if top + 1 == n {
+        let e = extent(top);
+        offset = offset.min(e.lead.max(e.unit - height).max(0.0));
+    }
+    (top, offset)
+}
+
+/// The `(top, offset)` that puts the top of row `idx` `y` pixels below the
+/// view's top edge (clamped: the view can't start above row 0).
+fn anchor(idx: usize, y: f32, extent: &mut dyn FnMut(usize) -> Extent) -> (usize, f32) {
+    // The unit starts above its row by the file-level blocks.
+    let mut y = y - extent(idx).lead;
+    let mut i = idx;
+    while y > 0.0 && i > 0 {
+        i -= 1;
+        y -= extent(i).unit;
+    }
+    if y > 0.0 { (0, 0.0) } else { (i, -y) }
+}
+
+/// Scrolls the least needed to show `need` pixels from the top of row `idx`
+/// inside a view `height` tall; a row taller than the view goes to the top.
+/// Going up to row 0 also shows the file-level blocks above it, if they fit.
+fn follow(top: usize, offset: f32, height: f32, n: usize, idx: usize, need: f32, extent: &mut dyn FnMut(usize) -> Extent) -> (usize, f32) {
+    let rows = rows_in_view(top, offset, height, n, extent);
+    let above = match rows.iter().find(|r| r.0 == idx) {
+        Some(&(_, y, _)) if y >= 0.0 && y + need <= height => return (top, offset),
+        Some(&(_, y, _)) => y < 0.0,
+        None => rows.first().map_or(idx < top, |r| idx < r.0),
+    };
+    let y = if !above {
+        (height - need).max(0.0)
+    } else if idx == 0 {
+        extent(0).lead.min((height - need).max(0.0))
+    } else {
+        0.0
+    };
+    anchor(idx, y, extent)
+}
+
+/// The rows whose unit (row, comment field, blocks) has some pixel on screen,
+/// top to bottom: `(idx, row top, row height)`, with y measured from the
+/// view's top edge (negative above it).
+fn rows_in_view(top: usize, offset: f32, height: f32, n: usize, extent: &mut dyn FnMut(usize) -> Extent) -> Vec<(usize, f32, f32)> {
+    let mut out = Vec::new();
+    let mut y = -offset;
+    for idx in top..n {
+        if y >= height {
+            break;
+        }
+        let e = extent(idx);
+        if y + e.unit > 0.0 {
+            out.push((idx, y + e.lead, e.row));
+        }
+        y += e.unit;
+    }
+    out
+}
+
+/// Where the cursor goes when the view moved under it: `cur` if its row is
+/// fully on screen, else the nearest row that is; with none (a row or comment
+/// taller than the view), `cur` if its unit shows, else the top row.
+fn nearest_visible(rows: &[(usize, f32, f32)], cur: usize, height: f32) -> usize {
+    let full: Vec<usize> = rows.iter().filter(|(_, y, h)| *y >= 0.0 && y + h <= height).map(|r| r.0).collect();
+    match (full.first(), full.last()) {
+        (Some(&first), _) if cur < first => first,
+        (_, Some(&last)) if cur > last => last,
+        (Some(_), _) => cur,
+        _ if rows.iter().any(|r| r.0 == cur) => cur,
+        _ => rows.first().map_or(cur, |r| r.0),
     }
 }
 
@@ -563,11 +794,15 @@ fn render_job(r: &RenderRow, text: &str, syntax: &[(std::ops::Range<usize>, Colo
 
 /// Draws Markdown `md` at `at`, `width` wide, clipped to `clip`; returns its
 /// height. Its widgets are disabled, so a click lands on the row (cursor, ⌘M)
-/// and keys stay with vim.
-fn draw_markdown(ui: &mut Ui, clip: Rect, at: Pos2, width: f32, md: &str, font_size: f32, id: egui::Id) -> f32 {
+/// and keys stay with vim. `paint: false` lays it out invisibly, to measure.
+#[allow(clippy::too_many_arguments)]
+fn draw_markdown(ui: &mut Ui, clip: Rect, at: Pos2, width: f32, md: &str, font_size: f32, id: egui::Id, paint: bool) -> f32 {
     let cache = ui.data_mut(|d| d.get_temp_mut_or_default::<Arc<Mutex<CommonMarkCache>>>(egui::Id::new("commonmark")).clone());
     let max = Rect::from_min_size(at, Vec2::new(width.max(80.0), f32::INFINITY));
-    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(id).max_rect(max).layout(egui::Layout::top_down(egui::Align::Min)));
+    let mut builder = egui::UiBuilder::new().max_rect(max).layout(egui::Layout::top_down(egui::Align::Min));
+    // The measuring copy gets its own ids, so it never clashes with the painted one.
+    builder = if paint { builder.id_salt(id) } else { builder.id_salt(id.with("measure")).invisible() };
+    let mut child = ui.new_child(builder);
     child.set_clip_rect(clip.intersect(ui.clip_rect()));
     child.set_style(markdown_style(ui.style(), font_size));
     child.disable();
@@ -603,13 +838,19 @@ fn markdown_style(base: &egui::Style, font_size: f32) -> egui::Style {
     s
 }
 
-fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32) -> f32 {
-    let title_font = FontId::proportional(11.5);
-    let body_font = FontId::proportional(12.5);
+/// A block's title and body galleys and its height, shared by painting and
+/// measuring.
+fn layout_block(ui: &Ui, b: &Block, width: f32) -> (Arc<Galley>, Arc<Galley>, f32) {
     let text_color = if b.dim { theme::DIM } else { theme::TEXT };
-    let title = ui.fonts_mut(|f| f.layout(b.title.clone(), title_font, b.color, width - 16.0));
-    let body = ui.fonts_mut(|f| f.layout(b.body.clone(), body_font, text_color, width - 16.0));
+    let title = ui.fonts_mut(|f| f.layout(b.title.clone(), FontId::proportional(11.5), b.color, width - 16.0));
+    let body = ui.fonts_mut(|f| f.layout(b.body.clone(), FontId::proportional(12.5), text_color, width - 16.0));
     let h = title.size().y + body.size().y + 12.0;
+    (title, body, h)
+}
+
+fn draw_block(ui: &Ui, painter: &egui::Painter, b: &Block, at: Pos2, width: f32) -> f32 {
+    let text_color = if b.dim { theme::DIM } else { theme::TEXT };
+    let (title, body, h) = layout_block(ui, b, width);
     let r = Rect::from_min_size(at, Vec2::new(width, h));
     painter.rect_filled(r, 5.0, if b.dim { theme::PANEL } else { theme::SELECTED });
     painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(3.0, h)), 2.0, b.color);
@@ -658,4 +899,100 @@ pub(crate) fn collect_keys(ui: &Ui) -> Vec<VimKey> {
         }
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ten 20 px rows; row 3 carries a 300 px comment, row 0 a 50 px
+    /// file-level block above it.
+    fn ext(i: usize) -> Extent {
+        let lead = if i == 0 { 50.0 } else { 0.0 };
+        let below = if i == 3 { 300.0 } else { 0.0 };
+        Extent { lead, row: 20.0, unit: lead + 20.0 + below }
+    }
+
+    const N: usize = 10;
+    const H: f32 = 200.0;
+
+    #[test]
+    fn scroll_px_moves_through_a_tall_comment_pixel_by_pixel() {
+        // Row 3's unit starts at 50 + 3 * 20 = 110 px.
+        let mut at = (0, 0.0);
+        for _ in 0..200 {
+            at = scroll_px(at.0, at.1, 1.0, H, N, &mut ext);
+        }
+        assert_eq!(at, (3, 90.0), "200 px down is 90 px into row 3's comment");
+        at = scroll_px(at.0, at.1, 1.0, H, N, &mut ext);
+        assert_eq!(at, (3, 91.0));
+    }
+
+    #[test]
+    fn scroll_px_crosses_units_both_ways_and_stops_at_both_ends() {
+        assert_eq!(scroll_px(3, 10.0, 320.0, H, N, &mut ext), (4, 10.0));
+        assert_eq!(scroll_px(4, 10.0, -320.0, H, N, &mut ext), (3, 10.0));
+        assert_eq!(scroll_px(2, 0.0, -1000.0, H, N, &mut ext), (0, 0.0));
+        // The end: the last row reaches the top edge, no further.
+        assert_eq!(scroll_px(0, 0.0, 10_000.0, H, N, &mut ext), (N - 1, 0.0));
+        // A doc that shrank under the view.
+        assert_eq!(scroll_px(40, 5.0, 0.0, H, N, &mut ext), (N - 1, 0.0));
+        assert_eq!(scroll_px(4, 5.0, 0.0, H, 0, &mut ext), (0, 0.0));
+    }
+
+    #[test]
+    fn scroll_px_reaches_the_end_of_a_tall_comment_on_the_last_row() {
+        let mut tall_last = |i: usize| Extent { lead: 0.0, row: 20.0, unit: if i == 1 { 520.0 } else { 20.0 } };
+        // Its unit's end may reach the bottom edge: 520 - 200.
+        assert_eq!(scroll_px(0, 0.0, 10_000.0, H, 2, &mut tall_last), (1, 320.0));
+    }
+
+    #[test]
+    fn anchor_counts_file_level_blocks_and_clamps_at_the_start() {
+        // Row 0's row is 50 px into its unit.
+        assert_eq!(anchor(0, 0.0, &mut ext), (0, 50.0));
+        assert_eq!(anchor(0, 80.0, &mut ext), (0, 0.0));
+        // Row 4 at 100 px: row 3's unit (320) is cut 220 px.
+        assert_eq!(anchor(4, 100.0, &mut ext), (3, 220.0));
+        assert_eq!(anchor(4, 0.0, &mut ext), (4, 0.0));
+    }
+
+    #[test]
+    fn follow_scrolls_just_enough_and_leaves_a_visible_row_alone() {
+        // Row 2 is on screen at the start.
+        assert_eq!(follow(0, 0.0, H, N, 2, 20.0, &mut ext), (0, 0.0));
+        // Row 4 is below row 3's comment: it ends up at the bottom edge.
+        assert_eq!(follow(0, 0.0, H, N, 4, 20.0, &mut ext), (3, 140.0));
+        // Back up to row 1 from below: it goes to the top edge.
+        assert_eq!(follow(5, 0.0, H, N, 1, 20.0, &mut ext), (1, 0.0));
+        // Up to row 0: the file-level blocks above it show too.
+        assert_eq!(follow(5, 0.0, H, N, 0, 20.0, &mut ext), (0, 0.0));
+        // A row cut by the top edge comes fully into view.
+        assert_eq!(follow(4, 5.0, H, N, 4, 20.0, &mut ext), (4, 0.0));
+    }
+
+    #[test]
+    fn rows_in_view_includes_rows_cut_by_either_edge() {
+        // 200 px into row 3's unit: its row is above the edge, its comment on screen.
+        let rows = rows_in_view(3, 200.0, H, N, &mut ext);
+        assert_eq!(rows.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(), vec![(3, -200.0), (4, 120.0), (5, 140.0), (6, 160.0), (7, 180.0)]);
+        // 10 px into row 1: rows 1 (cut) and 2 show, then row 3 and part of its comment.
+        let rows = rows_in_view(1, 10.0, H, N, &mut ext);
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(rows[0].1, -10.0);
+    }
+
+    #[test]
+    fn nearest_visible_prefers_fully_shown_rows() {
+        let rows = rows_in_view(1, 10.0, H, N, &mut ext);
+        assert_eq!(nearest_visible(&rows, 1, H), 2, "row 1 is cut by the top edge");
+        assert_eq!(nearest_visible(&rows, 2, H), 2);
+        assert_eq!(nearest_visible(&rows, 8, H), 3);
+        // Only row 3's comment on screen: the cursor stays on row 3, or goes there.
+        let rows = rows_in_view(3, 100.0, H, N, &mut ext);
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(nearest_visible(&rows, 3, H), 3);
+        assert_eq!(nearest_visible(&rows, 7, H), 3);
+        assert_eq!(nearest_visible(&rows, 1, H), 3);
+    }
 }
