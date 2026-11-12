@@ -23,6 +23,12 @@ const REFRESH_LOCK: &str = "kitchen-refresh";
 /// Prefix for background git work: below the agents' CPU and I/O priority.
 const NICE: &str = "nice -n 10 $(command -v ionice >/dev/null && echo ionice -c2 -n7)";
 
+/// Packs not in the multi-pack index that make [`Repo::index_packs`] write it
+/// again. A partial clone gets a pack per on-demand download (a devbox's agi:
+/// ~1,200 a day, 55k over seven weeks), and every object lookup searches each
+/// pack the index doesn't cover.
+const UNINDEXED_PACKS: usize = 50;
+
 pub struct Repo<'a> {
     pub host: &'a Host,
     /// Absolute path of the main checkout.
@@ -158,8 +164,26 @@ impl<'a> Repo<'a> {
     /// overwrite local changes. Also says whether HEAD moved (a new worktree
     /// counts as moved).
     pub fn checkout_worktree(&self, path: &str, to: Checkout, fetch: &[String]) -> Result<(Worktree, bool)> {
+        self.checkout_worktree_unless(path, to, fetch, &[])
+    }
+
+    /// [`Self::checkout_worktree`], skipping the fetch when every `(rev,
+    /// commit)` in `have` already holds: `rev` names `commit` here (e.g. a
+    /// PR's ref and base branch at the commits GitHub reports). A fetch from
+    /// GitHub is seconds; most switches back to a PR find nothing new.
+    pub fn checkout_worktree_unless(&self, path: &str, to: Checkout, fetch: &[String], have: &[(String, String)]) -> Result<(Worktree, bool)> {
         let r = shell_quote(self.path);
-        let fetch = if fetch.is_empty() { String::new() } else { format!("{} || exit 11\n", fetch_cmd(&r, fetch)) };
+        let fetch = match (fetch.is_empty(), have.is_empty()) {
+            (true, _) => String::new(),
+            (false, true) => format!("{} || exit 11\n", fetch_cmd(&r, fetch)),
+            (false, false) => {
+                let checks: Vec<String> = have
+                    .iter()
+                    .map(|(rev, commit)| format!("[ \"$(git -C {r} rev-parse --verify --quiet {})\" = {} ]", shell_quote(&format!("{rev}^{{commit}}")), shell_quote(commit)))
+                    .collect();
+                format!("if ! {{ {}; }}; then {} || exit 11; fi\n", checks.join(" && "), fetch_cmd(&r, fetch))
+            }
+        };
         let checkout = match to {
             Checkout::Branch(branch) => format!(
                 r#"b={b}
@@ -344,17 +368,31 @@ exit ${{err:-0}}"#,
 
     /// Once per workspace setup: turn on git's untracked-file cache unless the
     /// repo configures it (big repos: `git status` stops walking every
-    /// directory), and run the cheap maintenance tasks, niced. No repacking:
-    /// partial clones keep their promisor packs as they are. Returns what it
-    /// changed, for the log.
+    /// directory), run the cheap maintenance tasks, and index the packs (see
+    /// [`Self::index_packs`]), niced. No repacking: partial clones keep their
+    /// promisor packs as they are. Returns what it changed, for the log.
     pub fn tune(&self) -> Result<Vec<String>> {
         let script = format!(
             r#"git config --get core.untrackedCache >/dev/null || {{ git config core.untrackedCache true && echo "set core.untrackedCache=true"; }}
 {NICE} git maintenance run --task=loose-objects --task=commit-graph >/dev/null 2>&1 && echo "maintenance: loose-objects, commit-graph"
-true"#
+{}
+true"#,
+            index_packs_snippet()
         );
         let out = self.host.sh_ok(&script, Some(self.path))?;
         Ok(out.lines().map(String::from).filter(|l| !l.is_empty()).collect())
+    }
+
+    /// Write the repo's multi-pack index when at least [`UNINDEXED_PACKS`]
+    /// packs are newer than it (or there is none), so an object lookup
+    /// searches one index, not every pack (a devbox's agi with 55k packs: a
+    /// lookup 395 ms → 89 ms, the viewer's diff listing 896 ms → 155 ms). It
+    /// only indexes the packs, never repacks them; deleting
+    /// `objects/pack/multi-pack-index` undoes it. Niced; seconds on a big
+    /// repo. Whether it was written.
+    pub fn index_packs(&self) -> Result<bool> {
+        let out = self.host.sh_ok(index_packs_snippet(), Some(self.path))?;
+        Ok(out.lines().any(|l| l.starts_with("multi-pack-index written")))
     }
 
     pub fn describe(&self, path: &str) -> Result<Worktree> {
@@ -490,6 +528,19 @@ fn gunzip_if_gzipped(bytes: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 /// Shell lines printing `KT_PATH=`/`KT_HEAD=`/`KT_BRANCH=` for [`parse_report`].
+/// Shell (run in the repo) for [`Repo::index_packs`]; prints
+/// "multi-pack-index written (N packs)" when it wrote it.
+fn index_packs_snippet() -> &'static str {
+    static SNIPPET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SNIPPET.get_or_init(|| {
+        format!(
+            r#"d=$(git rev-parse --git-path objects/pack) && m="$d/multi-pack-index"
+if [ -f "$m" ]; then n=$(find "$d" -maxdepth 1 -name '*.pack' -newer "$m" | wc -l); else n=$(find "$d" -maxdepth 1 -name '*.pack' | wc -l); fi
+if [ "$n" -ge {UNINDEXED_PACKS} ]; then {NICE} git multi-pack-index write >/dev/null 2>&1 && echo "multi-pack-index written ($(find "$d" -maxdepth 1 -name '*.pack' | wc -l | tr -d ' ') packs)"; fi"#
+        )
+    })
+}
+
 fn report_snippet(dir: &str) -> String {
     format!(
         r#"echo "KT_PATH=$(git -C {dir} rev-parse --show-toplevel)"; echo "KT_HEAD=$(git -C {dir} rev-parse --verify --quiet HEAD)"; echo "KT_BRANCH=$(git -C {dir} symbolic-ref --quiet --short HEAD)""#
@@ -874,6 +925,68 @@ mod tests {
 
     /// Existing branches and PR heads, fetched and checked out in one trip,
     /// then moved forward (never reset) when opened again.
+    /// A PR view skips its fetch when its refs already name the commits
+    /// GitHub reports, and fetches when one is stale or missing.
+    #[test]
+    fn checkout_skips_the_fetch_when_the_commits_are_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sh(
+            root,
+            "git init -q -b main origin && cd origin && git config user.email t@t && git config user.name t \
+             && echo one > a.txt && git add . && git commit -qm init \
+             && git checkout -qb pr && echo pr > p.txt && git add . && git commit -qm pr \
+             && git update-ref refs/pull/7/head HEAD && git checkout -q main \
+             && cd .. && git clone -q origin repo",
+        );
+        let host = Host::Local;
+        let repo_path = root.join("repo").display().to_string();
+        let repo = Repo::new(&host, &repo_path);
+        let rev = |r: &str| repo.git(&["rev-parse", r]).unwrap().trim().to_string();
+        let origin = |r: &str| Repo::new(&host, &root.join("origin").display().to_string()).git(&["rev-parse", r]).unwrap().trim().to_string();
+        let det = repo.sibling_path("kitchen-pr-7");
+        let specs = ["+refs/pull/7/head:refs/kitchen/pr/7".to_string()];
+        // Not here yet: fetched.
+        let have = vec![("refs/kitchen/pr/7".to_string(), origin("refs/pull/7/head"))];
+        let (wt, moved) = repo.checkout_worktree_unless(&det, Checkout::Detached("refs/kitchen/pr/7"), &specs, &have).unwrap();
+        assert!(moved && wt.head == origin("refs/pull/7/head"));
+        // Here: no fetch, so a refspec that can't be fetched doesn't matter.
+        let broken = ["+refs/pull/nope/head:refs/kitchen/pr/7".to_string()];
+        let (_, moved) = repo.checkout_worktree_unless(&det, Checkout::Detached("refs/kitchen/pr/7"), &broken, &have).unwrap();
+        assert!(!moved);
+        // GitHub reports a newer head: fetched (and here the fetch fails).
+        let stale = vec![("refs/kitchen/pr/7".to_string(), origin("main"))];
+        let e = repo.checkout_worktree_unless(&det, Checkout::Detached("refs/kitchen/pr/7"), &broken, &stale).unwrap_err();
+        assert!(e.to_string().contains("exit 11"), "{e:#}");
+        assert_eq!(rev("refs/kitchen/pr/7"), origin("refs/pull/7/head"));
+        let _ = std::fs::remove_dir_all(&det);
+    }
+
+    /// Packs get a multi-pack index once enough of them aren't in one.
+    #[test]
+    fn index_packs_writes_the_multi_pack_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sh(root, "git init -q -b main r && cd r && git config user.email t@t && git config user.name t");
+        let r = root.join("r");
+        let host = Host::Local;
+        let path = r.display().to_string();
+        let repo = Repo::new(&host, &path);
+        let midx = r.join(".git/objects/pack/multi-pack-index");
+        // A pack per commit, like a partial clone's downloads.
+        let packs = |n: usize, from: usize| {
+            for i in from..from + n {
+                sh(&r, &format!("echo {i} > f && git add f && git commit -qm {i} && git repack -q"));
+            }
+        };
+        packs(UNINDEXED_PACKS - 1, 0);
+        assert!(!repo.index_packs().unwrap() && !midx.exists(), "few packs: no index");
+        packs(1, UNINDEXED_PACKS);
+        assert!(repo.index_packs().unwrap() && midx.exists());
+        assert!(!repo.index_packs().unwrap(), "every pack is indexed");
+        assert!(repo.tune().unwrap().iter().all(|l| !l.starts_with("multi-pack-index")), "tune indexes only when needed");
+    }
+
     #[test]
     fn checkout_worktree_branch_and_detached() {
         let tmp = tempfile::tempdir().unwrap();

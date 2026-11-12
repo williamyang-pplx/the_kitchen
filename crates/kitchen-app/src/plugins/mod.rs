@@ -974,6 +974,12 @@ mod tests {
         // Merged: the base just before the merge.
         let s = to_json(view.call(("t1", 12, info(serde_json::json!({"baseRefName": "dev", "state": "MERGED", "mergeCommit": {"oid": "abc"}})), "main")).unwrap());
         assert_eq!((s["base"].as_str(), s["fetch"][1].as_str()), (Some("abc^1"), Some("abc")));
+        assert!(s.get("have").is_none(), "no head commit from gh: always fetch");
+        // With the commits GitHub reports, the fetch can be skipped when they are here.
+        let s = to_json(view.call(("t1", 12, info(serde_json::json!({"baseRefName": "dev", "baseRefOid": "b1", "headRefOid": "h1", "state": "OPEN"})), "main")).unwrap());
+        assert_eq!(s["have"], serde_json::json!([{ "rev": "refs/kitchen/pr/12", "commit": "h1" }, { "rev": "refs/remotes/origin/dev", "commit": "b1" }]));
+        let s = to_json(view.call(("t1", 12, info(serde_json::json!({"headRefOid": "h1", "state": "MERGED", "mergeCommit": {"oid": "abc"}})), "main")).unwrap());
+        assert_eq!(s["have"][1], serde_json::json!({ "rev": "abc", "commit": "abc" }), "merged: the merge commit itself");
 
         // Review comments: threads from gh's list, items for the viewer, post arguments.
         let list = lua
@@ -1022,7 +1028,7 @@ mod tests {
         let q: String = m.get::<mlua::Function>("query").unwrap().call(("o/r", val(serde_json::json!([12, 13])))).unwrap();
         assert!(q.starts_with(r#"query { repository(owner: "o", name: "r") { p12: pullRequest(number: 12) {"#) && q.contains("p13: pullRequest(number: 13)"), "{q}");
 
-        let pr = |n: u64, base: &str, head: &str, state: &str| serde_json::json!({ "number": n, "title": format!("t{n}"), "state": state, "baseRefName": base, "headRefName": head, "additions": 1, "deletions": 0 });
+        let pr = |n: u64, base: &str, head: &str, state: &str| serde_json::json!({ "number": n, "title": format!("t{n}"), "state": state, "baseRefName": base, "headRefName": head, "baseRefOid": format!("b{n}"), "headRefOid": format!("h{n}"), "additions": 1, "deletions": 0 });
         // Two stacks (main ← a ← b, and main ← c), listed out of order; a cycle; a reviewed PR.
         let listed = val(serde_json::json!([pr(2, "a", "b", "OPEN"), pr(3, "main", "c", "OPEN"), pr(1, "main", "a", "OPEN"), pr(5, "y", "x", "OPEN"), pr(6, "x", "y", "OPEN")]));
         let reviewing = val(serde_json::json!([pr(9, "main", "bo/fix", "MERGED")]));
@@ -1043,6 +1049,7 @@ mod tests {
         assert_eq!(e[1]["view"], serde_json::json!({ "base": "origin/a" }));
         assert_eq!((e[0]["view"]["name"].as_str(), e[0]["view"]["base"].as_str(), e[0]["view"].get("tab")), (Some("kitchen-pr-1"), Some("origin/main"), None));
         assert_eq!(e[5]["view"]["name"], "kitchen-pr-9");
+        assert_eq!(e[0]["view"]["have"][0], serde_json::json!({ "rev": "refs/kitchen/pr/1", "commit": "h1" }), "rows skip the fetch when nothing moved");
     }
 
     fn prune_module(lua: &mlua::Lua) -> mlua::Table {

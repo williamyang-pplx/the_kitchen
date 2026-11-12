@@ -177,6 +177,18 @@ pub struct ViewAt {
     pub fetch: Vec<String>,
     /// What the viewer diffs against (default `origin/<default>`).
     pub base: Option<String>,
+    /// Revs and the commits they must name for `fetch` to be skipped (a PR's
+    /// ref and base branch at the commits GitHub reports): a switch back to a
+    /// PR that hasn't moved costs no fetch.
+    #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
+    pub have: Vec<Have>,
+}
+
+/// `rev` names `commit` (see [`ViewAt::have`]).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct Have {
+    pub rev: String,
+    pub commit: String,
 }
 
 /// One row of a tab's PR menu (⌘⇧S), from `kitchen.views`.
@@ -590,8 +602,8 @@ impl Engine {
 
     /// Keep the workspace's spares hot so a new tab never waits on the
     /// network: fetch and refresh them now and every [`SPARE_REFRESH`] until
-    /// the workspace is closed. One warmer per workspace; repeat calls do
-    /// nothing.
+    /// the workspace is closed, and keep the repo's packs indexed. One warmer
+    /// per workspace; repeat calls do nothing.
     pub fn keep_spares_warm(self: &Arc<Self>, ws_id: &str) {
         let key = format!("warm:{ws_id}");
         if !self.opening.lock().unwrap().insert(key.clone()) {
@@ -603,8 +615,16 @@ impl Engine {
             .name("spare warmer".into())
             .spawn(move || {
                 let _guard = OpeningGuard { engine: &me, key };
-                while me.workspace(&ws_id).is_some() {
+                while let Some(ws) = me.workspace(&ws_id) {
                     me.refill_spare(&ws_id, true);
+                    // A partial clone gains a pack per on-demand download;
+                    // keep them indexed, or every object lookup slows down.
+                    let host = ws.host();
+                    match Repo::new(&host, &ws.row.repo_path).index_packs() {
+                        Ok(true) => log::info!("{}: multi-pack-index written", ws.row.name),
+                        Ok(false) => {}
+                        Err(e) => log::warn!("{}: multi-pack-index: {e:#}", ws.row.name),
+                    }
                     std::thread::sleep(SPARE_REFRESH);
                 }
             })
@@ -982,7 +1002,7 @@ impl Engine {
             return Ok(());
         };
         let shown = self.shown_by(&v).context("kitchen.view needs a name with a rev")?;
-        self.checkout_view(&ws, &shown.0, &rev, &v.at.fetch)?;
+        self.checkout_view(&ws, &shown.0, &rev, &v.at)?;
         self.push_ui(UiCommand::ShowViewer { tab_id: v.tab, view: shown, seq });
         Ok(())
     }
@@ -993,7 +1013,7 @@ impl Engine {
     pub fn refresh_view(self: &Arc<Self>, v: View) -> Result<()> {
         let (Some(rev), Some((ws, _))) = (v.at.rev.clone(), self.find_tab(&v.tab)) else { return Ok(()) };
         let Some((worktree, _)) = self.shown_by(&v) else { return Ok(()) };
-        if self.checkout_view(&ws, &worktree, &rev, &v.at.fetch)? {
+        if self.checkout_view(&ws, &worktree, &rev, &v.at)? {
             self.push_ui(UiCommand::ReloadViewer { tab_id: v.tab, worktree });
         }
         Ok(())
@@ -1001,7 +1021,7 @@ impl Engine {
 
     /// Check `rev` out detached at `path` beside `ws`'s repo, after any other
     /// checkout of that path finished. Whether HEAD moved.
-    fn checkout_view(self: &Arc<Self>, ws: &Workspace, path: &str, rev: &str, fetch: &[String]) -> Result<bool> {
+    fn checkout_view(self: &Arc<Self>, ws: &Workspace, path: &str, rev: &str, at: &ViewAt) -> Result<bool> {
         let key = format!("open:{}:{path}", ws.row.id);
         // A refresh, or the same row picked twice: wait for it, then this
         // checkout is quick and its caller still shows its own view.
@@ -1012,7 +1032,8 @@ impl Engine {
         }
         let _guard = OpeningGuard { engine: self, key };
         let host = ws.host();
-        let checked = Repo::new(&host, &ws.row.repo_path).checkout_worktree(path, Checkout::Detached(rev), fetch);
+        let have: Vec<(String, String)> = at.have.iter().map(|h| (h.rev.clone(), h.commit.clone())).collect();
+        let checked = Repo::new(&host, &ws.row.repo_path).checkout_worktree_unless(path, Checkout::Detached(rev), &at.fetch, &have);
         // The checkout may have taken over a spare (even if it failed after).
         self.refill_spare(&ws.row.id, false);
         Ok(checked?.1)
@@ -1524,7 +1545,7 @@ mod tests {
         let repo = crate::test_util::TestRepo::new("echo 1 > a");
         repo.sh("git checkout -qb pr && echo 2 > a && git commit -qam pr && git checkout -q main");
         let (_ctx, engine) = crate::test_util::engine("local", &repo.path(), &["t"]);
-        let at = |rev: Option<&str>| ViewAt { rev: rev.map(String::from), name: Some("kitchen-pr-7".into()), fetch: vec![], base: Some("main".into()) };
+        let at = |rev: Option<&str>| ViewAt { rev: rev.map(String::from), name: Some("kitchen-pr-7".into()), base: Some("main".into()), ..Default::default() };
         let view = |rev: Option<&str>| View { tab: "t".into(), at: at(rev) };
         let shown = |e: &Engine| -> Vec<(Shown, u64)> {
             e.take_ui_commands()
@@ -1555,6 +1576,13 @@ mod tests {
         assert!(matches!(&cmds[..], [UiCommand::ReloadViewer { tab_id, worktree }] if tab_id == "t" && *worktree == wt), "{cmds:?}");
         engine.refresh_view(view(None)).unwrap();
         assert!(engine.take_ui_commands().is_empty(), "nothing to refresh without a rev");
+        // The rev already names the commit GitHub reports: no fetch (this one
+        // could never succeed), and nothing moved.
+        let head = String::from_utf8(std::process::Command::new("git").args(["-C", &repo.path(), "rev-parse", "pr"]).output().unwrap().stdout).unwrap();
+        let have = vec![Have { rev: "pr".into(), commit: head.trim().into() }];
+        let unfetchable = View { tab: "t".into(), at: ViewAt { fetch: vec!["+refs/nope:refs/nope".into()], have, ..at(Some("pr")) } };
+        engine.refresh_view(unfetchable).unwrap();
+        assert!(engine.take_ui_commands().is_empty());
 
         engine.view(View { tab: "t".into(), at: ViewAt::default() }, None).unwrap();
         assert_eq!(shown(&engine)[0].0, (repo.path(), "origin/main".into()));

@@ -74,17 +74,25 @@ end
 
 -- The kitchen.view spec that shows PR `n` (gh's `info`) in tab `tab`: its
 -- head detached in <repo>-kitchen-pr-<n>, diffed against its base (for a
--- merged PR, the base just before the merge; `dflt` if gh names none).
+-- merged PR, the base just before the merge; `dflt` if gh names none). With
+-- the commits GitHub reports (`headRefOid`, `baseRefOid`) the fetch is
+-- skipped when they are already here.
 function M.view(tab, n, info, dflt)
   local rev = "refs/kitchen/pr/" .. n
   local spec = { tab = tab, rev = rev, name = "kitchen-pr-" .. n, fetch = { "+refs/pull/" .. n .. "/head:" .. rev } }
+  local base_have
   if info.state == "MERGED" and info.mergeCommit and info.mergeCommit.oid then
     table.insert(spec.fetch, info.mergeCommit.oid)
     spec.base = info.mergeCommit.oid .. "^1"
+    base_have = { rev = info.mergeCommit.oid, commit = info.mergeCommit.oid }
   else
     local b = info.baseRefName or dflt
     table.insert(spec.fetch, "+refs/heads/" .. b .. ":refs/remotes/origin/" .. b)
     spec.base = "origin/" .. b
+    base_have = info.baseRefName and info.baseRefOid and { rev = "refs/remotes/origin/" .. b, commit = info.baseRefOid }
+  end
+  if info.headRefOid and base_have then
+    spec.have = { { rev = rev, commit = info.headRefOid }, base_have }
   end
   return spec
 end
@@ -98,7 +106,7 @@ local function show(ws, tab, slug, n)
   if not M.contains(viewed[tab], n) then
     table.insert(viewed[tab], n)
   end
-  gh({ "pr", "view", tostring(n), "-R", slug, "--json", "title,baseRefName,state,mergeCommit" }, function(res)
+  gh({ "pr", "view", tostring(n), "-R", slug, "--json", "title,baseRefName,baseRefOid,headRefOid,state,mergeCommit" }, function(res)
     local ok, info = pcall(kitchen.json.decode, res.code == 0 and res.stdout or "")
     if not (ok and type(info) == "table") then
       return kitchen.notify("couldn't read " .. slug .. "#" .. n .. ": " .. why(res), "error")
@@ -160,7 +168,7 @@ function M.list(lines, slug)
   return out
 end
 
-local FIELDS = "number title state headRefName baseRefName additions deletions mergeCommit { oid }"
+local FIELDS = "number title state headRefName headRefOid baseRefName baseRefOid additions deletions mergeCommit { oid }"
 
 -- One GraphQL query for PRs `ns` of `slug`, each aliased p<N>.
 function M.query(slug, ns)

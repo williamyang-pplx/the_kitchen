@@ -244,6 +244,10 @@ kitchen.on("open", function(ev)   -- ev = the command ctx of the tab, plus `text
     name = "kitchen-pr-12",
     fetch = { "+refs/pull/12/head:refs/kitchen/pr/12" },  -- fetched from origin first
     base = "origin/main",        -- the viewer diffs against merge-base(HEAD, this)
+    have = {                     -- optional: skip the fetch when these revs already name these commits
+      { rev = "refs/kitchen/pr/12", commit = "<headRefOid>" },
+      { rev = "refs/remotes/origin/main", commit = "<baseRefOid>" },
+    },
   }
 end)
 kitchen.view { tab = ctx.tab }   -- back to the tab's own worktree
@@ -253,7 +257,11 @@ A link (a URL or `owner/repo#N`) typed into ⌘⇧P goes to every plugin's
 `open` handler; the one that recognises it calls `kitchen.view` (the rest
 return). Fetch and checkout run in one round trip on the workspace's host (a
 new worktree takes over a spare); the tab's viewer then shows that worktree,
-with `ctx.viewer.worktree` set to it. See `plugins/github/init.lua`.
+with `ctx.viewer.worktree` set to it. With `have` (the commits GitHub
+reports for the PR's head and base), the fetch is skipped when they are
+already there, so going back to a PR that hasn't moved costs no round trip
+to GitHub. Kitchens that don't know `have` ignore it and always fetch. See
+`plugins/github/init.lua`.
 
 ```lua
 kitchen.on("views", function(ev)   -- ⌘⇧S: the tab's command ctx, plus ev.prs (the lines

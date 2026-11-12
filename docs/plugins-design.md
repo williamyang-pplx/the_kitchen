@@ -241,3 +241,12 @@ about LSP:
   take the screen back. A cached row shows at once; its checkout is then
   refreshed, and its viewers are rebuilt (same file and line) only if HEAD
   moved.
+* Speed (2026-11-12). On a devbox's agi (a `blob:none` partial clone) every
+  git command was slow because every on-demand download leaves a pack, and
+  nothing merges them: 55k packs, an object lookup 395 ms, the viewer's diff
+  listing 896 ms. `Repo::index_packs` writes a multi-pack index (lookup
+  89 ms, listing 155 ms) at workspace setup, and the spare warmer rewrites it
+  once 50 packs are newer than it; it never repacks, so promisor packs stay
+  as they are. And a view's `have` skips its fetch (4 s) when GitHub's head
+  and base commits are already here. Git already fetches a diff's or a
+  checkout's missing contents in one batch, so the kitchen doesn't.
