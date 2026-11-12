@@ -670,10 +670,12 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
     let c = cx.clone();
     k.set(
         "open",
-        lua.create_function(move |_, (path, line): (String, Option<usize>)| {
+        lua.create_function(move |_, (path, line, opts): (String, Option<usize>, Option<Table>)| {
+            // opts.diff: open in diff (true) or plain (false) mode; nil keeps the viewer's.
+            let diff = opts.map(|o| o.get::<Option<bool>>("diff")).transpose()?.flatten();
             if let Some(e) = c.host.engine() {
                 if let Some(tab_id) = e.selected_workspace().and_then(|w| w.selected().map(|t| t.row.id.clone())) {
-                    e.push_ui(UiCommand::OpenViewer { tab_id, path: Some(path), line, diff: None });
+                    e.push_ui(UiCommand::OpenViewer { tab_id, path: Some(path), line, diff });
                     e.ctx.request_repaint();
                 }
             }

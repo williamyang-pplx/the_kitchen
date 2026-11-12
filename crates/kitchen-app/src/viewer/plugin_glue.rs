@@ -371,6 +371,8 @@ impl Viewer {
             "word": word,
             "sel": sel,
             "dir": self.dir,
+            // Diff mode (⌘D) rather than the plain file.
+            "diff": self.diff,
             "version": self.current.as_ref().and_then(|p| self.files.get(p)).map(|f| f.version.clone()),
         })
     }

@@ -101,8 +101,8 @@ kitchen.keymap("viewer", "<leader>xy", target)   -- \ then 1–3 keys, viewer no
 ```
 
 `target` is a command name or a function. `ctx = {workspace, tab, host,
-worktree, viewer = {path, file, line, col, word, sel = {from, to}, dir,
-version}}`: `file` is `{host, worktree, path, abs}` like `ev.file`, `col` is
+worktree, viewer = {path, file, line, col, word, sel = {from, to}, dir, diff,
+version}}` (`diff`: the viewer is in diff mode): `file` is `{host, worktree, path, abs}` like `ev.file`, `col` is
 the cursor's 1-based character of the raw line, `word` the identifier under
 it.
 Chords need cmd, alt or ctrl; built-in shortcuts can't be taken (the call
@@ -399,8 +399,8 @@ on the `dashboard` event. See `plugins/dashboard`.
 
 ### Misc
 
-`kitchen.notify(msg, "info"|"warn"|"error")` (toast), `kitchen.open(path, line)`
-(viewer), `kitchen.log(...)`/`print(...)`, `kitchen.config`, `kitchen.name`,
+`kitchen.notify(msg, "info"|"warn"|"error")` (toast), `kitchen.open(path, line,
+{diff = bool})` (viewer; `diff` picks diff or plain mode, nil keeps the viewer's), `kitchen.log(...)`/`print(...)`, `kitchen.config`, `kitchen.name`,
 `kitchen.json.encode/decode` (`kitchen.json.null` encodes as `null`),
 `require()` from the plugin's `lua/` folder.
 

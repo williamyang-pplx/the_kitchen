@@ -948,7 +948,7 @@ mod tests {
     fn github_plugin_views() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
-        lua.load("kitchen = { on = function() end, command = function() end, config = {}, json = {} }").exec().unwrap();
+        lua.load("kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {} }").exec().unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let parse: mlua::Function = m.get("parse").unwrap();
@@ -1017,7 +1017,7 @@ mod tests {
     fn github_plugin_menu() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
-        lua.load("kitchen = { on = function() end, command = function() end, config = {}, json = {} }").exec().unwrap();
+        lua.load("kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {} }").exec().unwrap();
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
@@ -1050,6 +1050,30 @@ mod tests {
         assert_eq!((e[0]["view"]["name"].as_str(), e[0]["view"]["base"].as_str(), e[0]["view"].get("tab")), (Some("kitchen-pr-1"), Some("origin/main"), None));
         assert_eq!(e[5]["view"]["name"], "kitchen-pr-9");
         assert_eq!(e[0]["view"]["have"][0], serde_json::json!({ "rev": "refs/kitchen/pr/1", "commit": "h1" }), "rows skip the fetch when nothing moved");
+    }
+
+    /// github ⌘⇧D: a PR's description as the page the viewer renders, its
+    /// HTML (which the renderer would print) turned into Markdown.
+    #[test]
+    fn github_plugin_description() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        lua.load("kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {} }").exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
+        let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
+        let md: mlua::Function = m.get("github_markdown").unwrap();
+        let body = "Fixes it.\r\n<!-- template: say why -->\r\n\r\n\r\n\r\n<details><summary> Logs </summary>\n\n```\nok\n```\n</details>\nline<br>next\n![shot](https://x/y.png) <img width=\"10\" src=\"https://x/z.png\">";
+        let got: String = md.call(body).unwrap();
+        assert_eq!(got, "Fixes it.\n\n**▸ Logs**\n\n```\nok\n```\n\nline  \nnext\n[image: shot](https://x/y.png) [image](https://x/z.png)");
+        let info = lua
+            .to_value(&serde_json::json!({ "number": 12, "title": "Add retries", "author": { "login": "al" }, "state": "OPEN", "isDraft": true,
+                "baseRefName": "main", "headRefName": "al/retry", "additions": 40, "deletions": 3, "url": "https://github.com/o/r/pull/12", "body": "" }))
+            .unwrap();
+        let page: String = m.get::<mlua::Function>("description").unwrap().call(info).unwrap();
+        assert_eq!(
+            page,
+            "# Add retries\n\n**#12** · @al · draft · `main` ← `al/retry` · +40 −3\n\n[https://github.com/o/r/pull/12](https://github.com/o/r/pull/12)\n\n---\n\n_No description provided._\n"
+        );
     }
 
     fn prune_module(lua: &mlua::Lua) -> mlua::Table {

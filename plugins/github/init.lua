@@ -5,7 +5,8 @@
 -- reply, on a line that has one) to the PR. Each PR viewed gets a ⌘⇧P entry
 -- (github.pr_<N>) to show it again; github.own_changes shows the tab's own
 -- worktree again. ⌘⇧S lists the PRs in the tab's $KITCHEN_PRS_FILE, one
--- section per stack, then the PRs opened in the tab with ⌘⇧P.
+-- section per stack, then the PRs opened in the tab with ⌘⇧P. ⌘⇧D shows the
+-- shown PR's description, rendered as on GitHub, and goes back.
 
 local M = {}
 
@@ -507,5 +508,126 @@ end, { desc = "re-read the shown PR's review comments from GitHub" })
 kitchen.command("own_changes", function(ctx)
   kitchen.view({ tab = ctx.tab })
 end, { desc = "show this tab's own worktree in its viewer again" })
+
+-- The PR description (⌘⇧D) ------------------------------------------------
+
+-- Where the viewer was before ⌘⇧D showed a description, by tab: { path, line, dir }.
+local before = {}
+
+-- The description file of PR `n` in a worktree (`.kitchen/` is git-excluded).
+local function description_path(n)
+  return ".kitchen/pr-" .. n .. ".md"
+end
+
+-- `body` (GitHub-flavored Markdown) for the viewer's renderer, which prints
+-- HTML as text: drop HTML comments (PR templates' hints, hidden on GitHub),
+-- open <details> with its summary as a bold line, <br> as line breaks, and
+-- images (which it can't load) as links.
+function M.github_markdown(body)
+  local s = (body or ""):gsub("\r\n", "\n")
+  s = s:gsub("<!%-%-.-%-%->", "")
+  s = s:gsub("<summary[^>]*>(.-)</summary>", function(text)
+    return "\n**▸ " .. (text:gsub("^%s+", ""):gsub("%s+$", "")) .. "**\n"
+  end)
+  s = s:gsub("</?details[^>]*>", "")
+  s = s:gsub("<br%s*/?>", "  \n")
+  s = s:gsub("<img[^>]-src=\"([^\"]+)\"[^>]*>", "[image](%1)")
+  s = s:gsub("!%[([^%]]*)%]%(([^%)]+)%)", function(alt, src)
+    return "[image" .. (alt ~= "" and ": " .. alt or "") .. "](" .. src .. ")"
+  end)
+  return (s:gsub("\n\n\n+", "\n\n"))
+end
+
+-- The description page for PR `info` (gh's JSON): title, a line of facts,
+-- then the body.
+function M.description(info)
+  local state = info.isDraft and "draft" or (info.state or ""):lower()
+  local facts = {
+    "**#" .. info.number .. "**",
+    info.author and info.author.login and ("@" .. info.author.login) or nil,
+    state ~= "" and state or nil,
+    info.baseRefName and info.headRefName and ("`" .. info.baseRefName .. "` ← `" .. info.headRefName .. "`") or nil,
+    info.additions and ("+" .. info.additions .. " −" .. (info.deletions or 0)) or nil,
+  }
+  local line = {}
+  for i = 1, 5 do
+    if facts[i] then
+      table.insert(line, facts[i])
+    end
+  end
+  local body = M.github_markdown(info.body)
+  if not body:find("%S") then
+    body = "_No description provided._"
+  end
+  local url = info.url and ("\n\n[" .. info.url .. "](" .. info.url .. ")") or ""
+  return "# " .. (info.title or ("PR #" .. info.number)) .. "\n\n" .. table.concat(line, " · ") .. url .. "\n\n---\n\n" .. body .. "\n"
+end
+
+-- Write PR `ref`'s description into `worktree` on `host` and show it rendered.
+local function show_description(ctx, slug, ref)
+  local fields = "number,title,body,author,state,isDraft,baseRefName,headRefName,additions,deletions,url"
+  gh({ "pr", "view", tostring(ref), "-R", slug, "--json", fields }, function(res)
+    local ok, info = pcall(kitchen.json.decode, res.code == 0 and res.stdout or "")
+    if not (ok and type(info) == "table" and info.number) then
+      return kitchen.notify("couldn't read the PR's description: " .. why(res), "warn")
+    end
+    local rel = description_path(info.number)
+    local abs = ctx.viewer.worktree .. "/" .. rel
+    local sh = "mkdir -p " .. q(ctx.viewer.worktree .. "/.kitchen") .. " && cat > " .. q(abs)
+    kitchen.run({ sh = sh, host = ctx.host, stdin = M.description(info), timeout = 15 }, function(w)
+      if w.code ~= 0 then
+        return kitchen.notify("couldn't write the description: " .. why(w), "error")
+      end
+      before[ctx.tab] = { path = ctx.viewer.path, line = ctx.viewer.line, dir = ctx.viewer.dir, diff = ctx.viewer.diff }
+      -- Plain, not diffed: the file is in no commit, so a diff shows it all as added.
+      kitchen.open(abs, nil, { diff = false })
+      kitchen.render.show(ctx.tab, true)
+    end)
+  end)
+end
+
+-- ⌘⇧D: the shown PR's description, rendered; again, back to where the
+-- viewer was. The PR is the one checked out (kitchen-pr-<N>), else the one
+-- for the branch checked out in the tab's worktree.
+kitchen.command("description", function(ctx)
+  local v = ctx.viewer
+  if not v then
+    return
+  end
+  if v.path and v.path:match("^%.kitchen/pr%-%d+%.md$") then
+    local b = before[ctx.tab] or {}
+    before[ctx.tab] = nil
+    kitchen.render.show(ctx.tab, false)
+    local opts = { diff = b.diff }
+    if b.path then
+      kitchen.open(v.worktree .. "/" .. b.path, b.line, opts)
+    else
+      kitchen.open(v.worktree .. "/" .. ((b.dir or "") ~= "" and b.dir .. "/" or ""), nil, opts)
+    end
+    return
+  end
+  local pr = pr_of({ host = ctx.host, worktree = v.worktree })
+  if pr then
+    return show_description(ctx, pr.slug, pr.n)
+  end
+  local slug
+  for _, w in ipairs(kitchen.workspaces()) do
+    if w.id == ctx.workspace then
+      slug = w.github_slug
+    end
+  end
+  if not slug then
+    return kitchen.notify("this workspace isn't a GitHub repo", "warn")
+  end
+  kitchen.run({ cmd = { "git", "symbolic-ref", "--short", "-q", "HEAD" }, host = ctx.host, cwd = v.worktree, timeout = 15 }, function(r)
+    local branch = r.code == 0 and r.stdout:match("%S+")
+    if not branch then
+      return kitchen.notify("the viewer isn't showing a PR or a branch", "warn")
+    end
+    show_description(ctx, slug, branch)
+  end)
+end, { desc = "show the PR's description rendered, as on GitHub (again: back)" })
+
+kitchen.keymap("cmd+shift+d", "github.description", { when = "viewer" })
 
 return M
