@@ -946,6 +946,8 @@ impl KitchenApp {
             heights[c] += rows.len() + 2;
         }
         const WIDTH: f32 = 960.0;
+        // The keys' column; a longer key list wraps inside it.
+        const KEYS_W: f32 = 72.0;
         let area = egui::Area::new(egui::Id::new("shortcuts")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0)).show(ctx, |ui| {
             widgets::overlay_frame().inner_margin(egui::Margin::same(theme::SPACE_XL as i8)).show(ui, |ui| {
                 ui.set_width(WIDTH);
@@ -966,13 +968,23 @@ impl KitchenApp {
                                 let (title, rows) = &groups[i];
                                 col.label(widgets::section_label(title, theme::SUBTLE));
                                 col.add_space(theme::SPACE_XS);
-                                egui::Grid::new(("shortcuts", title)).num_columns(2).spacing([theme::SPACE_M, 4.0]).min_col_width(72.0).show(col, |ui| {
-                                    for (keys, what) in rows {
-                                        ui.label(RichText::new(keys).font(theme::ui_font_semibold(theme::TEXT_SMALL)).color(theme::TEXT));
-                                        ui.label(RichText::new(what).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::MUTED));
-                                        ui.end_row();
-                                    }
-                                });
+                                // Rows, not a Grid: a Grid cell has no width, so a long
+                                // description would run into the next column instead of wrapping.
+                                let what_w = (col.available_width() - KEYS_W - theme::SPACE_M).max(0.0);
+                                for (keys, what) in rows {
+                                    col.horizontal_top(|ui| {
+                                        ui.spacing_mut().item_spacing.x = theme::SPACE_M;
+                                        let cell = |ui: &mut Ui, w: f32, text: RichText| {
+                                            ui.allocate_ui_with_layout(egui::vec2(w, 0.0), Layout::top_down(Align::Min), |ui| {
+                                                ui.set_width(w);
+                                                ui.add(egui::Label::new(text).wrap());
+                                            });
+                                        };
+                                        cell(ui, KEYS_W, RichText::new(keys).font(theme::ui_font_semibold(theme::TEXT_SMALL)).color(theme::TEXT));
+                                        cell(ui, what_w, RichText::new(what).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::MUTED));
+                                    });
+                                    col.add_space(4.0);
+                                }
                                 col.add_space(theme::SPACE_L);
                             }
                         }
