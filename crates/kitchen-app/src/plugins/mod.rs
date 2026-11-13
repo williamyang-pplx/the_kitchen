@@ -1084,6 +1084,20 @@ mod tests {
         assert_eq!(e[2]["view"]["base"], "origin/main");
         assert_eq!(e[5]["view"]["name"], "kitchen-pr-9");
         assert_eq!(e[0]["view"]["have"][0], serde_json::json!({ "rev": "refs/kitchen/pr/1", "commit": "h1" }), "rows skip the fetch when nothing moved");
+
+        // The live row's worktree maps to its PR (⌘M posts there) until it leaves the branch.
+        lua.load("kitchen.comments = { clear = function() end }").exec().unwrap();
+        let remember: mlua::Function = m.get("remember_live").unwrap();
+        let pr_of: mlua::Function = m.get("pr_of").unwrap();
+        let tab = |branch: &str| val(serde_json::json!({ "host": "box", "worktree": "/r/air-x", "branch": branch }));
+        let listed = || val(serde_json::json!([pr(1, "main", "a", "MERGED"), pr(2, "a", "b", "OPEN")]));
+        let at = || val(serde_json::json!({ "host": "box", "worktree": "/r/air-x" }));
+        remember.call::<()>((tab("b"), "o/r", listed())).unwrap();
+        let got = to_json(pr_of.call(at()).unwrap());
+        assert_eq!((got["slug"].as_str(), got["n"].as_u64(), got["branch"].as_str()), (Some("o/r"), Some(2), Some("b")));
+        assert!(to_json(pr_of.call(val(serde_json::json!({ "host": "other", "worktree": "/r/air-x" }))).unwrap()).is_null(), "another host's worktree");
+        remember.call::<()>((tab("a"), "o/r", listed())).unwrap();
+        assert!(to_json(pr_of.call(at()).unwrap()).is_null(), "#1 is merged: nothing live, the mapping goes");
     }
 
     /// github ⌘⇧D: a PR's description as the page the viewer renders, its

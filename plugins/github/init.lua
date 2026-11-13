@@ -18,8 +18,9 @@ local JQ = ".[] | {id, in_reply_to_id, path, line, original_line, start_line, si
   .. " user: .user.login, body, created_at} | with_entries(select(.value != null)) | @json"
 
 -- The PRs whose worktrees the viewer has shown, by "<host>:<worktree path>"
--- (a repo can be a workspace both here and on a devbox).
-local prs = {} -- key → { slug, n, threads, at, files = {path → file}, drafts = {path → items} }
+-- (a repo can be a workspace both here and on a devbox). A tab's own
+-- worktree is in it while ⌘⇧S last found it live, with the PR's `branch`.
+local prs = {} -- key → { slug, n, branch, threads, at, files = {path → file}, drafts = {path → items} }
 
 -- PRs opened with ⌘⇧P, by tab id: { [tab] = { n, … } } (in memory; a reload forgets them).
 local viewed = {}
@@ -59,8 +60,9 @@ end
 
 -- The PR whose view `f` ({host, worktree}: a viewer file or ctx.viewer) is
 -- in: its worktree is <repo>-kitchen-pr-<N> beside a GitHub workspace's repo
--- on the same host. Rebuilt from the name, so it survives a plugin reload.
-local function pr_of(f)
+-- on the same host (rebuilt from the name, so it survives a plugin reload),
+-- or a tab's worktree ⌘⇧S found live (forgotten on a reload until ⌘⇧S).
+function M.pr_of(f)
   local key = f.host .. ":" .. f.worktree
   if prs[key] then
     return prs[key]
@@ -188,10 +190,14 @@ end
 -- (open, draft, merged, closed: the menu draws GitHub's icon for it) and its
 -- page (for ⌘⇧O). The
 -- open PR whose head is `branch` (checked out in the tab's worktree) is live:
--- that worktree against its parent; every other PR is M.view's kitchen-pr-<N>
--- checkout, so its review comments and ⌘M work there.
+-- that worktree against its parent (remember_live maps it to the PR, for its
+-- review comments and ⌘M); every other PR is M.view's kitchen-pr-<N> checkout.
+function M.is_live(p, branch)
+  return p.state == "OPEN" and p.headRefName == branch
+end
+
 local function row(tab, p, section, place, branch, dflt)
-  local live = p.state == "OPEN" and p.headRefName == branch
+  local live = M.is_live(p, branch)
   local detail = { p.baseRefName .. " ← " .. p.headRefName, ("+%d −%d"):format(p.additions or 0, p.deletions or 0) }
   if place then
     table.insert(detail, 1, place)
@@ -274,6 +280,31 @@ function M.entries(tab, listed, reviewing, branch, dflt)
   return out
 end
 
+-- Map the tab's worktree (`ev`, the views event) to its live PR among
+-- `listed`, so ⌘M there posts to it and its comments show; drop a mapping
+-- the worktree has left.
+function M.remember_live(ev, slug, listed)
+  if not (ev.host and ev.worktree) then
+    return
+  end
+  local key = ev.host .. ":" .. ev.worktree
+  local n
+  for _, p in ipairs(listed) do
+    if M.is_live(p, ev.branch) then
+      n = p.number
+      break
+    end
+  end
+  local old = prs[key]
+  if old and old.n == n and old.slug == slug then
+    return
+  end
+  for _, file in pairs(old and old.files or {}) do
+    kitchen.comments.clear(file)
+  end
+  prs[key] = n and { slug = slug, n = n, branch = ev.branch, files = {}, drafts = {} } or nil
+end
+
 -- ⌘⇧S: the tab's PR list, plus its ⌘⇧P PRs, into kitchen.views. Every path
 -- ends in kitchen.views, so the menu stops saying "loading PRs…".
 local function menu(ev)
@@ -324,7 +355,9 @@ local function menu(ev)
       end
       return out
     end
-    done(M.entries(ev.tab, nodes(ns), nodes(rv), ev.branch, ws.default_branch or "main"))
+    local listed = nodes(ns)
+    M.remember_live(ev, slug, listed)
+    done(M.entries(ev.tab, listed, nodes(rv), ev.branch, ws.default_branch or "main"))
   end)
 end
 kitchen.on("views", menu)
@@ -450,7 +483,7 @@ local function fetch(pr)
 end
 
 kitchen.on("file_opened", function(ev)
-  local pr = pr_of(ev.file)
+  local pr = M.pr_of(ev.file)
   if not pr then
     return
   end
@@ -462,7 +495,7 @@ kitchen.on("file_opened", function(ev)
 end)
 
 kitchen.on("comment", function(ev)
-  local pr = pr_of(ev.file)
+  local pr = M.pr_of(ev.file)
   if not pr then
     kitchen.notify("comments go to GitHub PRs: paste a PR link into ⌘⇧P to view one", "warn")
     return
@@ -493,10 +526,15 @@ kitchen.on("comment", function(ev)
     return
   end
   -- Lines are relative to the commit the tab shows, which may be behind the PR.
-  kitchen.run({ cmd = { "git", "rev-parse", "HEAD" }, host = ev.file.host, cwd = ev.file.worktree, timeout = 15 }, function(head)
-    local sha = head.code == 0 and head.stdout:match("%x+")
+  kitchen.run({ cmd = { "git", "rev-parse", "HEAD", "--abbrev-ref", "HEAD" }, host = ev.file.host, cwd = ev.file.worktree, timeout = 15 }, function(head)
+    local sha, branch = (head.code == 0 and head.stdout or ""):match("^(%x+)%s+(%S+)")
     if not sha or not ev.line then
       done({ code = 1, stderr = "can't tell the tab's commit" })
+      return
+    end
+    -- A tab's own worktree may have switched branch since ⌘⇧S saw it live.
+    if pr.branch and branch ~= pr.branch then
+      done({ code = 1, stderr = "the worktree is on " .. branch .. " now, not #" .. pr.n .. "'s " .. pr.branch .. "; reopen ⌘⇧S" })
       return
     end
     gh(M.post_args(pr.slug, pr.n, ev, sha), function(res)
@@ -511,7 +549,7 @@ kitchen.on("comment", function(ev)
 end)
 
 kitchen.command("refresh_comments", function(ctx)
-  local pr = ctx.viewer and pr_of({ host = ctx.host, worktree = ctx.viewer.worktree })
+  local pr = ctx.viewer and M.pr_of({ host = ctx.host, worktree = ctx.viewer.worktree })
   if pr then
     fetch(pr)
   else
@@ -586,7 +624,7 @@ end
 -- shows its kitchen-pr-<N> checkout, else the branch checked out in the
 -- viewer's worktree (gh finds its PR).
 local function shown_pr(ctx, cb)
-  local pr = pr_of({ host = ctx.host, worktree = ctx.viewer.worktree })
+  local pr = M.pr_of({ host = ctx.host, worktree = ctx.viewer.worktree })
   if pr then
     return cb(pr.slug, pr.n)
   end
