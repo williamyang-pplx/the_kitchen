@@ -86,6 +86,23 @@ stack's PRs bottom first. Add a PR right after `gh pr create`, and drop it if
 it is closed without merging. William's ⌘⇧S menu in the viewer shows exactly
 these PRs, one section per stack.
 
+## Logins on a devbox
+
+The kitchen keeps William's CLI logins alive on every devbox with an open
+workspace. Every 5 minutes it refreshes them on the mac and copies the tokens
+to the box: Shipyard (`bin/shipyard`), Buildkite (`bin/bk`) and the Slack MCP
+server. A token close to expiry is replaced before it runs out, and a newly
+opened workspace gets the tokens within 10 seconds. So:
+
+- Never ask William to log in because a token will expire soon. An expiry
+  you saw earlier is stale; run `bin/shipyard auth status` or
+  `bin/bk auth status` right before you need it.
+- If a command fails on auth, wait up to 5 minutes, check the status again,
+  and retry. Ask William to log in only if it still fails, and say the
+  kitchen's sync didn't deliver.
+- AWS is not synced: the default `devbox-prod` profile needs no login, and
+  the SSO profiles (`sandbox`, `prod`, …) still need `aws sso login`.
+
 ## Plugins and viewer diagnostics
 
 Plugins are Lua in `~/.kitchen/plugins/<name>/` (`plugin.toml` + `init.lua`;
