@@ -937,10 +937,18 @@ impl KitchenApp {
         }
         let commands = self.engine.plugins().map(|p| p.registry()).unwrap_or_default();
         let groups = shortcut_groups(&km, &commands);
-        let half = groups.iter().map(|(_, rows)| rows.len() + 2).sum::<usize>() / 2;
+        // Three columns: each group goes to the shortest one so far.
+        let mut cols: [Vec<usize>; 3] = Default::default();
+        let mut heights = [0usize; 3];
+        for (i, (_, rows)) in groups.iter().enumerate() {
+            let c = (0..3).min_by_key(|c| heights[*c]).unwrap_or(0);
+            cols[c].push(i);
+            heights[c] += rows.len() + 2;
+        }
+        const WIDTH: f32 = 960.0;
         let area = egui::Area::new(egui::Id::new("shortcuts")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0)).show(ctx, |ui| {
             widgets::overlay_frame().inner_margin(egui::Margin::same(theme::SPACE_XL as i8)).show(ui, |ui| {
-                ui.set_width(760.0);
+                ui.set_width(WIDTH);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Keyboard shortcuts").font(theme::ui_font_semibold(theme::TEXT_TITLE)).color(theme::TEXT));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -949,23 +957,24 @@ impl KitchenApp {
                 });
                 ui.label(RichText::new(format!("change them in {}", keybindings::path().display())).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
                 ui.add_space(theme::SPACE_L);
-                let max_h = (ctx.content_rect().height() - 180.0).max(200.0);
-                egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
-                    ui.columns(2, |cols| {
-                        let mut used = 0;
-                        for (title, rows) in &groups {
-                            let col = if used < half { &mut cols[0] } else { &mut cols[1] };
-                            used += rows.len() + 2;
-                            col.label(widgets::section_label(title, theme::SUBTLE));
-                            col.add_space(theme::SPACE_XS);
-                            egui::Grid::new(("shortcuts", title)).num_columns(2).spacing([theme::SPACE_M, 5.0]).min_col_width(96.0).show(col, |ui| {
-                                for (keys, what) in rows {
-                                    ui.label(RichText::new(keys).font(theme::ui_font_semibold(theme::TEXT_BODY)).color(theme::TEXT));
-                                    ui.label(RichText::new(what).font(theme::ui_font(theme::TEXT_BODY)).color(theme::MUTED));
-                                    ui.end_row();
-                                }
-                            });
-                            col.add_space(theme::SPACE_L);
+                let max_h = (ctx.content_rect().height() - 200.0).max(200.0);
+                egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, |ui| {
+                    ui.set_width(WIDTH);
+                    ui.columns(3, |uis| {
+                        for (col, ids) in uis.iter_mut().zip(&cols) {
+                            for &i in ids {
+                                let (title, rows) = &groups[i];
+                                col.label(widgets::section_label(title, theme::SUBTLE));
+                                col.add_space(theme::SPACE_XS);
+                                egui::Grid::new(("shortcuts", title)).num_columns(2).spacing([theme::SPACE_M, 4.0]).min_col_width(72.0).show(col, |ui| {
+                                    for (keys, what) in rows {
+                                        ui.label(RichText::new(keys).font(theme::ui_font_semibold(theme::TEXT_SMALL)).color(theme::TEXT));
+                                        ui.label(RichText::new(what).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::MUTED));
+                                        ui.end_row();
+                                    }
+                                });
+                                col.add_space(theme::SPACE_L);
+                            }
                         }
                     });
                 });
