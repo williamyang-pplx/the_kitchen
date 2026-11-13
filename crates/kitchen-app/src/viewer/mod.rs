@@ -29,6 +29,8 @@ use kitchen_core::summaries;
 use kitchen_symbols::Symbol;
 
 use crate::engine::{Engine, MenuRow, Shown, View};
+use crate::keybindings::app::Action;
+use crate::keybindings::{self, Cmd, KeyFocus, ListCmd, Matcher, Place, Step};
 use crate::links::Link;
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::theme;
@@ -38,7 +40,30 @@ use code_view::{CodeView, ViewState};
 use doc::{Doc, DocLine, Unfolded};
 use highlight::Spans;
 use picker::{Picker, PickerResult};
-use vim::{Vim, VimAction};
+use vim::{Vim, VimAction, VimCmd};
+
+/// "{what} ({key})", or `what` when the action has no key.
+fn with_key(what: &str, place: Place, a: Action) -> String {
+    match keybindings::hint(place, a) {
+        k if k.is_empty() => what.to_string(),
+        k => format!("{what} ({k})"),
+    }
+}
+
+/// "{what}  {key}" for a tooltip, or `what`.
+fn spaced(what: &str, place: Place, a: Action) -> String {
+    match keybindings::hint(place, a) {
+        k if k.is_empty() => what.to_string(),
+        k => format!("{what}  {k}"),
+    }
+}
+
+/// "]c / [c": the commands' first keys, or `none` when none has one.
+fn keys_or(cmds: &[(Place, Cmd)], none: &str) -> String {
+    let km = keybindings::current();
+    let keys: Vec<String> = cmds.iter().map(|(p, c)| km.hint(*p, c, 1)).filter(|k| !k.is_empty()).collect();
+    if keys.is_empty() { none.to_string() } else { keys.join(" / ") }
+}
 
 /// Most symbols summarized per model call.
 const MAX_SUMMARY_SYMBOLS: usize = 80;
@@ -156,8 +181,8 @@ pub struct Viewer {
     list_cursor: usize,
     /// The list cursor moved: scroll it into view.
     list_scroll: bool,
-    /// Pending `g` of `gg` in the file list.
-    list_g: bool,
+    /// The file list's key sequence (`gg`).
+    list_keys: Matcher,
     /// The file list shows the repo's folders instead of the changed-files tree.
     list_all: bool,
     /// Where to put the cursor once the open file's diff is built.
@@ -200,8 +225,6 @@ pub struct Viewer {
     changes_at: std::time::Instant,
     changes_pending: bool,
     overlay: Option<plugin_glue::OverlayCache>,
-    /// Keys typed after the `\` leader, and when it was pressed.
-    leader: Option<(String, std::time::Instant)>,
     /// The `gd`/`gr` query in flight (answers for older ones are dropped).
     pending_nav: Option<nav::PendingNav>,
     nav_token: u64,
@@ -227,6 +250,17 @@ pub struct Viewer {
 }
 
 impl Viewer {
+    /// What a key pressed in this viewer lands in.
+    pub fn key_focus(&self) -> KeyFocus {
+        match &self.picker {
+            Some((_, p)) if p.is_menu() => KeyFocus::ViewerMenu,
+            Some(_) => KeyFocus::ViewerPicker,
+            None if self.editor.is_some() || self.vim.search_input.is_some() => KeyFocus::ViewerInput,
+            None if self.list_focus && self.show_files && !self.outline => KeyFocus::FileList,
+            None => KeyFocus::Viewer,
+        }
+    }
+
     /// A viewer of the tab's own worktree (the app goes through `at` and its cache).
     #[cfg(test)]
     pub fn new(engine: &Arc<Engine>, ws: &crate::engine::Workspace, tab: &crate::engine::Tab) -> Self {
@@ -259,7 +293,7 @@ impl Viewer {
             list_focus: false,
             list_cursor: 0,
             list_scroll: false,
-            list_g: false,
+            list_keys: Matcher::default(),
             list_all: false,
             hunk_goto: None,
             diff: false,
@@ -291,7 +325,6 @@ impl Viewer {
             changes_pending: false,
             stat_pending: false,
             overlay: None,
-            leader: None,
             pending_nav: None,
             nav_token: 0,
             goto_raw: false,
@@ -687,7 +720,7 @@ impl Viewer {
 
     fn step_hunk(&mut self, fwd: bool) {
         if !self.diff {
-            self.status = Some(("]c / [c move between changes in diff mode (⌘D)".into(), false));
+            self.status = Some((with_key(&format!("{} move between changes in diff mode", keys_or(&[(Place::Vim, VimCmd::NextHunk.into()), (Place::Vim, VimCmd::PrevHunk.into())], "the hunk keys")), Place::Panel, Action::ToggleDiff), false));
             return;
         }
         let starts = self.doc.hunk_starts();
@@ -758,6 +791,8 @@ impl Viewer {
                     self.close_asks();
                     self.status = None;
                 }
+                VimAction::Plugin(command) => self.run_plugin(&command),
+                VimAction::NoMapping(keys) => self.status = Some((format!("no mapping for {keys}"), false)),
                 VimAction::ScrollBy(_) | VimAction::Center | VimAction::Top | VimAction::Bottom => {}
             }
         }
@@ -934,7 +969,7 @@ impl Viewer {
     fn set_all_folds(&mut self, open: bool) {
         let diff = !self.outline && self.doc_key.as_ref().is_some_and(|k| k.1);
         let Some(path) = self.current.clone().filter(|_| diff) else {
-            self.status = Some(("folds are for diffs (⌘D)".into(), false));
+            self.status = Some((with_key("folds are for diffs", Place::Panel, Action::ToggleDiff), false));
             return;
         };
         if self.editor.is_some() {
@@ -1022,7 +1057,12 @@ impl Viewer {
             PanelCmd::Ask => self.start_ask(),
             // Submit after this frame's typing reaches the editor.
             PanelCmd::Submit if self.editor.is_some() => self.submit_pending = true,
-            PanelCmd::Submit => self.status = Some(("⌘M comments on the cursor line (V: a range)".into(), false)),
+            PanelCmd::Submit => {
+                let comment = keybindings::hint(Place::Panel, Action::Comment);
+                let visual = keybindings::hint(Place::Vim, VimCmd::VisualLine);
+                let range = if visual.is_empty() { String::new() } else { format!(" ({visual}: a range)") };
+                self.status = Some((if comment.is_empty() { "nothing to submit".into() } else { format!("{comment} comments on the cursor line{range}") }, false));
+            }
             PanelCmd::ToggleDiff => {
                 self.diff = !self.diff;
                 self.outline = false;
@@ -1152,7 +1192,7 @@ impl Viewer {
         let path = if self.browsing {
             format!("{}/", self.dir)
         } else {
-            self.current.clone().unwrap_or_else(|| "no file — ⌘P to pick".into())
+            self.current.clone().unwrap_or_else(|| keybindings::labelled("no file", &[(Place::Viewer, Action::FilePicker.into(), "to pick")]))
         };
         header_ui.label(widgets::path_job(&path, 12.5));
         header_ui.add_space(theme::SPACE_XS);
@@ -1172,12 +1212,12 @@ impl Viewer {
         }
         header_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(theme::SPACE_S);
-            if widgets::flat_button(ui, "File list", self.show_files).on_hover_text("Show / hide the file list  ⌘B").clicked_by(egui::PointerButton::Primary) {
+            if widgets::flat_button(ui, "File list", self.show_files).on_hover_text(spaced("Show / hide the file list", Place::Global, Action::ToggleFiles)).clicked_by(egui::PointerButton::Primary) {
                 self.show_files = !self.show_files;
             }
             // Which of the tab's PRs is on screen; a click switches.
             if let Some(label) = self.shown_entry_label() {
-                if widgets::flat_button(ui, &label, false).on_hover_text("Switch PR  ⌘⇧S").clicked_by(egui::PointerButton::Primary) {
+                if widgets::flat_button(ui, &label, false).on_hover_text(spaced("Switch PR", Place::Global, Action::ViewMenu)).clicked_by(egui::PointerButton::Primary) {
                     self.open_view_menu();
                 }
             }
@@ -1260,7 +1300,10 @@ impl Viewer {
             (_, None) if self.browsing => Some(("loading files…".to_string(), true)),
             (_, Some(Err(e))) if self.browsing => Some((format!("cannot list files: {e}"), false)),
             _ if self.browsing => None,
-            (None, _) => Some(("⌘P to open a file".into(), false)),
+            (None, _) => Some((match keybindings::hint(Place::Viewer, Action::FilePicker) {
+                k if k.is_empty() => "open a file from the file list".into(),
+                k => format!("{k} to open a file"),
+            }, false)),
             (Some(p), _) if !self.files.contains_key(p) => Some(match self.load_errors.get(p) {
                 Some(e) => (format!("cannot read {p}: {e}"), false),
                 None => (format!("loading {p}…"), true),
@@ -1288,9 +1331,6 @@ impl Viewer {
         } else {
             let focused = cx.focused && self.picker.is_none() && !self.list_focus;
             self.offer_follow_up(focused);
-            if focused && self.editor.is_none() {
-                self.leader_keys(&mut code_ui);
-            }
             let comments = self.comment_blocks();
             let blocks: Vec<code_view::Block> = comments.into_iter().map(|(b, _)| b).chain(self.ask_blocks()).collect();
             let overlay = self.overlay.as_ref().filter(|o| !self.browsing && !self.outline && self.current.as_deref() == Some(o.path.as_str())).map(|o| &o.overlay);
@@ -1309,8 +1349,12 @@ impl Viewer {
                 overlay,
                 repo: repo.as_deref(),
                 id: egui::Id::new(("viewer", &self.tab_id)),
+                focus: KeyFocus::Viewer,
             }
             .show(&mut code_ui);
+            for command in std::mem::take(&mut out.plugin_commands) {
+                self.run_plugin(&command);
+            }
             if out.clicked {
                 cx.clicked = true;
                 self.list_focus = false;
@@ -1346,8 +1390,6 @@ impl Viewer {
                 ui.label(RichText::new(s).size(11.5).color(if *err { theme::RED } else { theme::YELLOW }));
             } else if self.vim.anchor.is_some() {
                 ui.label(RichText::new("-- VISUAL --").size(11.5).color(theme::PURPLE));
-            } else if let Some((keys, _)) = &self.leader {
-                ui.label(RichText::new(format!("\\{keys}")).monospace().size(12.0).color(theme::PURPLE));
             } else if let Some((text, color)) = self.cursor_diagnostic() {
                 ui.label(RichText::new(text).size(11.5).color(color));
             }
@@ -1422,8 +1464,36 @@ impl Viewer {
         }
     }
 
-    /// vim-style keys for the file list: j/k, gg/G, ctrl-d/u, Enter/l/o
-    /// open, h/- up a folder.
+    /// This frame's `[file_list]` commands, through the list's matcher. A
+    /// key that breaks a sequence (`g` then `j`) still counts.
+    fn list_cmds(&mut self, ui: &Ui) -> Vec<ListCmd> {
+        let km = keybindings::current();
+        let (table, now) = (km.sequences(KeyFocus::FileList), std::time::Instant::now());
+        let mut steps: Vec<Step> = self.list_keys.tick(now, km.timeout).into_iter().collect();
+        for p in ui.input(keybindings::presses) {
+            steps.extend(self.list_keys.feed(p, table, now, km.timeout));
+        }
+        let mut out = Vec::new();
+        for step in steps {
+            match step {
+                Step::Fire(Cmd::List(c)) => out.push(c),
+                Step::Unbound(keys) if keys.len() > 1 => {
+                    let last = keys[keys.len() - 1];
+                    out.extend(self.list_keys.feed(last, table, now, km.timeout).into_iter().filter_map(|s| match s {
+                        Step::Fire(Cmd::List(c)) => Some(c),
+                        _ => None,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        if self.list_keys.is_pending() {
+            ui.ctx().request_repaint_after(km.timeout);
+        }
+        out
+    }
+
+    /// `[file_list]` keys for the folder list: move, open, up a folder.
     fn list_keys(&mut self, ui: &mut Ui, entries: &[Entry]) {
         let rows = self.changed.len() + entries.len();
         if rows == 0 {
@@ -1431,29 +1501,24 @@ impl Viewer {
         }
         let mut activate = false;
         let mut up = false;
-        let keys = code_view::collect_keys(ui);
-        for k in keys {
-            use vim::VimKey as K;
-            let g = std::mem::take(&mut self.list_g);
+        for c in self.list_cmds(ui) {
             let before = self.list_cursor;
-            match k {
-                K::Char('j') | K::Down => self.list_cursor = (self.list_cursor + 1).min(rows - 1),
-                K::Char('k') | K::Up => self.list_cursor = self.list_cursor.saturating_sub(1),
-                K::Ctrl('d') | K::PageDown => self.list_cursor = (self.list_cursor + 15).min(rows - 1),
-                K::Ctrl('u') | K::PageUp => self.list_cursor = self.list_cursor.saturating_sub(15),
-                K::Char('G') | K::End => self.list_cursor = rows - 1,
-                K::Char('g') if g => self.list_cursor = 0,
-                K::Char('g') => self.list_g = true,
-                K::Home => self.list_cursor = 0,
-                K::Enter | K::Char('l') | K::Char('o') | K::Right => activate = true,
-                K::Char('h') | K::Char('-') | K::Left | K::Backspace => up = true,
-                K::Char('a') if !self.changed.is_empty() => {
+            match c {
+                ListCmd::Down => self.list_cursor = (self.list_cursor + 1).min(rows - 1),
+                ListCmd::Up => self.list_cursor = self.list_cursor.saturating_sub(1),
+                ListCmd::PageDown => self.list_cursor = (self.list_cursor + 15).min(rows - 1),
+                ListCmd::PageUp => self.list_cursor = self.list_cursor.saturating_sub(15),
+                ListCmd::Bottom => self.list_cursor = rows - 1,
+                ListCmd::Top => self.list_cursor = 0,
+                ListCmd::Open => activate = true,
+                ListCmd::Parent => up = true,
+                ListCmd::Switch if !self.changed.is_empty() => {
                     self.list_all = false;
                     self.list_scroll = true;
                     return;
                 }
-                K::Esc => self.list_focus = false,
-                _ => {}
+                ListCmd::Switch => {}
+                ListCmd::Leave => self.list_focus = false,
             }
             if self.list_cursor != before {
                 self.list_scroll = true;
@@ -1473,38 +1538,31 @@ impl Viewer {
         }
     }
 
-    /// Keys for the changed-files tree: j/k (gg/G, ctrl-d/u) open the
-    /// next / previous changed file right away; Enter/l/Esc go to the code,
-    /// `a` switches to the folder list.
+    /// `[file_list]` keys for the changed-files tree: moving opens the next /
+    /// previous changed file right away; open and leave go to the code,
+    /// switch to the folder list.
     fn tree_keys(&mut self, ui: &mut Ui) {
         let last = self.changed.len().saturating_sub(1);
-        for k in code_view::collect_keys(ui) {
-            use vim::VimKey as K;
-            let g = std::mem::take(&mut self.list_g);
+        for c in self.list_cmds(ui) {
             let at = self.current_changed();
-            let target = match k {
-                K::Char('j') | K::Down => Some(at.map_or(0, |i| (i + 1).min(last))),
-                K::Char('k') | K::Up => Some(at.map_or(0, |i| i.saturating_sub(1))),
-                K::Ctrl('d') | K::PageDown => Some(at.map_or(0, |i| (i + 15).min(last))),
-                K::Ctrl('u') | K::PageUp => Some(at.map_or(0, |i| i.saturating_sub(15))),
-                K::Char('G') | K::End => Some(last),
-                K::Char('g') if g => Some(0),
-                K::Char('g') => {
-                    self.list_g = true;
-                    None
-                }
-                K::Home => Some(0),
-                K::Enter | K::Char('l') | K::Char('o') | K::Right | K::Esc => {
+            let target = match c {
+                ListCmd::Down => Some(at.map_or(0, |i| (i + 1).min(last))),
+                ListCmd::Up => Some(at.map_or(0, |i| i.saturating_sub(1))),
+                ListCmd::PageDown => Some(at.map_or(0, |i| (i + 15).min(last))),
+                ListCmd::PageUp => Some(at.map_or(0, |i| i.saturating_sub(15))),
+                ListCmd::Bottom => Some(last),
+                ListCmd::Top => Some(0),
+                ListCmd::Open | ListCmd::Leave => {
                     self.list_focus = false;
                     None
                 }
-                K::Char('a') => {
+                ListCmd::Parent => None,
+                ListCmd::Switch => {
                     self.list_all = true;
                     self.list_cursor = self.list_home();
                     self.list_scroll = true;
                     return;
                 }
-                _ => None,
             };
             if let Some(t) = target.filter(|t| Some(*t) != at) {
                 self.open_changed(t, false);
@@ -1569,6 +1627,9 @@ impl Viewer {
 
     /// `keys`: the list has the keyboard.
     fn file_list(&mut self, ui: &mut Ui, keys: bool) {
+        if !keys {
+            self.list_keys.reset();
+        }
         let r = ui.max_rect();
         ui.painter().rect_filled(r, egui::CornerRadius::ZERO, theme::PANEL);
         ui.painter().vline(r.right() + 0.5, r.y_range(), egui::Stroke::new(1.0, theme::BORDER));
@@ -1967,6 +2028,75 @@ mod tests {
         assert_eq!(v.current.as_deref(), Some("aster/top.py"));
         v.command(PanelCmd::FocusCode, &h.engine);
         assert!(!v.list_focus);
+    }
+
+    #[test]
+    fn list_keys_follow_the_keymap() {
+        let h = Harness::new(TestRepo::new("mkdir -p aster/a aster/b && echo 1 > aster/a/x.py && echo 3 > aster/top.py"));
+        let km = crate::keybindings::Keymap::with_user("[file_list]\ndown = [\"n\"]\ntop = [\"<Home>\", \"tt\"]\n");
+        crate::keybindings::with_keymap(km, || {
+            let mut v = h.viewer();
+            h.settle(&mut v, &|v| v.files_state.is_some());
+            h.frame(&mut v);
+            v.command(PanelCmd::FocusList, &h.engine);
+            h.frame(&mut v);
+            // Rows: ../ a/ top.py — the cursor starts on a/.
+            assert_eq!(v.list_cursor, 1);
+            h.text(&mut v, "n");
+            assert_eq!(v.list_cursor, 2, "n moves down");
+            h.text(&mut v, "j");
+            assert_eq!(v.list_cursor, 2, "j no longer does");
+            h.text(&mut v, "t");
+            h.text(&mut v, "k");
+            assert_eq!(v.list_cursor, 1, "t then k: the k still moves up");
+            h.text(&mut v, "tt");
+            assert_eq!(v.list_cursor, 0);
+        });
+    }
+
+    /// ⌘⇧L from the file list: the list's chain reaches the viewer's chords.
+    #[test]
+    fn cmd_shift_l_leaves_the_file_list() {
+        let h = Harness::new(TestRepo::new("mkdir -p aster && echo 1 > aster/x.py"));
+        let mut v = h.viewer();
+        h.settle(&mut v, &|v| v.files_state.is_some());
+        v.command(PanelCmd::FocusList, &h.engine);
+        h.frame(&mut v);
+        assert_eq!(v.key_focus(), KeyFocus::FileList);
+        let p = crate::keybindings::Binding::parse("cmd+shift+l", &[]).unwrap().0[0];
+        assert_eq!(crate::keybindings::current().lookup(v.key_focus(), None, &p), Some(&Cmd::App(Action::FocusCode)));
+        v.command(PanelCmd::FocusCode, &h.engine);
+        assert_eq!(v.key_focus(), KeyFocus::Viewer);
+    }
+
+    #[test]
+    fn leader_maps_fire_and_follow_the_leader() {
+        use crate::plugins::{Registry, ViewerMap};
+        let h = Harness::new(TestRepo::new("mkdir -p aster && echo 1 > aster/x.py"));
+        h.engine.set_plugins(crate::plugins::PluginHost::empty(&h.engine));
+        let mut reg = Registry::default();
+        reg.viewer_maps.push(ViewerMap { plugin: "p".into(), keys: "t".into(), command: "p.t".into() });
+        // `,` is vim's repeat_find_back: a leader may not also be a [vim] key.
+        assert!(crate::keybindings::Keymap::load(include_str!("../../assets/keybindings.toml"), Some("leader = \",\"\n")).is_err());
+        let km = crate::keybindings::Keymap::with_user("leader = \",\"\ntimeout_ms = 50\n[vim]\nrepeat_find_back = []\n").with_plugins(&reg);
+        crate::keybindings::with_keymap(km, || {
+            let mut v = h.viewer();
+            h.settle(&mut v, &|v| v.files_state.is_some() && !v.doc.lines.is_empty());
+            h.frame(&mut v);
+            h.text(&mut v, ",t");
+            let status = v.status.clone().map(|s| s.0).unwrap_or_default();
+            assert!(status.contains("p.t"), "the map ran (the empty host has no such command): {status:?}");
+            v.status = None;
+            h.text(&mut v, "\\j");
+            assert_eq!(v.status, None, "\\ is no longer the leader");
+            h.text(&mut v, ",x");
+            assert_eq!(v.status.as_ref().map(|s| s.0.as_str()), Some("no mapping for ,x"));
+            h.text(&mut v, ",");
+            assert!(v.vim.is_pending() && v.vim.pending_display() == ",");
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            h.frame(&mut v);
+            assert!(!v.vim.is_pending(), "a bare leader is dropped after timeout_ms");
+        });
     }
 
     /// A tab with changes opens on the first changed file's diff; the tree

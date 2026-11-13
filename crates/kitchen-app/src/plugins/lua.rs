@@ -17,7 +17,7 @@ use super::dashboard::Section;
 use super::decor::{self, FileKey};
 use super::jobs::{self, JobSpec};
 use super::procs::{self, Proc, ProcSpec, Stream};
-use super::keys::Chord;
+use crate::keybindings::Binding;
 use super::timers::{self, TimerSpec};
 use super::{ChordEntry, CommandEntry, FileEvent, LinkEntry, Location, MAX_TEXT, PROVIDER_KINDS, PluginHost, ProviderEntry, ToPlugin, ViewerMap, When};
 use crate::engine::UiCommand;
@@ -458,8 +458,9 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                     Value::String(s) => s.to_str()?.to_string(),
                     _ => return Err(mlua::Error::runtime("kitchen.keymap(\"viewer\", \"<leader>x\", target)")),
                 };
-                let keys = seq.strip_prefix("<leader>").or_else(|| seq.strip_prefix('\\')).ok_or_else(|| mlua::Error::runtime(format!("viewer maps start with <leader> (\\): {seq:?}")))?;
-                if keys.is_empty() || keys.chars().count() > 3 {
+                let keys = seq.strip_prefix("<leader>").ok_or_else(|| mlua::Error::runtime(format!("viewer maps start with <leader>: {seq:?}")))?;
+                let presses = Binding::parse(keys, &[]).map_err(|e| mlua::Error::runtime(format!("{seq:?}: {e}")))?;
+                if keys.is_empty() || presses.0.len() > 3 {
                     return Err(mlua::Error::runtime("viewer maps are <leader> + 1–3 keys"));
                 }
                 let target = rest.into_iter().next().unwrap_or(Value::Nil);
@@ -467,7 +468,10 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                 c.host.register_viewer_map(&c.name, c.generation, ViewerMap { plugin: c.name.clone(), keys: keys.to_string(), command });
                 return Ok(());
             }
-            let chord = Chord::parse(&a).map_err(mlua::Error::runtime)?;
+            let chord = Binding::parse(&a, &[]).map_err(mlua::Error::runtime)?;
+            if !chord.is_chord() {
+                return Err(mlua::Error::runtime(format!("{a:?} needs cmd, alt or ctrl (plain keys belong to the terminal/viewer)")));
+            }
             let opts = match rest.into_iter().next() {
                 Some(Value::Table(t)) => Some(t),
                 _ => None,

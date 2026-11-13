@@ -18,6 +18,7 @@ use kitchen_core::{ask, plan};
 
 use crate::ask_thread::{self, Thread};
 use crate::engine::{Engine, Tab, Workspace};
+use crate::keybindings::{self, KeyFocus, Place, app::Action};
 use crate::links::Link;
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::theme;
@@ -74,6 +75,11 @@ pub struct PlanView {
 }
 
 impl PlanView {
+    /// What a key pressed in the plan lands in.
+    pub fn key_focus(&self) -> KeyFocus {
+        if self.editor.is_some() || self.vim.search_input.is_some() { KeyFocus::PlanInput } else { KeyFocus::Plan }
+    }
+
     pub fn new(engine: &Arc<Engine>, ws: &Workspace, tab: &Tab) -> Self {
         let (tx, rx) = channel();
         Self {
@@ -218,7 +224,7 @@ impl PlanView {
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
         let what = if end > start { format!("lines {}–{}", start + 1, end + 1) } else { format!("line {}", start + 1) };
         let who = self.engine.find_tab(&self.tab_id).map_or_else(|| self.engine.settings().ask_model, |_| "the planning agent".into());
-        let label = format!("Ask {who} about {what} — Enter asks · Esc cancels");
+        let label = crate::ask_thread::ask_label(&format!("Ask {who} about {what}"));
         self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true, follow_up: false });
     }
 
@@ -290,7 +296,7 @@ impl PlanView {
         if focused && self.editor.is_none() && self.vim.anchor.is_none() && self.asks_on_cursor().contains(&id) {
             self.open_follow_up(id);
         } else {
-            self.status = Some(("answered · ⌘⇧A on its lines follows up · Esc there closes it".into(), false));
+            self.status = Some((crate::ask_thread::answered_note(), false));
         }
     }
 
@@ -309,7 +315,13 @@ impl PlanView {
         let quote = self.doc.lines.get(ed.start).map(|l| l.text.clone()).unwrap_or_default();
         let end = (ed.end > ed.start).then_some(ed.end as i64 + 1);
         match self.engine.add_plan_comment(&self.tab_id, &path, ed.start as i64 + 1, end, &quote, &body) {
-            Ok(id) => self.status = Some((format!("comment #{id} saved · ⌘Enter (no field open) sends open comments to the agent"), false)),
+            Ok(id) => {
+                let send = match keybindings::hint(Place::Panel, Action::Submit) {
+                    k if k.is_empty() => String::new(),
+                    k => format!(" · {k} (no field open) sends open comments to the agent"),
+                };
+                self.status = Some((format!("comment #{id} saved{send}"), false));
+            }
             Err(e) => self.status = Some((format!("{e:#}"), true)),
         }
         self.vim.anchor = None;
@@ -329,7 +341,10 @@ impl PlanView {
                     start,
                     end,
                     text: String::new(),
-                    label: format!("Plan comment on {lines} — stays local until you send (⌘Enter with no field open)"),
+                    label: match keybindings::hint(Place::Panel, Action::Submit) {
+                        k if k.is_empty() => format!("Plan comment on {lines} — stays local until you send"),
+                        k => format!("Plan comment on {lines} — stays local until you send ({k} with no field open)"),
+                    },
                     needs_focus: true,
                     follow_up: false,
                     ask: false,
@@ -341,7 +356,10 @@ impl PlanView {
             PanelCmd::Submit => {
                 let open = self.comments.iter().filter(|c| c.state == "open").count();
                 let Some(path) = self.plan.as_ref().map(|d| d.path.clone()).filter(|_| open > 0) else {
-                    self.status = Some(("no open comments to send (⌘M to comment)".into(), false));
+                    self.status = Some((match keybindings::hint(Place::Panel, Action::Comment) {
+                        k if k.is_empty() => "no open comments to send".into(),
+                        k => format!("no open comments to send ({k} to comment)"),
+                    }, false));
                     return;
                 };
                 self.status = Some((format!("sending {open} comment(s)…"), false));
@@ -357,7 +375,8 @@ impl PlanView {
                 self.poll_file(true);
             }
             PanelCmd::ToggleDiff | PanelCmd::ToggleOutline | PanelCmd::FilePicker | PanelCmd::FocusList | PanelCmd::FocusCode | PanelCmd::ToggleFiles | PanelCmd::NextFile | PanelCmd::PrevFile | PanelCmd::Diagnostics | PanelCmd::Render(_) | PanelCmd::Open { .. } | PanelCmd::ViewMenu => {
-                self.status = Some(("plan reviewer: ⌘M comment · ⌘⇧A ask · ⌘Enter submit / send to agent".into(), false));
+                let keys = keybindings::hint_line(&[(Place::Panel, Action::Comment.into(), "comment"), (Place::Panel, Action::Ask.into(), "ask"), (Place::Panel, Action::Submit.into(), "submit / send to agent")]);
+                self.status = Some((format!("plan reviewer: {keys}"), false));
             }
         }
     }
@@ -428,6 +447,7 @@ impl PlanView {
                 overlay: None,
                 repo: None,
                 id: egui::Id::new(("plan", &self.tab_id)),
+                focus: KeyFocus::Plan,
             }
             .show(&mut body_ui);
             if out.clicked {
@@ -469,7 +489,8 @@ impl PlanView {
             } else if let Some((s, err)) = &self.status {
                 ui.label(RichText::new(s).size(11.5).color(if *err { theme::RED } else { theme::YELLOW }));
             } else if self.vim.anchor.is_some() {
-                ui.label(RichText::new("-- VISUAL --  ⌘M comment on selection · ⌘⇧A ask about it").size(11.5).color(theme::PURPLE));
+                let keys = keybindings::hint_line(&[(Place::Panel, Action::Comment.into(), "comment on selection"), (Place::Panel, Action::Ask.into(), "ask about it")]);
+                ui.label(RichText::new(format!("-- VISUAL --  {keys}")).size(11.5).color(theme::PURPLE));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);

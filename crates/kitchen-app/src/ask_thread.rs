@@ -50,12 +50,12 @@ impl Thread {
     }
 
     /// Why a follow-up can't be asked now, if it can't.
-    pub fn blocked(&self) -> Option<&'static str> {
+    pub fn blocked(&self) -> Option<String> {
         if self.pending() {
-            Some("the last question is still being answered")
+            Some("the last question is still being answered".into())
         } else if !self.turns[0].answer.as_ref().is_some_and(|a| a.is_ok()) {
             // There may be no session to resume.
-            Some("the question failed: Esc closes it, then ask again")
+            Some(failed())
         } else {
             None
         }
@@ -63,17 +63,17 @@ impl Thread {
 
     /// The follow-up field, under the thread's cards at doc row `row`.
     pub fn editor(&self, row: usize) -> Editor {
-        let label = format!("Follow up on “{}” — Enter asks · Esc cancels", self.question());
+        let label = ask_label(&format!("Follow up on “{}”", self.question()));
         Editor { start: row, end: row, text: String::new(), label, needs_focus: true, ask: true, follow_up: true }
     }
 
     /// Ask `text` in the thread on a worker; `send` gets the answer.
     /// `Err`: why it can't be asked now.
-    pub fn follow_up(&mut self, text: &str, answer: Answerer, send: impl FnOnce(Answer) + Send + 'static) -> Result<(), &'static str> {
+    pub fn follow_up(&mut self, text: &str, answer: Answerer, send: impl FnOnce(Answer) + Send + 'static) -> Result<(), String> {
         if let Some(why) = self.blocked() {
             return Err(why);
         }
-        let Some(asker) = self.asker.clone() else { return Err("the question failed: Esc closes it, then ask again") };
+        let Some(asker) = self.asker.clone() else { return Err(failed()) };
         self.turns.push(Turn { question: text.to_string(), asked: Instant::now(), answer: None });
         let (id, text) = (self.id, text.to_string());
         std::thread::spawn(move || {
@@ -115,3 +115,26 @@ pub fn close(threads: impl IntoIterator<Item = Thread>) {
 pub fn discard(answer: Answer) {
     std::thread::spawn(move || ask::close(&answer.asker));
 }
+
+/// "{what} — Enter asks · Esc cancels", with the live `[input]` keys.
+pub fn ask_label(what: &str) -> String {
+    use crate::keybindings::{FieldCmd, Place, labelled};
+    labelled(what, &[(Place::Input, FieldCmd::Submit.into(), "asks"), (Place::Input, FieldCmd::Cancel.into(), "cancels")])
+}
+
+/// "answered · ⌘⇧A on its lines follows up · Esc there closes it".
+pub fn answered_note() -> String {
+    use crate::keybindings::{Place, app::Action, hint_line};
+    use crate::viewer::vim::VimCmd;
+    let keys = hint_line(&[(Place::Panel, Action::Ask.into(), "on its lines follows up"), (Place::Vim, VimCmd::Escape.into(), "there closes it")]);
+    if keys.is_empty() { "answered".into() } else { format!("answered · {keys}") }
+}
+
+/// Why a failed thread takes no follow-up.
+fn failed() -> String {
+    match crate::keybindings::hint(crate::keybindings::Place::Vim, crate::viewer::vim::VimCmd::Escape) {
+        k if k.is_empty() => "the question failed: close it, then ask again".into(),
+        k => format!("the question failed: {k} closes it, then ask again"),
+    }
+}
+

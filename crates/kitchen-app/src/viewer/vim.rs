@@ -1,25 +1,78 @@
 //! Vim normal/visual-mode navigation over a read-only buffer.
 //!
-//! Pure state machine: feed it [`VimKey`]s plus the buffer lines and the
-//! viewport, it moves the cursor and returns [`VimAction`]s for things the
-//! owner must do (jump to a definition, scroll, switch file). No egui here,
-//! so every motion is unit-testable.
+//! Pure state machine: feed it presses plus the buffer lines and the
+//! viewport; the keymap's `[vim]` section turns them into [`VimCmd`]s, which
+//! move the cursor and return [`VimAction`]s for things the owner must do
+//! (jump to a definition, scroll, switch file). No egui frames here, so every
+//! motion is unit-testable.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VimKey {
-    Char(char),
-    Ctrl(char),
-    Esc,
-    Enter,
-    Backspace,
-    Up,
+use std::time::Instant;
+
+use crate::keybindings::{Cmd, FieldCmd, KeyFocus, Keymap, Matcher, Press, Step};
+
+/// What a `[vim]` binding names; the file's action names are these in snake_case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VimCmd {
     Down,
+    Up,
     Left,
     Right,
-    PageUp,
+    LineStart,
+    FirstNonBlank,
+    LineEnd,
+    WordNext,
+    BigWordNext,
+    WordPrev,
+    BigWordPrev,
+    WordEnd,
+    BigWordEnd,
+    GoToLine,
+    GoToTop,
+    ViewTop,
+    ViewMiddle,
+    ViewBottom,
+    ParagraphNext,
+    ParagraphPrev,
+    MatchBracket,
+    FindForward,
+    FindBackward,
+    TillForward,
+    TillBackward,
+    RepeatFind,
+    RepeatFindBack,
+    HalfPageDown,
+    HalfPageUp,
     PageDown,
-    Home,
-    End,
+    PageUp,
+    ScrollDown,
+    ScrollUp,
+    ScrollCenter,
+    ScrollTop,
+    ScrollBottom,
+    OpenFold,
+    OpenAllFolds,
+    CloseAllFolds,
+    Enter,
+    Escape,
+    JumpToDef,
+    References,
+    JumpBack,
+    JumpForward,
+    NextHunk,
+    PrevHunk,
+    NextFile,
+    PrevFile,
+    NextDiag,
+    PrevDiag,
+    Parent,
+    SearchForward,
+    SearchBackward,
+    SearchNext,
+    SearchPrev,
+    SearchWord,
+    SearchWordBack,
+    Visual,
+    VisualLine,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +114,10 @@ pub enum VimAction {
     /// ]d / [d: next / previous plugin diagnostic.
     NextDiag,
     PrevDiag,
+    /// A plugin leader map fired.
+    Plugin(String),
+    /// Keys after the leader that no map has (the footer says so).
+    NoMapping(String),
 }
 
 /// What the owner tells the machine about the viewport.
@@ -87,7 +144,10 @@ pub struct Vim {
     /// Visual mode anchor (line, col, linewise).
     pub anchor: Option<(usize, usize, bool)>,
     count: String,
-    pending: Option<char>,
+    /// The key sequence being typed.
+    keys: Matcher,
+    /// f/F/t/T waiting for its char, with the count typed before it.
+    find: Option<(FindKind, Option<usize>)>,
     last_find: Option<(FindKind, char)>,
     /// Last search (pattern, forward).
     pub search: Option<(String, bool)>,
@@ -130,9 +190,27 @@ impl Vim {
         self.anchor.map(|(l, _, _)| (l.min(self.line), l.max(self.line)))
     }
 
-    /// Pending count/operator keys, for the status line.
+    /// Pending count, keys and f/t, for the status line.
     pub fn pending_display(&self) -> String {
-        format!("{}{}", self.count, self.pending.map(String::from).unwrap_or_default())
+        let find = self.find.map(|(k, _)| match k {
+            FindKind::F => "f",
+            FindKind::BigF => "F",
+            FindKind::T => "t",
+            FindKind::BigT => "T",
+        });
+        format!("{}{}{}", self.count, self.keys.pending(), find.unwrap_or_default())
+    }
+
+    /// A key sequence is half typed: call `tick` every frame.
+    pub fn is_pending(&self) -> bool {
+        self.keys.is_pending()
+    }
+
+    /// Focus left: forget a half-typed sequence, count and f/t.
+    pub fn reset_keys(&mut self) {
+        self.keys.reset();
+        self.count.clear();
+        self.find = None;
     }
 
     fn take_count(&mut self) -> Option<usize> {
@@ -157,81 +235,124 @@ impl Vim {
         word_at(lines.get(self.line)?, self.col)
     }
 
-    /// Feed one key. Returns the actions the owner must perform.
-    pub fn key(&mut self, key: VimKey, lines: &[String], view: Viewport) -> Vec<VimAction> {
+    /// Feed one press: prompt input, f/t's char, a count digit, or a key
+    /// sequence; runs what it completes. `intercept` sees each command (with
+    /// the cursor line at that moment) first and returns true when the owner
+    /// handled it (the tall-row scroll).
+    pub fn feed(&mut self, press: Press, km: &Keymap, focus: KeyFocus, now: Instant, lines: &[String], view: Viewport, intercept: &mut dyn FnMut(VimCmd, Option<usize>, usize) -> bool) -> Vec<VimAction> {
         self.message = None;
         if let Some((mut q, fwd)) = self.search_input.take() {
-            match key {
-                VimKey::Esc => {}
-                VimKey::Enter => {
+            match km.lookup(focus.input(), None, &press) {
+                Some(Cmd::Field(FieldCmd::Cancel)) => {}
+                Some(Cmd::Field(FieldCmd::Submit)) => {
                     let q = if q.is_empty() { self.search.as_ref().map(|s| s.0.clone()).unwrap_or_default() } else { q };
                     if !q.is_empty() {
                         self.search = Some((q, fwd));
                         return self.search_next(lines, false);
                     }
                 }
-                VimKey::Backspace => {
-                    if q.pop().is_some() || !q.is_empty() {
+                _ => match press {
+                    Press::Char(c) => {
+                        q.push(c);
                         self.search_input = Some((q, fwd));
                     }
-                }
-                VimKey::Char(c) => {
-                    q.push(c);
-                    self.search_input = Some((q, fwd));
-                }
-                _ => self.search_input = Some((q, fwd)),
+                    Press::Key { key: egui::Key::Backspace, .. } => {
+                        if q.pop().is_some() || !q.is_empty() {
+                            self.search_input = Some((q, fwd));
+                        }
+                    }
+                    _ => self.search_input = Some((q, fwd)),
+                },
             }
             return Vec::new();
         }
-        let out = self.key_inner(key, lines, view);
+        let mut out = Vec::new();
+        if let Some((kind, count)) = self.find.take() {
+            // f/t's character; any other press cancels it.
+            if let (Press::Char(ch), false) = (press, lines.is_empty()) {
+                self.last_find = Some((kind, ch));
+                for _ in 0..count.unwrap_or(1) {
+                    self.find(lines, kind, ch, false);
+                }
+            }
+        } else if matches!(press, Press::Char('1'..='9')) && !self.keys.is_pending() || press == Press::Char('0') && !self.count.is_empty() && !self.keys.is_pending() {
+            if let Press::Char(c) = press {
+                self.count.push(c);
+            }
+        } else {
+            let steps = self.keys.feed(press, km.sequences(focus), now, km.timeout);
+            for step in steps {
+                out.extend(self.settle(step, km, false, lines, view, intercept));
+            }
+        }
         self.clamp(lines);
         out
     }
 
-    fn key_inner(&mut self, key: VimKey, lines: &[String], view: Viewport) -> Vec<VimAction> {
+    /// The timeout passed with a sequence pending (call every frame while `is_pending`).
+    pub fn tick(&mut self, km: &Keymap, now: Instant, lines: &[String], view: Viewport) -> Vec<VimAction> {
+        let Some(step) = self.keys.tick(now, km.timeout) else { return Vec::new() };
+        let out = self.settle(step, km, true, lines, view, &mut |_, _, _| false);
+        self.clamp(lines);
+        out
+    }
+
+    /// What one matcher step does. `timed_out`: a dropped prefix says nothing.
+    fn settle(&mut self, step: Step, km: &Keymap, timed_out: bool, lines: &[String], view: Viewport, intercept: &mut dyn FnMut(VimCmd, Option<usize>, usize) -> bool) -> Vec<VimAction> {
+        match step {
+            Step::Pending => Vec::new(),
+            Step::Fire(Cmd::Vim(c)) => {
+                let count = self.take_count();
+                if intercept(c, count, self.line) { Vec::new() } else { self.run(c, count, lines, view) }
+            }
+            Step::Fire(Cmd::Plugin(p)) => {
+                self.take_count();
+                vec![VimAction::Plugin(p)]
+            }
+            Step::Fire(_) => Vec::new(),
+            Step::Unbound(keys) => {
+                self.take_count();
+                let leader = km.leader();
+                let esc = matches!(keys.last(), Some(Press::Key { key: egui::Key::Escape, .. }));
+                if !timed_out && !esc && keys.len() > leader.len() && keys.starts_with(leader) {
+                    vec![VimAction::NoMapping(crate::keybindings::Binding(keys).label())]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// One command, with the count typed before it.
+    fn run(&mut self, cmd: VimCmd, count: Option<usize>, lines: &[String], view: Viewport) -> Vec<VimAction> {
         let n_lines = lines.len();
         if n_lines == 0 {
             return Vec::new();
         }
-        if let Some(p) = self.pending.take() {
-            return self.pending_key(p, key, lines);
-        }
         let from = (self.line, self.col);
         let half = (view.rows / 2).max(1);
-        match key {
-            VimKey::Char(c @ '1'..='9') => {
-                self.count.push(c);
-                return Vec::new();
-            }
-            VimKey::Char('0') if !self.count.is_empty() => {
-                self.count.push('0');
-                return Vec::new();
-            }
-            _ => {}
-        }
-        let count = self.take_count();
         let n = count.unwrap_or(1);
         let mut out = Vec::new();
-        match key {
-            VimKey::Char('j') | VimKey::Down => self.vertical(n as isize, lines),
-            VimKey::Enter => out.push(VimAction::Enter),
-            VimKey::Char('-') => out.push(VimAction::Parent),
-            VimKey::Char('k') | VimKey::Up => self.vertical(-(n as isize), lines),
-            VimKey::Char('h') | VimKey::Left | VimKey::Backspace => {
+        match cmd {
+            VimCmd::Down => self.vertical(n as isize, lines),
+            VimCmd::Enter => out.push(VimAction::Enter),
+            VimCmd::Parent => out.push(VimAction::Parent),
+            VimCmd::Up => self.vertical(-(n as isize), lines),
+            VimCmd::Left => {
                 self.col = self.col.saturating_sub(n);
                 self.want_col = self.col;
             }
-            VimKey::Char('l') | VimKey::Right | VimKey::Char(' ') => {
+            VimCmd::Right => {
                 let len = lines[self.line].chars().count();
                 self.col = (self.col + n).min(len.saturating_sub(1));
                 self.want_col = self.col;
             }
-            VimKey::Char('0') | VimKey::Home => self.set_col(0),
-            VimKey::Char('^') => {
+            VimCmd::LineStart => self.set_col(0),
+            VimCmd::FirstNonBlank => {
                 let c = lines[self.line].chars().take_while(|c| c.is_whitespace()).count();
                 self.set_col(c);
             }
-            VimKey::Char('$') | VimKey::End => {
+            VimCmd::LineEnd => {
                 if n > 1 {
                     self.line = (self.line + n - 1).min(n_lines - 1);
                 }
@@ -239,137 +360,99 @@ impl Vim {
                 self.col = len.saturating_sub(1);
                 self.want_col = usize::MAX;
             }
-            VimKey::Char('w') => (0..n).for_each(|_| self.word_forward(lines, false)),
-            VimKey::Char('W') => (0..n).for_each(|_| self.word_forward(lines, true)),
-            VimKey::Char('b') => (0..n).for_each(|_| self.word_back(lines, false)),
-            VimKey::Char('B') => (0..n).for_each(|_| self.word_back(lines, true)),
-            VimKey::Char('e') => (0..n).for_each(|_| self.word_end(lines, false)),
-            VimKey::Char('E') => (0..n).for_each(|_| self.word_end(lines, true)),
-            VimKey::Char('G') => {
+            VimCmd::WordNext => (0..n).for_each(|_| self.word_forward(lines, false)),
+            VimCmd::BigWordNext => (0..n).for_each(|_| self.word_forward(lines, true)),
+            VimCmd::WordPrev => (0..n).for_each(|_| self.word_back(lines, false)),
+            VimCmd::BigWordPrev => (0..n).for_each(|_| self.word_back(lines, true)),
+            VimCmd::WordEnd => (0..n).for_each(|_| self.word_end(lines, false)),
+            VimCmd::BigWordEnd => (0..n).for_each(|_| self.word_end(lines, true)),
+            VimCmd::GoToLine => {
                 let target = count.map(|c| c.saturating_sub(1)).unwrap_or(n_lines - 1);
                 self.goto_line(target, lines);
                 out.push(VimAction::BigMove { from });
             }
-            VimKey::Char('H') => self.goto_line(view.top + n - 1, lines),
-            VimKey::Char('M') => self.goto_line(view.top + view.rows.min(n_lines - view.top.min(n_lines)) / 2, lines),
-            VimKey::Char('L') => {
+            VimCmd::GoToTop => {
+                self.goto_line(count.map(|n| n.saturating_sub(1)).unwrap_or(0), lines);
+                out.push(VimAction::BigMove { from });
+            }
+            VimCmd::ViewTop => self.goto_line(view.top + n - 1, lines),
+            VimCmd::ViewMiddle => self.goto_line(view.top + view.rows.min(n_lines - view.top.min(n_lines)) / 2, lines),
+            VimCmd::ViewBottom => {
                 let bottom = (view.top + view.rows).min(n_lines).saturating_sub(1);
                 self.goto_line(bottom.saturating_sub(n - 1), lines);
             }
-            VimKey::Char('}') => {
+            VimCmd::ParagraphNext | VimCmd::ParagraphPrev => {
                 for _ in 0..n {
-                    self.paragraph(lines, true);
+                    self.paragraph(lines, cmd == VimCmd::ParagraphNext);
                 }
                 out.push(VimAction::BigMove { from });
             }
-            VimKey::Char('{') => {
-                for _ in 0..n {
-                    self.paragraph(lines, false);
-                }
-                out.push(VimAction::BigMove { from });
-            }
-            VimKey::Char('%') => {
+            VimCmd::MatchBracket => {
                 if self.match_bracket(lines) {
                     out.push(VimAction::BigMove { from });
                 }
             }
-            VimKey::Ctrl('d') => {
+            VimCmd::FindForward => self.find = Some((FindKind::F, count)),
+            VimCmd::FindBackward => self.find = Some((FindKind::BigF, count)),
+            VimCmd::TillForward => self.find = Some((FindKind::T, count)),
+            VimCmd::TillBackward => self.find = Some((FindKind::BigT, count)),
+            VimCmd::RepeatFind => self.repeat_find(lines, false, n),
+            VimCmd::RepeatFindBack => self.repeat_find(lines, true, n),
+            VimCmd::HalfPageDown => {
                 self.vertical((half * n) as isize, lines);
                 out.push(VimAction::ScrollBy((half * n) as isize));
             }
-            VimKey::Ctrl('u') => {
+            VimCmd::HalfPageUp => {
                 self.vertical(-((half * n) as isize), lines);
                 out.push(VimAction::ScrollBy(-((half * n) as isize)));
             }
-            VimKey::Ctrl('f') | VimKey::PageDown => {
+            VimCmd::PageDown => {
                 let page = view.rows.saturating_sub(2).max(1) * n;
                 self.vertical(page as isize, lines);
                 out.push(VimAction::ScrollBy(page as isize));
             }
-            VimKey::Ctrl('b') | VimKey::PageUp => {
+            VimCmd::PageUp => {
                 let page = view.rows.saturating_sub(2).max(1) * n;
                 self.vertical(-(page as isize), lines);
                 out.push(VimAction::ScrollBy(-(page as isize)));
             }
-            VimKey::Ctrl('e') => out.push(VimAction::ScrollBy(n as isize)),
-            VimKey::Ctrl('y') => out.push(VimAction::ScrollBy(-(n as isize))),
-            VimKey::Ctrl(']') => {
+            VimCmd::ScrollDown => out.push(VimAction::ScrollBy(n as isize)),
+            VimCmd::ScrollUp => out.push(VimAction::ScrollBy(-(n as isize))),
+            VimCmd::ScrollCenter => out.push(VimAction::Center),
+            VimCmd::ScrollTop => out.push(VimAction::Top),
+            VimCmd::ScrollBottom => out.push(VimAction::Bottom),
+            VimCmd::OpenFold => out.push(VimAction::OpenFold),
+            VimCmd::OpenAllFolds => out.push(VimAction::OpenAllFolds),
+            VimCmd::CloseAllFolds => out.push(VimAction::CloseAllFolds),
+            VimCmd::JumpToDef => out.extend(self.word_under_cursor(lines).map(VimAction::JumpToDef)),
+            VimCmd::References => out.extend(self.word_under_cursor(lines).map(VimAction::References)),
+            VimCmd::JumpBack => out.push(VimAction::JumpBack),
+            VimCmd::JumpForward => out.push(VimAction::JumpForward),
+            VimCmd::NextHunk => out.push(VimAction::NextHunk),
+            VimCmd::PrevHunk => out.push(VimAction::PrevHunk),
+            VimCmd::NextFile => out.push(VimAction::NextFile),
+            VimCmd::PrevFile => out.push(VimAction::PrevFile),
+            VimCmd::NextDiag => out.push(VimAction::NextDiag),
+            VimCmd::PrevDiag => out.push(VimAction::PrevDiag),
+            VimCmd::SearchForward => self.search_input = Some((String::new(), true)),
+            VimCmd::SearchBackward => self.search_input = Some((String::new(), false)),
+            VimCmd::SearchNext => (0..n).for_each(|_| out.extend(self.search_next(lines, false))),
+            VimCmd::SearchPrev => (0..n).for_each(|_| out.extend(self.search_next(lines, true))),
+            VimCmd::SearchWord | VimCmd::SearchWordBack => {
                 if let Some(w) = self.word_under_cursor(lines) {
-                    out.push(VimAction::JumpToDef(w));
-                }
-            }
-            VimKey::Ctrl('o') | VimKey::Ctrl('t') => out.push(VimAction::JumpBack),
-            VimKey::Ctrl('i') => out.push(VimAction::JumpForward),
-            VimKey::Char('/') => self.search_input = Some((String::new(), true)),
-            VimKey::Char('?') => self.search_input = Some((String::new(), false)),
-            VimKey::Char('n') => (0..n).for_each(|_| out.extend(self.search_next(lines, false))),
-            VimKey::Char('N') => (0..n).for_each(|_| out.extend(self.search_next(lines, true))),
-            VimKey::Char(c @ ('*' | '#')) => {
-                if let Some(w) = self.word_under_cursor(lines) {
-                    self.search = Some((format!("\\b{w}\\b"), c == '*'));
+                    self.search = Some((format!("\\b{w}\\b"), cmd == VimCmd::SearchWord));
                     out.extend(self.search_next(lines, false));
                 }
             }
-            VimKey::Char(';') => self.repeat_find(lines, false, n),
-            VimKey::Char(',') => self.repeat_find(lines, true, n),
-            VimKey::Char('v') => self.toggle_visual(false),
-            VimKey::Char('V') => self.toggle_visual(true),
-            VimKey::Esc => {
+            VimCmd::Visual => self.toggle_visual(false),
+            VimCmd::VisualLine => self.toggle_visual(true),
+            VimCmd::Escape => {
                 if self.anchor.take().is_none() {
                     out.push(VimAction::Escape);
                 }
             }
-            VimKey::Char(c @ ('g' | 'z' | '[' | ']' | 'f' | 'F' | 't' | 'T')) => {
-                if let Some(c) = count {
-                    self.count = c.to_string();
-                }
-                self.pending = Some(c);
-            }
-            _ => {}
         }
         out
-    }
-
-    fn pending_key(&mut self, p: char, key: VimKey, lines: &[String]) -> Vec<VimAction> {
-        let from = (self.line, self.col);
-        let count = self.take_count();
-        let VimKey::Char(c) = key else {
-            return Vec::new();
-        };
-        match (p, c) {
-            ('g', 'g') => {
-                self.goto_line(count.map(|n| n.saturating_sub(1)).unwrap_or(0), lines);
-                vec![VimAction::BigMove { from }]
-            }
-            ('g', 'd') => self.word_under_cursor(lines).map(VimAction::JumpToDef).into_iter().collect(),
-            ('g', 'r') => self.word_under_cursor(lines).map(VimAction::References).into_iter().collect(),
-            ('z', 'z') => vec![VimAction::Center],
-            ('z', 't') => vec![VimAction::Top],
-            ('z', 'b') => vec![VimAction::Bottom],
-            ('z', 'o') => vec![VimAction::OpenFold],
-            ('z', 'R') => vec![VimAction::OpenAllFolds],
-            ('z', 'M') => vec![VimAction::CloseAllFolds],
-            (']', 'c') => vec![VimAction::NextHunk],
-            (']', 'd') => vec![VimAction::NextDiag],
-            ('[', 'd') => vec![VimAction::PrevDiag],
-            ('[', 'c') => vec![VimAction::PrevHunk],
-            (']', 'f') => vec![VimAction::NextFile],
-            ('[', 'f') => vec![VimAction::PrevFile],
-            ('f' | 'F' | 't' | 'T', ch) => {
-                let kind = match p {
-                    'f' => FindKind::F,
-                    'F' => FindKind::BigF,
-                    't' => FindKind::T,
-                    _ => FindKind::BigT,
-                };
-                self.last_find = Some((kind, ch));
-                for _ in 0..count.unwrap_or(1) {
-                    self.find(lines, kind, ch, false);
-                }
-                Vec::new()
-            }
-            _ => Vec::new(),
-        }
     }
 
     fn set_col(&mut self, c: usize) {
@@ -645,18 +728,31 @@ pub fn word_at(line: &str, col: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keybindings::Keymap;
 
     fn buf(s: &str) -> Vec<String> {
         s.lines().map(String::from).collect()
     }
 
+    fn feed_with(v: &mut Vim, km: &Keymap, lines: &[String], p: Press, view: Viewport) -> Vec<VimAction> {
+        v.feed(p, km, KeyFocus::Viewer, Instant::now(), lines, view, &mut |_, _, _| false)
+    }
+
+    fn feed(v: &mut Vim, lines: &[String], p: Press, view: Viewport) -> Vec<VimAction> {
+        feed_with(v, &Keymap::defaults(), lines, p, view)
+    }
+
     fn keys(v: &mut Vim, lines: &[String], ks: &str) -> Vec<VimAction> {
         let view = Viewport { top: 0, rows: 10 };
-        let mut out = Vec::new();
-        for c in ks.chars() {
-            out.extend(v.key(VimKey::Char(c), lines, view));
-        }
-        out
+        ks.chars().flat_map(|c| feed(v, lines, Press::Char(c), view)).collect()
+    }
+
+    fn key(k: egui::Key) -> Press {
+        Press::Key { key: k, mods: Default::default() }
+    }
+
+    fn ctrl(k: egui::Key) -> Press {
+        Press::Key { key: k, mods: crate::keybindings::notation::Mods { ctrl: true, ..Default::default() } }
     }
 
     #[test]
@@ -731,11 +827,11 @@ mod tests {
         let b = buf("alpha\nbeta Alpha\ngamma alpha");
         let mut v = Vim::default();
         let view = Viewport { top: 0, rows: 10 };
-        v.key(VimKey::Char('/'), &b, view);
+        feed(&mut v, &b, Press::Char('/'), view);
         for c in "alpha".chars() {
-            v.key(VimKey::Char(c), &b, view);
+            feed(&mut v, &b, Press::Char(c), view);
         }
-        let acts = v.key(VimKey::Enter, &b, view);
+        let acts = feed(&mut v, &b, key(egui::Key::Enter), view);
         assert!(matches!(acts[0], VimAction::BigMove { .. }));
         assert_eq!((v.line, v.col), (1, 5), "smart-case matches Alpha");
         keys(&mut v, &b, "n");
@@ -761,11 +857,11 @@ mod tests {
         keys(&mut v, &b, "{");
         assert_eq!(v.line, 2);
         let view = Viewport { top: 2, rows: 3 };
-        v.key(VimKey::Char('H'), &b, view);
+        feed(&mut v, &b, Press::Char('H'), view);
         assert_eq!(v.line, 2);
-        v.key(VimKey::Char('L'), &b, view);
+        feed(&mut v, &b, Press::Char('L'), view);
         assert_eq!(v.line, 4);
-        let acts = v.key(VimKey::Ctrl('d'), &b, Viewport { top: 0, rows: 4 });
+        let acts = feed(&mut v, &b, ctrl(egui::Key::D), Viewport { top: 0, rows: 4 });
         assert_eq!(acts, vec![VimAction::ScrollBy(2)]);
     }
 
@@ -776,8 +872,8 @@ mod tests {
         keys(&mut v, &b, "fc");
         assert_eq!(keys(&mut v, &b, "gd"), vec![VimAction::JumpToDef("compute".into())]);
         assert_eq!(keys(&mut v, &b, "gr"), vec![VimAction::References("compute".into())]);
-        assert_eq!(v.key(VimKey::Ctrl(']'), &b, Viewport::default()), vec![VimAction::JumpToDef("compute".into())]);
-        assert_eq!(v.key(VimKey::Ctrl('o'), &b, Viewport::default()), vec![VimAction::JumpBack]);
+        assert_eq!(feed(&mut v, &b, ctrl(egui::Key::CloseBracket), Viewport::default()), vec![VimAction::JumpToDef("compute".into())]);
+        assert_eq!(feed(&mut v, &b, ctrl(egui::Key::O), Viewport::default()), vec![VimAction::JumpBack]);
         assert_eq!(keys(&mut v, &b, "]c[f"), vec![VimAction::NextHunk, VimAction::PrevFile]);
         assert_eq!(keys(&mut v, &b, "zz"), vec![VimAction::Center]);
         let at = (v.line, v.col);
@@ -785,8 +881,58 @@ mod tests {
         assert_eq!((v.line, v.col), at, "fold keys don't move the cursor");
         keys(&mut v, &b, "V");
         assert_eq!(v.visual_lines(), Some((0, 0)));
-        assert!(v.key(VimKey::Esc, &b, Viewport::default()).is_empty());
+        assert!(feed(&mut v, &b, key(egui::Key::Escape), Viewport::default()).is_empty());
         assert_eq!(v.visual_lines(), None);
-        assert_eq!(v.key(VimKey::Esc, &b, Viewport::default()), vec![VimAction::Escape]);
+        assert_eq!(feed(&mut v, &b, key(egui::Key::Escape), Viewport::default()), vec![VimAction::Escape]);
+    }
+
+    #[test]
+    fn zero_is_line_start_or_a_count() {
+        let b = buf(&"x\n".repeat(30));
+        let b2 = buf("  abc def");
+        let mut v = Vim::default();
+        keys(&mut v, &b2, "$0");
+        assert_eq!(v.col, 0, "0 alone goes to the line start");
+        keys(&mut v, &b, "10j");
+        assert_eq!(v.line, 10, "after a digit, 0 is part of the count");
+    }
+
+    #[test]
+    fn a_count_reaches_find() {
+        let b = buf("axbxcxd");
+        let mut v = Vim::default();
+        keys(&mut v, &b, "3fx");
+        assert_eq!(v.col, 5);
+        assert_eq!(v.pending_display(), "");
+        keys(&mut v, &b, "0f");
+        assert_eq!(v.pending_display(), "f", "f waits for its character");
+        feed(&mut v, &b, key(egui::Key::Escape), Viewport::default());
+        keys(&mut v, &b, "x");
+        assert_eq!(v.col, 0, "Esc cancelled the find");
+    }
+
+    #[test]
+    fn a_rebound_motion_replaces_the_default_key() {
+        let km = Keymap::with_user("[vim]\ndown = [\"n\"]\n");
+        let b = buf("a\nb\nc");
+        let mut v = Vim::default();
+        let view = Viewport { top: 0, rows: 10 };
+        feed_with(&mut v, &km, &b, Press::Char('n'), view);
+        assert_eq!(v.line, 1, "n moves down");
+        feed_with(&mut v, &km, &b, Press::Char('j'), view);
+        assert_eq!(v.line, 1, "j no longer does");
+    }
+
+    #[test]
+    fn sequences_time_out_like_vim() {
+        let b = buf("a\nb\nc");
+        let mut v = Vim::default();
+        keys(&mut v, &b, "Gg");
+        assert!(v.is_pending());
+        assert_eq!(v.pending_display(), "g");
+        let later = Instant::now() + Keymap::defaults().timeout * 2;
+        assert!(v.tick(&Keymap::defaults(), later, &b, Viewport::default()).is_empty());
+        assert!(!v.is_pending(), "a lone g is dropped");
+        assert_eq!(v.line, 2);
     }
 }

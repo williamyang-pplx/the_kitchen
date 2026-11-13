@@ -6,7 +6,7 @@ mod ask_thread;
 mod attach;
 mod dashboard_view;
 mod engine;
-mod keymap;
+mod keybindings;
 mod links;
 mod notify;
 mod panels;
@@ -40,7 +40,7 @@ fn main() -> eframe::Result {
             .with_title_shown(false)
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon-256.png")).unwrap_or_default()),
         // No default macOS menu: its ⌘H (Hide) and ⌘Q items would swallow
-        // those chords before the kitchen sees them. ⌘Q is handled in keymap.rs.
+        // those chords before the kitchen sees them. ⌘Q is a keybinding (keybindings/app.rs).
         event_loop_builder: Some(Box::new(|builder| {
             use winit::platform::macos::EventLoopBuilderExtMacOS;
             builder.with_default_menu(false);
@@ -55,6 +55,8 @@ fn main() -> eframe::Result {
             let db = kitchen_core::db::Db::open(&db_path)?;
             let engine = engine::Engine::new(cc.egui_ctx.clone(), db)?;
             notify::install(&engine);
+            // Before attach::install and the plugins: both read the keymap.
+            keybindings::watch(&engine);
             attach::install();
             if let Err(e) = api::serve(engine.clone()) {
                 engine.toast_err(format!("API socket: {e:#}"));

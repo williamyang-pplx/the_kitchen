@@ -28,11 +28,11 @@ use serde::{Deserialize, Serialize};
 use crate::engine::Engine;
 use dashboard::DashboardStore;
 use decor::{DecorStore, FileKey};
-use keys::Chord;
+use crate::keybindings::Binding;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 13;
+pub const API_LEVEL: u32 = 14;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
 /// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
@@ -121,7 +121,8 @@ pub struct CommandEntry {
 #[derive(Debug, Clone)]
 pub struct ChordEntry {
     pub plugin: String,
-    pub chord: Chord,
+    /// Always one press with cmd, alt or ctrl.
+    pub chord: Binding,
     pub command: String,
     pub when: When,
     pub filetype: Option<String>,
@@ -139,7 +140,8 @@ pub struct LinkEntry {
 #[derive(Debug, Clone)]
 pub struct ViewerMap {
     pub plugin: String,
-    /// Keys after the leader, e.g. `f` for `<leader>f`.
+    /// Keys after the leader as written (`e` for `<leader>e`); the leader is
+    /// put in front when merged, so changing it needs no plugin reload.
     pub keys: String,
     pub command: String,
 }
@@ -410,7 +412,7 @@ impl PluginHost {
             s.generation = 0;
         }
         drop(slots);
-        self.edit_registry(|r| {
+        self.edit_registry(true, |r| {
             r.commands.retain(|c| c.plugin != name);
             r.chords.retain(|c| c.plugin != name);
             r.viewer_maps.retain(|c| c.plugin != name);
@@ -571,7 +573,7 @@ impl PluginHost {
     fn register_listener(&self, plugin: &str, generation: u64, event: &str) {
         if self.current(plugin, generation) {
             let entry = (event.to_string(), plugin.to_string());
-            self.edit_registry(|r| {
+            self.edit_registry(false, |r| {
                 if !r.listeners.contains(&entry) {
                     r.listeners.push(entry);
                 }
@@ -601,7 +603,7 @@ impl PluginHost {
         if !self.current(plugin, generation) {
             return;
         }
-        self.edit_registry(|r| {
+        self.edit_registry(false, |r| {
             r.providers.retain(|p| !(p.plugin == entry.plugin && p.kind == entry.kind));
             r.providers.push(entry);
         });
@@ -611,13 +613,19 @@ impl PluginHost {
         lock(&self.registry).clone()
     }
 
-    fn edit_registry(&self, f: impl FnOnce(&mut Registry)) {
+    /// `keys`: chords or leader maps changed, so the keymap is rebuilt.
+    fn edit_registry(&self, keys: bool, f: impl FnOnce(&mut Registry)) {
         let mut r = lock(&self.registry);
         let mut next = (**r).clone();
         f(&mut next);
-        *r = Arc::new(next);
+        let snap = Arc::new(next);
+        *r = snap.clone();
+        // Taken under the registry lock, so a later edit always has a higher number.
+        let generation = self.registry_gen.fetch_add(1, Ordering::AcqRel) + 1;
         drop(r);
-        self.registry_gen.fetch_add(1, Ordering::AcqRel);
+        if keys {
+            crate::keybindings::refresh_plugins(snap, generation);
+        }
         if let Some(e) = self.engine() {
             e.ctx.request_repaint();
         }
@@ -633,7 +641,7 @@ impl PluginHost {
         if !self.current(plugin, generation) {
             return;
         }
-        self.edit_registry(|r| {
+        self.edit_registry(false, |r| {
             r.commands.retain(|c| c.name != entry.name);
             r.commands.push(entry);
         });
@@ -643,7 +651,7 @@ impl PluginHost {
         if !self.current(plugin, generation) {
             return;
         }
-        self.edit_registry(|r| {
+        self.edit_registry(false, |r| {
             r.links.retain(|l| !(l.plugin == entry.plugin && l.regex.as_str() == entry.regex.as_str()));
             r.links.push(entry);
         });
@@ -653,17 +661,18 @@ impl PluginHost {
         if !self.current(plugin, generation) {
             return Ok(());
         }
-        if let Some(b) = crate::keymap::builtin_conflict(&entry.chord) {
+        if let Some(b) = crate::keybindings::current().builtin_conflict(entry.when.place(), &entry.chord) {
             bail!("{} is a built-in shortcut ({b})", entry.chord.label());
         }
-        if entry.chord.ctrl && !entry.chord.cmd && !entry.chord.alt && matches!(entry.when, When::Any | When::Terminal) {
+        let ctrl_only = matches!(entry.chord.0[..], [crate::keybindings::Press::Key { mods, .. }] if mods.ctrl && !mods.cmd && !mods.alt);
+        if ctrl_only && matches!(entry.when, When::Any | When::Terminal) {
             bail!("{}: ctrl chords belong to the shell in terminals; use when = \"viewer\" (or add cmd/alt)", entry.chord.label());
         }
         let reg = self.registry();
         if let Some(other) = reg.chords.iter().find(|c| c.chord == entry.chord && c.when == entry.when && c.plugin != plugin) {
             bail!("{} is already mapped by plugin {}", entry.chord.label(), other.plugin);
         }
-        self.edit_registry(|r| {
+        self.edit_registry(true, |r| {
             r.chords.retain(|c| !(c.chord == entry.chord && c.when == entry.when && c.filetype == entry.filetype));
             r.chords.push(entry);
         });
@@ -674,10 +683,43 @@ impl PluginHost {
         if !self.current(plugin, generation) {
             return;
         }
-        self.edit_registry(|r| {
+        let km = crate::keybindings::current();
+        if let Some(b) = km.leader_map(&entry.keys).and_then(|keys| km.sequence_conflict(&keys)) {
+            self.report_error(plugin, &format!("<leader>{} is a built-in key ({b})", entry.keys));
+            return;
+        }
+        self.edit_registry(true, |r| {
             r.viewer_maps.retain(|m| m.keys != entry.keys);
             r.viewer_maps.push(entry);
         });
+    }
+
+    /// keybindings.toml reloaded: drop chords and leader maps that now take
+    /// a built-in key, reporting each like a failed `kitchen.keymap`. Reads
+    /// the keymap before `edit_registry`, never inside it (lock order).
+    pub fn recheck_chords(&self) {
+        let km = crate::keybindings::current();
+        let reg = self.registry();
+        let chords: Vec<(String, String)> = reg
+            .chords
+            .iter()
+            .filter_map(|c| km.builtin_conflict(c.when.place(), &c.chord).map(|b| (c.plugin.clone(), format!("{} is a built-in shortcut ({b})", c.chord.label()))))
+            .collect();
+        let maps: Vec<(String, String)> = reg
+            .viewer_maps
+            .iter()
+            .filter_map(|m| km.leader_map(&m.keys).and_then(|k| km.sequence_conflict(&k)).map(|b| (m.plugin.clone(), format!("<leader>{} is a built-in key ({b})", m.keys))))
+            .collect();
+        if chords.is_empty() && maps.is_empty() {
+            return;
+        }
+        self.edit_registry(true, |r| {
+            r.chords.retain(|c| km.builtin_conflict(c.when.place(), &c.chord).is_none());
+            r.viewer_maps.retain(|m| km.leader_map(&m.keys).and_then(|k| km.sequence_conflict(&k)).is_none());
+        });
+        for (plugin, msg) in chords.into_iter().chain(maps) {
+            self.report_error(&plugin, &msg);
+        }
     }
 
     fn register_timer(self: &Arc<Self>, spec: TimerSpec) {
@@ -2293,6 +2335,31 @@ end)
     }
 
     #[test]
+    fn a_reload_drops_a_plugin_chord_that_now_collides() {
+        let root = std::env::temp_dir().join(format!("kt-plugins-{}", kitchen_core::util::new_id()));
+        let dir = root.join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.toml"), "name = \"demo\"\n").unwrap();
+        std::fs::write(
+            dir.join("init.lua"),
+            "kitchen.command(\"hi\", function() end)\nkitchen.keymap(\"cmd+shift+y\", \"demo.hi\")\nkitchen.keymap(\"viewer\", \"<leader>h\", \"demo.hi\")\n",
+        )
+        .unwrap();
+        let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
+        let host = host_with(&engine, vec![root.clone()]);
+        wait(&|| host.registry().chords.len() == 1 && host.registry().viewer_maps.len() == 1);
+        host.recheck_chords();
+        assert_eq!(host.registry().chords.len(), 1, "no collision under the defaults");
+        let km = crate::keybindings::Keymap::with_user("[global]\nquit = [\"cmd+shift+y\"]\n[vim]\nscroll_center = [\"\\\\h\"]\n");
+        crate::keybindings::with_keymap(km, || host.recheck_chords());
+        assert!(host.registry().chords.is_empty(), "⌘⇧Y is quit now");
+        assert!(host.registry().viewer_maps.is_empty(), "\\h is a vim key now");
+        let log = std::fs::read_to_string(PluginHost::log_path("demo")).unwrap_or_default();
+        assert!(log.contains("built-in shortcut"), "{log}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn bundled_plugins() {
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
@@ -2318,7 +2385,7 @@ end)
         let mv = content_hash("# Hi\n\ntext\n");
         wait(&|| host.decor.get(&md).is_some_and(|d| d.render(&mv).is_some()));
         assert_eq!(host.decor.get(&md).unwrap().render(&mv).unwrap()[0].markdown, "# Hi\n\ntext");
-        assert!(host.registry().chords.iter().any(|c| c.command == "markdown.toggle" && c.chord.label() == "⇧⌘V"));
+        assert!(host.registry().chords.iter().any(|c| c.command == "markdown.toggle" && c.chord.label() == "⌘⇧V"));
         if std::process::Command::new("ruff").arg("--version").output().is_ok() {
             wait(&|| host.decor.get(&key).is_some_and(|d| !d.diagnostics(&v).is_empty()));
             let d = host.decor.get(&key).unwrap();

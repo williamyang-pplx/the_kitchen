@@ -99,46 +99,35 @@ for agents started outside the kitchen; regenerate it with
 
 ## Keybindings
 
+Every key can be changed in `~/.kitchen/keybindings.toml`. The defaults are in
+[`crates/kitchen-app/assets/keybindings.toml`](crates/kitchen-app/assets/keybindings.toml);
+your file lists only what you change, and reloads within a second. A line
+replaces all of an action's default keys (`quit = ["cmd+shift+q"]`), and `[]`
+unbinds it.
+
+Sections are places in the kitchen (global, terminal, panel, viewer, vim,
+file list, plan, picker, menu, dialog, input, edit, plugins). A key bound in
+an inner place wins over the same key outside it, so `cmd+d` is the diff in
+the viewer and the dashboard elsewhere. A mistake shows a toast and keeps the
+last good keymap. ⌘/ shows the live list, and every key hint in the window
+reads it too.
+
 A tab shows either its terminal or its side panel (the file viewer or the
 plan) on the whole screen; ⌘. switches between the terminal and the viewer,
 and each tab remembers which one it was showing when you come back to it.
-Every app shortcut is ⌘+key, and acts on what is shown: tab keys (⌘T ⌘I ⌘W)
+By default, app shortcuts are ⌘+key and act on what is shown: tab keys (⌘T ⌘I ⌘W)
 only in the terminal, panel keys (⌘M ⌘O ⌘Enter) only in the viewer or plan;
 the rest are global (⌘D: diff in the viewer or plan, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
 keys (`gd` definition, `gr` references, `Ctrl-o` back, `]d` next diagnostic, …).
 `gd`/`gr` ask a plugin's language server when there is one (Python: ty) and
 fall back to text search; a slow one (over 0.4s) shows the text matches until it answers.
+In a terminal, ⌘-click opens the file path or URL under the pointer; ⌘V with
+an image on the clipboard (or dropping files on it) pastes the files' paths,
+which Claude Code attaches (on a devbox the files are first copied to
+`~/.kitchen/attachments` there).
 
-| keys | action |
-|---|---|
-| ⌘N | new workspace |
-| ⌘J / ⌘K | next / previous workspace |
-| ⌘1 … ⌘9 | go to tab N of the current workspace |
-| ⌘H / ⌘L | previous / next tab |
-| ⌘⇧J / ⌘⇧K | in the viewer: next / previous changed file |
-| ⌘⇧D | in the viewer: the shown PR's description, rendered as on GitHub (title, author, state, base ← head); again, back to where you were |
-| ⌘⇧O | in the viewer: open the shown PR on GitHub in Chrome; in the ⌘⇧S menu, the PR under the cursor |
-| ⌘⇧S | PR menu: the PRs the tab's agent listed, one section per stack, plus those opened with ⌘⇧P (j/k, Enter shows, Esc closes); from a terminal it opens the viewer first |
-| ⌘⇧H / ⌘⇧L | in the viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
-| ⌘T | new tab — own worktree + branch (a purple tab) |
-| ⌘I | new tab in the workspace's main checkout — no worktree or branch, for quick tasks that need no PR (tabs share it; a yellow tab) |
-| ⌘-click | in a terminal: open the file path under the pointer in the viewer (at `path:line`; a partial path opens the worktree file whose path ends with it), or a URL in the browser; plugins add more with `kitchen.link` |
-| ⌘R | rename the current tab |
-| ⌘W | close tab |
-| ⌘⇧T | reopen the workspace's last closed tab (its agent resumes its conversation) |
-| ⌘P | fuzzy file picker (in the viewer) |
-| ⌘B | show / hide the viewer's file list |
-| ⌘⇧I | plan reviewer |
-| ⌘⇧R | rename the current workspace |
-| ⌘⇧P | command palette (plugin commands, diagnostics, reload plugins); paste a PR link to review it |
-| ⌘M | comment on the cursor line / selection (viewer, viewing a PR: posted to the PR on GitHub; on a commented line: a reply) |
-| ⌘⇧A | in the viewer or plan: ask the agent about the cursor line / selection (Enter asks; the answer shows under the line with a follow-up field; ⌘⇧A there reopens the field, Esc on the line closes the thread) |
-| ⌘Enter | submit comment (plan: send comments to agent) |
-| ⌘D | workspace dashboard; in the viewer or plan: toggle diff / plain file |
-| ⌘O | toggle outline (collapsed) mode |
-| ⌘. | switch the whole tab between the terminal and the file viewer (from the plan: back to the terminal) |
-| ⌘/ | list every shortcut |
-| ⌘C / ⌘V | copy / paste; in a terminal, ⌘V with an image on the clipboard (or dropping files on it) pastes the files' paths, which Claude Code attaches. On a devbox the files are first copied to `~/.kitchen/attachments` there |
+Plugin keys (`kitchen.keymap`) are defaults too: `[plugins]` in your file
+replaces them, e.g. `"github.description" = ["cmd+shift+d"]`.
 
 ## Layout
 

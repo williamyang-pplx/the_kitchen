@@ -1,9 +1,9 @@
 //! The viewer's side of plugins: file identity and freshness, the paint-time
-//! decoration overlay, `]d`/`[d`, the `\` leader maps and command context.
+//! decoration overlay, `]d`/`[d`, plugin leader maps and command context.
 
 use std::time::{Duration, Instant};
 
-use egui::{Color32, Ui};
+use egui::Color32;
 use kitchen_core::host::Host;
 use kitchen_core::util::shell_quote;
 
@@ -16,8 +16,6 @@ use crate::theme;
 
 /// How often the open file is re-`stat`ed while the viewer is shown.
 const STAT_EVERY: Duration = Duration::from_secs(3);
-/// A leader sequence is abandoned after this long.
-const LEADER_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) struct OverlayCache {
     generation: u64,
@@ -53,6 +51,13 @@ fn local_meta(path: &str) -> Option<String> {
     let m = std::fs::metadata(path).ok()?;
     let secs = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     Some(format!("{} {secs}", m.len()))
+}
+
+/// "{what} — ⌘Enter sends it to {who} · Esc cancels", with the live keys.
+fn comment_label(what: &str, who: &str) -> String {
+    use crate::keybindings::{FieldCmd, Place, app::Action, labelled};
+    let send = format!("sends it to {who}");
+    labelled(what, &[(Place::Panel, Action::Submit.into(), &send), (Place::Input, FieldCmd::Cancel.into(), "cancels")])
 }
 
 /// The tab-expanded text before 1-based raw column `col`.
@@ -324,7 +329,7 @@ impl Viewer {
         };
         self.reply_to = thread.and_then(|(_, id)| id);
         self.list_focus = false;
-        self.editor = Some(Editor { start, end, text: String::new(), label: format!("{what} — ⌘Enter sends it to {} · Esc cancels", who.join(", ")), needs_focus: true, ask: false, follow_up: false });
+        self.editor = Some(Editor { start, end, text: String::new(), label: comment_label(&what, &who.join(", ")), needs_focus: true, ask: false, follow_up: false });
     }
 
     /// Hand the comment field to the `comment` listeners.
@@ -401,60 +406,12 @@ impl Viewer {
         self.current.as_deref().filter(|_| !self.browsing).map(crate::plugins::filetype_of)
     }
 
-    /// `\` + keys → a plugin viewer map. Consumes the keys so vim never sees them.
-    pub(super) fn leader_keys(&mut self, ui: &mut Ui) {
+    /// A plugin command (a leader map), with the viewer's context.
+    pub(super) fn run_plugin(&mut self, command: &str) {
         let Some(plugins) = self.engine.plugins().cloned() else { return };
-        if self.leader.as_ref().is_some_and(|(_, at)| at.elapsed() > LEADER_TIMEOUT) {
-            self.leader = None;
-        }
-        let reg = plugins.registry();
-        if reg.viewer_maps.is_empty() && self.leader.is_none() {
-            return;
-        }
-        let mut typed: Vec<char> = Vec::new();
-        let mut cancel = false;
-        ui.input_mut(|i| {
-            let mut j = 0;
-            while j < i.events.len() {
-                match &i.events[j] {
-                    egui::Event::Text(t) if self.leader.is_some() || t.starts_with('\\') || !typed.is_empty() => {
-                        typed.extend(t.chars());
-                        i.events.remove(j);
-                    }
-                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } if self.leader.is_some() => {
-                        cancel = true;
-                        i.events.remove(j);
-                    }
-                    _ => j += 1,
-                }
-            }
-        });
-        if cancel {
-            self.leader = None;
-            return;
-        }
-        for c in typed {
-            match &mut self.leader {
-                None if c == '\\' => self.leader = Some((String::new(), Instant::now())),
-                None => {}
-                Some((keys, _)) => {
-                    keys.push(c);
-                    let keys = keys.clone();
-                    if let Some(m) = reg.viewer_maps.iter().find(|m| m.keys == keys) {
-                        self.leader = None;
-                        let ctx = crate::plugins::command_context(&self.engine, &self.tab_id, Some(self.context()));
-                        if let Err(e) = plugins.invoke(&m.command, ctx, false) {
-                            self.status = Some((format!("{e:#}"), true));
-                        }
-                    } else if !reg.viewer_maps.iter().any(|m| m.keys.starts_with(&keys)) {
-                        self.leader = None;
-                        self.status = Some((format!("no mapping for \\{keys}"), false));
-                    }
-                }
-            }
-        }
-        if self.leader.is_some() {
-            ui.ctx().request_repaint_after(LEADER_TIMEOUT);
+        let ctx = crate::plugins::command_context(&self.engine, &self.tab_id, Some(self.context()));
+        if let Err(e) = plugins.invoke(command, ctx, false) {
+            self.status = Some((format!("{e:#}"), true));
         }
     }
 }

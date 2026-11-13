@@ -87,12 +87,12 @@ pub fn pill(ui: &mut Ui, text: &str, color: Color32) -> Response {
     resp
 }
 
-/// `⌘T new  ⌘W close`: keys brighter than what they do.
-pub fn key_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
+/// `⌘T new  ⌘W close`: keys brighter than what they do; hints with no key are skipped.
+pub fn key_hints(ui: &mut Ui, hints: &[(String, &str)]) {
     let mut job = LayoutJob::default();
     let key = TextFormat { font_id: theme::ui_font_semibold(theme::TEXT_SMALL), color: theme::MUTED, ..Default::default() };
     let label = TextFormat { font_id: theme::ui_font(theme::TEXT_SMALL), color: theme::SUBTLE, ..Default::default() };
-    for (i, (k, what)) in hints.iter().enumerate() {
+    for (i, (k, what)) in hints.iter().filter(|(k, _)| !k.is_empty()).enumerate() {
         job.append(k, if i == 0 { 0.0 } else { 14.0 }, key.clone());
         job.append(what, 5.0, label.clone());
     }
@@ -133,8 +133,10 @@ pub fn overlay_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(theme::SPACE_L as i8))
 }
 
-/// A centered title, an optional line under it, and the keys to press.
-pub fn empty_state(ui: &mut Ui, title: &str, body: Option<&str>, hints: &[(&str, &str)]) {
+/// A centered title, an optional line under it, and the keys to press
+/// (hints with no key are skipped).
+pub fn empty_state(ui: &mut Ui, title: &str, body: Option<&str>, hints: &[(String, &str)]) {
+    let hints: Vec<&(String, &str)> = hints.iter().filter(|(k, _)| !k.is_empty()).collect();
     let height = 26.0 + body.map_or(0.0, |_| 22.0) + theme::SPACE_L + hints.len() as f32 * 30.0;
     ui.add_space(((ui.available_height() - height) / 2.0 - 24.0).max(0.0));
     ui.vertical_centered(|ui| {

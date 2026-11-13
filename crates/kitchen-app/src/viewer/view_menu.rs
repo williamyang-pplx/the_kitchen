@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(p.icons, vec![Some(PrState::Merged), Some(PrState::Open), None, None], "…its icons too");
 
         for _ in 0..3 {
-            h.frame_with(&mut v, vec![key(egui::Key::K)]);
+            h.frame_with(&mut v, vec![key(egui::Key::K), egui::Event::Text("k".into())]);
         }
         assert_eq!(
             v.context()["menu"],
@@ -241,7 +241,7 @@ mod tests {
         v.command(PanelCmd::ViewMenu, &h.engine);
         h.frame(&mut v);
         assert_eq!(cursor(&v), "● worktree");
-        h.frame_with(&mut v, vec![key(egui::Key::K)]);
+        h.frame_with(&mut v, vec![key(egui::Key::K), egui::Event::Text("k".into())]);
         assert_eq!(cursor(&v), "#8");
         set(&h, serde_json::json!([pr(6), pr(7), pr(8)]));
         h.frame(&mut v);

@@ -1,60 +1,8 @@
-//! Chord strings like `cmd+shift+y` → egui modifiers + key.
+//! Key sequences for `kitchenctl debug keys` (`gd<c-o><cmd-shift-p>`) → egui events.
 
 use egui::{Key, Modifiers};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Chord {
-    pub cmd: bool,
-    pub shift: bool,
-    pub alt: bool,
-    pub ctrl: bool,
-    pub key: Key,
-}
-
-impl Chord {
-    pub fn parse(s: &str) -> Result<Chord, String> {
-        let mut c = Chord { cmd: false, shift: false, alt: false, ctrl: false, key: Key::A };
-        let mut key = None;
-        for part in s.split('+').map(|p| p.trim().to_ascii_lowercase()) {
-            match part.as_str() {
-                "cmd" | "command" | "super" => c.cmd = true,
-                "shift" => c.shift = true,
-                "alt" | "opt" | "option" | "meta" => c.alt = true,
-                "ctrl" | "control" => c.ctrl = true,
-                k if key.is_none() => key = Some(parse_key(k).ok_or_else(|| format!("unknown key {k:?} in {s:?}"))?),
-                _ => return Err(format!("more than one key in {s:?}")),
-            }
-        }
-        c.key = key.ok_or_else(|| format!("no key in {s:?}"))?;
-        if !(c.cmd || c.alt || c.ctrl) {
-            return Err(format!("{s:?} needs cmd, alt or ctrl (plain keys belong to the terminal/viewer)"));
-        }
-        Ok(c)
-    }
-
-    /// Exact modifier match (egui's logical matching would let ⌘Y fire ⌘⇧Y).
-    pub fn matches(&self, key: Key, m: Modifiers) -> bool {
-        key == self.key && (m.mac_cmd || m.command) == self.cmd && m.shift == self.shift && m.alt == self.alt && m.ctrl == self.ctrl
-    }
-
-    pub fn label(&self) -> String {
-        let mut s = String::new();
-        if self.ctrl {
-            s.push('⌃');
-        }
-        if self.alt {
-            s.push('⌥');
-        }
-        if self.shift {
-            s.push('⇧');
-        }
-        if self.cmd {
-            s.push('⌘');
-        }
-        s.push_str(self.key.name());
-        s
-    }
-}
+use crate::keybindings::notation::parse_key;
 
 /// Keystrokes for `kitchenctl debug keys`: plain characters are typed, and
 /// `<esc>`, `<cr>`, `<c-o>`, `<cmd-shift-p>`, `<alt-h>` press keys/chords.
@@ -104,50 +52,9 @@ pub fn parse_sequence(s: &str) -> Result<Vec<egui::Event>, String> {
     Ok(out)
 }
 
-fn parse_key(k: &str) -> Option<Key> {
-    let named = match k {
-        "enter" | "return" | "cr" => Some(Key::Enter),
-        "esc" | "escape" => Some(Key::Escape),
-        "tab" => Some(Key::Tab),
-        "space" => Some(Key::Space),
-        "up" => Some(Key::ArrowUp),
-        "down" => Some(Key::ArrowDown),
-        "left" => Some(Key::ArrowLeft),
-        "right" => Some(Key::ArrowRight),
-        "backspace" | "bs" => Some(Key::Backspace),
-        "," | "comma" => Some(Key::Comma),
-        "." | "period" => Some(Key::Period),
-        ";" | "semicolon" => Some(Key::Semicolon),
-        "/" | "slash" => Some(Key::Slash),
-        "\\" | "backslash" => Some(Key::Backslash),
-        "[" => Some(Key::OpenBracket),
-        "]" => Some(Key::CloseBracket),
-        "-" | "minus" => Some(Key::Minus),
-        "=" | "equals" => Some(Key::Equals),
-        "`" | "backtick" => Some(Key::Backtick),
-        "'" | "quote" => Some(Key::Quote),
-        _ => None,
-    };
-    named.or_else(|| Key::from_name(&k.to_ascii_uppercase())).or_else(|| Key::from_name(k))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_chords() {
-        let c = Chord::parse("cmd+shift+y").unwrap();
-        assert!(c.cmd && c.shift && !c.alt && c.key == Key::Y);
-        assert!(c.matches(Key::Y, Modifiers { mac_cmd: true, command: true, shift: true, ..Default::default() }));
-        assert!(!c.matches(Key::Y, Modifiers { mac_cmd: true, command: true, ..Default::default() }));
-        assert_eq!(Chord::parse("alt+5").unwrap().key, Key::Num5);
-        assert_eq!(Chord::parse("ctrl+enter").unwrap().key, Key::Enter);
-        assert!(Chord::parse("y").is_err());
-        assert_eq!(Chord::parse("cmd+c").unwrap().key, Key::C, "letters are keys, not modifier aliases");
-        assert_eq!(Chord::parse("alt+s").unwrap().key, Key::S);
-        assert!(Chord::parse("cmd+nope").is_err());
-    }
 
     #[test]
     fn key_sequences() {

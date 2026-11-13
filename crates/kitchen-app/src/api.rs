@@ -406,7 +406,10 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             let id = engine.resolve_tab(t.tab.as_deref(), t.workspace.as_deref(), caller)?;
             let (ws, tab) = engine.find_tab(&id).context("no such tab")?;
             engine.push_ui(UiCommand::ReloadPlan { tab_id: id.clone() });
-            engine.notify(Some(&ws.row.id), Some(&id), "plan ready", &format!("{} — review with ⌘⇧I", tab.row.title))?;
+            engine.notify(Some(&ws.row.id), Some(&id), "plan ready", &match crate::keybindings::hint(crate::keybindings::Place::Global, crate::keybindings::app::Action::OpenPlan) {
+                k if k.is_empty() => tab.row.title.clone(),
+                k => format!("{} — review with {k}", tab.row.title),
+            })?;
             Ok(json!({"tab": id}))
         }
         "plan.comments" => {

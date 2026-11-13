@@ -1,10 +1,12 @@
 //! Modal dialogs: new workspace (⌘N), new tab (⌘T), rename tab (⌘R) / workspace (⌘⇧R), close confirmations.
-//! Enter submits, Esc cancels, Tab moves between fields.
+//! `[dialog]` submit (Enter) and cancel (Esc) keys; Tab moves between fields.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use egui::{Key, RichText};
+use egui::RichText;
+
+use crate::keybindings::{self, Cmd, FieldCmd, KeyFocus, Place};
 
 use crate::engine::{Engine, NewTab, Tab, Workspace};
 use crate::theme;
@@ -96,7 +98,11 @@ impl Dialog {
     }
 
     pub fn show(&mut self, ctx: &egui::Context, engine: &Arc<Engine>) -> DialogOutcome {
-        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        let km = keybindings::current();
+        let esc = ctx.input_mut(|i| {
+            let p = keybindings::presses(i).into_iter().find(|p| km.lookup(KeyFocus::Dialog, None, p) == Some(&Cmd::Field(FieldCmd::Cancel)));
+            p.is_some_and(|p| keybindings::take(i, &p, true))
+        });
         if esc {
             return DialogOutcome::Closed;
         }
@@ -166,14 +172,18 @@ fn field<'t>(text: &'t mut String, hint: &str) -> egui::TextEdit<'t> {
         .desired_width(FIELD_WIDTH)
 }
 
-/// Right-aligned "Cancel" and "<label> ⏎" (enabled when `can`; Enter presses it too).
+/// Right-aligned "Cancel" and "<label> ⏎" (enabled when `can`; the
+/// `[dialog]` submit key presses it too, and the field still sees it).
 fn buttons(ui: &mut egui::Ui, label: &str, can: bool, on_yes: impl FnOnce()) -> DialogOutcome {
-    let enter = ui.input(|i| i.key_pressed(Key::Enter));
+    let km = keybindings::current();
+    let enter = ui.input(|i| keybindings::presses(i).iter().any(|p| km.lookup(KeyFocus::Dialog, None, p) == Some(&Cmd::Field(FieldCmd::Submit)) && keybindings::pressed(i, p, false)));
+    let key = km.hint(Place::Dialog, &Cmd::Field(FieldCmd::Submit), 1);
+    let label = if key.is_empty() { label.to_string() } else { format!("{label}  {key}") };
     let mut out = DialogOutcome::Open;
     ui.add_space(theme::SPACE_XL);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.spacing_mut().button_padding = egui::vec2(14.0, 6.0);
-        if (ui.add_enabled(can, widgets::primary_button(&format!("{label}  ⏎"))).clicked() || enter) && can {
+        if (ui.add_enabled(can, widgets::primary_button(&label)).clicked() || enter) && can {
             on_yes();
             out = DialogOutcome::Done;
         }
@@ -387,6 +397,40 @@ mod tests {
         assert!(h[0].devbox && h[1].devbox && !h[2].devbox);
     }
 
+    #[test]
+    fn a_rebound_dialog_key_submits() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = egui::Context::default();
+            crate::theme::install(&ctx);
+            let engine = Engine::new(ctx.clone(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
+            let km = crate::keybindings::Keymap::with_user("[dialog]\nsubmit = [\"<C-s>\"]\ncancel = [\"<C-g>\"]\n");
+            let got = crate::keybindings::with_keymap(km, || {
+                let mut step = |dialog: &mut Dialog, events: Vec<egui::Event>| {
+                    let mut outcome = DialogOutcome::Closed;
+                    let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| outcome = dialog.show(ui.ctx(), &engine));
+                    out.textures_delta.clear();
+                    outcome
+                };
+                let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+                let mut d = Dialog::new_tab(false);
+                step(&mut d, vec![]);
+                step(&mut d, vec![]);
+                let enter = matches!(step(&mut d, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]), DialogOutcome::Open);
+                let esc = matches!(step(&mut d, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]), DialogOutcome::Open);
+                let cancel = matches!(step(&mut d, vec![key(egui::Key::G, egui::Modifiers::CTRL)]), DialogOutcome::Closed);
+                let mut d = Dialog::new_tab(false);
+                step(&mut d, vec![]);
+                step(&mut d, vec![]);
+                let submit = matches!(step(&mut d, vec![key(egui::Key::S, egui::Modifiers::CTRL)]), DialogOutcome::Done);
+                (enter, esc, cancel, submit)
+            });
+            tx.send(got).unwrap();
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("the dialog hung");
+        assert_eq!(got, (true, true, true, true), "Enter and Esc do nothing; ⌃G cancels, ⌃S submits");
+    }
+
     /// Enter in the ⌘T dialog once re-locked the egui context inside
     /// `ui.input` and hung the app; now it just submits.
     #[test]
@@ -405,7 +449,7 @@ mod tests {
             };
             step(vec![]);
             step(vec![]);
-            let enter = egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+            let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
             tx.send(matches!(step(vec![enter]), DialogOutcome::Done)).unwrap();
         });
         let done = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("Enter in the new tab dialog deadlocked");

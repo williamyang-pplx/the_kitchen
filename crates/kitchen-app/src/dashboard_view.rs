@@ -207,7 +207,10 @@ pub fn button(ui: &mut Ui, on: bool) -> egui::Response {
         let sq = egui::Rect::from_center_size(c + egui::vec2(dx * 3.2, dy * 3.2), egui::vec2(5.0, 5.0));
         ui.painter().rect_filled(sq, 1.0, color);
     }
-    resp.on_hover_text("Dashboard ⌘D")
+    resp.on_hover_text(match crate::keybindings::hint(crate::keybindings::Place::Global, crate::keybindings::app::Action::Dashboard) {
+        k if k.is_empty() => "Dashboard".to_string(),
+        k => format!("Dashboard {k}"),
+    })
 }
 
 #[cfg(test)]

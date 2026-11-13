@@ -11,10 +11,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, CornerRadius, FontId, Galley, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
+use egui::{Color32, CornerRadius, FontId, Galley, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
 use super::doc::{Doc, Fold, LineKind};
-use super::vim::{Vim, VimAction, VimKey, Viewport};
+use super::vim::{Vim, VimAction, VimCmd, Viewport};
+use crate::keybindings::{self, Cmd, FieldCmd, KeyFocus};
 use crate::plugins::decor::Reply;
 use crate::theme;
 use crate::web;
@@ -40,8 +41,6 @@ pub struct ViewState {
     pub rows: usize,
     /// Cursor row at the end of the last frame: a change means the cursor moved.
     last_line: Option<usize>,
-    /// A `g` held back while scrolling a tall row: `gg` goes to its top.
-    g_pending: bool,
     /// Heights measured invisibly, for the doc length, width and font size
     /// in `md_key`; painting refreshes them, a new key clears them.
     heights: Heights,
@@ -155,6 +154,8 @@ pub struct Output {
     pub submit_editor: bool,
     /// Links clicked in rendered Markdown, to open with `Link::Url`.
     pub urls: Vec<String>,
+    /// Plugin leader maps that fired.
+    pub plugin_commands: Vec<String>,
 }
 
 pub struct CodeView<'a> {
@@ -176,6 +177,8 @@ pub struct CodeView<'a> {
     /// (GitHub renders it in that repo's context).
     pub repo: Option<&'a str>,
     pub id: egui::Id,
+    /// Viewer or Plan: which keys drive `vim`.
+    pub focus: KeyFocus,
 }
 
 /// Comment field height before it is first painted: its label and four rows.
@@ -280,7 +283,7 @@ impl Geometry<'_> {
 
 impl CodeView<'_> {
     pub fn show(self, ui: &mut Ui) -> Output {
-        let CodeView { doc, vim, state, blocks, mut editor, focused, font_size, two_gutters, relative, overlay, repo, id } = self;
+        let CodeView { doc, vim, state, blocks, mut editor, focused, font_size, two_gutters, relative, overlay, repo, id, focus } = self;
         let mut out = Output::default();
         let rect = ui.available_rect_before_wrap();
         let resp = ui.interact(rect, id.with("area"), Sense::click());
@@ -334,73 +337,49 @@ impl CodeView<'_> {
 
         // ---- keys -> vim
         if focused && !editor_focused && n > 0 {
-            let mut keys = Vec::new();
-            for key in collect_keys(ui) {
+            let km = keybindings::current();
+            let now = Instant::now();
+            for press in ui.input(keybindings::presses) {
+                let view = Viewport { top: state.top, rows: state.rows };
                 // A row taller than the view (a whole rendered document)
                 // scrolls under the motion keys until its edge shows.
-                let cur = vim.line.min(n - 1);
-                let row = rows_in_view(state.top, state.offset, height, n, &mut |i| geo.extent(ui, i, &mut state.heights)).into_iter().find(|r| r.0 == cur);
-                let delta = row.filter(|r| r.2 > height).and_then(|(_, top, h)| {
+                let mut intercept = |cmd: VimCmd, count: Option<usize>, line: usize| -> bool {
+                    let cur = line.min(n - 1);
+                    let row = rows_in_view(state.top, state.offset, height, n, &mut |i| geo.extent(ui, i, &mut state.heights)).into_iter().find(|r| r.0 == cur);
+                    let Some((_, top, h)) = row.filter(|r| r.2 > height) else { return false };
                     let (at_top, at_bottom) = (top >= -0.5, top + h <= height + 0.5);
-                    let held_g = std::mem::take(&mut state.g_pending);
-                    let d = match key {
-                        VimKey::Char('j') | VimKey::Down => row_h * 2.0,
-                        VimKey::Char('k') | VimKey::Up => -row_h * 2.0,
-                        VimKey::Ctrl('e') => row_h,
-                        VimKey::Ctrl('y') => -row_h,
-                        VimKey::Ctrl('d') => height / 2.0,
-                        VimKey::Ctrl('u') => -height / 2.0,
-                        VimKey::Ctrl('f') | VimKey::PageDown => height,
-                        VimKey::Ctrl('b') | VimKey::PageUp => -height,
-                        VimKey::Char('G') => h,
-                        VimKey::Char('g') if held_g => -h,
-                        VimKey::Char('g') => {
-                            state.g_pending = true;
-                            return Some(0.0);
-                        }
-                        _ => {
-                            if held_g {
-                                keys.push(VimKey::Char('g'));
-                            }
-                            return None;
-                        }
+                    let d = match cmd {
+                        VimCmd::Down => row_h * 2.0,
+                        VimCmd::Up => -row_h * 2.0,
+                        VimCmd::ScrollDown => row_h,
+                        VimCmd::ScrollUp => -row_h,
+                        VimCmd::HalfPageDown => height / 2.0,
+                        VimCmd::HalfPageUp => -height / 2.0,
+                        VimCmd::PageDown => height,
+                        VimCmd::PageUp => -height,
+                        VimCmd::GoToLine if count.is_none() => h,
+                        VimCmd::GoToTop => -h,
+                        _ => return false,
                     };
                     // At the row's edge the motion leaves it, as on any row.
                     if (d > 0.0 && at_bottom) || (d < 0.0 && at_top) {
-                        if held_g {
-                            keys.push(VimKey::Char('g'));
-                        }
-                        return None;
+                        return false;
                     }
                     // No further than the row's edges.
-                    Some(d.clamp(top.min(0.0), (top + h - height).max(0.0)))
-                });
-                match delta {
-                    Some(d) => (state.top, state.offset) = scroll_px(state.top, state.offset, d, height, n, &mut |i| geo.extent(ui, i, &mut state.heights)),
-                    None => keys.push(key),
-                }
+                    let d = d.clamp(top.min(0.0), (top + h - height).max(0.0));
+                    (state.top, state.offset) = scroll_px(state.top, state.offset, d, height, n, &mut |i| geo.extent(ui, i, &mut state.heights));
+                    true
+                };
+                let acts = vim.feed(press, &km, focus, now, &lines, view, &mut intercept);
+                apply(acts, vim.line.min(n - 1), (n, height), state, &geo, ui, &mut out);
             }
-            for key in keys.drain(..) {
-                let acts = vim.key(key, &lines, Viewport { top: state.top, rows: state.rows });
-                for a in acts {
-                    match a {
-                        // Keys scroll by whole rows.
-                        VimAction::ScrollBy(d) => state.scroll_to((state.top as isize + d).clamp(0, n as isize - 1) as usize),
-                        VimAction::Center | VimAction::Top | VimAction::Bottom => {
-                            let cur = vim.line.min(n - 1);
-                            let mut ext = |i| geo.extent(ui, i, &mut state.heights);
-                            let row = ext(cur).row;
-                            let y = match a {
-                                VimAction::Center => (height - row) / 2.0,
-                                VimAction::Top => 0.0,
-                                _ => height - row,
-                            };
-                            (state.top, state.offset) = anchor(cur, y.max(0.0), &mut ext);
-                        }
-                        other => out.actions.push(other),
-                    }
-                }
+            let acts = vim.tick(&km, now, &lines, Viewport { top: state.top, rows: state.rows });
+            apply(acts, vim.line.min(n - 1), (n, height), state, &geo, ui, &mut out);
+            if vim.is_pending() {
+                ui.ctx().request_repaint_after(km.timeout);
             }
+        } else {
+            vim.reset_keys();
         }
 
         // ---- wheel (pixels; egui already eases them). With a zero delta this
@@ -650,8 +629,10 @@ impl CodeView<'_> {
                     .background_color(theme::BG)
                     .text_color(theme::TEXT);
                 // Taken before the field sees it, which would add a new line
-                // (`consume_key` ignores Shift, so ⇧Enter is let through first).
-                if ed.ask && editor_focused && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter)) {
+                // (⇧Enter is let through: a new line).
+                let km = keybindings::current();
+                let bound = |p: &keybindings::Press, c: FieldCmd| km.lookup(focus.input(), None, p) == Some(&Cmd::Field(c));
+                if ed.ask && editor_focused && ui.input_mut(|i| !i.modifiers.shift && keybindings::presses(i).into_iter().find(|p| bound(p, FieldCmd::Submit)).is_some_and(|p| keybindings::take(i, &p, true))) {
                     out.submit_editor = true;
                 }
                 let r = child.add(te);
@@ -665,7 +646,7 @@ impl CodeView<'_> {
                     r.request_focus();
                     ed.needs_focus = false;
                 }
-                if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(Key::Escape)) {
+                if (r.has_focus() || r.lost_focus()) && ui.input(|i| keybindings::presses(i).iter().any(|p| bound(p, FieldCmd::Cancel))) {
                     out.cancel_editor = true;
                 }
             }
@@ -898,45 +879,26 @@ fn draw_card(painter: &egui::Painter, paint: bool, b: &Block, at: Pos2, width: f
     y + CARD_PAD_Y - at.y
 }
 
-/// This frame's plain keys as vim keys (Cmd chords were consumed upstream).
-pub(crate) fn collect_keys(ui: &Ui) -> Vec<VimKey> {
-    let mut out = Vec::new();
-    ui.input(|i| {
-        for e in &i.events {
-            match e {
-                egui::Event::Key { key, pressed: true, modifiers, .. } if !modifiers.command || modifiers.ctrl && !modifiers.mac_cmd => {
-                    if modifiers.ctrl {
-                        let c = match key {
-                            Key::CloseBracket => Some(']'),
-                            k => k.name().chars().next().filter(|_| k.name().len() == 1).map(|c| c.to_ascii_lowercase()),
-                        };
-                        if let Some(c) = c {
-                            out.push(VimKey::Ctrl(c));
-                        }
-                        continue;
-                    }
-                    let k = match key {
-                        Key::Escape => VimKey::Esc,
-                        Key::Enter => VimKey::Enter,
-                        Key::Backspace => VimKey::Backspace,
-                        Key::ArrowUp => VimKey::Up,
-                        Key::ArrowDown => VimKey::Down,
-                        Key::ArrowLeft => VimKey::Left,
-                        Key::ArrowRight => VimKey::Right,
-                        Key::PageUp => VimKey::PageUp,
-                        Key::PageDown => VimKey::PageDown,
-                        Key::Home => VimKey::Home,
-                        Key::End => VimKey::End,
-                        _ => continue,
-                    };
-                    out.push(k);
-                }
-                egui::Event::Text(t) if !i.modifiers.ctrl && !i.modifiers.mac_cmd => out.extend(t.chars().map(VimKey::Char)),
-                _ => {}
+/// What the vim actions of one press do to the view; the rest go to the owner.
+fn apply(acts: Vec<VimAction>, cur: usize, (n, height): (usize, f32), state: &mut ViewState, geo: &Geometry, ui: &mut Ui, out: &mut Output) {
+    for a in acts {
+        match a {
+            // Keys scroll by whole rows.
+            VimAction::ScrollBy(d) => state.scroll_to((state.top as isize + d).clamp(0, n as isize - 1) as usize),
+            VimAction::Center | VimAction::Top | VimAction::Bottom => {
+                let mut ext = |i| geo.extent(ui, i, &mut state.heights);
+                let row = ext(cur).row;
+                let y = match a {
+                    VimAction::Center => (height - row) / 2.0,
+                    VimAction::Top => 0.0,
+                    _ => height - row,
+                };
+                (state.top, state.offset) = anchor(cur, y.max(0.0), &mut ext);
             }
+            VimAction::Plugin(p) => out.plugin_commands.push(p),
+            other => out.actions.push(other),
         }
-    });
-    out
+    }
 }
 
 #[cfg(test)]

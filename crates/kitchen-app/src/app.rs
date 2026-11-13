@@ -1,17 +1,18 @@
 //! The window: workspace sidebar, tab strip, terminal, side panel
-//! (viewer / plan), dialogs, and the Cmd keymap.
+//! (viewer / plan), dialogs, and dispatching the keymap's chords.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use egui::{Align, Color32, Key, Layout, Modifiers, RichText, Sense, Ui};
+use egui::{Align, Color32, Layout, Modifiers, RichText, Sense, Ui};
 
 use crate::attach;
 use crate::engine::{Engine, Shown, Tab, UiCommand, View, Workspace};
 use crate::viewer::Viewer;
-use crate::keymap::{self, Action};
+use crate::keybindings::app::Action;
+use crate::keybindings::{self, Cmd, FieldCmd, KeyFocus, MenuCmd, Place, places};
 use crate::panels::{PanelCmd, PanelCtx};
 use crate::terminal::{TermSession, TerminalView};
 use crate::theme;
@@ -73,8 +74,8 @@ pub struct KitchenApp {
     screenshots: Vec<(String, Sender<Result<(), String>>)>,
     /// Input events from `kitchenctl debug keys`, fed to the next frame.
     injected: Vec<egui::Event>,
-    /// ⌘V was pressed this frame (see attach.rs).
-    cmd_v: bool,
+    /// The paste key was pressed this frame (see attach.rs).
+    paste: bool,
     /// ⌘Q pressed; closes the window at the end of the frame.
     quit_requested: bool,
     /// Test hook: take a screenshot after a delay, then exit.
@@ -120,7 +121,7 @@ impl KitchenApp {
             shortcuts: false,
             screenshots: Vec::new(),
             injected: Vec::new(),
-            cmd_v: false,
+            paste: false,
             quit_requested: false,
             auto_shot,
             palette: None,
@@ -289,7 +290,6 @@ impl KitchenApp {
                 self.side_command(PanelCmd::ViewMenu);
             }
             Action::Shortcuts => self.shortcuts = !self.shortcuts,
-            Action::Plugin(_) => {} // resolved in `ui` against the registry snapshot
             Action::PrevTab => {
                 engine.cycle_tab(-1);
                 self.hide_dashboard();
@@ -305,14 +305,14 @@ impl KitchenApp {
                     engine.refill_spare(&ws.row.id, true);
                     self.dialog = Some(Dialog::new_tab(false));
                 } else {
-                    engine.toast_err("create a workspace first (⌘N)");
+                    engine.toast_err(with_key("create a workspace first", Place::Global, Action::NewWorkspace));
                 }
             }
             Action::NewMainCheckoutTab => {
                 if ws.is_some() {
                     self.dialog = Some(Dialog::new_tab(true));
                 } else {
-                    engine.toast_err("create a workspace first (⌘N)");
+                    engine.toast_err(with_key("create a workspace first", Place::Global, Action::NewWorkspace));
                 }
             }
             Action::RenameTab => {
@@ -350,12 +350,13 @@ impl KitchenApp {
             Action::Comment => self.side_command(PanelCmd::Comment),
             Action::Ask => self.side_command(PanelCmd::Ask),
             Action::Submit => self.side_command(PanelCmd::Submit),
-            Action::DiffOrDashboard if self.focus() == Focus::Side && self.side().is_some() => self.side_command(PanelCmd::ToggleDiff),
-            Action::DiffOrDashboard => {
+            Action::ToggleDiff => self.side_command(PanelCmd::ToggleDiff),
+            Action::Dashboard => {
                 if let Some(ws) = &ws {
                     self.toggle_dashboard(&ws.row.id);
                 }
             }
+            Action::FocusTerminal => self.set_focus(Focus::Terminal),
             Action::ToggleOutline => {
                 if self.side().is_none() {
                     self.set_side(SideKind::Viewer);
@@ -422,13 +423,22 @@ impl KitchenApp {
         }
     }
 
-    /// Where plugin chords apply right now.
-    fn plugin_context(&self) -> crate::plugins::When {
-        use crate::plugins::When;
-        match (self.focus(), self.side()) {
-            (Focus::Side, Some(SideKind::Viewer)) => When::Viewer,
-            (Focus::Side, Some(SideKind::Plan)) => When::Plan,
-            _ => When::Terminal,
+    /// What has keyboard focus, and the open file's filetype for plugin chords.
+    fn key_focus(&self) -> (KeyFocus, Option<String>) {
+        if self.dialog.is_some() {
+            return (KeyFocus::Dialog, None);
+        }
+        if self.palette.is_some() {
+            return (KeyFocus::Palette, None);
+        }
+        let tab = self.selected_tab_id();
+        match (self.focus(), self.side(), tab) {
+            (Focus::Side, Some(SideKind::Viewer), Some(t)) => match self.viewer_key(&t).and_then(|k| self.viewers.get(&k)) {
+                Some(v) => (v.key_focus(), v.current_filetype()),
+                None => (KeyFocus::Viewer, None),
+            },
+            (Focus::Side, Some(SideKind::Plan), Some(t)) => (self.plans.get(&t).map_or(KeyFocus::Plan, |p| p.key_focus()), None),
+            _ => (KeyFocus::Terminal, None),
         }
     }
 
@@ -537,27 +547,6 @@ impl KitchenApp {
         }
     }
 
-    /// Plugin chords for the focused context (context-specific ones first).
-    fn plugin_chords(&self) -> (Option<Arc<crate::plugins::Registry>>, keymap::PluginChords) {
-        use crate::plugins::When;
-        let Some(p) = self.engine.plugins() else { return (None, Vec::new()) };
-        let reg = p.registry();
-        if reg.chords.is_empty() {
-            return (Some(reg), Vec::new());
-        }
-        let here = self.plugin_context();
-        let ft = if here == When::Viewer { self.selected_tab_id().and_then(|t| self.viewer_key(&t)).and_then(|k| self.viewers.get(&k)).and_then(|v| v.current_filetype()) } else { None };
-        let mut chords: Vec<(usize, crate::plugins::keys::Chord, bool)> = reg
-            .chords
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| (c.when == When::Any || c.when == here) && c.filetype.as_ref().is_none_or(|f| ft.as_ref() == Some(f)))
-            .map(|(i, c)| (i, c.chord, c.when == When::Any))
-            .collect();
-        chords.sort_by_key(|c| c.2);
-        (Some(reg.clone()), chords.into_iter().map(|(i, c, _)| (i, c)).collect())
-    }
-
     fn run_plugin_command(&mut self, command: &str) {
         let Some(p) = self.engine.plugins().cloned() else { return };
         let tab = self.selected_tab_id().unwrap_or_default();
@@ -574,15 +563,18 @@ impl KitchenApp {
             return;
         }
         let mut items: Vec<(PaletteItem, (String, String))> = Vec::new();
+        let km = keybindings::current();
+        let keys = km.plugin_keys();
         if let Some(p) = self.engine.plugins() {
             let reg = p.registry();
             for c in &reg.commands {
-                let chords: Vec<String> = reg.chords.iter().filter(|k| k.command == c.name).map(|k| k.chord.label()).chain(reg.viewer_maps.iter().filter(|m| m.command == c.name).map(|m| format!("\\{}", m.keys))).collect();
-                let detail = [c.desc.clone(), chords.join(" ")].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ·  ");
+                let chords = keys.get(&c.name).map(|k| k.join(" ")).unwrap_or_default();
+                let detail = [c.desc.clone(), chords].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  ·  ");
                 items.push((PaletteItem::Command(c.name.clone()), (c.name.clone(), detail)));
             }
         }
-        items.push((PaletteItem::Diagnostics, ("viewer: diagnostics in this file".into(), "]d / [d".into())));
+        let diag = [crate::viewer::vim::VimCmd::NextDiag, crate::viewer::vim::VimCmd::PrevDiag].map(|c| km.hint(Place::Vim, &Cmd::Vim(c), 1)).into_iter().filter(|k| !k.is_empty()).collect::<Vec<_>>().join(" / ");
+        items.push((PaletteItem::Diagnostics, ("viewer: diagnostics in this file".into(), diag)));
         items.push((PaletteItem::ReloadPlugins, ("plugins: reload all".into(), format!("{}", kitchen_proto::state_dir().join("plugins").display()))));
         let (kinds, labels): (Vec<PaletteItem>, Vec<(String, String)>) = items.into_iter().unzip();
         let mut picker = crate::viewer::picker::Picker::new("Commands", labels);
@@ -595,7 +587,9 @@ impl KitchenApp {
         // Enter on a link (`owner/repo#12`, a URL): the plugins' `open`
         // handlers get it with the selected tab's command ctx.
         let link = Some(picker.query.trim().to_string()).filter(|q| crate::ui::dialogs::is_link(q));
-        if let Some(link) = link.filter(|_| ctx.input(|i| i.key_pressed(Key::Enter))) {
+        let km = keybindings::current();
+        let choose = ctx.input(|i| keybindings::presses(i).iter().any(|p| km.lookup(KeyFocus::Palette, None, p) == Some(&Cmd::Menu(MenuCmd::Choose))));
+        if let Some(link) = link.filter(|_| choose) {
             self.palette = None;
             let mut ev = crate::plugins::command_context(&self.engine, &self.selected_tab_id().unwrap_or_default(), None);
             ev["text"] = link.clone().into();
@@ -834,7 +828,7 @@ impl KitchenApp {
         let color = if resp.hovered() { theme::TEXT } else { theme::SUBTLE };
         let p = ui.painter();
         p.text(egui::pos2(card.left() + 12.0, card.center().y), egui::Align2::LEFT_CENTER, "+   New workspace", theme::ui_font(theme::TEXT_BODY), color);
-        p.text(egui::pos2(card.right() - 10.0, card.center().y), egui::Align2::RIGHT_CENTER, "⌘N", theme::ui_font(theme::TEXT_SMALL), theme::DIM);
+        p.text(egui::pos2(card.right() - 10.0, card.center().y), egui::Align2::RIGHT_CENTER, keybindings::hint(Place::Global, Action::NewWorkspace), theme::ui_font(theme::TEXT_SMALL), theme::DIM);
         if resp.clicked_by(egui::PointerButton::Primary) {
             self.run_action(Action::NewWorkspace);
         }
@@ -859,7 +853,7 @@ impl KitchenApp {
                     self.engine.select_tab(&tab.row.id);
                     self.dashboard.remove(&ws.row.id);
                 }
-                if resp.middle_clicked() {
+                if keybindings::current().clicked(Place::Global, places::ClickCmd::CloseTab, &resp, ui.input(|i| i.modifiers)) {
                     self.dialog = Some(Dialog::confirm_close(tab));
                 }
             }
@@ -868,7 +862,8 @@ impl KitchenApp {
                 tab_button(ui, strip, None, &format!("⋯ {title}"), None, p.focus, false, true).on_hover_text("fetching origin and preparing the worktree…");
             }
             ui.add_space(theme::SPACE_XS);
-            if icon_button(ui, strip, "+").on_hover_text("New edit tab  ⌘T\nNew read tab  ⌘I").clicked_by(egui::PointerButton::Primary) {
+            let tip = [("New edit tab", Action::NewTab), ("New read tab", Action::NewMainCheckoutTab)].map(|(what, a)| with_key_spaced(what, Place::Terminal, a)).join("\n");
+            if icon_button(ui, strip, "+").on_hover_text(tip).clicked_by(egui::PointerButton::Primary) {
                 self.run_action(Action::NewTab);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -880,11 +875,11 @@ impl KitchenApp {
                     self.toggle_dashboard(&ws.row.id);
                 }
                 for (kind, label, keys, action) in [
-                    (SideKind::Plan, "Plan", "⌘⇧I", Action::OpenPlan),
-                    (SideKind::Viewer, "Viewer", "⌘.", Action::ToggleFiles),
+                    (SideKind::Plan, "Plan", Action::OpenPlan, Action::OpenPlan),
+                    (SideKind::Viewer, "Viewer", Action::ToggleViewer, Action::ToggleFiles),
                 ] {
                     let on = self.focus() == Focus::Side && self.side() == Some(kind) && !self.dashboard.contains(&ws.row.id);
-                    if widgets::flat_button(ui, label, on).on_hover_text(format!("{label}  {keys}")).clicked_by(egui::PointerButton::Primary) {
+                    if widgets::flat_button(ui, label, on).on_hover_text(with_key_spaced(label, Place::Global, keys)).clicked_by(egui::PointerButton::Primary) {
                         if on {
                             self.set_focus(Focus::Terminal);
                         } else {
@@ -905,11 +900,15 @@ impl KitchenApp {
         ui.painter().hline(rect.x_range(), rect.top() + 0.5, egui::Stroke::new(1.0, theme::BORDER));
         ui.horizontal_centered(|ui| {
             ui.add_space(theme::SPACE_S);
-            let (focus, hints): (&str, &[(&str, &str)]) = match (self.focus(), self.side()) {
-                (Focus::Side, Some(SideKind::Viewer)) => ("VIEWER", &[("⌘P", "find file"), ("⌘M", "comment"), ("⌘D", "diff"), ("⌘.", "terminal"), ("⌘/", "shortcuts")]),
-                (Focus::Side, Some(SideKind::Plan)) => ("PLAN", &[("⌘M", "comment"), ("⌘⏎", "submit"), ("⌘.", "viewer"), ("⌘/", "shortcuts")]),
-                _ => ("TERMINAL", &[("⌘T", "new edit tab"), ("⌘I", "new read tab"), ("⌘.", "viewer"), ("⌘⇧P", "commands"), ("⌘/", "shortcuts")]),
+            use Action as A;
+            use Place::{Global as G, Panel as P, Terminal as T, Viewer as V};
+            let (focus, hints): (&str, &[(Place, Action, &str)]) = match (self.focus(), self.side()) {
+                (Focus::Side, Some(SideKind::Viewer)) => ("VIEWER", &[(V, A::FilePicker, "find file"), (P, A::Comment, "comment"), (P, A::ToggleDiff, "diff"), (G, A::ToggleViewer, "terminal"), (G, A::Shortcuts, "shortcuts")]),
+                (Focus::Side, Some(SideKind::Plan)) => ("PLAN", &[(P, A::Comment, "comment"), (P, A::Submit, "submit"), (G, A::ToggleViewer, "viewer"), (G, A::Shortcuts, "shortcuts")]),
+                _ => ("TERMINAL", &[(T, A::NewTab, "new edit tab"), (T, A::NewMainCheckoutTab, "new read tab"), (G, A::ToggleViewer, "viewer"), (G, A::Palette, "commands"), (G, A::Shortcuts, "shortcuts")]),
             };
+            let km = keybindings::current();
+            let hints: Vec<(String, &str)> = hints.iter().map(|(p, a, what)| (km.hint(*p, &Cmd::App(*a), 1), *what)).collect();
             widgets::pill(ui, focus, theme::ACCENT);
             if let Some(t) = toast {
                 ui.add_space(theme::SPACE_XS);
@@ -917,7 +916,7 @@ impl KitchenApp {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(theme::SPACE_M);
-                widgets::key_hints(ui, hints);
+                widgets::key_hints(ui, &hints);
             });
         });
         if self.engine.state().toasts.last().map(|t| t.at.elapsed() < Duration::from_secs(12)).unwrap_or(false) {
@@ -925,40 +924,50 @@ impl KitchenApp {
         }
     }
 
-    /// ⌘/: every shortcut, grouped, over whatever is shown.
+    /// ⌘/: every binding of the live keymap, grouped by place, over whatever is shown.
     fn shortcuts_ui(&mut self, ctx: &egui::Context) {
         if !self.shortcuts {
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        let km = keybindings::current();
+        let close = |p: &keybindings::Press| km.lookup(KeyFocus::Dialog, None, p) == Some(&Cmd::Field(FieldCmd::Cancel));
+        if ctx.input_mut(|i| keybindings::presses(i).into_iter().find(close).is_some_and(|p| keybindings::take(i, &p, true))) {
             self.shortcuts = false;
             return;
         }
+        let commands = self.engine.plugins().map(|p| p.registry()).unwrap_or_default();
+        let groups = shortcut_groups(&km, &commands);
+        let half = groups.iter().map(|(_, rows)| rows.len() + 2).sum::<usize>() / 2;
         let area = egui::Area::new(egui::Id::new("shortcuts")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0)).show(ctx, |ui| {
             widgets::overlay_frame().inner_margin(egui::Margin::same(theme::SPACE_XL as i8)).show(ui, |ui| {
-                ui.set_width(720.0);
+                ui.set_width(760.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Keyboard shortcuts").font(theme::ui_font_semibold(theme::TEXT_TITLE)).color(theme::TEXT));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        widgets::key_hints(ui, &[("esc", "close")]);
+                        widgets::key_hints(ui, &[(km.hint(Place::Dialog, &Cmd::Field(FieldCmd::Cancel), 1), "close")]);
                     });
                 });
+                ui.label(RichText::new(format!("change them in {}", keybindings::path().display())).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
                 ui.add_space(theme::SPACE_L);
-                ui.columns(2, |cols| {
-                    for (col, groups) in cols.iter_mut().zip(SHORTCUTS) {
-                        for (title, rows) in groups {
+                let max_h = (ctx.content_rect().height() - 180.0).max(200.0);
+                egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
+                    ui.columns(2, |cols| {
+                        let mut used = 0;
+                        for (title, rows) in &groups {
+                            let col = if used < half { &mut cols[0] } else { &mut cols[1] };
+                            used += rows.len() + 2;
                             col.label(widgets::section_label(title, theme::SUBTLE));
                             col.add_space(theme::SPACE_XS);
                             egui::Grid::new(("shortcuts", title)).num_columns(2).spacing([theme::SPACE_M, 5.0]).min_col_width(96.0).show(col, |ui| {
-                                for (keys, what) in rows.iter() {
-                                    ui.label(RichText::new(*keys).font(theme::ui_font_semibold(theme::TEXT_BODY)).color(theme::TEXT));
-                                    ui.label(RichText::new(*what).font(theme::ui_font(theme::TEXT_BODY)).color(theme::MUTED));
+                                for (keys, what) in rows {
+                                    ui.label(RichText::new(keys).font(theme::ui_font_semibold(theme::TEXT_BODY)).color(theme::TEXT));
+                                    ui.label(RichText::new(what).font(theme::ui_font(theme::TEXT_BODY)).color(theme::MUTED));
                                     ui.end_row();
                                 }
                             });
                             col.add_space(theme::SPACE_L);
                         }
-                    }
+                    });
                 });
             });
         });
@@ -983,7 +992,7 @@ impl KitchenApp {
                 let (resp, link) = egui::Frame::NONE.inner_margin(margin).show(ui, |ui| TerminalView::new(session).font_size(font_size).focused(focused).links(rules).show(ui)).inner;
                 // ⌘V with an image, and dropped files, paste paths Claude Code can read.
                 let mut sources = Vec::new();
-                if focused && self.cmd_v {
+                if focused && self.paste {
                     sources.push(attach::Source::Clipboard);
                 }
                 let dropped: Vec<_> = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
@@ -1008,7 +1017,10 @@ impl KitchenApp {
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
             }
             Some(TermSlot::Gone(msg)) => {
-                let msg = format!("{msg}\n⌘W closes this tab");
+                let msg = match keybindings::hint(Place::Terminal, Action::CloseTab) {
+                    k if k.is_empty() => msg.clone(),
+                    k => format!("{msg}\n{k} closes this tab"),
+                };
                 centered_note(ui, &msg, theme::RED)
             }
         }
@@ -1025,7 +1037,11 @@ impl KitchenApp {
                 .entry(tab.row.id.clone())
                 .or_insert_with(|| crate::plan_view::PlanView::new(&self.engine, ws, tab))
                 .ui(ui, &mut cx),
-            (_, None) => centered_note(ui, "open a tab first (⌘T or ⌘I)", theme::SUBTLE),
+            (_, None) => {
+                let keys: Vec<String> = [Action::NewTab, Action::NewMainCheckoutTab].map(|a| keybindings::hint(Place::Terminal, a)).into_iter().filter(|k| !k.is_empty()).collect();
+                let note = if keys.is_empty() { "open a tab first".to_string() } else { format!("open a tab first ({})", keys.join(" or ")) };
+                centered_note(ui, &note, theme::SUBTLE)
+            }
         }
         // A PR being checked out: the frying pan over the viewer (the PR
         // menu, a foreground overlay, still opens above it).
@@ -1092,7 +1108,7 @@ impl eframe::App for KitchenApp {
         if !self.injected.is_empty() {
             raw_input.events.append(&mut self.injected);
         }
-        keymap::unpaste_shift_v(raw_input, ctx.input(|i| i.modifiers));
+        keybindings::app::edit_keys(raw_input, &keybindings::current(), ctx.input(|i| i.modifiers));
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
@@ -1101,7 +1117,7 @@ impl eframe::App for KitchenApp {
         // Rendered Markdown asked for last frame is laid out off screen (and drawn once ready).
         crate::web::pump(frame, &ctx);
         self.poll_attach(&ctx);
-        self.cmd_v = attach::take_cmd_v();
+        self.paste = attach::take_paste();
         self.handle_ui_commands(&ctx);
         self.drop_stale_state();
 
@@ -1115,26 +1131,14 @@ impl eframe::App for KitchenApp {
                 }
             }
         } else {
-            let (reg, chords) = self.plugin_chords();
-            for action in keymap::collect(&ctx, &chords) {
-                // Chords belong to what is on screen; out-of-scope ones are swallowed.
-                let side_focused = self.focus() == Focus::Side && self.side().is_some();
-                if !action.allowed(side_focused, self.viewer_focused()) {
-                    continue;
+            // Chords belong to what has focus; ⌘ chords bound elsewhere are swallowed.
+            let (focus, filetype) = self.key_focus();
+            for cmd in keybindings::app::collect(&ctx, &keybindings::current(), focus, filetype.as_deref()) {
+                match cmd {
+                    Cmd::App(a) => self.run_action(a),
+                    Cmd::Plugin(c) => self.run_plugin_command(&c),
+                    _ => {}
                 }
-                match (action, &reg) {
-                    (Action::Plugin(i), Some(reg)) => {
-                        if let Some(c) = reg.chords.get(i) {
-                            let command = c.command.clone();
-                            self.run_plugin_command(&command);
-                        }
-                    }
-                    _ => self.run_action(action),
-                }
-            }
-            // Esc in a side panel that did not use it hands focus back.
-            if self.focus() == Focus::Side && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Escape)) {
-                self.set_focus(Focus::Terminal);
             }
         }
         let ws = self.engine.selected_workspace();
@@ -1178,9 +1182,14 @@ impl eframe::App for KitchenApp {
             (Some(ws), Some(tab)) => self.terminal_area(ui, ws, tab),
             (Some(ws), None) => {
                 let body = ws.status.clone().unwrap_or_else(|| format!("{} · {}", ws.row.host, ws.row.repo_path));
-                widgets::empty_state(ui, &ws.row.name, Some(&body), &[("⌘T", "New edit tab, in its own worktree and branch"), ("⌘I", "New read tab, in the main checkout"), ("⌘⇧P", "Review a PR from its link")]);
+                let hints = [
+                    (keybindings::hint(Place::Terminal, Action::NewTab), "New edit tab, in its own worktree and branch"),
+                    (keybindings::hint(Place::Terminal, Action::NewMainCheckoutTab), "New read tab, in the main checkout"),
+                    (keybindings::hint(Place::Global, Action::Palette), "Review a PR from its link"),
+                ];
+                widgets::empty_state(ui, &ws.row.name, Some(&body), &hints);
             }
-            (None, _) => widgets::empty_state(ui, "the kitchen", Some("A workspace is a repo on this mac or on a devbox."), &[("⌘N", "New workspace")]),
+            (None, _) => widgets::empty_state(ui, "the kitchen", Some("A workspace is a repo on this mac or on a devbox."), &[(keybindings::hint(Place::Global, Action::NewWorkspace), "New workspace")]),
         });
         self.palette_ui(&ctx);
         self.shortcuts_ui(&ctx);
@@ -1263,62 +1272,61 @@ fn icon_button(ui: &mut Ui, strip: egui::Rect, glyph: &str) -> egui::Response {
     resp
 }
 
-type ShortcutGroup = (&'static str, &'static [(&'static str, &'static str)]);
+/// "{what} ({key})", or just `what` when the action has no key.
+fn with_key(what: &str, place: Place, a: Action) -> String {
+    match keybindings::hint(place, a) {
+        k if k.is_empty() => what.to_string(),
+        k => format!("{what} ({k})"),
+    }
+}
 
-/// The ⌘/ list, in two columns.
-const SHORTCUTS: [&[ShortcutGroup]; 2] = [
-    &[
-        (
-            "Workspaces and tabs",
-            &[
-                ("⌘N", "new workspace"),
-                ("⌘J  ⌘K", "next / previous workspace"),
-                ("⌘⇧R", "rename workspace"),
-                ("⌘T", "new edit tab"),
-                ("⌘I", "new read tab"),
-                ("⌘1 … ⌘9", "go to tab"),
-                ("⌘H  ⌘L", "previous / next tab"),
-                ("⌘R", "rename tab"),
-                ("⌘W", "close tab"),
-                ("⌘⇧T", "reopen closed tab"),
-                ("⌘V", "paste (images too, for Claude)"),
-            ],
-        ),
-        (
-            "Everywhere",
-            &[
-                ("⌘.", "terminal ↔ viewer"),
-                ("⌘⇧I", "plan"),
-                ("⌘D", "dashboard (diff in a panel)"),
-                ("⌘⇧P", "commands, or a PR link"),
-                ("⌘/", "this list"),
-                ("⌘Q", "quit"),
-            ],
-        ),
-    ],
-    &[
-        (
-            "Viewer",
-            &[
-                ("⌘P", "find a file"),
-                ("⌘B", "show / hide the file list"),
-                ("⌘⇧H  ⌘⇧L", "file list ↔ code"),
-                ("⌘⇧J  ⌘⇧K", "next / previous changed file"),
-                ("⌘⇧S", "switch between the tab's PRs"),
-                ("⌘⇧A", "ask about the line or selection (again: follow up)"),
-                ("⌘O", "outline"),
-                ("]c  [c", "next / previous change"),
-                ("zo  zR  zM", "open a fold / all folds / fold again"),
-                ("gd  gr", "definition / references"),
-                ("⌃O", "back"),
-                ("-", "parent folder"),
-            ],
-        ),
-        ("Comments", &[("⌘M", "comment on the line or selection"), ("⌘⇧A", "plan: ask the planning agent"), ("⌘⏎", "submit (plan: send all to the agent)")]),
-    ],
-];
+/// "{what}  {key}" (a tooltip), or just `what`.
+fn with_key_spaced(what: &str, place: Place, a: Action) -> String {
+    match keybindings::hint(place, a) {
+        k if k.is_empty() => what.to_string(),
+        k => format!("{what}  {k}"),
+    }
+}
 
-/// `KITCHEN_PROFILE=1` logs the build time of every frame.
+/// The ⌘/ list: per place, its bound actions (keys, what) in file order,
+/// then the plugin commands with keys. ⌘1 … ⌘9 are one row.
+fn shortcut_groups(km: &keybindings::Keymap, reg: &crate::plugins::Registry) -> Vec<(String, Vec<(String, String)>)> {
+    let mut out = Vec::new();
+    for place in Place::ALL {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for def in places::actions(place) {
+            let keys = km.hint(place, &def.cmd, usize::MAX);
+            if keys.is_empty() {
+                continue;
+            }
+            match def.cmd {
+                Cmd::App(Action::GoToTab(n)) if n > 1 => {}
+                Cmd::App(Action::GoToTab(1)) => {
+                    let last = km.hint(place, &Cmd::App(Action::GoToTab(9)), 1);
+                    let first = km.hint(place, &def.cmd, 1);
+                    rows.push((if last.is_empty() { first } else { format!("{first} … {last}") }, "go to tab".into()));
+                }
+                _ => rows.push((keys, def.desc.to_string())),
+            }
+        }
+        if !rows.is_empty() {
+            out.push((place.title().to_string(), rows));
+        }
+    }
+    let plugin: Vec<(String, String)> = km
+        .plugin_keys()
+        .into_iter()
+        .map(|(name, keys)| {
+            let desc = reg.commands.iter().find(|c| c.name == name).map(|c| c.desc.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| name.clone());
+            (keys.join("  "), desc)
+        })
+        .collect();
+    if !plugin.is_empty() {
+        out.push(("Plugins".into(), plugin));
+    }
+    out
+}
+
 fn profiling() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KITCHEN_PROFILE").is_some())
@@ -1355,6 +1363,26 @@ fn tab_viewer<'a>(viewers: &'a mut HashMap<(String, Shown), Viewer>, shown: &Has
 mod tests {
     use super::*;
     use crate::test_util::{self, TestRepo};
+    use egui::Key;
+
+    #[test]
+    fn shortcuts_list_reads_the_keymap() {
+        use crate::plugins::{ChordEntry, CommandEntry, Registry, When};
+        let rows = |km: &keybindings::Keymap, reg: &Registry, group: &str| shortcut_groups(km, reg).into_iter().find(|(t, _)| t == group).map(|(_, r)| r).unwrap_or_default();
+        let reg = Registry::default();
+        let d = keybindings::Keymap::defaults();
+        let everywhere = rows(&d, &reg, "Everywhere");
+        assert!(everywhere.contains(&("⌘Q".into(), "quit".into())));
+        assert!(everywhere.contains(&("⌘1 … ⌘9".into(), "go to tab".into())));
+        assert!(rows(&d, &reg, "Vim motions").contains(&("j  ↓".into(), "down".into())));
+        let km = keybindings::Keymap::with_user("[global]\nquit = [\"cmd+shift+q\"]\n[vim]\ndown = []\n");
+        assert!(rows(&km, &reg, "Everywhere").contains(&("⌘⇧Q".into(), "quit".into())));
+        assert!(!rows(&km, &reg, "Vim motions").iter().any(|(_, what)| what == "down"), "unbound: not listed");
+        let mut reg = Registry::default();
+        reg.commands.push(CommandEntry { plugin: "p".into(), name: "p.x".into(), desc: "do x".into(), remote: false });
+        reg.chords.push(ChordEntry { plugin: "p".into(), chord: keybindings::Binding::parse("cmd+shift+y", &[]).unwrap(), command: "p.x".into(), when: When::Any, filetype: None });
+        assert_eq!(rows(&d.with_plugins(&reg), &reg, "Plugins"), vec![("⌘⇧Y".to_string(), "do x".to_string())]);
+    }
 
     fn key(key: Key, modifiers: Modifiers) -> Vec<egui::Event> {
         vec![

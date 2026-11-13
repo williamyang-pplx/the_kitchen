@@ -39,7 +39,7 @@ impl Viewer {
         let (first, last) = (self.row_line(start, false).1.unwrap_or(start + 1), self.row_line(end, true).1.unwrap_or(end + 1));
         let what = if end > start || last > first { format!("lines {first}–{last}") } else { format!("line {last}") };
         let who = self.engine.find_tab(&self.tab_id).map_or_else(|| self.engine.settings().ask_model, |_| "the agent".into());
-        let label = format!("Ask {who} about {what} — Enter asks · Esc cancels");
+        let label = crate::ask_thread::ask_label(&format!("Ask {who} about {what}"));
         self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true, follow_up: false });
     }
 
@@ -123,7 +123,7 @@ impl Viewer {
         if focused && self.editor.is_none() && self.vim.anchor.is_none() && self.asks_on_cursor().contains(&id) {
             self.open_follow_up(id);
         } else {
-            self.status = Some(("answered · ⌘⇧A on its lines follows up · Esc there closes it".into(), false));
+            self.status = Some((crate::ask_thread::answered_note(), false));
         }
     }
 

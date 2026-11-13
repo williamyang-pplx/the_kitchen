@@ -6,7 +6,8 @@
 //! tab every file is copied to `~/.kitchen/attachments` there (kept 7 days).
 //!
 //! egui-winit only pastes text: for ⌘V with no text on the clipboard it
-//! sends nothing at all, so an AppKit key monitor notices the ⌘V instead.
+//! sends nothing at all, so an AppKit key monitor notices the paste key
+//! (`[edit] paste` in keybindings.toml) instead.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,16 +24,21 @@ use crate::terminal::Paster;
 /// Dropped files bigger than this are not copied to a devbox.
 const MAX_UPLOAD: u64 = 64 << 20;
 
-static CMD_V: AtomicBool = AtomicBool::new(false);
+static PASTE: AtomicBool = AtomicBool::new(false);
 
-/// Start watching for ⌘V. Call once, on the main thread.
+/// Start watching for the paste key. Call once, on the main thread.
 pub fn install() {
     imp::install();
 }
 
-/// Whether ⌘V was pressed since the last call.
-pub fn take_cmd_v() -> bool {
-    CMD_V.swap(false, Ordering::Relaxed)
+/// Whether `edit.paste` was pressed since the last call.
+pub fn take_paste() -> bool {
+    PASTE.swap(false, Ordering::Relaxed)
+}
+
+/// The clipboard's text.
+pub fn clipboard_text() -> Option<String> {
+    imp::clipboard_text()
 }
 
 pub enum Source {
@@ -132,25 +138,62 @@ mod imp {
     use std::sync::atomic::Ordering;
 
     use block2::RcBlock;
+    use egui::Key;
     use objc2_app_kit::{
         NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventMask, NSEventModifierFlags, NSPasteboard, NSPasteboardTypePNG,
         NSPasteboardTypeString, NSPasteboardTypeTIFF,
     };
     use objc2_foundation::NSDictionary;
 
+    use crate::keybindings::notation::Mods;
+    use crate::keybindings::{EditCmd, Press};
+
     pub fn install() {
-        let chord = NSEventModifierFlags::Command | NSEventModifierFlags::Shift | NSEventModifierFlags::Control | NSEventModifierFlags::Option;
+        let mask = NSEventModifierFlags::Command | NSEventModifierFlags::Shift | NSEventModifierFlags::Control | NSEventModifierFlags::Option;
         let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
             // SAFETY: AppKit hands the monitor a valid event.
             let e = unsafe { event.as_ref() };
-            if e.modifierFlags() & chord == NSEventModifierFlags::Command && e.charactersIgnoringModifiers().is_some_and(|c| c.to_string() == "v") {
-                super::CMD_V.store(true, Ordering::Relaxed);
+            let flags = e.modifierFlags() & mask;
+            let mods = Mods {
+                cmd: flags.contains(NSEventModifierFlags::Command),
+                shift: flags.contains(NSEventModifierFlags::Shift),
+                alt: flags.contains(NSEventModifierFlags::Option),
+                ctrl: flags.contains(NSEventModifierFlags::Control),
+            };
+            let paste = key_of(e.keyCode()).is_some_and(|key| {
+                let km = crate::keybindings::current();
+                km.edit_presses(EditCmd::Paste).iter().any(|p| matches!(p, Press::Key { key: k, mods: m } if *k == key && *m == mods))
+            });
+            if paste {
+                super::PASTE.store(true, Ordering::Relaxed);
             }
             event.as_ptr() // the event goes on to winit
         });
         // SAFETY: the block returns the event it was given. The monitor lives
         // as long as the app.
         std::mem::forget(unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block) });
+    }
+
+    /// The egui key of a macOS virtual key code (ANSI layout positions);
+    /// keys outside the table never match.
+    fn key_of(code: u16) -> Option<Key> {
+        use Key::*;
+        const KEYS: [(u16, Key); 50] = [
+            (0x00, A), (0x01, S), (0x02, D), (0x03, F), (0x04, H), (0x05, G), (0x06, Z), (0x07, X), (0x08, C), (0x09, V),
+            (0x0B, B), (0x0C, Q), (0x0D, W), (0x0E, E), (0x0F, R), (0x10, Y), (0x11, T), (0x12, Num1), (0x13, Num2), (0x14, Num3),
+            (0x15, Num4), (0x16, Num6), (0x17, Num5), (0x18, Equals), (0x19, Num9), (0x1A, Num7), (0x1B, Minus), (0x1C, Num8), (0x1D, Num0), (0x1E, CloseBracket),
+            (0x1F, O), (0x20, U), (0x21, OpenBracket), (0x22, I), (0x23, P), (0x24, Enter), (0x25, L), (0x26, J), (0x27, Quote), (0x28, K),
+            (0x29, Semicolon), (0x2A, Backslash), (0x2B, Comma), (0x2C, Slash), (0x2D, N), (0x2E, M), (0x2F, Period), (0x30, Tab), (0x31, Space), (0x32, Backtick),
+        ];
+        KEYS.iter().find(|(c, _)| *c == code).map(|(_, k)| *k)
+    }
+
+    pub fn clipboard_text() -> Option<String> {
+        objc2::rc::autoreleasepool(|_| {
+            // SAFETY: AppKit's pasteboard type constants are initialized statics.
+            let string = unsafe { NSPasteboardTypeString };
+            NSPasteboard::generalPasteboard().stringForType(string).map(|s| s.to_string())
+        })
     }
 
     /// The clipboard's image as PNG, unless the clipboard also has text.
@@ -177,6 +220,10 @@ mod imp {
 #[cfg(not(target_os = "macos"))]
 mod imp {
     pub fn install() {}
+
+    pub fn clipboard_text() -> Option<String> {
+        None
+    }
 
     pub fn clipboard_image() -> Option<Vec<u8>> {
         None

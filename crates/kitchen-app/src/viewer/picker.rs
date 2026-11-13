@@ -9,7 +9,9 @@
 //! A term containing `/` is matched against the whole path, other terms
 //! prefer the file name.
 
-use egui::{Key, RichText};
+use egui::RichText;
+
+use crate::keybindings::{self, Cmd, KeyFocus, MenuCmd, Place};
 
 use crate::engine::PrState;
 use crate::theme;
@@ -228,6 +230,11 @@ impl Picker {
         p
     }
 
+    /// The ⌘⇧S menu: no query field.
+    pub fn is_menu(&self) -> bool {
+        self.menu
+    }
+
     /// The item under the cursor.
     pub fn selected_item(&self) -> Option<usize> {
         self.filtered.get(self.selected).map(|(i, _)| *i)
@@ -285,21 +292,28 @@ impl Picker {
                     }
                 });
             }
-            let (up, down, enter, esc) = ui.input_mut(|i| {
-                let ctrl = egui::Modifiers::CTRL;
-                let none = egui::Modifiers::NONE;
-                let keys = (
-                    i.consume_key(none, Key::ArrowUp) || i.consume_key(ctrl, Key::K) || i.consume_key(ctrl, Key::P) || (menu && i.consume_key(none, Key::K)),
-                    i.consume_key(none, Key::ArrowDown) || i.consume_key(ctrl, Key::J) || i.consume_key(ctrl, Key::N) || (menu && i.consume_key(none, Key::J)),
-                    i.consume_key(none, Key::Enter),
-                    i.consume_key(none, Key::Escape),
-                );
+            // Chords were taken by `collect` already: only [menu] / [picker] keys here.
+            let km = keybindings::current();
+            let focus = if menu { KeyFocus::ViewerMenu } else { KeyFocus::Palette };
+            let (mut up, mut down, mut enter, mut esc) = (false, false, false, false);
+            ui.input_mut(|i| {
+                for p in keybindings::presses(i) {
+                    let Some(Cmd::Menu(c)) = km.lookup(focus, None, &p).cloned() else { continue };
+                    if !keybindings::take(i, &p, true) {
+                        continue;
+                    }
+                    match c {
+                        MenuCmd::Up => up = true,
+                        MenuCmd::Down => down = true,
+                        MenuCmd::Choose => enter = true,
+                        MenuCmd::Cancel => esc = true,
+                    }
+                }
                 if menu {
                     // The keys' text too, or the viewer's vim reads a "j" typed
                     // in the frame the menu closes.
                     i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
                 }
-                keys
             });
             if esc {
                 return PickerResult::Cancelled;
@@ -404,10 +418,10 @@ impl Picker {
             egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 7, bottom: 8 }).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if self.menu {
-                        crate::ui::widgets::key_hints(ui, &[("j/k", "select"), ("⏎", "show"), ("esc", "close")]);
+                        crate::ui::widgets::key_hints(ui, &footer(Place::Menu, "show"));
                         return;
                     }
-                    crate::ui::widgets::key_hints(ui, &[("↑↓", "select"), ("⏎", "open"), ("esc", "close")]);
+                    crate::ui::widgets::key_hints(ui, &footer(Place::Picker, "open"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("spaces separate terms").font(theme::ui_font(theme::TEXT_SMALL)).color(theme::DIM));
                     });
@@ -420,6 +434,19 @@ impl Picker {
 
 /// One result: the label, and its detail right-aligned and dimmer. `icon`:
 /// drawn in the `ICON_SLOT` before the label's character at that index.
+/// "↑ ↓ select  ⏎ open  esc close" from the live keys; `moves` names where
+/// up / down are read first.
+fn footer(moves: Place, choose: &'static str) -> Vec<(String, &'static str)> {
+    let km = keybindings::current();
+    let first = |cmd: MenuCmd| {
+        let k = km.hint(moves, &Cmd::Menu(cmd), 1);
+        if k.is_empty() { km.hint(Place::Picker, &Cmd::Menu(cmd), 1) } else { k }
+    };
+    let (up, down) = (first(MenuCmd::Up), first(MenuCmd::Down));
+    let select = if up.is_empty() || down.is_empty() { format!("{up}{down}") } else { format!("{up}/{down}") };
+    vec![(select, "select"), (km.hint(Place::Picker, &Cmd::Menu(MenuCmd::Choose), 1), choose), (km.hint(Place::Picker, &Cmd::Menu(MenuCmd::Cancel), 1), "close")]
+}
+
 fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, detail: &str, icon: Option<(PrState, usize)>) -> egui::Response {
     let width = ui.available_width();
     let pad = egui::vec2(10.0, 5.0);
@@ -573,6 +600,24 @@ mod tests {
         assert_eq!(p.selected, 2, "clamped to the new rows");
         assert_eq!(p.items[p.filtered[0].0].0, "#0", "items keep their order");
         assert!(matches!(frame(&mut p, vec![key(egui::Key::Escape)]).0, PickerResult::Cancelled));
+    }
+
+    #[test]
+    fn a_rebound_menu_key_moves_the_cursor() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let items = (0..3).map(|i| (format!("#{i}"), String::new())).collect::<Vec<_>>();
+        let mut p = Picker::menu("PRs", items, vec![(0, "main ← a".into())]);
+        let km = crate::keybindings::Keymap::with_user("[menu]\ndown = [\"n\"]\n");
+        crate::keybindings::with_keymap(km, || {
+            for t in ["n", "n", "j"] {
+                let mut out = ctx.run_ui(egui::RawInput { events: vec![egui::Event::Text(t.into())], ..Default::default() }, |ui| {
+                    p.ui(ui, true);
+                });
+                out.textures_delta.clear();
+            }
+        });
+        assert_eq!(p.selected, 2, "n moves down, j no longer does");
     }
 
     /// Every menu row is numbered, 10 and up too, right-aligned so the

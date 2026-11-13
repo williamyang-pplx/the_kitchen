@@ -12,4 +12,4 @@ kitchen.command("where", function(ctx)
 end, { desc = "show file, host and branch" })
 
 kitchen.keymap("cmd+shift+y", "hello.where")      -- anywhere
-kitchen.keymap("viewer", "<leader>w", "hello.where") -- viewer normal mode: \w
+kitchen.keymap("viewer", "<leader>w", "hello.where") -- viewer normal mode: <leader>w

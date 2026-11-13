@@ -26,7 +26,7 @@ kitchen.command("greet", function(ctx)
   kitchen.notify(kitchen.config.greeting .. " from " .. (ctx.viewer.path or "?"))
 end, { desc = "say hi" })
 kitchen.keymap("cmd+shift+y", "hello.greet")        -- anywhere
-kitchen.keymap("viewer", "<leader>g", "hello.greet") -- viewer normal mode: \g
+kitchen.keymap("viewer", "<leader>g", "hello.greet") -- viewer normal mode: <leader>g
 ```
 
 Save and it's live: plugins reload when `plugin.toml` or any `*.lua` changes.
@@ -75,9 +75,9 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 13)
+## API (level 14)
 
-Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -108,7 +108,7 @@ manifest's `filetypes` are sent. After a reload, every open file is sent again.
 ```lua
 kitchen.command(name, fn(ctx), { desc = "…", remote = false })  -- → "<plugin>.<name>"
 kitchen.keymap("cmd+shift+y", target, { when = "viewer", filetype = "py" })
-kitchen.keymap("viewer", "<leader>xy", target)   -- \ then 1–3 keys, viewer normal mode
+kitchen.keymap("viewer", "<leader>xy", target)   -- <leader> then 1–3 keys, viewer normal mode
 ```
 
 `target` is a command name or a function. `ctx = {workspace, tab, host,
@@ -118,10 +118,18 @@ the cursor's 1-based character of the raw line, `word` the identifier under
 it. While the ⌘⇧S menu is up (a plugin chord still fires then), `menu` is
 the `{label, section, url}` of the `kitchen.views` entry under its cursor, `{}`
 on the tab's worktree row.
-Chords need cmd, alt or ctrl; built-in shortcuts can't be taken (the call
-errors). `when`: `any` (default), `terminal`, `viewer`, `plan`;
+Chords need cmd, alt or ctrl. `when`: `any` (default), `terminal`, `viewer`, `plan`;
 ctrl-only chords aren't allowed in terminals. `remote = true` lets
 `kitchenctl plugin run` from a devbox run the command.
+
+`kitchen.keymap` sets a command's *default* keys. `[plugins]` in
+`~/.kitchen/keybindings.toml` replaces them (`"ruff.explain" = ["<leader>x"]`)
+in the places the plugin registered the command (chords: its `when`; leader
+maps: the viewer). `<leader>` is `leader` in that file (`\` by default). A
+default may not take a key a built-in binds where the chord applies, or an
+`[edit]` key (the call errors); a keybindings.toml reload that makes one
+collide drops it with the same error. The defaults are in
+`crates/kitchen-app/assets/keybindings.toml`.
 
 ### Links
 

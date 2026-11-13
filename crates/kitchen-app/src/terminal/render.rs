@@ -12,6 +12,7 @@ use egui::{Color32, CornerRadius, EventFilter, FontId, Modifiers, PointerButton,
 use super::colors::{self, BACKGROUND, CURSOR, SELECTION};
 use super::input::{key_bytes, paste_bytes, sgr_mouse};
 use super::{GridSize, Listener, TermSession};
+use crate::keybindings::{ClickCmd, Place};
 use crate::links::{self, Link};
 use crate::plugins::LinkEntry;
 
@@ -79,8 +80,10 @@ impl<'a> TerminalView<'a> {
             }
         }
         let geom = Geom { origin: inner.min, cw, ch, cols, rows };
+        let km = crate::keybindings::current();
+        let mods = ui.input(|i| i.modifiers);
         let hovered = match resp.hover_pos() {
-            Some(pos) if ui.input(|i| i.modifiers.command) => hovered_link(session, &geom, pos, plugin_links),
+            Some(pos) if km.held(Place::Terminal, ClickCmd::OpenLink, mods) => hovered_link(session, &geom, pos, plugin_links),
             _ => None,
         };
         if hovered.is_some() {
@@ -94,7 +97,7 @@ impl<'a> TerminalView<'a> {
         if session.predictor.pending() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         }
-        let link = hovered.filter(|_| resp.clicked_by(PointerButton::Primary)).map(|h| h.link);
+        let link = hovered.filter(|_| km.clicked(Place::Terminal, ClickCmd::OpenLink, &resp, mods)).map(|h| h.link);
         (resp, link)
     }
 }
@@ -267,9 +270,10 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
     let hovered = resp.rect.contains(pos);
     let mode = *session.term.lock().mode();
     let mods: Modifiers = ui.input(|i| i.modifiers);
+    let link_click = crate::keybindings::current().held(Place::Terminal, ClickCmd::OpenLink, mods);
     let (col, row, side) = geom.cell_at(pos);
     // Shift bypasses mouse reporting so local selection always works. A
-    // ⌘-click is a link click (see `show`): neither reported nor selecting.
+    // link click (⌘-click, see `show`) is neither reported nor selecting.
     let report = mode.intersects(TermMode::MOUSE_MODE) && !mods.shift;
     let now = std::time::Instant::now();
 
@@ -320,7 +324,7 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
         for (button, code) in [(PointerButton::Primary, 0u8), (PointerButton::Middle, 1), (PointerButton::Secondary, 2)] {
             let bit = 1 << code;
             // ⌘-presses are ours; releases of reported presses always go out.
-            if hovered && !mods.command && ui.input(|i| i.pointer.button_pressed(button)) {
+            if hovered && !link_click && ui.input(|i| i.pointer.button_pressed(button)) {
                 session.mouse_buttons_down |= bit;
                 session.write(sgr_mouse(code, col, row, true, false, mods));
             }
@@ -337,7 +341,7 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
         }
         return;
     }
-    if mods.command {
+    if link_click {
         return; // no local selection either
     }
 
@@ -770,10 +774,9 @@ mod tests {
         assert!(!text.contains("aster"), "the row after the wrapped line is its own line: {text:?}");
     }
 
-    /// ⌘-click on a printed path reports it (even with mouse reporting on);
-    /// a plain click doesn't.
-    #[test]
-    fn cmd_click_reports_the_link() {
+    /// The links a click with each of `mods` on a printed path reports
+    /// (with mouse reporting on, as Claude Code has it).
+    fn click_links(mods: &[Modifiers]) -> Vec<Option<Link>> {
         let ctx = egui::Context::default();
         // `\e[?1000h` turns mouse reporting on, as Claude Code does.
         let script = "printf '\\033[?1000hsee crates/a.rs:7 ok'; sleep 30";
@@ -810,15 +813,29 @@ mod tests {
                 vec![egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: mods }],
             ]
         };
-        let mut got = None;
-        for events in click(Modifiers::COMMAND) {
-            got = got.or(frame(Modifiers::COMMAND, events));
-        }
-        assert_eq!(got, Some(Link::File(links::FileRef { path: "crates/a.rs".into(), line: Some(7) })));
-        let mut got = None;
-        for events in click(Modifiers::NONE) {
-            got = got.or(frame(Modifiers::NONE, events));
-        }
-        assert_eq!(got, None, "a plain click goes to the program");
+        mods.iter()
+            .map(|m| {
+                let mut got = None;
+                for events in click(*m) {
+                    got = got.or(frame(*m, events));
+                }
+                got
+            })
+            .collect()
+    }
+
+    /// ⌘-click on a printed path reports it (even with mouse reporting on);
+    /// a plain click doesn't.
+    #[test]
+    fn cmd_click_reports_the_link() {
+        let link = Some(Link::File(links::FileRef { path: "crates/a.rs".into(), line: Some(7) }));
+        assert_eq!(click_links(&[Modifiers::COMMAND, Modifiers::NONE]), vec![link, None], "a plain click goes to the program");
+    }
+
+    #[test]
+    fn a_rebound_modifier_click_opens_the_link() {
+        let km = crate::keybindings::Keymap::with_user("[terminal]\nopen_link_click = [\"alt+click\"]\n");
+        let got = crate::keybindings::with_keymap(km, || click_links(&[Modifiers::ALT, Modifiers::COMMAND]));
+        assert_eq!(got, vec![Some(Link::File(links::FileRef { path: "crates/a.rs".into(), line: Some(7) })), None]);
     }
 }

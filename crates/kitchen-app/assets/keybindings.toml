@@ -1,0 +1,175 @@
+# The kitchen's default keybindings. Copy a line into
+# ~/.kitchen/keybindings.toml and change it; your file lists only changes.
+# It reloads within a second; a mistake shows a toast and keeps the last
+# good keymap.
+#
+#   action = ["key", ...]     your line replaces all of the action's keys
+#   action = []               unbinds it
+#
+# Chords: "cmd+shift+p", "alt+h", "ctrl+d" (cmd, shift, alt/opt, ctrl; keys
+# by name: "cmd+period", "cmd+slash", "cmd+enter", "cmd+escape").
+# Sequences, vim notation: "gg", "]c", "<C-d>", "<CR>", "<Esc>", "<Down>",
+# "<PageDown>", "<Space>", "<BS>", "<leader>e". Mouse: "cmd+click",
+# "middle-click".
+#
+# A section is a place in the kitchen. Where several apply (the viewer is
+# also a panel, and everything is global), the innermost one that binds a
+# key wins. In one place, your line takes a key from the default that had it.
+
+leader = "\\"          # one key; what <leader> means in sequences
+timeout_ms = 2000      # how long a sequence waits for its next key
+
+[global]               # everywhere except dialogs
+new_workspace = ["cmd+n"]
+next_workspace = ["cmd+j"]
+prev_workspace = ["cmd+k"]
+rename_workspace = ["cmd+shift+r"]
+prev_tab = ["cmd+h"]
+next_tab = ["cmd+l"]
+go_to_tab_1 = ["cmd+1"]
+go_to_tab_2 = ["cmd+2"]
+go_to_tab_3 = ["cmd+3"]
+go_to_tab_4 = ["cmd+4"]
+go_to_tab_5 = ["cmd+5"]
+go_to_tab_6 = ["cmd+6"]
+go_to_tab_7 = ["cmd+7"]
+go_to_tab_8 = ["cmd+8"]
+go_to_tab_9 = ["cmd+9"]
+rename_tab = ["cmd+r"]
+reopen_tab = ["cmd+shift+t"]
+toggle_viewer = ["cmd+period"]
+toggle_files = ["cmd+b"]
+open_plan = ["cmd+shift+i"]
+view_menu = ["cmd+shift+s"]
+dashboard = ["cmd+d"]
+palette = ["cmd+shift+p"]
+shortcuts = ["cmd+slash"]
+quit = ["cmd+q"]
+close_tab_click = ["middle-click"]   # on a tab in the tab strip
+
+[terminal]             # the terminal pane; keys not bound here go to the shell
+new_tab = ["cmd+t"]
+new_main_checkout_tab = ["cmd+i"]
+close_tab = ["cmd+w"]
+open_link_click = ["cmd+click"]
+
+[panel]                # the viewer or the plan
+comment = ["cmd+m"]
+ask = ["cmd+shift+a"]
+submit = ["cmd+enter"]        # send a comment (plan: send comments to the agent)
+toggle_diff = ["cmd+d"]
+toggle_outline = ["cmd+o"]
+focus_terminal = ["cmd+escape"]
+
+[viewer]               # the file viewer, any part of it; plugin leader maps land here too
+file_picker = ["cmd+p"]
+focus_file_list = ["cmd+shift+h"]
+focus_code = ["cmd+shift+l"]
+next_file = ["cmd+shift+j"]
+prev_file = ["cmd+shift+k"]
+
+[vim]                  # normal mode in the viewer's code and in the plan
+down = ["j", "<Down>"]
+up = ["k", "<Up>"]
+left = ["h", "<Left>", "<BS>"]
+right = ["l", "<Right>", "<Space>"]
+line_start = ["0", "<Home>"]   # 0 is a count digit once a count is started
+first_non_blank = ["^"]
+line_end = ["$", "<End>"]
+word_next = ["w"]
+big_word_next = ["W"]
+word_prev = ["b"]
+big_word_prev = ["B"]
+word_end = ["e"]
+big_word_end = ["E"]
+go_to_line = ["G"]
+go_to_top = ["gg"]
+view_top = ["H"]
+view_middle = ["M"]
+view_bottom = ["L"]
+paragraph_next = ["}"]
+paragraph_prev = ["{"]
+match_bracket = ["%"]
+find_forward = ["f"]           # the next key typed is the character to find
+find_backward = ["F"]
+till_forward = ["t"]
+till_backward = ["T"]
+repeat_find = [";"]
+repeat_find_back = [","]
+half_page_down = ["<C-d>"]
+half_page_up = ["<C-u>"]
+page_down = ["<C-f>", "<PageDown>"]
+page_up = ["<C-b>", "<PageUp>"]
+scroll_down = ["<C-e>"]
+scroll_up = ["<C-y>"]
+scroll_center = ["zz"]
+scroll_top = ["zt"]
+scroll_bottom = ["zb"]
+open_fold = ["zo"]
+open_all_folds = ["zR"]
+close_all_folds = ["zM"]
+enter = ["<CR>"]
+escape = ["<Esc>"]
+jump_to_def = ["gd", "<C-]>"]
+references = ["gr"]
+jump_back = ["<C-o>", "<C-t>"]
+jump_forward = ["<C-i>"]
+next_hunk = ["]c"]
+prev_hunk = ["[c"]
+next_file = ["]f"]
+prev_file = ["[f"]
+next_diag = ["]d"]
+prev_diag = ["[d"]
+parent = ["-"]
+search_forward = ["/"]
+search_backward = ["?"]
+search_next = ["n"]
+search_prev = ["N"]
+search_word = ["*"]
+search_word_back = ["#"]
+visual = ["v"]
+visual_line = ["V"]
+
+[file_list]            # the viewer's file list and changed-files tree
+down = ["j", "<Down>"]
+up = ["k", "<Up>"]
+page_down = ["<C-d>", "<PageDown>"]
+page_up = ["<C-u>", "<PageUp>"]
+top = ["gg", "<Home>"]
+bottom = ["G", "<End>"]
+open = ["<CR>", "l", "o", "<Right>"]
+parent = ["h", "-", "<Left>", "<BS>"]
+switch = ["a"]
+leave = ["<Esc>"]
+
+[plan]                 # the plan reviewer (plugin chords with when = "plan")
+
+[picker]               # ⌘P and ⌘⇧P: a text field has focus
+up = ["<Up>", "<C-k>", "<C-p>"]
+down = ["<Down>", "<C-j>", "<C-n>"]
+choose = ["<CR>"]
+cancel = ["<Esc>"]
+
+[menu]                 # ⌘⇧S: no text field (and [picker]'s keys)
+up = ["k"]
+down = ["j"]
+
+[dialog]               # new workspace / tab, rename, confirm, the ⌘/ list
+submit = ["<CR>"]
+cancel = ["<Esc>"]
+
+[input]                # the ask field under a line, the / and ? search prompt
+submit = ["<CR>"]              # ask / search (a comment is sent with panel.submit)
+cancel = ["<Esc>"]
+
+[edit]                 # everywhere: text fields and the terminal
+copy = ["cmd+c"]
+cut = ["cmd+x"]
+paste = ["cmd+v"]
+select_all = ["cmd+a"]
+undo = ["cmd+z"]
+redo = ["cmd+shift+z", "cmd+y"]
+
+[plugins]              # "<plugin>.<command>" = keys; replaces the plugin's own keys
+# "ruff.explain" = ["<leader>e"]
+# "github.description" = ["cmd+shift+d"]
