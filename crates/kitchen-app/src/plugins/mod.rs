@@ -952,15 +952,18 @@ mod tests {
         assert_eq!((s["tab"].as_str(), s["name"].as_str(), s["rev"].as_str(), s["base"].as_str()), (Some("t1"), Some("kitchen-pr-12"), Some("refs/kitchen/pr/12"), Some("origin/dev")));
         assert_eq!(s["fetch"], serde_json::json!(["+refs/pull/12/head:refs/kitchen/pr/12", "+refs/heads/dev:refs/remotes/origin/dev"]));
         assert_eq!(to_json(view.call(("t1", 12, info(serde_json::json!({})), "main")).unwrap())["base"], "origin/main", "no base from gh");
-        // Merged: the base just before the merge.
-        let s = to_json(view.call(("t1", 12, info(serde_json::json!({"baseRefName": "dev", "state": "MERGED", "mergeCommit": {"oid": "abc"}})), "main")).unwrap());
-        assert_eq!((s["base"].as_str(), s["fetch"][1].as_str()), (Some("abc^1"), Some("abc")));
-        assert!(s.get("have").is_none(), "no head commit from gh: always fetch");
+        // Merged or closed: the base GitHub froze, not the branch (which a
+        // squashed parent in the stack may since have left behind, or which is gone).
+        for state in ["MERGED", "CLOSED"] {
+            let s = to_json(view.call(("t1", 12, info(serde_json::json!({"baseRefName": "dev", "baseRefOid": "b1", "state": state})), "main")).unwrap());
+            assert_eq!((s["base"].as_str(), s["fetch"][1].as_str()), (Some("b1"), Some("b1")), "{state}");
+            assert!(s.get("have").is_none(), "no head commit from gh: always fetch");
+        }
         // With the commits GitHub reports, the fetch can be skipped when they are here.
         let s = to_json(view.call(("t1", 12, info(serde_json::json!({"baseRefName": "dev", "baseRefOid": "b1", "headRefOid": "h1", "state": "OPEN"})), "main")).unwrap());
         assert_eq!(s["have"], serde_json::json!([{ "rev": "refs/kitchen/pr/12", "commit": "h1" }, { "rev": "refs/remotes/origin/dev", "commit": "b1" }]));
-        let s = to_json(view.call(("t1", 12, info(serde_json::json!({"headRefOid": "h1", "state": "MERGED", "mergeCommit": {"oid": "abc"}})), "main")).unwrap());
-        assert_eq!(s["have"][1], serde_json::json!({ "rev": "abc", "commit": "abc" }), "merged: the merge commit itself");
+        let s = to_json(view.call(("t1", 12, info(serde_json::json!({"baseRefName": "dev", "baseRefOid": "b1", "headRefOid": "h1", "state": "MERGED"})), "main")).unwrap());
+        assert_eq!(s["have"][1], serde_json::json!({ "rev": "b1", "commit": "b1" }), "merged: the base commit itself");
 
         // Review comments: threads from gh's list, items for the viewer, post arguments.
         let list = lua
@@ -1013,7 +1016,9 @@ mod tests {
 
         let pr = |n: u64, base: &str, head: &str, state: &str| serde_json::json!({ "number": n, "title": format!("t{n}"), "state": state, "baseRefName": base, "headRefName": head, "baseRefOid": format!("b{n}"), "headRefOid": format!("h{n}"), "additions": 1, "deletions": 0 });
         // Two stacks (main ← a ← b, and main ← c), listed out of order; a cycle; a reviewed PR.
-        let listed = val(serde_json::json!([pr(2, "a", "b", "OPEN"), pr(3, "main", "c", "OPEN"), pr(1, "main", "a", "OPEN"), pr(5, "y", "x", "OPEN"), pr(6, "x", "y", "OPEN")]));
+        let mut draft = pr(3, "main", "c", "OPEN");
+        draft["isDraft"] = true.into();
+        let listed = val(serde_json::json!([pr(2, "a", "b", "OPEN"), draft, pr(1, "main", "a", "MERGED"), pr(5, "y", "x", "OPEN"), pr(6, "x", "y", "CLOSED")]));
         let reviewing = val(serde_json::json!([pr(9, "main", "bo/fix", "MERGED")]));
         let e = to_json(m.get::<mlua::Function>("entries").unwrap().call(("t1", listed, reviewing, "b", "main")).unwrap());
         let rows: Vec<(&str, &str, &str)> = e.as_array().unwrap().iter().map(|r| (r["section"].as_str().unwrap(), r["label"].as_str().unwrap(), r["detail"].as_str().unwrap())).collect();
@@ -1025,12 +1030,15 @@ mod tests {
                 ("main ← c", "#3 t3", "1/1 · main ← c · +1 −0"),
                 ("y ← x", "#5 t5", "1/2 · y ← x · +1 −0"),
                 ("y ← x", "#6 t6", "2/2 · x ← y · +1 −0"),
-                ("Reviewing", "#9 t9", "main ← bo/fix · +1 −0 · merged"),
+                ("Reviewing", "#9 t9", "main ← bo/fix · +1 −0"),
             ]
         );
+        let states: Vec<&str> = e.as_array().unwrap().iter().map(|r| r["state"].as_str().unwrap()).collect();
+        assert_eq!(states, vec!["merged", "open", "draft", "open", "closed", "merged"], "each row's icon");
         // The live row is the tab's worktree against its parent; the others are checkouts.
         assert_eq!(e[1]["view"], serde_json::json!({ "base": "origin/a" }));
-        assert_eq!((e[0]["view"]["name"].as_str(), e[0]["view"]["base"].as_str(), e[0]["view"].get("tab")), (Some("kitchen-pr-1"), Some("origin/main"), None));
+        assert_eq!((e[0]["view"]["name"].as_str(), e[0]["view"]["base"].as_str(), e[0]["view"].get("tab")), (Some("kitchen-pr-1"), Some("b1"), None), "merged: its frozen base");
+        assert_eq!(e[2]["view"]["base"], "origin/main");
         assert_eq!(e[5]["view"]["name"], "kitchen-pr-9");
         assert_eq!(e[0]["view"]["have"][0], serde_json::json!({ "rev": "refs/kitchen/pr/1", "commit": "h1" }), "rows skip the fetch when nothing moved");
     }

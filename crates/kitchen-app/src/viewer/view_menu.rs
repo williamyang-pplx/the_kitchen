@@ -8,16 +8,17 @@ use std::time::{Duration, Instant};
 
 use super::picker::Picker;
 use super::{PickerKind, Viewer};
-use crate::engine::{MenuRow, Shown, View, ViewAt};
+use crate::engine::{MenuRow, PrState, Shown, View, ViewAt};
 
 /// How long the menu says "loading PRs…" while it waits for a plugin.
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The menu's picker items, section headers, each row's view, and the row
-/// on screen.
+/// The menu's picker items, section headers, each row's PR state and view,
+/// and the row on screen.
 struct Rows {
     items: Vec<(String, String)>,
     sections: Vec<(usize, String)>,
+    icons: Vec<Option<PrState>>,
     views: Vec<(View, Shown)>,
     current: Option<usize>,
 }
@@ -36,8 +37,8 @@ impl Viewer {
 
     fn view_menu_rows(&self, menu: Option<&Arc<Vec<MenuRow>>>) -> Rows {
         let shown = self.shown();
-        let mut rows = Rows { items: Vec::new(), sections: Vec::new(), views: Vec::new(), current: None };
-        let push = |rows: &mut Rows, section: &str, label: &str, detail: &str, view: View, at: Shown| {
+        let mut rows = Rows { items: Vec::new(), sections: Vec::new(), icons: Vec::new(), views: Vec::new(), current: None };
+        let push = |rows: &mut Rows, section: &str, label: &str, detail: &str, state: Option<PrState>, view: View, at: Shown| {
             if rows.sections.last().is_none_or(|(_, s)| s != section) {
                 rows.sections.push((rows.items.len(), section.to_string()));
             }
@@ -46,17 +47,18 @@ impl Viewer {
                 rows.current = Some(rows.items.len());
             }
             rows.items.push((format!("{}{label}", if current { "● " } else { "" }), detail.to_string()));
+            rows.icons.push(state);
             rows.views.push((view, at));
         };
         for (e, at) in menu.map(|m| m.as_slice()).unwrap_or_default() {
-            push(&mut rows, &e.section, &e.label, &e.detail, View { tab: self.tab_id.clone(), at: e.view.clone() }, at.clone());
+            push(&mut rows, &e.section, &e.label, &e.detail, e.state, View { tab: self.tab_id.clone(), at: e.view.clone() }, at.clone());
         }
         // The tab's worktree against its diff base, unless a row already is.
         if let Some((ws, tab)) = self.engine.find_tab(&self.tab_id) {
             let own = (tab.row.worktree.clone(), tab.diff_base(&ws));
             if !rows.views.iter().any(|(_, at)| *at == own) {
                 let detail = format!("{} vs {}", tab.row.branch.as_deref().unwrap_or("HEAD"), own.1);
-                push(&mut rows, "This tab", "worktree", &detail, View { tab: self.tab_id.clone(), at: ViewAt::default() }, own);
+                push(&mut rows, "This tab", "worktree", &detail, None, View { tab: self.tab_id.clone(), at: ViewAt::default() }, own);
             }
         }
         rows
@@ -75,6 +77,7 @@ impl Viewer {
         picker.hint = "The PRs this tab's agent listed, one section per stack".into();
         picker.loading_note = "loading PRs…".into();
         picker.loading = self.asked.is_some();
+        picker.icons = rows.icons;
         if let Some(i) = rows.current {
             picker.select(i);
         }
@@ -108,6 +111,7 @@ impl Viewer {
                     rows.current
                 };
                 picker.set_menu(rows.items, rows.sections);
+                picker.icons = rows.icons;
                 if let Some(i) = keep {
                     picker.select(i);
                 }
@@ -174,8 +178,8 @@ mod tests {
     fn view_menu_lists_entries_and_marks_the_shown_one() {
         let h = Harness::new(TestRepo::new("echo 1 > a"));
         let stack = serde_json::json!([
-            { "section": "main ← a", "label": "#7 a", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
-            { "section": "main ← a", "label": "#8 b", "view": { "base": "origin/a" } },
+            { "section": "main ← a", "label": "#7 a", "state": "merged", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
+            { "section": "main ← a", "label": "#8 b", "state": "open", "view": { "base": "origin/a" } },
         ]);
         set(&h, stack.clone());
         let mut v = h.viewer();
@@ -185,12 +189,15 @@ mod tests {
         assert_eq!(rows(&v), vec!["#7 a", "#8 b", "● worktree"]);
         let Some((_, p)) = &v.picker else { unreachable!() };
         assert_eq!(p.filtered[p.selected].0, 2, "cursor on the row shown");
+        assert_eq!(p.icons, vec![Some(PrState::Merged), Some(PrState::Open), None], "each PR's state as its icon");
 
         let mut more = stack.as_array().unwrap().clone();
         more.push(serde_json::json!({ "section": "Reviewing", "label": "#9 c", "view": { "rev": "refs/kitchen/pr/9", "name": "kitchen-pr-9" } }));
         set(&h, serde_json::Value::Array(more));
         h.frame(&mut v);
         assert_eq!(rows(&v), vec!["#7 a", "#8 b", "#9 c", "● worktree"], "an open menu follows kitchen.views");
+        let Some((_, p)) = &v.picker else { unreachable!() };
+        assert_eq!(p.icons, vec![Some(PrState::Merged), Some(PrState::Open), None, None], "…its icons too");
 
         for _ in 0..3 {
             h.frame_with(&mut v, vec![key(egui::Key::K)]);

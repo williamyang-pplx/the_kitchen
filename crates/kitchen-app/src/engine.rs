@@ -204,7 +204,20 @@ pub struct ViewEntry {
     /// Dimmed, e.g. "2/3 · william/a ← william/b · +40 −3 · live"
     #[serde(default)]
     pub detail: String,
+    /// The PR's state, drawn as GitHub's icon before the label.
+    #[serde(default)]
+    pub state: Option<PrState>,
     pub view: ViewAt,
+}
+
+/// A PR's state on GitHub, as a menu row's icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
 }
 
 /// `kitchen.views{tab, entries}`: a tab's whole PR menu, replacing the last.

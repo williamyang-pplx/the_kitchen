@@ -4,6 +4,7 @@
 use egui::text::LayoutJob;
 use egui::{Color32, CornerRadius, Response, RichText, Sense, TextFormat, Ui};
 
+use crate::engine::PrState;
 use crate::theme;
 
 /// Height of the header row atop the viewer and the plan.
@@ -25,6 +26,55 @@ pub fn section_label(text: &str, color: Color32) -> LayoutJob {
     let format = TextFormat { font_id: theme::ui_font_semibold(theme::TEXT_LABEL), color, extra_letter_spacing: 0.6, ..Default::default() };
     job.append(&text.to_uppercase(), 0.0, format);
     job
+}
+
+/// GitHub's octicon for a PR in `state`, in GitHub's color for it, filling
+/// the square `rect`: git-pull-request (open), its draft and closed forms,
+/// and git-merge (merged).
+pub fn pr_icon(painter: &egui::Painter, rect: egui::Rect, state: PrState) {
+    let color = match state {
+        PrState::Open => Color32::from_rgb(0x3f, 0xb9, 0x50),
+        PrState::Draft => Color32::from_rgb(0x91, 0x98, 0xa1),
+        PrState::Merged => Color32::from_rgb(0xab, 0x7d, 0xf8),
+        PrState::Closed => Color32::from_rgb(0xf8, 0x51, 0x49),
+    };
+    // Drawn on the octicons' 16-unit grid.
+    let unit = rect.width() / 16.0;
+    let at = |x: f32, y: f32| rect.min + egui::vec2(x, y) * unit;
+    let stroke = egui::Stroke::new(1.5 * unit, color);
+    let ring = |x: f32, y: f32| painter.circle_stroke(at(x, y), 1.75 * unit, stroke);
+    let line = |a: (f32, f32), b: (f32, f32)| painter.line_segment([at(a.0, a.1), at(b.0, b.1)], stroke);
+    // Every form starts from the base branch on the left: a ring at each end.
+    ring(4.0, 3.5);
+    ring(4.0, 12.5);
+    line((4.0, 5.25), (4.0, 10.75));
+    match state {
+        PrState::Merged => {
+            // The head curving out of the top ring into the right one.
+            ring(12.0, 8.0);
+            let curve = [at(4.0, 5.25), at(4.0, 8.0), at(7.0, 8.0), at(10.25, 8.0)];
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(curve, false, Color32::TRANSPARENT, stroke));
+        }
+        PrState::Open => {
+            // The head, and an arrow from it back to the base.
+            ring(12.0, 12.5);
+            line((12.0, 10.75), (12.0, 6.5));
+            let curve = [at(12.0, 6.5), at(12.0, 3.5), at(9.0, 3.5)];
+            painter.add(egui::epaint::QuadraticBezierShape::from_points_stroke(curve, false, Color32::TRANSPARENT, stroke));
+            line((10.5, 2.0), (9.0, 3.5));
+            line((9.0, 3.5), (10.5, 5.0));
+        }
+        PrState::Closed => {
+            ring(12.0, 12.5);
+            line((10.25, 2.25), (13.75, 5.75));
+            line((13.75, 2.25), (10.25, 5.75));
+        }
+        PrState::Draft => {
+            ring(12.0, 12.5);
+            painter.circle_filled(at(12.0, 8.0), 0.9 * unit, color);
+            painter.circle_filled(at(12.0, 4.0), 0.9 * unit, color);
+        }
+    }
 }
 
 /// A small tinted badge: `color` text on a faint wash of it.

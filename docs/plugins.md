@@ -280,7 +280,7 @@ kitchen.on("views", function(ev)   -- ⌘⇧S: the tab's command ctx, plus ev.pr
   kitchen.views {
     tab = ev.tab,
     entries = {
-      { section = "main ← william/a", label = "#12 add retries", detail = "1/2",
+      { section = "main ← william/a", label = "#12 add retries", detail = "1/2", state = "merged",
         view = { rev = "refs/kitchen/pr/12", name = "kitchen-pr-12", fetch = { … }, base = "origin/main" } },
       { section = "main ← william/a", label = "#13 use them", detail = "2/2 · live",
         view = { base = "origin/william/a" } },   -- no rev: the tab's own worktree
@@ -292,8 +292,9 @@ end)
 ⌘⇧S opens the tab's PR menu and sends `views` to every listener. A
 listener answers with `kitchen.views`: the tab's whole menu, replacing the
 last one (an open menu updates in place). Each entry's `view` takes
-`kitchen.view`'s fields without `tab`. Rows with the same `section` go
-together under that header. The kitchen adds a last row for the tab's
+`kitchen.view`'s fields without `tab`. An entry's `state` (`"open"`,
+`"draft"`, `"merged"` or `"closed"`) draws GitHub's icon for the PR before its
+label. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.
 Picking a row shows it. A view the tab showed before comes back at once
 from the viewer cache, and its checkout is then refreshed (the viewer is

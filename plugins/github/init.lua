@@ -74,18 +74,20 @@ local function pr_of(f)
 end
 
 -- The kitchen.view spec that shows PR `n` (gh's `info`) in tab `tab`: its
--- head detached in <repo>-kitchen-pr-<n>, diffed against its base (for a
--- merged PR, the base just before the merge; `dflt` if gh names none). With
--- the commits GitHub reports (`headRefOid`, `baseRefOid`) the fetch is
--- skipped when they are already here.
+-- head detached in <repo>-kitchen-pr-<n>, diffed against its base. An open
+-- PR's base is its base branch (`dflt` if gh names none). A merged or closed
+-- PR's is the commit GitHub froze as its base (`baseRefOid`), so it shows the
+-- diff it had on GitHub: its parent in a stack may since have been squashed
+-- into main, and its base branch deleted. With the commits GitHub reports
+-- (`headRefOid`, `baseRefOid`) the fetch is skipped when they are already here.
 function M.view(tab, n, info, dflt)
   local rev = "refs/kitchen/pr/" .. n
   local spec = { tab = tab, rev = rev, name = "kitchen-pr-" .. n, fetch = { "+refs/pull/" .. n .. "/head:" .. rev } }
   local base_have
-  if info.state == "MERGED" and info.mergeCommit and info.mergeCommit.oid then
-    table.insert(spec.fetch, info.mergeCommit.oid)
-    spec.base = info.mergeCommit.oid .. "^1"
-    base_have = { rev = info.mergeCommit.oid, commit = info.mergeCommit.oid }
+  if info.state ~= "OPEN" and info.baseRefOid then
+    table.insert(spec.fetch, info.baseRefOid)
+    spec.base = info.baseRefOid
+    base_have = { rev = info.baseRefOid, commit = info.baseRefOid }
   else
     local b = info.baseRefName or dflt
     table.insert(spec.fetch, "+refs/heads/" .. b .. ":refs/remotes/origin/" .. b)
@@ -107,7 +109,7 @@ local function show(ws, tab, slug, n)
   if not M.contains(viewed[tab], n) then
     table.insert(viewed[tab], n)
   end
-  gh({ "pr", "view", tostring(n), "-R", slug, "--json", "title,baseRefName,baseRefOid,headRefOid,state,mergeCommit" }, function(res)
+  gh({ "pr", "view", tostring(n), "-R", slug, "--json", "title,baseRefName,baseRefOid,headRefOid,state" }, function(res)
     local ok, info = pcall(kitchen.json.decode, res.code == 0 and res.stdout or "")
     if not (ok and type(info) == "table") then
       return kitchen.notify("couldn't read " .. slug .. "#" .. n .. ": " .. why(res), "error")
@@ -169,7 +171,7 @@ function M.list(lines, slug)
   return out
 end
 
-local FIELDS = "number title state headRefName headRefOid baseRefName baseRefOid additions deletions mergeCommit { oid }"
+local FIELDS = "number title state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions"
 
 -- One GraphQL query for PRs `ns` of `slug`, each aliased p<N>.
 function M.query(slug, ns)
@@ -181,10 +183,11 @@ function M.query(slug, ns)
   return ('query { repository(owner: "%s", name: "%s") { %s } }'):format(owner, name, table.concat(parts, " "))
 end
 
--- One menu row for PR `p` (a GraphQL node) under `section`. The open PR whose
--- head is `branch` (checked out in the tab's worktree) is live: that worktree
--- against its parent; every other PR is M.view's kitchen-pr-<N> checkout, so
--- its review comments and ⌘M work there.
+-- One menu row for PR `p` (a GraphQL node) under `section`, with its state
+-- (open, draft, merged, closed: the menu draws GitHub's icon for it). The
+-- open PR whose head is `branch` (checked out in the tab's worktree) is live:
+-- that worktree against its parent; every other PR is M.view's kitchen-pr-<N>
+-- checkout, so its review comments and ⌘M work there.
 local function row(tab, p, section, place, branch, dflt)
   local live = p.state == "OPEN" and p.headRefName == branch
   local detail = { p.baseRefName .. " ← " .. p.headRefName, ("+%d −%d"):format(p.additions or 0, p.deletions or 0) }
@@ -193,12 +196,17 @@ local function row(tab, p, section, place, branch, dflt)
   end
   if live then
     table.insert(detail, "live")
-  elseif p.state ~= "OPEN" then
-    table.insert(detail, p.state:lower())
   end
+  local state = p.state == "OPEN" and (p.isDraft and "draft" or "open") or (p.state or ""):lower()
   local view = live and { base = "origin/" .. p.baseRefName } or M.view(tab, p.number, p, dflt)
   view.tab = nil
-  return { section = section, label = "#" .. p.number .. " " .. (p.title or ""), detail = table.concat(detail, " · "), view = view }
+  return {
+    section = section,
+    label = "#" .. p.number .. " " .. (p.title or ""),
+    detail = table.concat(detail, " · "),
+    state = state ~= "" and state or nil,
+    view = view,
+  }
 end
 
 -- Menu entries: the stacks among `listed` (GraphQL nodes, in list order),
