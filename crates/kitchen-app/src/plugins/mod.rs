@@ -1684,10 +1684,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    fn shipyard_token_sync_module(lua: &mlua::Lua) -> mlua::Table {
+    fn cli_token_sync_module(lua: &mlua::Lua) -> mlua::Table {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/cli-token-sync");
         lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/shipyard-token-sync/init.lua");
-        lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap()
+        lua.load(format!("package.path = {:?} .. ';' .. package.path", format!("{}/lua/?.lua", dir.display()))).exec().unwrap();
+        lua.load(std::fs::read_to_string(dir.join("init.lua")).unwrap()).eval().unwrap()
+    }
+
+    /// The `name` source (lua/sources/<name>.lua) of cli-token-sync.
+    fn cli_token_source(lua: &mlua::Lua, name: &str) -> mlua::Table {
+        cli_token_sync_module(lua).get::<mlua::Table>("sources").unwrap().get(name).unwrap()
     }
 
     /// Runs `python3 -c script` with `stdin` and the given environment
@@ -1712,63 +1718,80 @@ mod tests {
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64
     }
 
-    /// shipyard-token-sync: the payload carries only the access token's
-    /// fields and only tokens with time left; what is worth a toast.
+    /// cli-token-sync: the payload carries only the source's token fields and
+    /// only tokens with time left; what is worth a toast.
     #[test]
-    fn shipyard_token_sync_payload_and_problems() {
+    fn cli_token_sync_payload_and_problems() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
-        let m = shipyard_token_sync_module(&lua);
+        let m = cli_token_sync_module(&lua);
+        let sources: mlua::Table = m.get("sources").unwrap();
+        let (shipyard, buildkite): (mlua::Table, mlua::Table) = (sources.get("shipyard").unwrap(), sources.get("buildkite").unwrap());
         let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
         let val = |j: serde_json::Value| lua.to_value(&j).unwrap();
         let f = |name: &str| m.get::<mlua::Function>(name).unwrap();
 
-        let label: String = f("label").call("https://shipyard.prod.p.perplexity.ai/").unwrap();
-        assert_eq!(label, "shipyard.prod.p.perplexity.ai");
+        let label = |src: &mlua::Table, key: &str| -> String { src.get::<mlua::Function>("label").unwrap().call(key).unwrap() };
+        assert_eq!(label(&shipyard, "https://shipyard.prod.p.perplexity.ai/"), "shipyard.prod.p.perplexity.ai");
+        assert_eq!(label(&buildkite, "perplexity"), "buildkite.com/perplexity");
 
         let now = 1_000_000;
         let entry = |tok: &str, exp: i64| serde_json::json!({ "access_token": tok, "expires_at": exp, "issuer": "https://okta", "client_id": "cid", "refresh_token": "ref-leak" });
-        let report = val(serde_json::json!({ "servers": [
+        let report = serde_json::json!({ "servers": [
             { "key": "https://live", "expires_at": now + 3000, "entry": entry("t1", now + 3000) },
             { "key": "https://soon", "expires_at": now + 60, "entry": entry("t2", now + 60) },
             { "key": "https://forever", "entry": { "access_token": "t3" } },
             { "key": "https://empty", "entry": { "access_token": "" } },
             { "key": "https://raced", "entry": {} },
-        ] }));
-        let payload = to_json(f("payload").call((report, now)).unwrap());
+            { "key": "https://refused", "error": "HTTP 400" },
+        ] });
         assert_eq!(
-            payload,
+            to_json(f("payload").call((shipyard.clone(), val(report.clone()), now)).unwrap()),
             serde_json::json!({ "servers": [
                 { "key": "https://live", "entry": { "access_token": "t1", "expires_at": now + 3000, "issuer": "https://okta", "client_id": "cid" } },
                 { "key": "https://forever", "entry": { "access_token": "t3" } },
             ] }),
             "no refresh token; a token with a minute or less left, or none, stays home"
         );
-
-        let problem = |row: serde_json::Value, login_exp: Option<i64>| -> Option<String> { f("problem").call((val(row), login_exp, now, 7)).unwrap() };
-        let ok = serde_json::json!({ "key": "https://s", "expires_at": now + 3000 });
-        assert_eq!(problem(ok.clone(), None), None);
-        assert_eq!(problem(ok.clone(), Some(now + 8 * 86400)), None, "more than warn_days left");
-        assert_eq!(problem(ok.clone(), Some(1_500_000)), Some("s: the mac's Shipyard login ends 1970-01-18 08:40 UTC; run bin/shipyard auth login on the mac before then".into()));
-        assert_eq!(problem(serde_json::json!({ "key": "https://s", "expires_at": now + 30, "error": "HTTP 503" }), None), None, "still valid: retried next pass");
         assert_eq!(
-            problem(serde_json::json!({ "key": "https://s", "expires_at": now - 1, "error": "HTTP 503" }), None),
+            to_json(f("payload").call((buildkite.clone(), val(report), now)).unwrap())["servers"][0],
+            serde_json::json!({ "key": "https://live", "entry": { "access_token": "t1", "expires_at": now + 3000 } }),
+            "each source sends only its own fields"
+        );
+
+        let problem = |src: &mlua::Table, row: serde_json::Value, login_exp: Option<i64>| -> Option<String> { f("problem").call((src.clone(), val(row), login_exp, now, 7)).unwrap() };
+        let row = |exp: i64| serde_json::json!({ "key": "https://s", "expires_at": exp, "entry": { "access_token": "t", "expires_at": exp } });
+        let with = |mut r: serde_json::Value, k: &str, v: serde_json::Value| {
+            r[k] = v;
+            r
+        };
+        assert_eq!(problem(&shipyard, row(now + 3000), None), None);
+        assert_eq!(problem(&shipyard, row(now + 3000), Some(now + 8 * 86400)), None, "more than warn_days left");
+        assert_eq!(problem(&shipyard, row(now + 3000), Some(1_500_000)), Some("s: the mac's Shipyard login ends 1970-01-18 08:40 UTC; run bin/shipyard auth login on the mac before then".into()));
+        assert_eq!(problem(&shipyard, with(row(now + 300), "error", "HTTP 503".into()), None), None, "still valid: retried next pass");
+        assert_eq!(
+            problem(&shipyard, with(row(now - 1), "error", "HTTP 503".into()), None),
             Some("s: the mac's Shipyard token expired and refreshing failed (HTTP 503); run bin/shipyard auth login on the mac".into())
         );
         assert_eq!(
-            problem(serde_json::json!({ "key": "https://s", "expires_at": now + 3000, "login_active": false }), Some(now + 86400 * 30)),
+            problem(&shipyard, with(row(now + 3000), "login_active", false.into()), Some(now + 86400 * 30)),
             Some("s: the mac's Shipyard login has ended; run bin/shipyard auth login on the mac".into())
+        );
+        assert_eq!(
+            problem(&buildkite, serde_json::json!({ "key": "perplexity", "error": "HTTP 503" }), None),
+            Some("buildkite.com/perplexity: the mac's Buildkite token expired and refreshing failed (HTTP 503); run bin/bk auth login on the mac".into()),
+            "no entry: the token doesn't work"
         );
     }
 
-    /// shipyard-token-sync: MERGE_PY against a temp HOME — creates the file
+    /// cli-token-sync, shipyard: MERGE_PY against a temp HOME — creates the file
     /// (600) in ~/.config or $XDG_CONFIG_HOME, writes only a token that lasts
     /// longer, keeps the box's own refresh token, never clobbers a broken file.
     #[test]
-    fn shipyard_token_sync_merge_script_on_a_temp_home() {
+    fn cli_token_sync_shipyard_merge_on_a_temp_home() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let lua = mlua::Lua::new();
-        let script: String = shipyard_token_sync_module(&lua).get("MERGE_PY").unwrap();
+        let script: String = cli_token_source(&lua, "shipyard").get("MERGE_PY").unwrap();
         let home = std::env::temp_dir().join(format!("kt-shipyard-{}", kitchen_core::util::new_id()));
         std::fs::create_dir_all(&home).unwrap();
         let (dir, file) = (home.join(".config/shipyard"), home.join(".config/shipyard/tokens.json"));
@@ -1830,17 +1853,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// shipyard-token-sync: MAC_PY against a fake Okta — refreshes only near
+    /// cli-token-sync, shipyard: MAC_PY against a fake Okta — refreshes only near
     /// expiry, with bin/shipyard's form; writes the rotated refresh token back
     /// (600) and keeps it out of the report; asks introspection when the login
     /// ends; a failed refresh leaves the file alone.
     #[test]
-    fn shipyard_token_sync_mac_script_against_a_fake_okta() {
+    fn cli_token_sync_shipyard_mac_against_a_fake_okta() {
         use mlua::LuaSerdeExt;
         use std::io::BufRead;
         use std::os::unix::fs::PermissionsExt;
         let lua = mlua::Lua::new();
-        let script: String = shipyard_token_sync_module(&lua).get("MAC_PY").unwrap();
+        let script: String = cli_token_source(&lua, "shipyard").get("MAC_PY").unwrap();
         let root = std::env::temp_dir().join(format!("kt-okta-{}", kitchen_core::util::new_id()));
         std::fs::create_dir_all(&root).unwrap();
         let (file, log) = (root.join("tokens.json"), root.join("requests.jsonl"));
@@ -1948,12 +1971,239 @@ s.serve_forever()
         assert_eq!(report["servers"][0]["error"], "HTTP 400 invalid_grant The refresh token is invalid or expired.");
         assert_eq!(report["servers"][0]["login_active"], false);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), dead);
-        let problem: Option<String> = shipyard_token_sync_module(&lua).get::<mlua::Function>("problem").unwrap().call((lua.to_value(&report["servers"][0]).unwrap(), mlua::Nil, now, 7)).unwrap();
+        let m = cli_token_sync_module(&lua);
+        let src: mlua::Table = m.get::<mlua::Table>("sources").unwrap().get("shipyard").unwrap();
+        let problem: Option<String> = m.get::<mlua::Function>("problem").unwrap().call((src, lua.to_value(&report["servers"][0]).unwrap(), mlua::Nil, now, 7)).unwrap();
         assert_eq!(problem.as_deref(), Some("a: the mac's Shipyard login has ended; run bin/shipyard auth login on the mac"));
 
         std::fs::remove_file(&file).unwrap();
         assert_eq!(run(false).1, serde_json::json!({ "missing": true }));
         let _ = server.kill();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// cli-token-sync, buildkite: MAC_PY against a fake `security` and a fake
+    /// Buildkite — refreshes only near expiry or after a 401, with bk's form;
+    /// writes both tokens back as go-keyring does and keeps the refresh token
+    /// out of the report; a refusal after bk rotated uses bk's tokens.
+    #[test]
+    fn cli_token_sync_buildkite_mac_against_a_fake_keychain_and_api() {
+        use std::io::BufRead;
+        use std::os::unix::fs::PermissionsExt;
+        let lua = mlua::Lua::new();
+        let script: String = cli_token_source(&lua, "buildkite").get("MAC_PY").unwrap();
+        let root = std::env::temp_dir().join(format!("kt-bk-{}", kitchen_core::util::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (keychain, log, security) = (root.join("keychain.json"), root.join("requests.jsonl"), root.join("security"));
+        std::fs::write(
+            &security,
+            r#"#!/usr/bin/env python3
+import json, os, shlex, sys
+path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keychain.json")
+def load():
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+args = sys.argv[1:]
+if args[:1] == ["find-generic-password"]:
+    v = load().get(args[args.index("-s") + 1] + "|" + args[args.index("-wa") + 1])
+    if v is None:
+        sys.exit(print("security: The specified item could not be found in the keychain.", file=sys.stderr) or 44)
+    print(v)
+elif args == ["-i"]:
+    for line in sys.stdin:
+        w = shlex.split(line)
+        store = load()
+        store[w[w.index("-s") + 1] + "|" + w[w.index("-a") + 1]] = w[w.index("-w") + 1]
+        with open(path, "w") as f:
+            json.dump(store, f)
+else:
+    sys.exit(2)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let api = r#"
+import base64, http.server, json, sys, time, urllib.parse
+log, keychain = sys.argv[1], sys.argv[2]
+LEFT = {"acc-far": 3000, "acc-soon": 300, "acc-new": 3600, "acc-bk": 3500}
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def note(self, entry):
+        with open(log, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    def do_GET(self):
+        token = self.headers.get("Authorization", "")[len("Bearer "):]
+        self.note({"path": self.path, "token": token})
+        if token == "acc-forever":
+            return self.reply(200, {"uuid": "u", "expires_at": None})
+        if token not in LEFT:
+            return self.reply(401, {"message": "Authentication required."})
+        exp = time.strftime("%Y-%m-%dT%H:%M:%S.123Z", time.gmtime(time.time() + LEFT[token]))
+        self.reply(200, {"uuid": "u", "expires_at": exp})
+    def do_POST(self):
+        form = dict(urllib.parse.parse_qsl(self.rfile.read(int(self.headers["Content-Length"])).decode()))
+        self.note({"path": self.path, "form": form})
+        ref = form.get("refresh_token")
+        if ref == "flaky":
+            return self.reply(503, {})
+        if ref == "race":  # bk refreshed at the same time
+            with open(keychain) as f:
+                store = json.load(f)
+            enc = lambda v: "go-keyring-base64:" + base64.b64encode(v.encode()).decode()
+            store.update({"buildkite-cli|perplexity": enc("acc-bk"), "buildkite-cli-refresh|perplexity": enc("ref-bk")})
+            with open(keychain, "w") as f:
+                json.dump(store, f)
+        if ref != "ref-ok":
+            return self.reply(400, {"error": "invalid_grant", "error_description": "The refresh token is invalid."})
+        self.reply(200, {"access_token": "acc-new", "refresh_token": "ref-new", "expires_in": 3600, "token_type": "Bearer"})
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(s.server_port, flush=True)
+s.serve_forever()
+"#;
+        let mut server = std::process::Command::new("python3").arg("-c").arg(api).arg(&log).arg(&keychain).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut port = String::new();
+        std::io::BufReader::new(server.stdout.take().unwrap()).read_line(&mut port).unwrap();
+        let base = format!("http://127.0.0.1:{}", port.trim());
+        // go-keyring's encoding: its prefix, then standard base64.
+        let b64 = |v: &str| {
+            const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::from("go-keyring-base64:");
+            for chunk in v.as_bytes().chunks(3) {
+                let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+                for i in 0..4 {
+                    out.push(if i <= chunk.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+                }
+            }
+            out
+        };
+        let seed = |access: &str, refresh: &str| {
+            std::fs::write(&keychain, serde_json::json!({ "buildkite-cli|perplexity": b64(access), "buildkite-cli-refresh|perplexity": refresh }).to_string()).unwrap();
+        };
+        let stored = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(&keychain).unwrap()).unwrap() };
+        let requests = || -> Vec<serde_json::Value> {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        };
+        let run = || -> (serde_json::Value, String) {
+            let req = serde_json::json!({ "org": "perplexity", "window": 900, "security": security, "api": base, "oauth": base });
+            let (ok, out) = run_python(&script, &req, &[]);
+            assert!(ok, "{out}");
+            (serde_json::from_str(&out).unwrap(), out)
+        };
+        let row = |report: &serde_json::Value| report["servers"][0].clone();
+        let exp_near = |r: &serde_json::Value, left: i64| {
+            let exp = r["expires_at"].as_i64().unwrap();
+            assert!((unix_now() + left - 10..=unix_now() + left).contains(&exp), "{exp}");
+            assert_eq!(r["entry"]["expires_at"], exp);
+            exp
+        };
+
+        // Far from expiry: one lookup, no refresh. The refresh token is stored plain.
+        seed("acc-far", "ref-ok");
+        let (report, _) = run();
+        exp_near(&row(&report), 3000);
+        assert_eq!((row(&report)["key"].as_str(), row(&report)["entry"]["access_token"].as_str(), row(&report).get("refreshed")), (Some("perplexity"), Some("acc-far"), None));
+        assert_eq!(requests(), [serde_json::json!({ "path": "/v2/access-token", "token": "acc-far" })]);
+
+        // In the window, and after a 401: refreshed with bk's form, both tokens written back base64'd.
+        for access in ["acc-soon", "acc-gone"] {
+            seed(access, "ref-ok");
+            let (report, out) = run();
+            assert!(!out.contains("ref-"), "no refresh token in the report: {out}");
+            assert_eq!((row(&report)["refreshed"].as_bool(), row(&report)["entry"]["access_token"].as_str()), (Some(true), Some("acc-new")), "{access}");
+            exp_near(&row(&report), 3600);
+            assert_eq!(stored(), serde_json::json!({ "buildkite-cli|perplexity": b64("acc-new"), "buildkite-cli-refresh|perplexity": b64("ref-new") }));
+            let posts: Vec<_> = requests().into_iter().filter(|r| r["path"] == "/oauth/token").collect();
+            assert_eq!(posts, [serde_json::json!({ "path": "/oauth/token", "form": { "grant_type": "refresh_token", "refresh_token": "ref-ok", "client_id": "5214b230f06b48938ab5" } })]);
+        }
+
+        // Refused: the login has ended; the keychain is left alone, no token goes out.
+        seed("acc-gone", "dead");
+        let before = stored();
+        let (report, _) = run();
+        assert_eq!(row(&report), serde_json::json!({ "key": "perplexity", "expires_at": 0, "error": "HTTP 400 invalid_grant The refresh token is invalid.", "login_active": false }));
+        assert_eq!(stored(), before);
+
+        // Refused because bk rotated meanwhile: bk's tokens win.
+        seed("acc-gone", "race");
+        let (report, _) = run();
+        assert_eq!((row(&report)["entry"]["access_token"].as_str(), row(&report).get("error"), row(&report).get("refreshed")), (Some("acc-bk"), None, None));
+        exp_near(&row(&report), 3500);
+
+        // A transient failure while the token still works: reported, the token still goes.
+        seed("acc-soon", "flaky");
+        let (report, _) = run();
+        assert_eq!((row(&report)["error"].as_str(), row(&report)["entry"]["access_token"].as_str(), row(&report).get("login_active")), (Some("HTTP 503"), Some("acc-soon"), None));
+
+        // A token without an expiry is never refreshed.
+        seed("acc-forever", "ref-ok");
+        let (report, _) = run();
+        assert_eq!(row(&report), serde_json::json!({ "key": "perplexity", "expires_at": 0, "entry": { "access_token": "acc-forever", "expires_at": 0 } }));
+
+        std::fs::write(&keychain, "{}").unwrap();
+        assert_eq!(run().0, serde_json::json!({ "missing": true }));
+        let _ = server.kill();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// cli-token-sync, buildkite: MERGE_PY against a temp store path — creates
+    /// it (700/600) under bk's lock, writes the token with "shm" preferred,
+    /// keeps the box's refresh token and other orgs, writes only on change,
+    /// never clobbers a broken file.
+    #[test]
+    fn cli_token_sync_buildkite_merge_on_a_temp_store() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let lua = mlua::Lua::new();
+        let script: String = cli_token_source(&lua, "buildkite").get("MERGE_PY").unwrap();
+        let root = std::env::temp_dir().join(format!("kt-bkshm-{}", kitchen_core::util::new_id()));
+        let (dir, file) = (root.join("buildkite-cli-1000"), root.join("buildkite-cli-1000/credentials.json"));
+        let run = |token: &str| run_python(&script, &serde_json::json!({ "servers": [{ "key": "perplexity", "entry": { "access_token": token, "expires_at": 5 } }] }), &[("BUILDKITE_CREDENTIAL_STORE_PATH", Some(&file))]);
+        let read = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap() };
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(run("acc-1"), (true, "updated perplexity\n".into()), "no store yet");
+        assert_eq!((mode(&dir), mode(&file), mode(&dir.join(".credentials.lock"))), (0o700, 0o600, 0o600));
+        assert_eq!(read(), serde_json::json!({ "services": { "buildkite-cli": { "perplexity": "acc-1" } }, "preferred_stores": { "buildkite-cli": { "perplexity": "shm" } } }));
+        let before = std::fs::metadata(&file).unwrap();
+        assert_eq!(run("acc-1"), (true, String::new()), "unchanged: nothing printed");
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), before.ino(), "unchanged: not rewritten");
+
+        let boxed = serde_json::json!({
+            "services": { "buildkite-cli": { "perplexity": "box-acc", "other": "o" }, "buildkite-cli-refresh": { "perplexity": "box-ref" } },
+            "preferred_stores": { "buildkite-cli-refresh": { "perplexity": "shm" } },
+        });
+        std::fs::write(&file, boxed.to_string()).unwrap();
+        assert_eq!(run("acc-2"), (true, "updated perplexity\n".into()));
+        assert_eq!(
+            read(),
+            serde_json::json!({
+                "services": { "buildkite-cli": { "perplexity": "acc-2", "other": "o" }, "buildkite-cli-refresh": { "perplexity": "box-ref" } },
+                "preferred_stores": { "buildkite-cli-refresh": { "perplexity": "shm" }, "buildkite-cli": { "perplexity": "shm" } },
+            }),
+            "the box's refresh token and other orgs stay"
+        );
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(run("acc-3"), (true, "updated perplexity\n".into()), "an empty file is an empty store, as for bk");
+
+        for broken in ["{not json", "[]", r#"{"services": []}"#, r#"{"services": {"buildkite-cli": 3}}"#] {
+            std::fs::write(&file, broken).unwrap();
+            assert!(!run("acc-4").0, "{broken:?}: fails");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), broken, "{broken:?}: left alone");
+        }
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, [".credentials.lock", "credentials.json"], "no temp files left");
         let _ = std::fs::remove_dir_all(&root);
     }
 

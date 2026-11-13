@@ -1,0 +1,21 @@
+name = "cli-token-sync"
+version = "0.1.0"
+description = "Every few minutes, refresh the mac's logins of OAuth CLIs (bin/shipyard, bin/bk) and push their access tokens (no refresh tokens) to every devbox with an open workspace, so those CLIs there need no login"
+api = 10
+
+[config]
+# The CLIs to sync, by adapter name (lua/sources/<name>.lua).
+sources = ["shipyard", "buildkite"]
+# Minutes between passes (at least 1).
+interval_minutes = 5
+# The mac refreshes a token with this many minutes or less left. Both CLIs'
+# access tokens last an hour; keep this above interval_minutes plus a few
+# minutes, so a box always gets a token with time left before the next pass.
+refresh_minutes = 15
+# Warn this many days before a login ends, when the CLI's provider says when
+# (Shipyard: 90 days after `bin/shipyard auth login`).
+warn_days = 7
+# bin/shipyard's token file on the mac (Go's os.UserConfigDir on macOS).
+shipyard_tokens = "~/Library/Application Support/shipyard/tokens.json"
+# The Buildkite org whose bin/bk login is synced (the keychain account).
+buildkite_org = "perplexity"

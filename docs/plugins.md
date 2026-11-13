@@ -49,14 +49,18 @@ OAuth tokens for the `servers` it lists, without refresh tokens, into
 `~/.claude/.credentials.json` on every devbox with an open workspace, and
 clears those servers from Claude's needs-auth cache there; a newly opened
 devbox workspace is pushed to within 10 seconds; Claude on the mac stays the
-only one that refreshes) and `shipyard-token-sync` (every 5 minutes,
-refreshes the mac's `bin/shipyard` Okta login when it has 15 minutes or less
-left, and copies its access token, without the refresh token, into
-`~/.config/shipyard/tokens.json` on every devbox with an open workspace; a
-box's own refresh token stays; warns 7 days before the 90-day login ends).
-`install.sh` links `ruff`, `python`, `todo`, `github`, `markdown`,
-`prune-worktrees`, `bazel-cache`, `dashboard`, `download`, `mcp-token-sync`
-and `shipyard-token-sync` into `~/.kitchen/plugins/`.
+only one that refreshes) and `cli-token-sync` (every 5 minutes,
+refreshes the mac's logins of OAuth CLIs when a token has 15 minutes or less
+left, the way each CLI does it, and copies their access tokens, without
+refresh tokens, to every devbox with an open workspace; a box's own refresh
+token stays. Each CLI is a source in `lua/sources/`: `shipyard`
+(`bin/shipyard`'s Okta login in `tokens.json`, into
+`~/.config/shipyard/tokens.json` on the box; warns 7 days before the 90-day
+login ends) and `buildkite` (`bin/bk`'s login in the mac's keychain, into
+bk's `/dev/shm` store on the box, which a box restart wipes). `install.sh`
+links `ruff`, `python`, `todo`, `github`, `markdown`, `prune-worktrees`,
+`bazel-cache`, `dashboard`, `download`, `mcp-token-sync` and `cli-token-sync`
+into `~/.kitchen/plugins/`.
 
 ## Configuration
 

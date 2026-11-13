@@ -60,10 +60,10 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   of removed worktrees, then the least recently used cache entries, never under
   a running build), `mcp-token-sync` (every 5 minutes, pushes the mac's MCP
   OAuth tokens, e.g. Slack's, to each open devbox, and to a newly opened one
-  within 10 seconds, so Claude there stays logged in), `shipyard-token-sync`
-  (every 5 minutes, refreshes the mac's `bin/shipyard` login and pushes its
-  access token to each open devbox, so Shipyard there needs no login) and
-  `dashboard`. ⌘⇧P is the command palette.
+  within 10 seconds, so Claude there stays logged in), `cli-token-sync`
+  (every 5 minutes, refreshes the mac's `bin/shipyard` and `bin/bk` logins and
+  pushes their access tokens to each open devbox, so Shipyard and Buildkite
+  there need no login) and `dashboard`. ⌘⇧P is the command palette.
 - **Dashboard** (⌘D, or the grid at the right end of the tab strip): each
   plugin timer's runs (last fired, next due, stats), and the workspace's
   worktrees, disk and RAM on its host, from the `dashboard` plugin.
