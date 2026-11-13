@@ -6,7 +6,8 @@
 -- (github.pr_<N>) to show it again; github.own_changes shows the tab's own
 -- worktree again. ⌘⇧S lists the PRs in the tab's $KITCHEN_PRS_FILE, one
 -- section per stack, then the PRs opened in the tab with ⌘⇧P. ⌘⇧D shows the
--- shown PR's description, rendered as on GitHub, and goes back.
+-- shown PR's description, rendered as on GitHub, and goes back. ⌘⇧O opens
+-- the shown PR (in the ⌘⇧S menu, the row under the cursor) in Chrome.
 
 local M = {}
 
@@ -171,7 +172,7 @@ function M.list(lines, slug)
   return out
 end
 
-local FIELDS = "number title state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions"
+local FIELDS = "number title url state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions"
 
 -- One GraphQL query for PRs `ns` of `slug`, each aliased p<N>.
 function M.query(slug, ns)
@@ -184,7 +185,8 @@ function M.query(slug, ns)
 end
 
 -- One menu row for PR `p` (a GraphQL node) under `section`, with its state
--- (open, draft, merged, closed: the menu draws GitHub's icon for it). The
+-- (open, draft, merged, closed: the menu draws GitHub's icon for it) and its
+-- page (for ⌘⇧O). The
 -- open PR whose head is `branch` (checked out in the tab's worktree) is live:
 -- that worktree against its parent; every other PR is M.view's kitchen-pr-<N>
 -- checkout, so its review comments and ⌘M work there.
@@ -205,6 +207,7 @@ local function row(tab, p, section, place, branch, dflt)
     label = "#" .. p.number .. " " .. (p.title or ""),
     detail = table.concat(detail, " · "),
     state = state ~= "" and state or nil,
+    url = p.url,
     view = view,
   }
 end
@@ -579,9 +582,34 @@ local function show_description(ctx, slug, ref)
   end)
 end
 
+-- The PR the viewer shows: cb(slug, ref), `ref` its number when the viewer
+-- shows its kitchen-pr-<N> checkout, else the branch checked out in the
+-- viewer's worktree (gh finds its PR).
+local function shown_pr(ctx, cb)
+  local pr = pr_of({ host = ctx.host, worktree = ctx.viewer.worktree })
+  if pr then
+    return cb(pr.slug, pr.n)
+  end
+  local slug
+  for _, w in ipairs(kitchen.workspaces()) do
+    if w.id == ctx.workspace then
+      slug = w.github_slug
+    end
+  end
+  if not slug then
+    return kitchen.notify("this workspace isn't a GitHub repo", "warn")
+  end
+  kitchen.run({ cmd = { "git", "symbolic-ref", "--short", "-q", "HEAD" }, host = ctx.host, cwd = ctx.viewer.worktree, timeout = 15 }, function(r)
+    local branch = r.code == 0 and r.stdout:match("%S+")
+    if not branch then
+      return kitchen.notify("the viewer isn't showing a PR or a branch", "warn")
+    end
+    cb(slug, branch)
+  end)
+end
+
 -- ⌘⇧D: the shown PR's description, rendered; again, back to where the
--- viewer was. The PR is the one checked out (kitchen-pr-<N>), else the one
--- for the branch checked out in the tab's worktree.
+-- viewer was.
 kitchen.command("description", function(ctx)
   local v = ctx.viewer
   if not v then
@@ -599,28 +627,52 @@ kitchen.command("description", function(ctx)
     end
     return
   end
-  local pr = pr_of({ host = ctx.host, worktree = v.worktree })
-  if pr then
-    return show_description(ctx, pr.slug, pr.n)
-  end
-  local slug
-  for _, w in ipairs(kitchen.workspaces()) do
-    if w.id == ctx.workspace then
-      slug = w.github_slug
-    end
-  end
-  if not slug then
-    return kitchen.notify("this workspace isn't a GitHub repo", "warn")
-  end
-  kitchen.run({ cmd = { "git", "symbolic-ref", "--short", "-q", "HEAD" }, host = ctx.host, cwd = v.worktree, timeout = 15 }, function(r)
-    local branch = r.code == 0 and r.stdout:match("%S+")
-    if not branch then
-      return kitchen.notify("the viewer isn't showing a PR or a branch", "warn")
-    end
-    show_description(ctx, slug, branch)
+  shown_pr(ctx, function(slug, ref)
+    show_description(ctx, slug, ref)
   end)
 end, { desc = "show the PR's description rendered, as on GitHub (again: back)" })
 
 kitchen.keymap("cmd+shift+d", "github.description", { when = "viewer" })
+
+-- Opening a PR on GitHub (⌘⇧O) ---------------------------------------------
+
+-- Open `url` in Chrome on this mac (devbox tabs too), else the default browser.
+local function browse(url)
+  local sh = "open -a 'Google Chrome' " .. q(url) .. " 2>/dev/null || open " .. q(url)
+  kitchen.run({ sh = sh, host = "local", timeout = 15 }, function(res)
+    if res.code ~= 0 then
+      kitchen.notify("couldn't open " .. url .. ": " .. why(res), "error")
+    end
+  end)
+end
+
+-- ⌘⇧O: the PR on GitHub, in Chrome. In the ⌘⇧S menu, the row under the
+-- cursor; else the PR the viewer shows.
+kitchen.command("open_in_browser", function(ctx)
+  local v = ctx.viewer
+  if not v then
+    return
+  end
+  if v.menu then
+    if not v.menu.url then
+      return kitchen.notify("that row isn't a PR", "warn")
+    end
+    return browse(v.menu.url)
+  end
+  shown_pr(ctx, function(slug, ref)
+    if type(ref) == "number" then
+      return browse("https://github.com/" .. slug .. "/pull/" .. ref)
+    end
+    gh({ "pr", "view", ref, "-R", slug, "--json", "url", "--jq", ".url" }, function(res)
+      local url = res.code == 0 and res.stdout:match("%S+")
+      if not url then
+        return kitchen.notify("no PR for " .. ref .. ": " .. why(res), "warn")
+      end
+      browse(url)
+    end)
+  end)
+end, { desc = "open the shown PR on GitHub in Chrome (in the ⌘⇧S menu: the row under the cursor)" })
+
+kitchen.keymap("cmd+shift+o", "github.open_in_browser", { when = "viewer" })
 
 return M

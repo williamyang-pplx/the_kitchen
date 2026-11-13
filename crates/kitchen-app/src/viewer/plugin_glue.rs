@@ -383,7 +383,18 @@ impl Viewer {
             // Diff mode (⌘D) rather than the plain file.
             "diff": self.diff,
             "version": self.current.as_ref().and_then(|p| self.files.get(p)).map(|f| f.version.clone()),
+            "menu": self.menu_row(),
         })
+    }
+
+    /// While the ⌘⇧S menu is up, the plugin's entry under its cursor:
+    /// `{label, section, url}`, `{}` on a row that is none (the tab's own
+    /// worktree). None while the menu is down.
+    fn menu_row(&self) -> Option<serde_json::Value> {
+        let Some((super::PickerKind::Views { menu, .. }, picker)) = &self.picker else { return None };
+        // The menu's rows are its entries, in order, then the worktree row.
+        let entry = menu.as_ref().zip(picker.selected_item()).and_then(|(m, i)| m.get(i));
+        Some(entry.map_or_else(|| serde_json::json!({}), |(e, _)| serde_json::json!({ "label": e.label, "section": e.section, "url": e.url })))
     }
 
     pub fn current_filetype(&self) -> Option<String> {

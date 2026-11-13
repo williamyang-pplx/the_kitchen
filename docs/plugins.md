@@ -75,9 +75,9 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 12)
+## API (level 13)
 
-Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -113,9 +113,11 @@ kitchen.keymap("viewer", "<leader>xy", target)   -- \ then 1–3 keys, viewer no
 
 `target` is a command name or a function. `ctx = {workspace, tab, host,
 worktree, viewer = {path, file, line, col, word, sel = {from, to}, dir, diff,
-version}}` (`diff`: the viewer is in diff mode): `file` is `{host, worktree, path, abs}` like `ev.file`, `col` is
+version, menu}}` (`diff`: the viewer is in diff mode): `file` is `{host, worktree, path, abs}` like `ev.file`, `col` is
 the cursor's 1-based character of the raw line, `word` the identifier under
-it.
+it. While the ⌘⇧S menu is up (a plugin chord still fires then), `menu` is
+the `{label, section, url}` of the `kitchen.views` entry under its cursor, `{}`
+on the tab's worktree row.
 Chords need cmd, alt or ctrl; built-in shortcuts can't be taken (the call
 errors). `when`: `any` (default), `terminal`, `viewer`, `plan`;
 ctrl-only chords aren't allowed in terminals. `remote = true` lets
@@ -294,7 +296,8 @@ listener answers with `kitchen.views`: the tab's whole menu, replacing the
 last one (an open menu updates in place). Each entry's `view` takes
 `kitchen.view`'s fields without `tab`. An entry's `state` (`"open"`,
 `"draft"`, `"merged"` or `"closed"`) draws GitHub's icon for the PR before its
-label. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
+label; its `url` comes back to commands as `ctx.viewer.menu.url` while the
+cursor is on it. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.
 Picking a row shows it. A view the tab showed before comes back at once
 from the viewer cache, and its checkout is then refreshed (the viewer is

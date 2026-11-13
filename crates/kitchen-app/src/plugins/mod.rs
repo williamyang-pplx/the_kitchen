@@ -32,7 +32,7 @@ use keys::Chord;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 12;
+pub const API_LEVEL: u32 = 13;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
 /// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
@@ -1014,7 +1014,7 @@ mod tests {
         let q: String = m.get::<mlua::Function>("query").unwrap().call(("o/r", val(serde_json::json!([12, 13])))).unwrap();
         assert!(q.starts_with(r#"query { repository(owner: "o", name: "r") { p12: pullRequest(number: 12) {"#) && q.contains("p13: pullRequest(number: 13)"), "{q}");
 
-        let pr = |n: u64, base: &str, head: &str, state: &str| serde_json::json!({ "number": n, "title": format!("t{n}"), "state": state, "baseRefName": base, "headRefName": head, "baseRefOid": format!("b{n}"), "headRefOid": format!("h{n}"), "additions": 1, "deletions": 0 });
+        let pr = |n: u64, base: &str, head: &str, state: &str| serde_json::json!({ "number": n, "title": format!("t{n}"), "url": format!("https://github.com/o/r/pull/{n}"), "state": state, "baseRefName": base, "headRefName": head, "baseRefOid": format!("b{n}"), "headRefOid": format!("h{n}"), "additions": 1, "deletions": 0 });
         // Two stacks (main ← a ← b, and main ← c), listed out of order; a cycle; a reviewed PR.
         let mut draft = pr(3, "main", "c", "OPEN");
         draft["isDraft"] = true.into();
@@ -1035,6 +1035,7 @@ mod tests {
         );
         let states: Vec<&str> = e.as_array().unwrap().iter().map(|r| r["state"].as_str().unwrap()).collect();
         assert_eq!(states, vec!["merged", "open", "draft", "open", "closed", "merged"], "each row's icon");
+        assert_eq!(e[2]["url"], "https://github.com/o/r/pull/3", "each row's page, for ⌘⇧O");
         // The live row is the tab's worktree against its parent; the others are checkouts.
         assert_eq!(e[1]["view"], serde_json::json!({ "base": "origin/a" }));
         assert_eq!((e[0]["view"]["name"].as_str(), e[0]["view"]["base"].as_str(), e[0]["view"].get("tab")), (Some("kitchen-pr-1"), Some("b1"), None), "merged: its frozen base");

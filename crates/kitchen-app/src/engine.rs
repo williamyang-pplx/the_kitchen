@@ -207,6 +207,9 @@ pub struct ViewEntry {
     /// The PR's state, drawn as GitHub's icon before the label.
     #[serde(default)]
     pub state: Option<PrState>,
+    /// The PR's page; `ctx.viewer.menu` hands it back to plugin commands.
+    #[serde(default)]
+    pub url: Option<String>,
     pub view: ViewAt,
 }
 

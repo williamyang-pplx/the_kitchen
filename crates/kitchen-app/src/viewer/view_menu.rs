@@ -178,7 +178,7 @@ mod tests {
     fn view_menu_lists_entries_and_marks_the_shown_one() {
         let h = Harness::new(TestRepo::new("echo 1 > a"));
         let stack = serde_json::json!([
-            { "section": "main ← a", "label": "#7 a", "state": "merged", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
+            { "section": "main ← a", "label": "#7 a", "state": "merged", "url": "https://github.com/o/r/pull/7", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
             { "section": "main ← a", "label": "#8 b", "state": "open", "view": { "base": "origin/a" } },
         ]);
         set(&h, stack.clone());
@@ -190,6 +190,7 @@ mod tests {
         let Some((_, p)) = &v.picker else { unreachable!() };
         assert_eq!(p.filtered[p.selected].0, 2, "cursor on the row shown");
         assert_eq!(p.icons, vec![Some(PrState::Merged), Some(PrState::Open), None], "each PR's state as its icon");
+        assert_eq!(v.context()["menu"], serde_json::json!({}), "the worktree row is no entry");
 
         let mut more = stack.as_array().unwrap().clone();
         more.push(serde_json::json!({ "section": "Reviewing", "label": "#9 c", "view": { "rev": "refs/kitchen/pr/9", "name": "kitchen-pr-9" } }));
@@ -202,9 +203,15 @@ mod tests {
         for _ in 0..3 {
             h.frame_with(&mut v, vec![key(egui::Key::K)]);
         }
+        assert_eq!(
+            v.context()["menu"],
+            serde_json::json!({ "label": "#7 a", "section": "main ← a", "url": "https://github.com/o/r/pull/7" }),
+            "commands see the entry under the cursor"
+        );
         let picked = h.frame_with(&mut v, vec![key(egui::Key::Enter)]).expect("a view for the window");
         assert_eq!(picked.at.name.as_deref(), Some("kitchen-pr-7"));
         assert!(!v.menu_open());
+        assert_eq!(v.context()["menu"], serde_json::Value::Null, "no menu, no row");
         v.command(PanelCmd::ViewMenu, &h.engine);
         assert!(v.menu_open());
         v.command(PanelCmd::ViewMenu, &h.engine);

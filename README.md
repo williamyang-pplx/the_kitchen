@@ -117,6 +117,7 @@ fall back to text search; a slow one (over 0.4s) shows the text matches until it
 | ⌘H / ⌘L | previous / next tab |
 | ⌘⇧J / ⌘⇧K | in the viewer: next / previous changed file |
 | ⌘⇧D | in the viewer: the shown PR's description, rendered as on GitHub (title, author, state, base ← head); again, back to where you were |
+| ⌘⇧O | in the viewer: open the shown PR on GitHub in Chrome; in the ⌘⇧S menu, the PR under the cursor |
 | ⌘⇧S | PR menu: the PRs the tab's agent listed, one section per stack, plus those opened with ⌘⇧P (j/k, Enter shows, Esc closes); from a terminal it opens the viewer first |
 | ⌘⇧H / ⌘⇧L | in the viewer: file list ↔ code (changed-files tree: j/k open the next / previous file, Enter/Esc back to code, `a` all files; folder list: j/k, gg/G, Enter/l open, h/- up) |
 | ⌘T | new tab — own worktree + branch (a purple tab) |

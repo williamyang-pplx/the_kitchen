@@ -1,6 +1,6 @@
 name = "github"
 version = "0.1.0"
-description = "Review a GitHub PR in the current tab: paste its link into ⌘⇧P to see its diff and review comments; ⌘M posts to the PR; ⌘⇧S switches between the tab's PRs; ⌘⇧D shows the PR's description"
+description = "Review a GitHub PR in the current tab: paste its link into ⌘⇧P to see its diff and review comments; ⌘M posts to the PR; ⌘⇧S switches between the tab's PRs; ⌘⇧D shows the PR's description; ⌘⇧O opens it in Chrome"
 api = 12
 
 [config]
