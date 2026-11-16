@@ -297,3 +297,9 @@ about LSP:
   pytest fixtures), and drops any answer once the user is elsewhere. The
   column sent is the shown word's start (the cursor on a `.` asked about the
   word before it), and removed diff rows skip the provider.
+* ty answered from stale files: the client never told it about changes it
+  didn't make, and a reload replayed the viewer's old text as open
+  documents. The client now polls `git status` per server root (adaptive:
+  `git status` takes 1–2 s on agi, so it runs every ~20 s there) and sends
+  `didChangeWatchedFiles`; replays are flagged and kept only for column
+  maths; documents beyond 32 are closed.

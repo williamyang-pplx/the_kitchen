@@ -77,7 +77,7 @@ Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen
 
 ## API (level 16)
 
-Level 16: `kitchen.on("stop")` runs before a plugin's processes get EOF and are killed (a local one with its process group), and `kitchen.lsp.define` takes `max_rss_mb` and `idle_minutes` and returns the server (see "Language servers"); `ctx.viewer.col` is where `word` starts, and `ctx.viewer.removed` marks a removed diff row. Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 16: `kitchen.on("stop")` runs before a plugin's processes get EOF and are killed (a local one with its process group), and `kitchen.lsp.define` takes `max_rss_mb` and `idle_minutes` and returns the server (see "Language servers"); `ctx.viewer.col` is where `word` starts, and `ctx.viewer.removed` marks a removed diff row; file events carry `replay`. Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -102,7 +102,9 @@ kitchen.on("dashboard", function(ev) end)     -- a dashboard was shown / hidden 
 `ev.file = {host, worktree, path, abs}` identifies the file (pass it back to
 `diagnostics.set`); `ev.filetype` (extension), `ev.version` (content hash),
 `ev.lines`, `ev.text()` (contents; nil above 2 MB). Only files matching the
-manifest's `filetypes` are sent. After a reload, every open file is sent again.
+manifest's `filetypes` are sent. After a reload, the files viewers hold (the
+newest 64) are sent again with `ev.replay = true`: their text may be older than
+the file on disk.
 
 ### Commands and keys
 
@@ -258,7 +260,17 @@ server's memory (its whole process tree) and restarts it above
 per host (starting a fourth stops the least recently used). Every exit is
 logged with its code; a server that dies within 30 s three times is not
 restarted until the plugin reloads. On unload the client cancels requests
-and sends `exit` before the process is killed. See `plugins/python/init.lua`.
+and sends `exit` before the process is killed.
+
+Servers learn about files that change on disk without the viewer (an
+agent's edit, a checkout, a rebase) from the client: it polls `git status`
+(and HEAD) under each server's root and sends `didChangeWatchedFiles`,
+every 5 s or, on a big repo where `git status` is slow, every ten times as
+long as it takes. A changed `uv.lock`, `ty.toml` or root `pyproject.toml`,
+or more than 2000 changed files, restarts the server instead. Replayed
+files are not opened on the server (it reads them from disk), and at most
+32 documents stay open per server. `lsp.restart(server, host, root)` stops
+and restarts one. See `plugins/python/init.lua`.
 
 ### Linters
 

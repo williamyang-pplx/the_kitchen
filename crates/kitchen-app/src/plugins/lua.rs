@@ -263,6 +263,7 @@ fn event_table(lua: &Lua, ev: &Arc<FileEvent>) -> mlua::Result<Table> {
     t.set("filetype", ev.filetype.as_str())?;
     t.set("version", ev.version.as_str())?;
     t.set("changed", ev.changed)?;
+    t.set("replay", ev.replay)?;
     t.set("lines", ev.text.lines().count())?;
     let text = ev.clone();
     t.set("text", lua.create_function(move |_, ()| Ok((text.text.len() <= MAX_TEXT).then(|| text.text.to_string())))?)?;

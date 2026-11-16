@@ -16,7 +16,9 @@
 -- viewer's `gd` (definition) and `gr` (references). A request replaces the
 -- older one of its method. While servers run, a sweep every few seconds
 -- cancels requests nobody waits for any more, restarts servers over their
--- memory cap, stops idle ones, and keeps a few per host.
+-- memory cap, stops idle ones, and keeps a few per host. It also tells
+-- servers which files changed on disk (an agent's edit, a checkout): it polls
+-- git status and mtimes, because the viewer only watches the file it shows.
 
 local M = {}
 
@@ -30,6 +32,11 @@ local REQUEST_TIMEOUT = 20 -- s; the viewer stops waiting then too
 local MAX_SERVERS = 3 -- per host; starting one more stops the least recently used
 local KILL_GRACE_SECS = 2 -- between `exit` and the kill, for servers we stop
 local HEALTHY_AFTER_SECS = 30 -- uptime after which an exit no longer counts as a crash
+local MAX_OPEN_DOCS = 32 -- documents kept open per server; older ones get didClose
+local MAX_CHANGED_FILES = 2000 -- more changed files than this at once: restart the server
+local POLL_COST = 10 -- poll at most every POLL_COST × the last poll's duration (git status is slow on big repos)
+-- Changes to these restart the server (its project or environment changed).
+local RESTART_ON = { ["uv.lock"] = true, ["ty.toml"] = true, ["pyproject.toml"] = true }
 local NAV = { ["textDocument/definition"] = true, ["textDocument/references"] = true }
 
 local json = kitchen.json
@@ -382,8 +389,8 @@ local function start(s, host, root, realwt)
   end
   c = {
     key = key, host = host, root = root, realwt = realwt, buf = "", errbuf = "", next_id = 0,
-    pending = {}, inflight = {}, ready = false, queue = {}, open = {}, encoding = "utf-16",
-    started = os.time(), last_used = os.time(),
+    pending = {}, inflight = {}, ready = false, queue = {}, open = {}, open_order = {}, encoding = "utf-16",
+    started = os.time(), last_used = os.time(), polled_at = 0, poll_every = TICK_SECS,
   }
   local spec = {
     host = host,
@@ -423,7 +430,7 @@ local function start(s, host, root, realwt)
         references = {},
         publishDiagnostics = {},
       },
-      workspace = { configuration = true, workspaceFolders = true },
+      workspace = { configuration = true, workspaceFolders = true, didChangeWatchedFiles = { dynamicRegistration = true } },
     },
     clientInfo = { name = "the kitchen" },
   }, function(result, err)
@@ -501,7 +508,8 @@ end
 
 local function sync(s, c, key)
   local d = s.docs[key]
-  if not d then
+  -- A replayed file may have changed on disk since: the server reads it itself.
+  if not d or d.stale then
     return
   end
   local uri = uri_of(d.file.abs)
@@ -512,6 +520,21 @@ local function sync(s, c, key)
     notify(c, "textDocument/didChange", { textDocument = { uri = uri, version = d.v }, contentChanges = { { text = d.text } } })
   end
   c.open[key] = d.v
+  for i, k in ipairs(c.open_order) do
+    if k == key then
+      table.remove(c.open_order, i)
+      break
+    end
+  end
+  table.insert(c.open_order, key)
+  if #c.open_order > MAX_OPEN_DOCS then
+    local old = table.remove(c.open_order, 1)
+    local od = s.docs[old]
+    if od then
+      notify(c, "textDocument/didClose", { textDocument = { uri = uri_of(od.file.abs) } })
+    end
+    c.open[old] = nil
+  end
 end
 
 -- ------------------------------------------------------------ queries
@@ -615,11 +638,19 @@ local function on_file(ev)
   end
   local key = ev.file.host .. "\0" .. ev.file.abs
   local d = s.docs[key]
+  if ev.replay == true then
+    -- Re-sent after a reload, maybe stale: kept for column maths and
+    -- diagnostics, never opened on a server, and no server is started.
+    if not d then
+      s.docs[key] = { file = ev.file, text = text, v = 1, kversion = ev.version, stale = true }
+    end
+    return
+  end
   if d then
-    if d.kversion == ev.version then
+    if d.kversion == ev.version and not d.stale then
       return
     end
-    d.text, d.v, d.kversion = text, d.v + 1, ev.version
+    d.text, d.v, d.kversion, d.stale = text, d.v + 1, ev.version, nil
   else
     s.docs[key] = { file = ev.file, text = text, v = 1, kversion = ev.version }
   end
@@ -628,6 +659,137 @@ local function on_file(ev)
       c.last_used = os.time()
       sync(s, c, key)
     end
+  end)
+end
+
+-- What git says is dirty under the root (with mtimes), the HEAD, and, when
+-- HEAD moved since `old_head`, the files that move touched. `recheck`: paths
+-- dirty last time, stat'ed again (a revert or a commit makes them vanish).
+local SNAPSHOT_SCRIPT = [[cd %s 2>/dev/null || exit 0
+head=$(git rev-parse HEAD 2>/dev/null) || { echo nogit; exit 0; }
+echo "head $head"
+mtime() { stat -c %%Y -- "$1" 2>/dev/null || stat -f %%m -- "$1" 2>/dev/null || echo gone; }
+git -c core.quotePath=false status --porcelain=v1 -uall -- '*.py' '*.pyi' pyproject.toml ty.toml uv.lock 2>/dev/null |
+while IFS= read -r l; do
+  p=${l#???}; p=${p##* -> }
+  printf 's %%s %%s %%s
+' "$(mtime "$p")" "$(printf %%s "$l" | cut -c1-2 | tr ' ' _)" "$p"
+done
+for p in %s; do printf 'x %%s %%s
+' "$(mtime "$p")" "$p"; done
+old=%s
+if [ -n "$old" ] && [ "$old" != "$head" ]; then
+  git -c core.quotePath=false diff --name-only "$old" "$head" -- '*.py' '*.pyi' pyproject.toml ty.toml uv.lock 2>/dev/null | sed 's/^/d /'
+fi]]
+
+local function send_changes(s, c, changes)
+  if #changes == 0 then
+    return
+  end
+  for _, ch in ipairs(changes) do
+    if RESTART_ON[ch.path] then
+      kitchen.log(string.format("%s: %s changed in %s; restarting", s.name, ch.path, c.root))
+      return M.restart(s, c.host, c.root)
+    end
+  end
+  if #changes > MAX_CHANGED_FILES then
+    kitchen.log(string.format("%s: %d files changed in %s; restarting", s.name, #changes, c.root))
+    return M.restart(s, c.host, c.root)
+  end
+  local list = {}
+  for _, ch in ipairs(changes) do
+    table.insert(list, { uri = uri_of(c.root .. "/" .. ch.path), type = ch.type })
+  end
+  notify(c, "workspace/didChangeWatchedFiles", { changes = list })
+  kitchen.log(string.format("%s: %d file(s) changed on disk in %s", s.name, #list, c.root))
+end
+
+local function poll_changes(s, c)
+  local now = os.time()
+  if not c.ready or c.polling or c.nogit or c.stopping or now - c.polled_at < c.poll_every then
+    return
+  end
+  c.polling, c.polled_at = true, now
+  local snap = c.snapshot
+  local recheck = {}
+  for path in pairs(snap and snap.files or {}) do
+    table.insert(recheck, q(path))
+  end
+  local script = string.format(SNAPSHOT_SCRIPT, q(c.root), table.concat(recheck, " "), q(snap and snap.head or ""))
+  local started = os.time()
+  kitchen.run({ sh = script, host = c.host, timeout = 30 }, function(res)
+    c.polling = false
+    local took = os.time() - started
+    c.poll_every = math.max(TICK_SECS, took * POLL_COST)
+    if c.stopping or s.clients[c.key] ~= c or res.code ~= 0 then
+      return
+    end
+    if res.stdout:match("^nogit") then
+      c.nogit = true
+      return
+    end
+    local new = { head = res.stdout:match("^head (%S+)"), files = {} }
+    local again, moved = {}, {}
+    for line in res.stdout:gmatch("[^\n]+") do
+      local m, xy, path = line:match("^s (%S+) (%S+) (.+)$")
+      if m then
+        new.files[path] = { mtime = m, untracked = xy == "??" }
+      end
+      local xm, xpath = line:match("^x (%S+) (.+)$")
+      if xm then
+        again[xpath] = xm
+      end
+      local dpath = line:match("^d (.+)$")
+      if dpath then
+        table.insert(moved, dpath)
+      end
+    end
+    c.snapshot = new
+    if not snap then
+      kitchen.log(string.format("%s: watching %s (%d dirty file(s))", s.name, c.root, (function()
+        local n = 0
+        for _ in pairs(new.files) do
+          n = n + 1
+        end
+        return n
+      end)()))
+      return
+    end
+    local changes, seen = {}, {}
+    local function add(path, type)
+      if not seen[path] then
+        seen[path] = true
+        table.insert(changes, { path = path, type = type })
+      end
+    end
+    for path, f in pairs(new.files) do
+      local was = snap.files[path]
+      if f.mtime == "gone" then
+        if not was or was.mtime ~= "gone" then
+          add(path, 3)
+        end
+      elseif not was then
+        add(path, f.untracked and 1 or 2)
+      elseif was.mtime ~= f.mtime then
+        add(path, 2)
+      end
+    end
+    for path, was in pairs(snap.files) do
+      if not new.files[path] then
+        local m = again[path]
+        if m == "gone" then
+          if was.mtime ~= "gone" then
+            add(path, 3)
+          end
+        else
+          add(path, 2) -- reverted or committed: the content changed back
+        end
+      end
+    end
+    for _, path in ipairs(moved) do
+      add(path, 2)
+    end
+    send_changes(s, c, changes)
   end)
 end
 
@@ -697,6 +859,8 @@ tick = function()
       end
       if s.idle_minutes > 0 and now - c.last_used >= s.idle_minutes * 60 then
         stop_client(s, c, "idle")
+      else
+        poll_changes(s, c)
       end
     end
     check_rss(s)
@@ -710,6 +874,25 @@ tick = function()
       end
     end
     s.stopped = still
+  end
+end
+
+-- Stop the server at (host, root) and start it again for a document under the
+-- root (its project, environment or many files changed).
+function M.restart(s, host, root)
+  local c = s.clients[host .. "\0" .. root]
+  if c then
+    stop_client(s, c, "restart")
+  end
+  for key, d in pairs(s.docs) do
+    if d.file.host == host and not d.stale and (d.file.abs == root or under(d.file.abs, root)) then
+      with_client(s, d.file, function(nc)
+        if nc then
+          sync(s, nc, key)
+        end
+      end)
+      return
+    end
   end
 end
 

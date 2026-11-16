@@ -41,6 +41,8 @@ pub const API_LEVEL: u32 = 16;
 pub const EMITTED: &[&str] = &["open", "comment", "dashboard", "views"];
 /// File text above this is not handed to plugins (`ev.text()` returns nil).
 pub const MAX_TEXT: usize = 2 * 1024 * 1024;
+/// Most held files replayed to a plugin after it reloads (the newest are kept).
+const MAX_OPEN_FILES: usize = 64;
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -206,6 +208,8 @@ pub struct FileEvent {
     pub version: String,
     pub text: Arc<str>,
     pub changed: bool,
+    /// Re-sent after the plugin reloaded; the file may have changed since.
+    pub replay: bool,
 }
 
 /// What a command sees about where it was run from.
@@ -282,8 +286,10 @@ pub struct PluginHost {
     scheduler: AtomicBool,
     registry: Mutex<Arc<Registry>>,
     registry_gen: AtomicU64,
-    /// Latest text of every file a viewer holds, replayed after a reload.
-    open_files: Mutex<HashMap<FileKey, Arc<FileEvent>>>,
+    /// Latest text of the files viewers hold, with their load order. They
+    /// are replayed after a reload; the newest [`MAX_OPEN_FILES`] are kept.
+    open_files: Mutex<HashMap<FileKey, (Arc<FileEvent>, u64)>>,
+    open_seq: AtomicU64,
     toasted: Mutex<HashSet<String>>,
     /// Provider requests awaiting a reply: id -> (plugin, reply).
     requests: Mutex<HashMap<u64, (String, ReplyFn)>>,
@@ -305,6 +311,7 @@ impl PluginHost {
             registry: Mutex::new(Arc::new(Registry::default())),
             registry_gen: AtomicU64::new(0),
             open_files: Mutex::new(HashMap::new()),
+            open_seq: AtomicU64::new(0),
             toasted: Mutex::new(HashSet::new()),
             requests: Mutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
@@ -334,6 +341,7 @@ impl PluginHost {
             registry: Mutex::new(Arc::new(Registry::default())),
             registry_gen: AtomicU64::new(0),
             open_files: Mutex::new(HashMap::new()),
+            open_seq: AtomicU64::new(0),
             toasted: Mutex::new(HashSet::new()),
             requests: Mutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
@@ -469,9 +477,11 @@ impl PluginHost {
         }
         drop(slots);
         // Replay the files viewers hold so diagnostics come back after a reload.
-        let files: Vec<Arc<FileEvent>> = lock(&self.open_files).values().cloned().collect();
-        for f in files {
-            self.send_file(name, &f);
+        let mut files: Vec<(Arc<FileEvent>, u64)> = lock(&self.open_files).values().cloned().collect();
+        files.sort_by_key(|(_, seq)| *seq);
+        for (f, _) in files {
+            let replay = Arc::new(FileEvent { key: f.key.clone(), filetype: f.filetype.clone(), version: f.version.clone(), text: f.text.clone(), changed: f.changed, replay: true });
+            self.send_file(name, &replay);
         }
     }
 
@@ -490,8 +500,17 @@ impl PluginHost {
     pub fn file_loaded(&self, key: FileKey, text: Arc<str>, changed: bool) {
         let filetype = filetype_of(&key.path);
         let version = content_hash(&text);
-        let ev = Arc::new(FileEvent { key: key.clone(), filetype, version, text, changed });
-        lock(&self.open_files).insert(key, ev.clone());
+        let ev = Arc::new(FileEvent { key: key.clone(), filetype, version, text, changed, replay: false });
+        let seq = self.open_seq.fetch_add(1, Ordering::Relaxed);
+        let mut open = lock(&self.open_files);
+        open.insert(key, (ev.clone(), seq));
+        if open.len() > MAX_OPEN_FILES {
+            let oldest = open.iter().min_by_key(|(_, (_, seq))| *seq).map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                open.remove(&k);
+            }
+        }
+        drop(open);
         let slots = lock(&self.slots);
         for s in slots.iter() {
             if let (Some(tx), Some(m)) = (&s.tx, &s.manifest) {
@@ -2656,6 +2675,99 @@ end)
         assert!(f.ask("definition", "one/a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
         assert!(f.ask("definition", "two/b.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
         f.wait_for(10, &|f| f.plugin_log().contains("more than 1 servers"));
+    }
+
+    impl FakeLsp {
+        /// Make the worktree a git repo with everything committed.
+        fn git_init(&self) {
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init")
+                .current_dir(&self.wt)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+
+        fn count(&self, method: &str) -> usize {
+            self.methods().iter().filter(|m| *m == method).count()
+        }
+    }
+
+    /// Replays (after a reload) never start a server or open documents: the
+    /// files may have changed on disk since the viewer read them.
+    #[test]
+    fn lsp_keeps_replays_stale() {
+        let Some(f) = FakeLsp::start("", "", &[("root.marker", ""), ("a.py", "x = 1\n")]) else { return };
+        assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        f.host.reload(Some(&f.name)).unwrap();
+        wait(&|| f.host.has_provider("definition", "py") && f.plugin_log().matches("] loaded").count() == 2);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(f.count("initialize"), 1, "a replay started a server: {:?}", f.methods());
+    }
+
+    #[test]
+    fn open_files_keeps_the_newest() {
+        let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
+        let host = PluginHost::empty(&engine);
+        let key = |i: usize| FileKey { host: "local".into(), worktree: "/w".into(), path: format!("f{i}.py") };
+        for i in 0..MAX_OPEN_FILES + 6 {
+            host.file_loaded(key(i), Arc::from("x = 1\n"), false);
+        }
+        let open = lock(&host.open_files);
+        assert_eq!(open.len(), MAX_OPEN_FILES);
+        assert!(!open.contains_key(&key(0)) && open.contains_key(&key(MAX_OPEN_FILES + 5)));
+        assert!(open.values().all(|(ev, _)| !ev.replay));
+    }
+
+    /// More than 32 documents open: the oldest is closed.
+    #[test]
+    fn lsp_closes_docs_beyond_cap() {
+        let files: Vec<(String, String)> = (0..34).map(|i| (format!("m{i:02}.py"), "x = 1\n".to_string())).collect();
+        let mut all: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+        all.push(("root.marker", ""));
+        let Some(f) = FakeLsp::start("", "", &all) else { return };
+        for (p, t) in &files {
+            f.host.file_loaded(f.key(p), Arc::from(t.as_str()), false);
+        }
+        f.wait_for(30, &|f| f.count("textDocument/didOpen") == 34);
+        f.wait_for(10, &|f| f.count("textDocument/didClose") == 2);
+        let closed = f.received().into_iter().find(|m| m["method"] == "textDocument/didClose").unwrap();
+        assert!(closed["params"]["textDocument"]["uri"].as_str().unwrap().ends_with("/m00.py"), "{closed}");
+    }
+
+    /// A file edited on disk outside the viewer reaches the server as a watched-file change.
+    #[test]
+    fn lsp_sends_watched_file_changes() {
+        let Some(f) = FakeLsp::start("", "", &[("root.marker", ""), ("a.py", "x = 1\n"), ("b.py", "y = 2\n")]) else { return };
+        f.git_init();
+        assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        f.wait_for(20, &|f| f.plugin_log().contains("watching"));
+        std::fs::write(f.wt.join("b.py"), "y = 3\nz = 4\n").unwrap();
+        f.wait_for(20, &|f| {
+            f.received().iter().any(|m| m["method"] == "workspace/didChangeWatchedFiles" && m["params"]["changes"][0]["uri"].as_str().is_some_and(|u| u.ends_with("/b.py")))
+        });
+    }
+
+    /// uv.lock changing means a new environment: the server restarts.
+    #[test]
+    fn lsp_restarts_on_lock_change() {
+        let Some(f) = FakeLsp::start("", "", &[("root.marker", ""), ("a.py", "x = 1\n"), ("uv.lock", "v1\n")]) else { return };
+        f.git_init();
+        assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        f.wait_for(20, &|f| f.plugin_log().contains("watching"));
+        std::fs::write(f.wt.join("uv.lock"), "v2\n").unwrap();
+        f.wait_for(20, &|f| f.count("initialize") == 2);
+    }
+
+    /// A worktree that isn't a git repo is not polled.
+    #[test]
+    fn lsp_skips_polling_outside_git() {
+        let Some(f) = FakeLsp::start("", "", &[("root.marker", ""), ("a.py", "x = 1\n")]) else { return };
+        assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        std::thread::sleep(Duration::from_secs(12));
+        assert!(!f.plugin_log().contains("watching"), "{}", f.plugin_log());
     }
 
     /// The bundled python plugin: ty (via uvx) answers gd / gr across files,
