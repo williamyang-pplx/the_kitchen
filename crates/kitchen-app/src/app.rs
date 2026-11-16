@@ -1136,6 +1136,9 @@ impl eframe::App for KitchenApp {
         let frame_start = Instant::now();
         let ctx = ui.ctx().clone();
         // Rendered Markdown asked for last frame is laid out off screen (and drawn once ready).
+        if crate::hidden::active() {
+            crate::hidden::hide(frame);
+        }
         crate::web::pump(frame, &ctx);
         self.poll_attach(&ctx);
         self.paste = attach::take_paste();

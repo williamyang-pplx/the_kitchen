@@ -79,12 +79,13 @@ scripts/install.sh              # release build, ~/Applications/The Kitchen.app 
 scripts/install.sh --no-linux   # skip the devbox cross-build
 cargo run -p kitchen-app        # development
 scripts/build-cli-linux.sh      # just the devbox binaries (needs cargo-zigbuild + zig)
-scripts/screenshots.sh [DIR]    # PNGs of every view, from an isolated test kitchen
+scripts/screenshots.sh [DIR]    # PNGs of every view, from a hidden, isolated test kitchen
 ```
 
 Needs `git`, `tmux` and `claude` on each host. State is
 in `~/.kitchen` (`KITCHEN_STATE_DIR` overrides it for an isolated test
-kitchen). Tabs are tmux sessions on the kitchen's own server:
+kitchen; `KITCHEN_HIDDEN=1` keeps a test kitchen off the screen, see
+[docs/testing.md](docs/testing.md)). Tabs are tmux sessions on the kitchen's own server:
 `tmux -L kitchen ls`. When a host restarts (a devbox resumed from pause),
 a tab's session comes back in its worktree with its agent resuming the
 conversation it was in.

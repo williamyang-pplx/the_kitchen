@@ -6,6 +6,7 @@ mod ask_thread;
 mod attach;
 mod dashboard_view;
 mod engine;
+mod hidden;
 mod keybindings;
 mod links;
 mod notify;
@@ -28,8 +29,13 @@ fn main() -> eframe::Result {
     kitchen_core::host::augment_local_path();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).format_timestamp_millis().init();
     let db_path = kitchen_proto::state_dir().join("kitchen.db");
+    let hidden = hidden::active();
+    let mut viewport = egui::ViewportBuilder::default();
+    if hidden {
+        viewport = viewport.with_active(false);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: viewport
             .with_title("the kitchen")
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([800.0, 480.0])
@@ -41,10 +47,17 @@ fn main() -> eframe::Result {
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon-256.png")).unwrap_or_default()),
         // No default macOS menu: its ⌘H (Hide) and ⌘Q items would swallow
         // those chords before the kitchen sees them. ⌘Q is a keybinding (keybindings/app.rs).
-        event_loop_builder: Some(Box::new(|builder| {
-            use winit::platform::macos::EventLoopBuilderExtMacOS;
+        event_loop_builder: Some(Box::new(move |builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
             builder.with_default_menu(false);
+            if hidden {
+                builder.with_activation_policy(ActivationPolicy::Accessory).with_activate_ignoring_other_apps(false);
+            }
         })),
+        // A hidden kitchen keeps its own egui state: the shared file holds
+        // the live window's position, which would put this one on screen.
+        persist_window: !hidden,
+        persistence_path: hidden.then(|| kitchen_proto::state_dir().join("egui.ron")),
         ..Default::default()
     };
     eframe::run_native(

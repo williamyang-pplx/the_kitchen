@@ -17,3 +17,12 @@ straight to `main`:
 
 Never reset, force-push or rewrite `main`, and never discard uncommitted
 changes you didn't make: they may belong to another agent.
+
+## Testing UI changes: run the kitchen hidden
+
+To check a UI change, start a test kitchen built from your checkout with
+`KITCHEN_HIDDEN=1`. Drive it with `kitchenctl` and look at
+`kitchenctl debug screenshot` PNGs. William sees nothing. Give it its own
+`KITCHEN_STATE_DIR` and `KITCHEN_SOCKET_PATH` and a throwaway clone, or you
+drive his live kitchen and make worktrees in his checkout. See
+[docs/testing.md](docs/testing.md) for the rules and a recipe.

@@ -68,7 +68,8 @@ app is not reachable.
 | `plan resolve ID` | `plan.resolve` | |
 | `notify --title T [--body B] [-t T]` | `notify` | badge + macOS banner |
 | `notifications [--unread] [--limit N]` | `notification.list` | |
-| `debug screenshot PATH` | `debug.screenshot` | PNG of the window |
+| `debug screenshot PATH` | `debug.screenshot` | PNG of the window (works for a hidden kitchen too, see [testing.md](testing.md)) |
+| `debug keys KEYS` | `debug.keys` | type into the focused pane: `gd`, `<cmd-p>main<cr>` |
 
 Hidden helpers: `__relay` (devbox tunnel, above) and `__index` (symbol
 extraction for devbox viewers; not wired up yet — it exits with an error).

@@ -36,6 +36,6 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSError", "NSObject", "NSSet", "NSBundle", "NSData", "NSValue", "NSGeometry"] }
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKWebView", "WKSnapshotConfiguration", "block2", "objc2-app-kit"] }
 wry = { version = "0.53", features = ["transparent"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSPasteboard", "NSImageRep", "NSBitmapImageRep", "NSImage", "NSView", "NSResponder"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSPasteboard", "NSImageRep", "NSBitmapImageRep", "NSImage", "NSView", "NSResponder", "NSWindow"] }
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger"] }
 block2 = "0.6"

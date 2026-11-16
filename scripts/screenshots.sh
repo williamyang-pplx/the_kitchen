@@ -3,7 +3,8 @@
 #
 #   scripts/screenshots.sh [OUT_DIR]     # default /tmp/kitchen-shots
 #
-# The test kitchen gets its own state dir and socket, so it never talks to
+# The test kitchen runs hidden (KITCHEN_HIDDEN=1, see docs/testing.md), so
+# nothing shows on screen. It gets its own state dir and socket, so it never talks to
 # the real app (a kitchen tab exports KITCHEN_SOCKET_PATH, which would win
 # over KITCHEN_STATE_DIR). Its tabs live on the shared `tmux -L kitchen`
 # server; the script ends them when it exits.
@@ -14,6 +15,7 @@ OUT=${1:-/tmp/kitchen-shots}
 TMP=$(mktemp -d /tmp/kitchen-shots-XXXX)
 
 unset KITCHEN_WORKSPACE_ID KITCHEN_TAB_ID KITCHEN_PLAN_FILE KITCHEN_DIFF_BASE
+export KITCHEN_HIDDEN=1
 export KITCHEN_STATE_DIR=$TMP/state
 export KITCHEN_SOCKET_PATH=$TMP/state/kitchen.sock
 mkdir -p "$KITCHEN_STATE_DIR/plugins" "$OUT"
