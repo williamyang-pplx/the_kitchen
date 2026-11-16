@@ -1,6 +1,6 @@
-//! `gd` / `gr`: ask a plugin provider (e.g. a language server) first. A slow
-//! provider gets a text search alongside it, shown until it answers; none, or
-//! one that declines, gets the text search alone.
+//! `gd` / `gr`: ask a plugin provider (e.g. a language server) and wait for
+//! it; no answer, an error, a self-answer or a timeout falls back to a text
+//! search. Answers that arrive after the user left the spot are dropped.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -15,8 +15,6 @@ use crate::plugins::Location;
 
 /// A provider that hasn't answered by then is no longer waited for.
 const NAV_TIMEOUT: Duration = Duration::from_secs(20);
-/// A provider that hasn't answered by then gets a text search alongside it.
-const RACE_AFTER: Duration = Duration::from_millis(400);
 /// Most text-search references listed.
 const MAX_REFS: usize = 500;
 /// Most definition candidate files read per jump (one round trip).
@@ -46,17 +44,13 @@ impl NavKind {
             NavKind::References => format!("no references to {name}"),
         }
     }
-}
 
-/// Where the text search of a nav query is.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Grep {
-    NotStarted,
-    Running,
-    /// Finished with nothing, while the provider still works.
-    Empty,
-    /// Its results are in the picker, while the provider still works.
-    Shown,
+    fn finding(self, name: &str) -> String {
+        match self {
+            NavKind::Definition => format!("finding the definition of {name}…"),
+            NavKind::References => format!("finding references to {name}…"),
+        }
+    }
 }
 
 pub(super) struct PendingNav {
@@ -64,25 +58,39 @@ pub(super) struct PendingNav {
     kind: NavKind,
     name: String,
     started: Instant,
-    /// Cursor when gd/gr was pressed (ranking, and the definition we stand on).
+    /// Cursor when gd/gr was pressed: ranking, and whether an answer still applies.
     here: Option<Loc>,
+    /// 1-based raw column where the asked word starts.
+    word_col: Option<usize>,
+    /// Asked from a removed diff row: `here` is then the next current line.
+    removed: bool,
     /// The provider was asked and hasn't answered.
     provider: bool,
-    grep: Grep,
+    /// The status line this query set, cleared with it.
+    status: Option<String>,
 }
 
 impl Viewer {
     /// `gd`: a provider's answer, else the symbol/grep search.
     pub(super) fn jump_to_def(&mut self, name: String) {
-        if !self.ask_provider(NavKind::Definition, &name) {
-            self.text_search(NavKind::Definition, name, self.here());
-        }
+        self.nav(NavKind::Definition, name);
     }
 
     /// `gr`: a provider's answer, else `git grep -w`.
     pub(super) fn find_references(&mut self, name: String) {
-        if !self.ask_provider(NavKind::References, &name) {
-            self.text_search(NavKind::References, name, self.here());
+        self.nav(NavKind::References, name);
+    }
+
+    fn nav(&mut self, kind: NavKind, name: String) {
+        if self.current.as_deref().is_some_and(|p| kitchen_symbols::is_keyword(p, &name)) {
+            self.status = Some((format!("{name} is a keyword"), false));
+            return;
+        }
+        let word_col = self.word_here().map(|(col, _)| col);
+        // A removed row is old text: the provider only knows the current file.
+        let removed = self.on_removed_row();
+        if removed || !self.ask_provider(kind, &name, word_col) {
+            self.text_search(kind, name, self.here(), word_col, removed, None);
         }
     }
 
@@ -90,12 +98,43 @@ impl Viewer {
         self.nav_token += 1;
         self.status = None;
         let (token, here) = (self.nav_token, self.here());
-        self.pending_nav = Some(PendingNav { token, kind, name: name.to_string(), started: Instant::now(), here, provider, grep: Grep::NotStarted });
+        self.pending_nav = Some(PendingNav { token, kind, name: name.to_string(), started: Instant::now(), here, word_col: None, removed: false, provider, status: None });
         token
     }
 
+    /// Show `msg` for the pending query; it goes when the query does.
+    fn nav_status(&mut self, msg: String) {
+        if let Some(p) = self.pending_nav.as_mut() {
+            p.status = Some(msg.clone());
+        }
+        self.status = Some((msg, false));
+    }
+
+    /// Clear the status line if it still shows what `p` put there.
+    fn clear_nav_status(&mut self, p: &PendingNav) {
+        if p.status.is_some() && self.status.as_ref().map(|s| &s.0) == p.status.as_ref() {
+            self.status = None;
+        }
+    }
+
+    /// End the pending query early (another file, Esc, or the user moved):
+    /// forget it and clear the status it set.
+    pub(super) fn abandon_nav(&mut self) {
+        if let Some(p) = self.pending_nav.take() {
+            self.clear_nav_status(&p);
+        }
+    }
+
+    /// The cursor is still where `p` was asked: same file and line.
+    fn still_here(&self, p: &PendingNav) -> bool {
+        match (&p.here, self.here()) {
+            (Some(a), Some(b)) => a.path == b.path && a.line == b.line,
+            (a, b) => a.is_none() && b.is_none(),
+        }
+    }
+
     /// Hand the query to a plugin; false when no plugin answers for this file.
-    fn ask_provider(&mut self, kind: NavKind, name: &str) -> bool {
+    fn ask_provider(&mut self, kind: NavKind, name: &str, word_col: Option<usize>) -> bool {
         let Some(plugins) = self.engine.plugins().cloned() else { return false };
         let Some(ft) = self.current_filetype() else { return false };
         if !plugins.has_provider(kind.provider(), &ft) {
@@ -103,6 +142,9 @@ impl Viewer {
         }
         let ctx = crate::plugins::command_context(&self.engine, &self.tab_id, Some(self.context()));
         let token = self.start_nav(kind, name, true);
+        if let Some(p) = self.pending_nav.as_mut() {
+            p.word_col = word_col;
+        }
         let (tx, egui_ctx, host, wt) = (self.tx.clone(), self.engine.ctx.clone(), self.host.clone(), self.worktree.clone());
         let asked = plugins.provide(kind.provider(), &ft, ctx, move |answer| {
             // Off the plugin's thread: previews may need a round trip.
@@ -121,20 +163,23 @@ impl Viewer {
             self.pending_nav = None;
             return false;
         }
-        let what = if kind == NavKind::Definition { "finding the definition of" } else { "finding references to" };
-        self.status = Some((format!("{what} {name}…"), false));
-        self.engine.ctx.request_repaint_after(RACE_AFTER);
+        self.nav_status(kind.finding(name));
+        self.engine.ctx.request_repaint_after(NAV_TIMEOUT);
         true
     }
 
-    /// No provider (or it declined): the text search is the answer.
-    /// `gd`: a unique definition in this file jumps straight there.
-    fn text_search(&mut self, kind: NavKind, name: String, here: Option<Loc>) {
-        if kind == NavKind::Definition {
-            let Some(here) = here.clone() else { return };
+    /// The text search: no provider, or it had nothing. `gd`: a unique
+    /// definition in this file jumps straight there. `status` says why it runs.
+    fn text_search(&mut self, kind: NavKind, name: String, here: Option<Loc>, word_col: Option<usize>, removed: bool, status: Option<String>) {
+        if kind == NavKind::Definition && !removed {
+            let Some(here) = here.clone() else {
+                self.status = None;
+                return;
+            };
             let local = self.local_defs(&name, &here.path);
             if let [only] = local.as_slice() {
                 if only.line != here.line {
+                    self.status = None;
                     let loc = Loc { path: only.path.clone(), line: only.line, col: only.col };
                     self.record_and_go_raw(loc);
                     return;
@@ -143,9 +188,9 @@ impl Viewer {
         }
         self.start_nav(kind, &name, false);
         if let Some(p) = self.pending_nav.as_mut() {
-            p.here = here;
+            (p.here, p.word_col, p.removed) = (here, word_col, removed);
         }
-        self.status = Some((format!("searching for {name}…"), false));
+        self.nav_status(status.unwrap_or_else(|| format!("searching for {name}…")));
         self.start_grep();
     }
 
@@ -157,17 +202,14 @@ impl Viewer {
 
     /// Spawn the text search for the pending query (`Msg::Grep` comes back).
     fn start_grep(&mut self) {
-        let Some(p) = self.pending_nav.as_ref().filter(|p| p.grep == Grep::NotStarted) else { return };
-        let (token, name, kind) = (p.token, p.name.clone(), p.kind);
+        let Some(p) = self.pending_nav.as_ref() else { return };
+        let (token, name, kind, removed) = (p.token, p.name.clone(), p.kind, p.removed);
         let (tx, ctx, host, wt) = (self.tx.clone(), self.engine.ctx.clone(), self.host.clone(), self.worktree.clone());
         match kind {
             NavKind::Definition => {
                 let Some(here) = p.here.clone() else {
-                    // Nowhere to search from; a provider may still answer.
-                    if !p.provider {
-                        self.pending_nav = None;
-                        self.status = Some((kind.nothing(&name), true));
-                    }
+                    self.pending_nav = None;
+                    self.status = Some((kind.nothing(&name), true));
                     return;
                 };
                 let local = self.local_defs(&name, &here.path);
@@ -178,8 +220,11 @@ impl Viewer {
                             locs.push(l);
                         }
                     }
-                    // Drop the definition we're standing on.
-                    locs.retain(|l| !(l.path == here.path && l.line == here.line));
+                    // Drop the definition we're standing on (on a removed row
+                    // `here` is the next line, which may well be the answer).
+                    if !removed {
+                        locs.retain(|l| !(l.path == here.path && l.line == here.line));
+                    }
                     let _ = tx.send(Msg::Grep { token, locs });
                     ctx.request_repaint();
                 });
@@ -191,110 +236,59 @@ impl Viewer {
                 });
             }
         }
-        if let Some(p) = self.pending_nav.as_mut() {
-            p.grep = Grep::Running;
-        }
     }
 
-    /// Per frame: start the text search once the provider is slow, and stop
-    /// waiting for it at [`NAV_TIMEOUT`].
+    /// Per frame: stop waiting for a provider at [`NAV_TIMEOUT`] and search
+    /// text instead (when the user is still where they asked).
     pub(super) fn check_nav_timeout(&mut self) {
         let Some(p) = self.pending_nav.as_ref().filter(|p| p.provider) else { return };
         let elapsed = p.started.elapsed();
-        if p.grep == Grep::NotStarted && elapsed > RACE_AFTER {
-            self.start_grep();
-        }
-        let Some(p) = self.pending_nav.as_mut() else { return };
         if elapsed <= NAV_TIMEOUT {
-            let deadline = if p.grep == Grep::NotStarted { RACE_AFTER } else { NAV_TIMEOUT };
-            self.engine.ctx.request_repaint_after(deadline.saturating_sub(elapsed).max(Duration::from_millis(10)));
+            self.engine.ctx.request_repaint_after(NAV_TIMEOUT.saturating_sub(elapsed).max(Duration::from_millis(10)));
             return;
         }
         log::info!(target: "kitchen::nav", "{:?} {}: no answer from the language server in {NAV_TIMEOUT:?}", p.kind, p.name);
-        p.provider = false;
-        match p.grep {
-            // Its result is final now.
-            Grep::Running => {}
-            Grep::Shown => {
-                self.pending_nav = None;
-                self.status = None;
-            }
-            Grep::Empty | Grep::NotStarted => {
-                let msg = p.kind.nothing(&p.name);
-                self.pending_nav = None;
-                self.status = Some((msg, true));
-            }
+        let Some(p) = self.pending_nav.take() else { return };
+        if !self.still_here(&p) {
+            self.clear_nav_status(&p);
+            return;
         }
+        let msg = format!("no answer from the language server for {}; searching text…", p.name);
+        self.text_search(p.kind, p.name, p.here, p.word_col, p.removed, Some(msg));
     }
 
     /// The provider's answer (`None`: it couldn't tell).
     pub(super) fn finish_nav(&mut self, token: u64, answer: Option<Vec<Location>>) {
-        let Some(mut p) = self.pending_nav.take_if(|p| p.token == token) else { return };
+        let Some(p) = self.pending_nav.take_if(|p| p.token == token) else { return };
         let n = answer.as_ref().map(Vec::len);
         log::info!(target: "kitchen::nav", "{:?} {}: language server → {n:?} in {:?}", p.kind, p.name, p.started.elapsed());
-        p.provider = false;
-        match (answer, p.grep) {
-            (Some(locs), Grep::Shown) => {
-                let ours = matches!(self.picker, Some((PickerKind::RawLocs(_), _)));
-                self.status = None;
-                match locs.len() {
-                    _ if !ours => {} // the user moved on to another picker
-                    0 => {}          // keep the text matches as the answer
-                    1 => {
-                        self.picker = None;
-                        self.show_locations(p.kind, &p.name, locs);
-                    }
-                    _ => self.replace_picker(p.kind, &p.name, locs),
-                }
-            }
-            (Some(locs), _) => {
-                self.status = None;
+        if !self.still_here(&p) {
+            self.clear_nav_status(&p);
+            return;
+        }
+        // A definition that is the asked word itself (a pytest fixture, say) is no answer.
+        let answer = answer.filter(|locs| !(p.kind == NavKind::Definition && answers_itself(&p, locs)));
+        match answer {
+            Some(locs) => {
+                self.clear_nav_status(&p);
                 self.show_locations(p.kind, &p.name, locs);
             }
-            (None, Grep::NotStarted) => {
-                let (kind, name, here) = (p.kind, p.name, p.here);
-                self.text_search(kind, name, here);
+            None => {
+                let msg = format!("the language server found nothing for {}; searching text…", p.name);
+                self.text_search(p.kind, p.name, p.here, p.word_col, p.removed, Some(msg));
             }
-            (None, Grep::Running) => self.pending_nav = Some(p),
-            (None, Grep::Empty) => self.status = Some((p.kind.nothing(&p.name), true)),
-            (None, Grep::Shown) => self.status = None,
         }
     }
 
     /// The text search's answer.
     pub(super) fn finish_grep(&mut self, token: u64, locs: Vec<Location>) {
-        let Some(p) = self.pending_nav.as_mut().filter(|p| p.token == token) else { return };
+        let Some(p) = self.pending_nav.take_if(|p| p.token == token) else { return };
         log::info!(target: "kitchen::nav", "{:?} {}: text search → {} in {:?}", p.kind, p.name, locs.len(), p.started.elapsed());
-        let (kind, name) = (p.kind, p.name.clone());
-        if !p.provider {
-            self.pending_nav = None;
-            self.status = None;
-            self.show_locations(kind, &name, locs);
+        self.clear_nav_status(&p);
+        if !self.still_here(&p) {
             return;
         }
-        // The provider still works: show what we have meanwhile.
-        match locs.len() {
-            0 => {
-                p.grep = Grep::Empty;
-                self.status = Some((format!("no text match for {name}; waiting for the language server…"), false));
-            }
-            1 => {
-                self.pending_nav = None;
-                self.status = None;
-                self.show_locations(kind, &name, locs);
-            }
-            _ => {
-                p.grep = Grep::Shown;
-                self.show_locations(kind, &name, locs);
-                let what = if kind == NavKind::Definition { "finding the definition of" } else { "finding references to" };
-                self.status = Some((format!("{what} {name}… (text matches shown)"), false));
-            }
-        }
-    }
-
-    /// The open picker shows the pending query's text matches.
-    pub(super) fn provisional_picker(&self) -> bool {
-        self.pending_nav.as_ref().is_some_and(|p| p.grep == Grep::Shown) && matches!(self.picker, Some((PickerKind::RawLocs(_), _)))
+        self.show_locations(p.kind, &p.name, locs);
     }
 
     fn show_locations(&mut self, kind: NavKind, name: &str, locs: Vec<Location>) {
@@ -306,15 +300,6 @@ impl Viewer {
                 self.picker = Some((PickerKind::RawLocs(locs.iter().map(loc_of).collect()), Picker::new(title, items)));
             }
         }
-    }
-
-    /// Swap the text matches in the picker for the provider's answer, keeping the query.
-    fn replace_picker(&mut self, kind: NavKind, name: &str, locs: Vec<Location>) {
-        let Some((PickerKind::RawLocs(old), picker)) = self.picker.as_mut() else { return };
-        let (title, items) = picker_items(kind, name, &locs);
-        picker.title = title;
-        picker.set_items(items, vec![0; locs.len()]);
-        *old = locs.iter().map(loc_of).collect();
     }
 
     /// Like `record_and_go`, for a 1-based raw column (as plugins give).
@@ -331,6 +316,13 @@ impl Viewer {
         let text = self.current.as_ref().and_then(|p| self.files.get(p)).and_then(|f| f.text.lines().nth(line.saturating_sub(1)));
         super::plugin_glue::display_col(text.unwrap_or(""), col)
     }
+}
+
+/// Every location is the word the query was asked about.
+fn answers_itself(p: &PendingNav, locs: &[Location]) -> bool {
+    let (Some(here), Some(col)) = (&p.here, p.word_col) else { return false };
+    let width = p.name.chars().count();
+    !locs.is_empty() && locs.iter().all(|l| l.path == here.path && l.line == here.line && (col..col + width).contains(&l.col))
 }
 
 fn loc_of(l: &Location) -> Loc {
@@ -490,6 +482,7 @@ mod tests {
         assert_eq!(locs[1].text.as_deref(), Some("é = foo:bar"));
     }
 
+    use crate::panels::PanelCmd;
     use crate::test_util::{Harness, TestRepo};
 
     /// A viewer on a fresh git repo holding `files`.
@@ -541,10 +534,7 @@ mod tests {
         assert_eq!(picker.items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["m.py:123", "n.py:3"]);
     }
 
-    /// A slow provider: the text search starts after RACE_AFTER and its
-    /// results show until the provider answers (or the user acts on them).
-    #[test]
-    fn slow_provider_races_text_search() {
+    fn repo() -> (Harness, Viewer) {
         let (h, mut v) = harness(&[
             ("use.py", "from a import foo, bar\nfoo()\nbar()\nnone_here()\n"),
             ("a.py", "def foo():\n    pass\n\n\ndef bar():\n    pass\n"),
@@ -552,84 +542,124 @@ mod tests {
         ]);
         v.open("use.py", Some(2), false);
         h.settle(&mut v, &|v| v.files.contains_key("use.py") && v.current_source_line() == Some(2));
-        // A provider asked `RACE_AFTER` ago, so this frame starts the text search.
-        let ask = |v: &mut Viewer, kind: NavKind, name: &str| {
-            let t = v.start_nav(kind, name, true);
-            v.pending_nav.as_mut().unwrap().started = Instant::now() - RACE_AFTER * 2;
-            t
-        };
-        let grep_is = |g: Grep| move |v: &Viewer| v.pending_nav.as_ref().is_some_and(|p| p.grep == g);
-        let loc = |path: &str, line: usize| Location { path: path.into(), line, col: 1, text: Some("x".into()) };
+        (h, v)
+    }
 
-        // (a) Two text matches: a provisional picker; the provider's answer
-        // replaces its items in place and keeps the typed query.
-        let t = ask(&mut v, NavKind::Definition, "foo");
-        h.settle(&mut v, &grep_is(Grep::Shown));
-        assert!(v.provisional_picker());
-        let (_, picker) = v.picker.as_mut().unwrap();
-        assert_eq!(picker.items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["a.py:1", "b.py:1"]);
-        picker.query = "a".into();
-        v.finish_nav(t, Some(vec![loc("a.py", 1), loc("c.py", 9)]));
-        assert!(v.pending_nav.is_none());
-        let (kind, picker) = v.picker.as_ref().unwrap();
-        assert!(matches!(kind, PickerKind::RawLocs(l) if l.len() == 2 && l[1].path == "c.py"));
-        assert_eq!((picker.query.as_str(), picker.items[1].0.as_str()), ("a", "c.py:9"));
-        h.key(&mut v, egui::Key::Escape);
-        assert!(v.picker.is_none());
+    fn status(v: &Viewer) -> Option<&str> {
+        v.status.as_ref().map(|s| s.0.as_str())
+    }
 
-        // (b) Cancelling the provisional picker ends the query: a late answer is dropped.
-        let t = ask(&mut v, NavKind::Definition, "foo");
-        h.settle(&mut v, &grep_is(Grep::Shown));
-        h.key(&mut v, egui::Key::Escape);
-        assert!(v.picker.is_none() && v.pending_nav.is_none());
-        v.finish_nav(t, Some(vec![loc("c.py", 9)]));
-        assert_eq!(v.current.as_deref(), Some("use.py"));
-
-        // (g) ⌘P replaces the provisional picker: a late answer leaves it alone.
-        let t = ask(&mut v, NavKind::Definition, "foo");
-        h.settle(&mut v, &grep_is(Grep::Shown));
-        v.open_file_picker();
-        assert!(!v.provisional_picker());
-        v.finish_nav(t, Some(vec![loc("a.py", 1), loc("c.py", 9)]));
-        assert!(matches!(v.picker, Some((PickerKind::Files, _))));
-        v.picker = None;
-
-        // (f) The provider's single answer closes the provisional picker and jumps.
-        let t = ask(&mut v, NavKind::Definition, "foo");
-        h.settle(&mut v, &grep_is(Grep::Shown));
-        v.finish_nav(t, Some(vec![Location { path: "a.py".into(), line: 1, col: 5, text: None }]));
-        assert!(v.picker.is_none());
-        h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.pending_goto.is_none());
-        v.jump_back();
-        h.settle(&mut v, &|v| v.current.as_deref() == Some("use.py") && v.pending_goto.is_none());
-
-        // (c) One text match jumps at once; the provider's late answer is dropped.
-        let back = v.back.len();
-        let t = ask(&mut v, NavKind::Definition, "bar");
-        h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.pending_goto.is_none());
-        assert_eq!((v.current_source_line(), v.back.len()), (Some(5), back + 1));
-        v.finish_nav(t, Some(vec![loc("c.py", 9)]));
-        assert_eq!((v.current.as_deref(), v.back.len()), (Some("a.py"), back + 1));
-        v.jump_back();
-        h.settle(&mut v, &|v| v.current.as_deref() == Some("use.py") && v.pending_goto.is_none());
-
-        // (e) No text match, then the provider can't tell: "no definition", query over.
-        let t = ask(&mut v, NavKind::Definition, "none_here");
-        h.settle(&mut v, &grep_is(Grep::Empty));
-        v.finish_nav(t, None);
-        assert!(v.pending_nav.is_none());
-        assert_eq!(v.status, Some(("no definition found for none_here".into(), true)));
-
-        // (d) The provider can't tell while the text search runs: its result is final.
-        let t = v.start_nav(NavKind::References, "foo", true);
-        v.pending_nav.as_mut().unwrap().started = Instant::now() - RACE_AFTER * 2;
+    /// A slow provider is waited for: no text search runs meanwhile.
+    #[test]
+    fn slow_provider_runs_no_text_search() {
+        let (_h, mut v) = repo();
+        v.start_nav(NavKind::Definition, "foo", true);
+        v.pending_nav.as_mut().unwrap().started = Instant::now() - Duration::from_secs(5);
         v.check_nav_timeout();
-        assert!(grep_is(Grep::Running)(&v));
+        assert!(v.pending_nav.as_ref().is_some_and(|p| p.provider), "still waiting for the provider");
+        assert!(v.picker.is_none());
+    }
+
+    /// "Can't tell" falls back to the text search, and the status says so.
+    #[test]
+    fn provider_none_falls_back_to_text_search() {
+        let (h, mut v) = repo();
+        let t = v.start_nav(NavKind::Definition, "foo", true);
         v.finish_nav(t, None);
+        assert_eq!(status(&v), Some("the language server found nothing for foo; searching text…"));
         h.settle(&mut v, &|v| v.picker.is_some());
+        assert!(v.status.is_none());
+        assert_eq!(v.picker.as_ref().unwrap().1.items.len(), 2);
+    }
+
+    #[test]
+    fn timeout_falls_back_to_text_search() {
+        let (h, mut v) = repo();
+        v.start_nav(NavKind::Definition, "foo", true);
+        v.pending_nav.as_mut().unwrap().started = Instant::now() - NAV_TIMEOUT * 2;
+        v.check_nav_timeout();
+        assert_eq!(status(&v), Some("no answer from the language server for foo; searching text…"));
+        h.settle(&mut v, &|v| v.picker.is_some());
+    }
+
+    /// A definition that is the asked word itself (pytest fixtures) is no answer.
+    #[test]
+    fn self_answer_falls_back_to_text_search() {
+        let (h, mut v) = repo();
+        let t = v.start_nav(NavKind::Definition, "foo", true);
+        v.pending_nav.as_mut().unwrap().word_col = Some(1);
+        v.finish_nav(t, Some(vec![Location { path: "use.py".into(), line: 2, col: 1, text: None }]));
+        assert_eq!(status(&v), Some("the language server found nothing for foo; searching text…"));
+        h.settle(&mut v, &|v| v.picker.is_some());
+    }
+
+    /// An answer that arrives after the user opened another file, moved to
+    /// another line or pressed Esc is dropped, with its status.
+    #[test]
+    fn late_answers_are_dropped() {
+        let (h, mut v) = repo();
+        let elsewhere = || Some(vec![Location { path: "b.py".into(), line: 1, col: 7, text: None }]);
+
+        let t = v.start_nav(NavKind::Definition, "foo", true);
+        v.nav_status(NavKind::Definition.finding("foo"));
+        v.open("a.py", Some(1), false);
+        assert!(v.pending_nav.is_none() && v.status.is_none(), "opening a file abandons the query");
+        v.finish_nav(t, elsewhere());
+        assert_eq!(v.current.as_deref(), Some("a.py"));
+
+        v.open("use.py", Some(2), false);
+        h.settle(&mut v, &|v| v.current_source_line() == Some(2));
+        let t = v.start_nav(NavKind::Definition, "foo", true);
+        v.nav_status(NavKind::Definition.finding("foo"));
+        v.vim.line += 1;
+        assert_eq!(v.current_source_line(), Some(3));
+        v.finish_nav(t, elsewhere());
+        assert_eq!((v.current.as_deref(), v.status.as_ref()), (Some("use.py"), None), "moved away: dropped");
+
+        v.start_nav(NavKind::Definition, "bar", true);
+        v.nav_status(NavKind::Definition.finding("bar"));
+        h.key(&mut v, egui::Key::Escape);
+        assert!(v.pending_nav.is_none() && v.status.is_none(), "Esc abandons the query");
+    }
+
+    #[test]
+    fn keyword_is_not_searched() {
+        let (_h, mut v) = repo();
+        v.jump_to_def("return".into());
         assert!(v.pending_nav.is_none());
-        let (_, picker) = v.picker.as_ref().unwrap();
-        assert_eq!(picker.title, "4 references to foo");
+        assert_eq!(status(&v), Some("return is a keyword"));
+    }
+
+    /// On a removed diff row the text search runs from the next current line
+    /// without dropping a definition that sits on it.
+    #[test]
+    fn removed_row_searches_text_without_dropping_the_next_line() {
+        let h = Harness::new(TestRepo::new("printf 'x = 1\\nold = helper()\\ndef helper():\\n    pass\\n' > a.py"));
+        h.repo.sh("printf 'x = 1\\ndef helper():\\n    pass\\n' > a.py && git commit -qam change");
+        let mut v = h.viewer();
+        h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none());
+        assert!(v.on_removed_row(), "{:?}", v.doc.lines[v.vim.line].text);
+        assert_eq!(v.context()["removed"], true);
+        v.jump_to_def("helper".into());
+        h.settle(&mut v, &|v| v.pending_nav.is_none() && v.pending_goto.is_none());
+        assert!(!v.on_removed_row() && v.current_source_line() == Some(2), "jumped to the def on the next line");
+    }
+
+    /// gd asks about the word it shows: its start, after a tab, and in the outline.
+    #[test]
+    fn word_here_uses_the_word_start() {
+        let (h, mut v) = harness(&[("t.py", "\tchat_reply.usage = 1\nclass A:\n    def run(self):\n        pass\n")]);
+        v.open("t.py", Some(1), false);
+        h.settle(&mut v, &|v| v.files.contains_key("t.py") && v.current_source_line() == Some(1));
+        // Display "    chat_reply.usage": the cursor on the `.` (column 14).
+        v.vim.col = 14;
+        assert_eq!(v.word_here(), Some((13, "usage".to_string())));
+        assert_eq!(v.context()["col"], 13);
+        v.command(PanelCmd::ToggleOutline, &h.engine);
+        h.settle(&mut v, &|v| v.outline && v.doc.lines.len() == 2);
+        v.vim.line = 1; // "  def run(self):"
+        v.vim.col = 6;
+        assert_eq!(v.word_here(), Some((9, "run".to_string())));
     }
 
     /// One round trip finds the definitions: ranked from the asking file's

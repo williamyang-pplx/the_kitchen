@@ -558,6 +558,11 @@ impl Viewer {
         Some(Loc { path, line, col: self.vim.col })
     }
 
+    /// The cursor is on a removed diff row (old side only).
+    fn on_removed_row(&self) -> bool {
+        self.diff && !self.outline && self.doc.lines.get(self.vim.line).is_some_and(|l| l.kind == doc::LineKind::Removed)
+    }
+
     /// 1-based line in the current file under the cursor.
     fn current_source_line(&self) -> Option<usize> {
         if self.outline {
@@ -586,6 +591,8 @@ impl Viewer {
             self.dir = parent_dir(path).to_string();
         }
         if self.current.as_deref() != Some(path) {
+            // A query asked from the old file no longer applies.
+            self.abandon_nav();
             self.current = Some(path.to_string());
             self.editor = None;
             self.vim.anchor = None;
@@ -793,6 +800,7 @@ impl Viewer {
                 }
                 VimAction::Escape => {
                     self.close_asks();
+                    self.abandon_nav();
                     self.status = None;
                 }
                 VimAction::Plugin(command) => self.run_plugin(&command),
@@ -1274,11 +1282,6 @@ impl Viewer {
                 })
                 .inner
         });
-        if matches!(picked, Some(PickerResult::Cancelled | PickerResult::Chosen(_))) && self.provisional_picker() {
-            // The user acted on the text matches: a late provider answer is dropped.
-            self.pending_nav = None;
-            self.status = None;
-        }
         match picked {
             None | Some(PickerResult::Open) => {}
             Some(PickerResult::Cancelled) => self.picker = None,

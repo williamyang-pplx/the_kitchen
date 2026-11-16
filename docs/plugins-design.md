@@ -290,3 +290,10 @@ about LSP:
   (11 GB once). Local processes now lead their own process group, which is
   killed whole; a `stop` event lets `kitchen.lsp` cancel and send `exit`
   first, and the host waits half a second before killing.
+* The viewer no longer races a text search against a slow provider: on agi
+  the grep took 18–36 s, never won, and its late results jumped or opened a
+  picker in a file the user had left. It waits, searches text only when the
+  provider has nothing (or answers with the asked word itself, as ty does for
+  pytest fixtures), and drops any answer once the user is elsewhere. The
+  column sent is the shown word's start (the cursor on a `.` asked about the
+  word before it), and removed diff rows skip the provider.

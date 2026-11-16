@@ -76,7 +76,7 @@ pub(super) fn display_col(raw: &str, col: usize) -> usize {
 }
 
 /// 1-based raw column of display column `display` (0-based, tabs expanded).
-fn raw_col(raw: &str, display: usize) -> usize {
+pub(super) fn raw_col(raw: &str, display: usize) -> usize {
     let mut width = 0;
     for (i, c) in raw.chars().enumerate() {
         let w = if c == '\t' { 4 - width % 4 } else { 1 };
@@ -369,7 +369,8 @@ impl Viewer {
         });
         let line = if self.browsing { None } else { self.current_source_line() };
         let raw_line = line.and_then(|n| self.current.as_ref().and_then(|p| self.files.get(p)).and_then(|f| f.text.lines().nth(n - 1)));
-        let word = self.doc.lines.get(self.vim.line).and_then(|l| super::vim::word_at(&l.text, self.vim.col));
+        let here = self.word_here();
+        let word = here.as_ref().map(|(_, w)| w.clone());
         let file = self.current.as_ref().filter(|_| !self.browsing).map(|p| {
             let k = self.file_key(p);
             serde_json::json!({ "host": k.host, "worktree": k.worktree, "path": k.path, "abs": k.abs() })
@@ -381,12 +382,15 @@ impl Viewer {
             "worktree": self.worktree,
             "line": line,
             // 1-based character of the raw line (tabs count once), like diagnostics.
-            "col": raw_line.map(|l| raw_col(l, self.vim.col)).unwrap_or(self.vim.col + 1),
+            // Where the shown word starts, so a provider is asked about that word.
+            "col": here.map(|(c, _)| c).or_else(|| raw_line.map(|l| raw_col(l, self.vim.col))).unwrap_or(self.vim.col + 1),
             "word": word,
             "sel": sel,
             "dir": self.dir,
             // Diff mode (⌘D) rather than the plain file.
             "diff": self.diff,
+            // A removed diff row: `line` is then the next current-file line.
+            "removed": self.on_removed_row(),
             "version": self.current.as_ref().and_then(|p| self.files.get(p)).map(|f| f.version.clone()),
             "menu": self.menu_row(),
         })
@@ -400,6 +404,26 @@ impl Viewer {
         // The menu's rows are its entries, in order, then the worktree row.
         let entry = menu.as_ref().zip(picker.selected_item()).and_then(|(m, i)| m.get(i));
         Some(entry.map_or_else(|| serde_json::json!({}), |(e, _)| serde_json::json!({ "label": e.label, "section": e.section, "url": e.url })))
+    }
+
+    /// The identifier under the cursor, and the 1-based raw column where it
+    /// starts in the current file's line: what gd / gr ask about.
+    pub(super) fn word_here(&self) -> Option<(usize, String)> {
+        let row = &self.doc.lines.get(self.vim.line)?.text;
+        let (start, word) = super::vim::word_at(row, self.vim.col)?;
+        let line = self.current_source_line()?;
+        let raw = self.current.as_ref().and_then(|p| self.files.get(p)).and_then(|f| f.text.lines().nth(line - 1));
+        let Some(raw) = raw else { return Some((start + 1, word)) };
+        if self.outline {
+            // An outline row is the indented signature: the trimmed source line.
+            let indent = row.chars().take_while(|c| *c == ' ').count();
+            let lead = raw.chars().count() - raw.trim_start().chars().count();
+            return Some((lead + raw_col(raw.trim_start(), start.saturating_sub(indent)), word));
+        }
+        if self.on_removed_row() {
+            return Some((start + 1, word));
+        }
+        Some((raw_col(raw, start), word))
     }
 
     pub fn current_filetype(&self) -> Option<String> {

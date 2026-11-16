@@ -232,7 +232,7 @@ impl Vim {
 
     /// Identifier under (or right after) the cursor.
     pub fn word_under_cursor(&self, lines: &[String]) -> Option<String> {
-        word_at(lines.get(self.line)?, self.col)
+        word_at(lines.get(self.line)?, self.col).map(|(_, w)| w)
     }
 
     /// Feed one press: prompt input, f/t's char, a count digit, or a key
@@ -709,8 +709,9 @@ impl Vim {
     }
 }
 
-/// The identifier at (or right after) display column `col` of `line`.
-pub fn word_at(line: &str, col: usize) -> Option<String> {
+/// The identifier at (or right after) display column `col` of `line`, and
+/// the display column where it starts.
+pub fn word_at(line: &str, col: usize) -> Option<(usize, String)> {
     let cs = chars(line);
     if cs.is_empty() {
         return None;
@@ -722,13 +723,26 @@ pub fn word_at(line: &str, col: usize) -> Option<String> {
     }
     let start = (0..=i).rev().take_while(|&j| is_w(cs[j])).last().unwrap_or(i);
     let end = (i..cs.len()).take_while(|&j| is_w(cs[j])).last().unwrap_or(i);
-    Some(cs[start..=end].iter().collect())
+    Some((start, cs[start..=end].iter().collect()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::keybindings::Keymap;
+
+    #[test]
+    fn word_at_returns_start_column() {
+        assert_eq!(word_at("x = chat_reply.usage", 8), Some((4, "chat_reply".to_string())));
+        assert_eq!(word_at("abc", 0), Some((0, "abc".to_string())));
+    }
+
+    #[test]
+    fn word_at_on_punctuation_takes_next_word() {
+        assert_eq!(word_at("chat_reply.usage", 10), Some((11, "usage".to_string())));
+        assert_eq!(word_at("    yield x", 0), Some((4, "yield".to_string())));
+        assert_eq!(word_at("x = ", 2), None);
+    }
 
     fn buf(s: &str) -> Vec<String> {
         s.lines().map(String::from).collect()

@@ -77,7 +77,7 @@ Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen
 
 ## API (level 16)
 
-Level 16: `kitchen.on("stop")` runs before a plugin's processes get EOF and are killed (a local one with its process group), and `kitchen.lsp.define` takes `max_rss_mb` and `idle_minutes` and returns the server (see "Language servers"). Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 16: `kitchen.on("stop")` runs before a plugin's processes get EOF and are killed (a local one with its process group), and `kitchen.lsp.define` takes `max_rss_mb` and `idle_minutes` and returns the server (see "Language servers"); `ctx.viewer.col` is where `word` starts, and `ctx.viewer.removed` marks a removed diff row. Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -114,9 +114,11 @@ kitchen.keymap("viewer", "<leader>xy", target)   -- <leader> then 1–3 keys, vi
 
 `target` is a command name or a function. `ctx = {workspace, tab, host,
 worktree, viewer = {path, file, line, col, word, sel = {from, to}, dir, diff,
-version, menu}}` (`diff`: the viewer is in diff mode): `file` is `{host, worktree, path, abs}` like `ev.file`, `col` is
-the cursor's 1-based character of the raw line, `word` the identifier under
-it. While the ⌘⇧S menu is up (a plugin chord still fires then), `menu` is
+removed, version, menu}}` (`diff`: the viewer is in diff mode; `removed`: the
+cursor is on a removed row, and `line` is the next current-file line): `file`
+is `{host, worktree, path, abs}` like `ev.file`, `word` the identifier under
+(or right after) the cursor and `col` the 1-based character of the raw line
+where it starts. While the ⌘⇧S menu is up (a plugin chord still fires then), `menu` is
 the `{label, section, url}` of the `kitchen.views` entry under its cursor, `{}`
 on the tab's worktree row.
 Chords need cmd, alt or ctrl. `when`: `any` (default), `terminal`, `viewer`, `plan`;
@@ -223,8 +225,11 @@ The viewer asks the provider for the file's type on `gd` / `gr`. `reply`
 may be called later (after a server answers). `path` is worktree-relative,
 or absolute for files outside it; `col` is a raw 1-based character; an
 optional `text` is the preview line (filled in when missing). `reply(nil)`,
-an error, or no answer within 20 s makes the viewer use its text search;
-`reply({})` means "none".
+an error, a definition that is the asked word itself, or no answer within
+20 s makes the viewer use its text search; `reply({})` means "none". The
+viewer waits for the provider (no text search runs meanwhile), drops an
+answer that arrives after the user opened another file, moved to another
+line or pressed Esc, and doesn't ask on a removed diff row.
 
 ### Language servers
 
