@@ -2229,6 +2229,7 @@ dependencies = [
  "kitchen-core",
  "kitchen-proto",
  "kitchen-symbols",
+ "libc",
  "log",
  "mlua",
  "objc2 0.6.4",

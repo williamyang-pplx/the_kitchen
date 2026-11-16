@@ -75,9 +75,9 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 15)
+## API (level 16)
 
-Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 16: `kitchen.on("stop")` runs before a plugin's processes get EOF and are killed (a local one with its process group), and `kitchen.lsp.define` takes `max_rss_mb` and `idle_minutes` and returns the server (see "Language servers"). Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -93,6 +93,7 @@ column. Plugins written for level 1 keep working.
 kitchen.on("file_opened", function(ev) end)   -- the viewer loaded a file
 kitchen.on("file_changed", function(ev) end)  -- …and it changed on disk since
 kitchen.on("startup", function() end)         -- after init.lua ran
+kitchen.on("stop", function() end)            -- before a reload or stop kills its processes
 kitchen.on("open", function(ev) end)          -- a link typed into ⌘⇧P (see Views)
 kitchen.on("comment", function(ev) end)       -- ⌘M … ⌘Enter in the viewer (see Comments)
 kitchen.on("dashboard", function(ev) end)     -- a dashboard was shown / hidden (see Dashboard)
@@ -204,8 +205,11 @@ local p = kitchen.spawn {
 p:write(bytes)   p:close()   -- close stdin      p:kill()   p:alive()   p.id
 ```
 
-No timeout; at most 8 per plugin. Reloading or stopping the plugin kills
-them (on a devbox the ssh goes, and the remote process sees EOF on stdin).
+No timeout; at most 8 per plugin. Reloading or stopping the plugin runs its
+`stop` handlers, closes every process's stdin, waits up to 0.5 s, then kills
+what is left; a local process goes with its process group (the server a
+`uvx` wrapper started), on a devbox the ssh goes and the remote process sees
+EOF on stdin.
 
 ### gd / gr providers
 
@@ -225,12 +229,14 @@ an error, or no answer within 20 s makes the viewer use its text search;
 ### Language servers
 
 ```lua
-require("kitchen.lsp").define {
+local server = require("kitchen.lsp").define {
   name = "ty", filetypes = { "py", "pyi" }, language_id = "python",
   root_markers = { "pyproject.toml", "setup.py" },
   cmd = function(root) return "exec uvx ty server" end,   -- sh, or an argv table
   settings = {},         -- workspace/configuration answers, by section
   diagnostics = false,   -- show publishDiagnostics
+  max_rss_mb = 6144,     -- restart a server using more memory (0: no cap)
+  idle_minutes = 15,     -- stop a server nobody used for that long (0: never)
 }
 ```
 
@@ -238,8 +244,16 @@ Starts one server per (host, project root) — the nearest directory with a
 marker, up to the worktree — when the viewer opens a matching file, keeps
 open files in sync, and provides `definition` / `references`. Files outside
 the worktree (an installed package you jumped into) use the server that
-last answered on that host. Servers that die within 30 s three times are
-not restarted until the plugin reloads. See `plugins/python/init.lua`.
+last answered on that host.
+
+A new `gd` (or `gr`) cancels the one still running (`$/cancelRequest`), and
+requests older than 20 s are cancelled. Every 5 s the client checks each
+server's memory (its whole process tree) and restarts it above
+`max_rss_mb`, stops servers idle for `idle_minutes`, and keeps at most 3
+per host (starting a fourth stops the least recently used). Every exit is
+logged with its code; a server that dies within 30 s three times is not
+restarted until the plugin reloads. On unload the client cancels requests
+and sends `exit` before the process is killed. See `plugins/python/init.lua`.
 
 ### Linters
 

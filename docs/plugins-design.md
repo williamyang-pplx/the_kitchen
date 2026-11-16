@@ -277,3 +277,16 @@ about LSP:
   pixels under the motion keys.
 * Threads send replies as data, not as text: a prefix like `↳ @bo:` broke a
   reply that started with a list or a fence.
+
+## Level 16 (2026-11-16): language servers that don't run away
+
+* On agi (35k Python files), ty grew to 27 GB answering one `gr` on
+  `get_logger`, and nothing stopped it: the viewer gave up after 20 s, the
+  request kept running. `kitchen.lsp` now cancels a request when a newer one
+  of its method arrives and after 20 s, from a 5 s sweep that also restarts
+  a server above `max_rss_mb` (its process tree, measured with `ps` on its
+  host), stops idle servers and keeps 3 per host.
+* A plugin reload killed only `uvx`, the server's parent, and ty lived on
+  (11 GB once). Local processes now lead their own process group, which is
+  killed whole; a `stop` event lets `kitchen.lsp` cancel and send `exit`
+  first, and the host waits half a second before killing.

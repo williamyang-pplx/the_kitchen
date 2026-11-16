@@ -1,22 +1,36 @@
 -- kitchen.lsp: a small Language Server Protocol client for plugins.
 --
---   require("kitchen.lsp").define {
+--   local server = require("kitchen.lsp").define {
 --     name = "ty", filetypes = { "py", "pyi" }, language_id = "python",
 --     root_markers = { "pyproject.toml", ".git" },
 --     cmd = function(root) return "exec uvx ty server" end,   -- sh script, or an argv table
 --     settings = {},          -- answers to workspace/configuration, by section
 --     init_options = {},      -- initializationOptions
 --     diagnostics = false,    -- show the server's publishDiagnostics
+--     max_rss_mb = 6144,      -- restart a server using more memory (0: no cap)
+--     idle_minutes = 15,      -- stop a server nobody asked for that long (0: never)
 --   }
 --
 -- One server per (host, project root), started on the host where the code
 -- lives when the viewer opens a matching file. The server answers the
--- viewer's `gd` (definition) and `gr` (references).
+-- viewer's `gd` (definition) and `gr` (references). A request replaces the
+-- older one of its method. While servers run, a sweep every few seconds
+-- cancels requests nobody waits for any more, restarts servers over their
+-- memory cap, stops idle ones, and keeps a few per host.
 
 local M = {}
 
 local servers = {} -- every define()d server, in order
 local provided = false
+local ticking = false
+local tick -- the sweep, below
+
+local TICK_SECS = 5 -- between sweeps
+local REQUEST_TIMEOUT = 20 -- s; the viewer stops waiting then too
+local MAX_SERVERS = 3 -- per host; starting one more stops the least recently used
+local KILL_GRACE_SECS = 2 -- between `exit` and the kill, for servers we stop
+local HEALTHY_AFTER_SECS = 30 -- uptime after which an exit no longer counts as a crash
+local NAV = { ["textDocument/definition"] = true, ["textDocument/references"] = true }
 
 local json = kitchen.json
 
@@ -114,10 +128,41 @@ local function notify(c, method, params)
   end
 end
 
+-- Stop waiting for request `id`: the server is told, the caller gets nil.
+local function cancel(c, id, why)
+  local p = c.pending[id]
+  if not p then
+    return
+  end
+  c.pending[id] = nil
+  if c.inflight[p.method] == id then
+    c.inflight[p.method] = nil
+  end
+  local queued = false
+  for i, m in ipairs(c.queue) do
+    if m.id == id then
+      table.remove(c.queue, i)
+      queued = true
+      break
+    end
+  end
+  if not queued and c.ready then
+    send(c, { method = "$/cancelRequest", params = { id = id } })
+  end
+  kitchen.log(string.format("%s #%d cancelled: %s", (p.method:gsub("^textDocument/", "")), id, why))
+  p.cb(nil, { message = "cancelled: " .. why, cancelled = true })
+end
+
 local function request(c, method, params, cb)
   c.next_id = c.next_id + 1
   local id = c.next_id
-  c.pending[id] = cb
+  if NAV[method] and c.inflight[method] then
+    cancel(c, c.inflight[method], "superseded")
+  end
+  c.pending[id] = { cb = cb, method = method, sent = os.time() }
+  if NAV[method] then
+    c.inflight[method] = id
+  end
   local msg = { id = id, method = method, params = params }
   local sent = c.ready or method == "initialize"
   if sent then
@@ -126,9 +171,10 @@ local function request(c, method, params, cb)
     table.insert(c.queue, msg)
   end
   -- Log stamps are in ms: with "-> N result(s)" they time the server.
-  if method == "textDocument/definition" or method == "textDocument/references" then
+  if NAV[method] then
     kitchen.log(string.format("%s #%d %s", method:gsub("^textDocument/", ""), id, sent and "sent" or "queued until the server is ready"))
   end
+  return id
 end
 
 local function answer(s, c, msg)
@@ -196,10 +242,13 @@ local function on_data(s, c, data)
       elseif msg.method then
         on_notification(s, c, msg)
       elseif msg.id ~= nil then
-        local cb = c.pending[msg.id]
+        local p = c.pending[msg.id]
         c.pending[msg.id] = nil
-        if cb then
-          cb(msg.result, msg.error)
+        if p then
+          if c.inflight[p.method] == msg.id then
+            c.inflight[p.method] = nil
+          end
+          p.cb(msg.result, msg.error)
         end
       end
     end
@@ -208,22 +257,105 @@ end
 
 -- ------------------------------------------------------------ clients
 
+-- The server's stderr, whole lines: the pid line `wrap_cmd` prints, then logs.
+local function on_stderr(s, c, chunk)
+  c.errbuf = c.errbuf .. chunk
+  while true do
+    local nl = c.errbuf:find("\n", 1, true)
+    if not nl then
+      break
+    end
+    local line = c.errbuf:sub(1, nl - 1):gsub("\r$", "")
+    c.errbuf = c.errbuf:sub(nl + 1)
+    local pid = line:match("^kitchen%-lsp%-pid (%d+)$")
+    if pid and not c.pid then
+      c.pid = pid
+    elseif line ~= "" then
+      kitchen.log("[" .. s.name .. "] " .. line)
+    end
+  end
+  if #c.errbuf > 65536 then
+    kitchen.log("[" .. s.name .. "] " .. c.errbuf)
+    c.errbuf = ""
+  end
+end
+
+-- Stop a server on purpose: its requests are cancelled, it is told to exit,
+-- and the sweep kills it if it is still there after KILL_GRACE_SECS.
+local function stop_client(s, c, why)
+  if c.stopping then
+    return
+  end
+  c.stopping = why
+  if s.clients[c.key] == c then
+    s.clients[c.key] = nil
+  end
+  local ids = {}
+  for id in pairs(c.pending) do
+    table.insert(ids, id)
+  end
+  for _, id in ipairs(ids) do
+    cancel(c, id, why)
+  end
+  if c.ready then
+    send(c, { method = "exit" })
+  end
+  c.proc:close()
+  c.kill_at = os.time() + KILL_GRACE_SECS
+  table.insert(s.stopped, c)
+  kitchen.log(string.format("%s: stopped in %s:%s (%s)", s.name, c.host, c.root, why))
+end
+
 local function on_exit(s, c, code)
   if s.clients[c.key] == c then
     s.clients[c.key] = nil
   end
-  for _, cb in pairs(c.pending) do
-    cb(nil, { message = s.name .. " exited" })
+  local pending = c.pending
+  c.pending, c.inflight, c.exited = {}, {}, true
+  for _, p in pairs(pending) do
+    p.cb(nil, { message = s.name .. " exited" })
   end
-  c.pending = {}
-  if os.time() - c.started < 30 then
-    s.failures[c.key] = (s.failures[c.key] or 0) + 1
-    local msg = string.format("%s exited (code %s) in %s — see `kitchenctl plugin logs %s`", s.name, tostring(code), c.root, kitchen.name)
-    if s.failures[c.key] >= 3 then
-      msg = msg .. "; not restarting it (reload the plugin to retry)"
+  local up = os.time() - c.started
+  kitchen.log(string.format("%s exited (code %s) after %ds in %s:%s", s.name, tostring(code), up, c.host, c.root))
+  if c.stopping then
+    return
+  end
+  local logs = string.format(" — see `kitchenctl plugin logs %s`", kitchen.name)
+  if up >= HEALTHY_AFTER_SECS then
+    s.failures[c.key] = 0
+    kitchen.notify(string.format("%s exited (code %s) in %s; it restarts on the next gd/gr%s", s.name, tostring(code), c.root, logs), "error")
+    return
+  end
+  s.failures[c.key] = (s.failures[c.key] or 0) + 1
+  if s.failures[c.key] >= 3 then
+    kitchen.notify(string.format("%s disabled in %s after 3 crashes; reload the plugin to retry%s", s.name, c.root, logs), "error")
+  else
+    kitchen.notify(string.format("%s exited (code %s) in %s%s", s.name, tostring(code), c.root, logs), "error")
+  end
+end
+
+-- The server command, printing its pid first (the shell then execs into the
+-- server, so that is the server's pid) for the memory check.
+local function wrap_cmd(cmd)
+  local script = cmd
+  if type(cmd) == "table" then
+    local words = {}
+    for _, w in ipairs(cmd) do
+      table.insert(words, q(w))
     end
-    kitchen.notify(msg, "error")
+    script = "exec " .. table.concat(words, " ")
   end
+  return "echo kitchen-lsp-pid $$ >&2; " .. script
+end
+
+local function ensure_ticking()
+  if ticking then
+    return
+  end
+  ticking = true
+  kitchen.every("lsp", TICK_SECS, function()
+    tick()
+  end, { desc = "language servers: request timeouts, memory, idle servers", first_delay = TICK_SECS })
 end
 
 local function start(s, host, root, realwt)
@@ -235,23 +367,38 @@ local function start(s, host, root, realwt)
   if (s.failures[key] or 0) >= 3 then
     return nil
   end
-  c = { key = key, host = host, root = root, realwt = realwt, buf = "", next_id = 0, pending = {}, ready = false, queue = {}, open = {}, encoding = "utf-16", started = os.time() }
-  local cmd = s.cmd(root)
+  -- A few servers per host: starting one more stops the least recently used.
+  local count, lru = 0, nil
+  for _, o in pairs(s.clients) do
+    if o.host == host then
+      count = count + 1
+      if not lru or o.last_used < lru.last_used then
+        lru = o
+      end
+    end
+  end
+  if lru and count >= s.max_servers then
+    stop_client(s, lru, "more than " .. s.max_servers .. " servers on " .. host)
+  end
+  c = {
+    key = key, host = host, root = root, realwt = realwt, buf = "", errbuf = "", next_id = 0,
+    pending = {}, inflight = {}, ready = false, queue = {}, open = {}, encoding = "utf-16",
+    started = os.time(), last_used = os.time(),
+  }
   local spec = {
     host = host,
     cwd = root,
+    sh = wrap_cmd(s.cmd(root)),
     on_stdout = function(d)
       on_data(s, c, d)
+    end,
+    on_stderr = function(d)
+      on_stderr(s, c, d)
     end,
     on_exit = function(code)
       on_exit(s, c, code)
     end,
   }
-  if type(cmd) == "table" then
-    spec.cmd = cmd
-  else
-    spec.sh = cmd
-  end
   local ok, proc = pcall(kitchen.spawn, spec)
   if not ok then
     s.failures[key] = 3
@@ -295,6 +442,7 @@ local function start(s, host, root, realwt)
     end
     kitchen.log(string.format("%s: ready (%s), %d queued message(s) sent", s.name, c.root, #queued))
   end)
+  ensure_ticking()
   return c
 end
 
@@ -412,6 +560,7 @@ local function query(method, ctx, reply)
     if not c then
       return reply(nil)
     end
+    c.last_used = os.time()
     local key = file.host .. "\0" .. file.abs
     sync(s, c, key)
     local doc = s.docs[key]
@@ -425,7 +574,9 @@ local function query(method, ctx, reply)
     end
     request(c, method, params, function(result, err)
       if err then
-        kitchen.log(s.name .. ": " .. method .. ": " .. tostring(err.message or json.encode(err)))
+        if not err.cancelled then
+          kitchen.log(s.name .. ": " .. method .. ": " .. tostring(err.message or json.encode(err)))
+        end
         return reply(nil)
       end
       if result and (result.uri or result.targetUri) then
@@ -474,9 +625,111 @@ local function on_file(ev)
   end
   with_client(s, ev.file, function(c)
     if c then
+      c.last_used = os.time()
       sync(s, c, key)
     end
   end)
+end
+
+-- Each live server's memory: its process tree's RSS, one `ps` per host.
+local RSS_SCRIPT = [[ps -A -o pid=,ppid=,rss= | awk -v roots="%s" '
+{ parent[$1] = $2; rss[$1] = $3 }
+END {
+  n = split(roots, r, " ")
+  for (i = 1; i <= n; i++) {
+    total = 0
+    for (p in rss) {
+      q = p
+      for (d = 0; d < 64 && q != "" && q != "0"; d++) {
+        if (q == r[i]) { total += rss[p]; break }
+        q = parent[q]
+      }
+    }
+    print r[i], total
+  }
+}']]
+
+local function check_rss(s)
+  if s.max_rss_mb <= 0 then
+    return
+  end
+  local by_host = {}
+  for _, c in pairs(s.clients) do
+    if c.pid then
+      by_host[c.host] = by_host[c.host] or {}
+      by_host[c.host][c.pid] = c
+    end
+  end
+  for host, clients in pairs(by_host) do
+    if not s.rss_busy[host] then
+      s.rss_busy[host] = true
+      local pids = {}
+      for pid in pairs(clients) do
+        table.insert(pids, pid)
+      end
+      kitchen.run({ sh = string.format(RSS_SCRIPT, table.concat(pids, " ")), host = host, timeout = 20 }, function(res)
+        s.rss_busy[host] = nil
+        for pid, kib in res.stdout:gmatch("(%d+) (%d+)") do
+          local c = clients[pid]
+          local mb = tonumber(kib) / 1024
+          if c and not c.stopping and mb > s.max_rss_mb then
+            kitchen.notify(string.format("%s used %.1f GB in %s; restarted it (max_rss_mb is %d)", s.name, mb / 1024, c.root, s.max_rss_mb), "error")
+            stop_client(s, c, string.format("memory: %d MB", math.floor(mb)))
+          end
+        end
+      end)
+    end
+  end
+end
+
+tick = function()
+  local now = os.time()
+  for _, s in ipairs(servers) do
+    for _, c in pairs(s.clients) do
+      local late = {}
+      for id, p in pairs(c.pending) do
+        if NAV[p.method] and now - p.sent >= s.request_timeout then
+          table.insert(late, id)
+        end
+      end
+      for _, id in ipairs(late) do
+        cancel(c, id, "no answer in " .. s.request_timeout .. "s")
+      end
+      if s.idle_minutes > 0 and now - c.last_used >= s.idle_minutes * 60 then
+        stop_client(s, c, "idle")
+      end
+    end
+    check_rss(s)
+    local still = {}
+    for _, c in ipairs(s.stopped) do
+      if not c.exited then
+        if now >= c.kill_at then
+          c.proc:kill()
+        end
+        table.insert(still, c)
+      end
+    end
+    s.stopped = still
+  end
+end
+
+-- The plugin unloads: cancel what servers still work on and tell them to
+-- exit; the host then closes their stdin and kills what is left.
+local function on_stop()
+  for _, s in ipairs(servers) do
+    for _, c in pairs(s.clients) do
+      local ids = {}
+      for id in pairs(c.pending) do
+        table.insert(ids, id)
+      end
+      for _, id in ipairs(ids) do
+        cancel(c, id, "unload")
+      end
+      if c.ready then
+        send(c, { method = "exit" })
+      end
+    end
+  end
 end
 
 function M.define(spec)
@@ -495,6 +748,12 @@ function M.define(spec)
     settings = spec.settings or {},
     init_options = spec.init_options or json.null,
     diagnostics = spec.diagnostics == true,
+    max_rss_mb = tonumber(spec.max_rss_mb) or 6144,
+    idle_minutes = tonumber(spec.idle_minutes) or 15,
+    request_timeout = tonumber(spec.request_timeout) or REQUEST_TIMEOUT,
+    max_servers = tonumber(spec.max_servers) or MAX_SERVERS,
+    stopped = {},
+    rss_busy = {},
     clients = {},
     roots = {},
     waiting = {},
@@ -519,6 +778,7 @@ function M.define(spec)
     provided = true
     kitchen.on("file_opened", on_file)
     kitchen.on("file_changed", on_file)
+    kitchen.on("stop", on_stop)
   end
   return s
 end

@@ -29,6 +29,8 @@ const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 
 const LINT_LUA: &str = include_str!("lint.lua");
 const LSP_LUA: &str = include_str!("lsp.lua");
+/// How long unloading waits for a plugin's processes to exit after `stop`.
+const STOP_GRACE: Duration = Duration::from_millis(500);
 
 static NEXT_CALLBACK: AtomicU64 = AtomicU64::new(1);
 
@@ -100,7 +102,11 @@ fn run(host: Arc<PluginHost>, name: &str, dir: &Path, entry: &str, config: serde
     while let Ok(msg) = rx.recv() {
         used.set(0);
         match msg {
-            ToPlugin::Stop => break,
+            ToPlugin::Stop => {
+                // Before the processes go, so a language server can be sent `exit`.
+                fire(&lua, &cx, &used, "stop", Value::Table(lua.create_table().expect("table")));
+                break;
+            }
             ToPlugin::File(ev) => match event_table(&lua, &ev) {
                 Ok(t) => fire(&lua, &cx, &used, if ev.changed { "file_changed" } else { "file_opened" }, Value::Table(t)),
                 Err(e) => host.report_error(name, &format!("event: {e}")),
@@ -230,7 +236,8 @@ fn run(host: Arc<PluginHost>, name: &str, dir: &Path, entry: &str, config: serde
             }
         }
     }
-    cx.procs.borrow_mut().clear();
+    let procs: Vec<Proc> = cx.procs.borrow_mut().drain().map(|(_, p)| p).collect();
+    procs::shutdown_all(procs, STOP_GRACE);
     host.log(name, "stopped");
 }
 
@@ -381,8 +388,8 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
     k.set(
         "on",
         lua.create_function(move |lua, (event, f): (String, Function)| {
-            if !matches!(event.as_str(), "startup" | "file_opened" | "file_changed") && !super::EMITTED.contains(&event.as_str()) {
-                return Err(mlua::Error::runtime(format!("unknown event {event:?} (startup, file_opened, file_changed, {})", super::EMITTED.join(", "))));
+            if !matches!(event.as_str(), "startup" | "stop" | "file_opened" | "file_changed") && !super::EMITTED.contains(&event.as_str()) {
+                return Err(mlua::Error::runtime(format!("unknown event {event:?} (startup, stop, file_opened, file_changed, {})", super::EMITTED.join(", "))));
             }
             if super::EMITTED.contains(&event.as_str()) {
                 c.host.register_listener(&c.name, c.generation, &event);

@@ -1,7 +1,7 @@
 name = "python"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python go-to-definition (gd) and references (gr) from a language server (ty by default), run where the code lives"
-api = 2
+api = 16
 filetypes = ["py", "pyi"]
 
 [config]
@@ -11,3 +11,7 @@ server = "ty"
 cmd = ""
 # Show the server's type errors as diagnostics (ruff already lints).
 diagnostics = false
+# Restart a server whose processes use more than this many MB (0: no cap).
+max_rss_mb = 6144
+# Stop a server after this many minutes without gd/gr or file events (0: never).
+idle_minutes = 15

@@ -39,6 +39,8 @@ require("kitchen.lsp").define {
   root_markers = { "pyproject.toml", "setup.py", "setup.cfg", "pyrightconfig.json", "ty.toml" },
   cmd = command,
   diagnostics = kitchen.config.diagnostics == true,
+  max_rss_mb = kitchen.config.max_rss_mb,
+  idle_minutes = kitchen.config.idle_minutes,
   -- pyright-family servers ask for these; others ignore them.
   settings = {
     python = { analysis = { autoSearchPaths = true, diagnosticMode = "openFilesOnly" } },

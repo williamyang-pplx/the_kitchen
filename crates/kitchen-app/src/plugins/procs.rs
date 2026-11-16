@@ -1,14 +1,17 @@
 //! Long-lived processes started by plugins (`kitchen.spawn`): language
 //! servers, watchers, REPLs. Output streams back to the plugin's thread as
 //! messages; writes go through a writer thread so a child that stops reading
-//! can never block plugin code. Dropping a [`Proc`] kills the child (for
-//! devboxes, the ssh — the remote side then sees EOF on stdin).
+//! can never block plugin code. Dropping a [`Proc`] kills the child. A local
+//! child leads its own process group, so its children go too (the server a
+//! `uvx` wrapper started); for devboxes it is the ssh, and the remote side
+//! then sees EOF on stdin.
 
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kitchen_core::host::Host;
 
@@ -33,6 +36,8 @@ pub struct ProcSpec {
 pub struct Proc {
     child: Arc<Mutex<Child>>,
     stdin: Option<Sender<Vec<u8>>>,
+    /// The process group a local child leads; None over ssh.
+    group: Option<i32>,
 }
 
 impl Proc {
@@ -44,7 +49,12 @@ impl Proc {
         let argv: Vec<&str> = spec.argv.iter().map(String::as_str).collect();
         let mut cmd = spec.host.command(&argv, spec.cwd.as_deref());
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let local = matches!(spec.host, Host::Local);
+        if local {
+            cmd.process_group(0);
+        }
         let mut child = cmd.spawn().map_err(|e| format!("cannot start {}: {e}", spec.argv[0]))?;
+        let group = local.then(|| child.id() as i32);
         let (win, rin) = channel::<Vec<u8>>();
         if let Some(mut pipe) = child.stdin.take() {
             std::thread::spawn(move || {
@@ -91,7 +101,7 @@ impl Proc {
             };
             let _ = tx.send(ToPlugin::ProcExit { generation, proc: id, code });
         });
-        Ok(Proc { child, stdin: Some(win) })
+        Ok(Proc { child, stdin: Some(win), group })
     }
 
     pub fn write(&self, data: Vec<u8>) -> bool {
@@ -103,10 +113,36 @@ impl Proc {
         self.stdin = None;
     }
 
+    /// Kill the child, and a local child's whole process group with it.
     pub fn kill(&self) {
         let mut c = super::lock(&self.child);
+        if let Some(group) = self.group {
+            // The group outlives its leader while any member runs; once the
+            // leader is reaped and the group is empty this fails harmlessly.
+            unsafe {
+                libc::killpg(group, libc::SIGKILL);
+            }
+        }
         let _ = c.kill();
     }
+
+    fn exited(&self) -> bool {
+        !matches!(super::lock(&self.child).try_wait(), Ok(None))
+    }
+}
+
+/// Close every process's stdin, give them up to `grace` to exit on their own
+/// (a language server that was sent `exit`), then kill what is left.
+pub fn shutdown_all(mut procs: Vec<Proc>, grace: Duration) {
+    for p in &mut procs {
+        p.close_stdin();
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline && procs.iter().any(|p| !p.exited()) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Dropping kills (the group too) whatever still runs.
+    drop(procs);
 }
 
 impl Drop for Proc {
@@ -136,6 +172,46 @@ mod tests {
             }
         }
         assert_eq!((out.as_slice(), err.as_slice(), code), (&b"got hi\n"[..], &b"oops\n"[..], Some(3)));
+    }
+
+    #[test]
+    fn kill_takes_the_group() {
+        let (tx, rx) = channel();
+        let spec = ProcSpec { host: Host::Local, argv: vec!["sh".into(), "-c".into(), "sleep 60 & echo $!; wait".into()], cwd: None };
+        let p = Proc::spawn(&spec, 1, 1, tx).unwrap();
+        let mut out = Vec::new();
+        let pid: i32 = loop {
+            if let ToPlugin::ProcOut { stream: Stream::Stdout, data, .. } = rx.recv_timeout(Duration::from_secs(10)).expect("pid") {
+                out.extend(data);
+                if let Some(line) = std::str::from_utf8(&out).ok().and_then(|s| s.strip_suffix('\n')) {
+                    break line.trim().parse().unwrap();
+                }
+            }
+        };
+        p.kill();
+        // A killed child stays a zombie until it is reaped, and `kill -0` still
+        // finds a zombie: wait for its reaper (init, or launchd) for a while.
+        let gone = (0..250).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            let zombie = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().starts_with('Z')).unwrap_or(false);
+            !alive || zombie
+        });
+        assert!(gone, "the group's sleep {pid} survived");
+    }
+
+    #[test]
+    fn shutdown_all_lets_processes_exit_first() {
+        let (tx, rx) = channel();
+        let spec = ProcSpec { host: Host::Local, argv: vec!["sh".into(), "-c".into(), "read x; exit 7".into()], cwd: None };
+        let p = Proc::spawn(&spec, 1, 1, tx).unwrap();
+        shutdown_all(vec![p], Duration::from_secs(5));
+        loop {
+            if let ToPlugin::ProcExit { code, .. } = rx.recv_timeout(Duration::from_secs(5)).expect("exit") {
+                assert_eq!(code, 7, "exited on its own after EOF, not killed");
+                break;
+            }
+        }
     }
 
     #[test]

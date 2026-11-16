@@ -32,7 +32,7 @@ use crate::keybindings::Binding;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 15;
+pub const API_LEVEL: u32 = 16;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
 /// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
@@ -2507,6 +2507,155 @@ end)
             let _ = tx.send(r);
         }));
         rx.recv_timeout(Duration::from_secs(120)).expect("provider answered")
+    }
+
+    /// A plugin whose kitchen.lsp server is `testdata/fake_lsp.py`, over a
+    /// fresh worktree; None (the test skips) without python3.
+    struct FakeLsp {
+        host: Arc<PluginHost>,
+        name: String,
+        wt: PathBuf,
+        log: PathBuf,
+        _engine: Arc<Engine>,
+    }
+
+    impl FakeLsp {
+        /// `spec`: extra `kitchen.lsp.define` fields; `env`: `K=V` words for the fake.
+        fn start(spec: &str, env: &str, files: &[(&str, &str)]) -> Option<FakeLsp> {
+            if std::process::Command::new("python3").arg("--version").output().is_err() {
+                eprintln!("python3 not installed; skipping");
+                return None;
+            }
+            let id = kitchen_core::util::new_id();
+            let name = format!("fakelsp{id}");
+            let root = std::env::temp_dir().join(format!("kt-fakelsp-{id}"));
+            let (dir, wt, log) = (root.join("plugins").join(&name), root.join("wt"), root.join("fake.log"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (path, text) in files {
+                let p = wt.join(path);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, text).unwrap();
+            }
+            std::fs::create_dir_all(&wt).unwrap();
+            let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/fake_lsp.py");
+            std::fs::write(dir.join("plugin.toml"), format!("name = \"{name}\"\napi = {API_LEVEL}\nfiletypes = [\"py\"]\n")).unwrap();
+            let init = format!(
+                "require(\"kitchen.lsp\").define {{\n  name = \"fake\", filetypes = {{ \"py\" }}, language_id = \"python\",\n  root_markers = {{ \"root.marker\" }},\n  cmd = \"exec env FAKE_LOG={} {env} python3 {}\",\n  {spec}\n}}\n",
+                log.display(),
+                fake.display()
+            );
+            std::fs::write(dir.join("init.lua"), init).unwrap();
+            let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
+            let host = host_with(&engine, vec![root.join("plugins")]);
+            wait(&|| host.has_provider("definition", "py"));
+            Some(FakeLsp { host, name, wt, log, _engine: engine })
+        }
+
+        fn key(&self, path: &str) -> FileKey {
+            FileKey { host: "local".into(), worktree: self.wt.display().to_string(), path: path.into() }
+        }
+
+        /// Load `path` in the "viewer" and ask `kind` at (line, col); the answer arrives on the receiver.
+        fn ask(&self, kind: &str, path: &str, line: usize) -> std::sync::mpsc::Receiver<ProviderReply> {
+            let key = self.key(path);
+            let text = std::fs::read_to_string(self.wt.join(path)).unwrap();
+            self.host.file_loaded(key.clone(), Arc::from(text.as_str()), false);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let file = serde_json::json!({ "host": key.host, "worktree": key.worktree, "path": key.path, "abs": key.abs() });
+            let ctx = serde_json::json!({ "viewer": { "path": key.path, "file": file, "line": line, "col": 1 } });
+            assert!(self.host.provide(kind, "py", ctx, move |r| {
+                let _ = tx.send(r);
+            }));
+            rx
+        }
+
+        /// What the fake server received, in order.
+        fn received(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&self.log).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.received().iter().filter_map(|m| m["method"].as_str().map(String::from)).collect()
+        }
+
+        fn plugin_log(&self) -> String {
+            std::fs::read_to_string(PluginHost::log_path(&self.name)).unwrap_or_default()
+        }
+
+        /// Wait up to `secs` for `f`.
+        fn wait_for(&self, secs: u64, f: &dyn Fn(&FakeLsp) -> bool) {
+            let start = Instant::now();
+            while !f(self) && start.elapsed() < Duration::from_secs(secs) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(f(self), "timed out; plugin log:\n{}\nfake got: {:?}", self.plugin_log(), self.methods());
+        }
+    }
+
+    /// A second gd replaces the first: the server is told to cancel it, and
+    /// the first asker gets "can't tell".
+    #[test]
+    fn lsp_cancels_superseded_requests() {
+        let Some(f) = FakeLsp::start("", "FAKE_DELAY_MS=3000", &[("root.marker", ""), ("a.py", "x = 1\ny = x\n")]) else { return };
+        let first = f.ask("definition", "a.py", 1);
+        f.wait_for(30, &|f| f.methods().iter().any(|m| m == "textDocument/definition"));
+        let second = f.ask("definition", "a.py", 2);
+        assert_eq!(first.recv_timeout(Duration::from_secs(10)).unwrap(), None);
+        let got = second.recv_timeout(Duration::from_secs(20)).unwrap().expect("an answer");
+        assert_eq!(got[0].line, 3);
+        let msgs = f.received();
+        let first_id = msgs.iter().find(|m| m["method"] == "textDocument/definition").unwrap()["id"].clone();
+        assert!(msgs.iter().any(|m| m["method"] == "$/cancelRequest" && m["params"]["id"] == first_id), "{msgs:?}");
+    }
+
+    /// A request nobody waits for any more is cancelled by the sweep.
+    #[test]
+    fn lsp_cancels_requests_after_timeout() {
+        let Some(f) = FakeLsp::start("request_timeout = 1,", "FAKE_DELAY_MS=60000", &[("root.marker", ""), ("a.py", "x = 1\n")]) else { return };
+        let answer = f.ask("definition", "a.py", 1);
+        assert_eq!(answer.recv_timeout(Duration::from_secs(25)).unwrap(), None);
+        f.wait_for(5, &|f| f.methods().iter().any(|m| m == "$/cancelRequest"));
+    }
+
+    /// Unloading cancels what the server works on and tells it to exit
+    /// before the process is killed.
+    #[test]
+    fn lsp_stop_event_cancels_and_exits() {
+        let Some(f) = FakeLsp::start("", "FAKE_DELAY_MS=60000", &[("root.marker", ""), ("a.py", "x = 1\n")]) else { return };
+        let answer = f.ask("definition", "a.py", 1);
+        f.wait_for(30, &|f| f.methods().iter().any(|m| m == "textDocument/definition"));
+        f.host.unload(&f.name);
+        assert_eq!(answer.recv_timeout(Duration::from_secs(10)).unwrap(), None);
+        f.wait_for(10, &|f| f.methods().ends_with(&["$/cancelRequest".to_string(), "exit".to_string()]));
+    }
+
+    /// A server over its memory cap is stopped, and the next query starts a new one.
+    #[test]
+    fn lsp_restarts_server_over_rss_cap() {
+        let Some(f) = FakeLsp::start("max_rss_mb = 16,", "FAKE_ALLOC_MB=64", &[("root.marker", ""), ("a.py", "x = 1\n")]) else { return };
+        assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        f.wait_for(30, &|f| f.plugin_log().contains("(memory:"));
+        assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        assert_eq!(f.methods().iter().filter(|m| *m == "initialize").count(), 2);
+    }
+
+    /// An idle server is stopped, and its exit is logged with its code.
+    #[test]
+    fn lsp_stops_idle_servers_and_logs_the_exit() {
+        let Some(f) = FakeLsp::start("idle_minutes = 0.05,", "", &[("root.marker", ""), ("a.py", "x = 1\n")]) else { return };
+        assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        f.wait_for(30, &|f| f.plugin_log().contains("(idle)"));
+        f.wait_for(10, &|f| f.plugin_log().contains("fake exited (code 0)"));
+    }
+
+    /// One server too many on a host stops the least recently used.
+    #[test]
+    fn lsp_caps_servers_per_host() {
+        let files = [("one/root.marker", ""), ("one/a.py", "x = 1\n"), ("two/root.marker", ""), ("two/b.py", "y = 2\n")];
+        let Some(f) = FakeLsp::start("max_servers = 1,", "", &files) else { return };
+        assert!(f.ask("definition", "one/a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        assert!(f.ask("definition", "two/b.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        f.wait_for(10, &|f| f.plugin_log().contains("more than 1 servers"));
     }
 
     /// The bundled python plugin: ty (via uvx) answers gd / gr across files,
