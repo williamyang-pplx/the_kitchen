@@ -277,7 +277,7 @@ long as it takes. A changed `uv.lock`, `ty.toml` or root `pyproject.toml`,
 or more than 2000 changed files, restarts the server instead. Replayed
 files are not opened on the server (it reads them from disk), and at most
 32 documents stay open per server. `lsp.restart(server, host, root)` stops
-and restarts one. See `plugins/python/init.lua`.
+and restarts one, once it isn't answering a `gd` / `gr`. See `plugins/python/init.lua`.
 
 ### Linters
 

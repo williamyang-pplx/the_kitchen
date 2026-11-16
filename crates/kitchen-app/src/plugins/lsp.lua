@@ -163,6 +163,16 @@ local function cancel(c, id, why)
   p.cb(nil, { message = "cancelled: " .. why, cancelled = true })
 end
 
+-- A gd / gr is being answered.
+local function busy(c)
+  for _, p in pairs(c.pending) do
+    if NAV[p.method] then
+      return true
+    end
+  end
+  return false
+end
+
 local function request(c, method, params, cb)
   c.next_id = c.next_id + 1
   local id = c.next_id
@@ -908,7 +918,9 @@ tick = function()
       for _, id in ipairs(late) do
         cancel(c, id, "no answer in " .. s.request_timeout .. "s")
       end
-      if s.idle_minutes > 0 and now - c.last_used >= s.idle_minutes * 60 then
+      if c.restart_when_idle and not busy(c) then
+        M.restart(s, c.host, c.root)
+      elseif s.idle_minutes > 0 and now - c.last_used >= s.idle_minutes * 60 then
         stop_client(s, c, "idle")
       else
         poll_changes(s, c)
@@ -933,6 +945,15 @@ end
 function M.restart(s, host, root)
   local key = host .. "\0" .. root
   local c = s.clients[key]
+  if c and busy(c) then
+    -- Never urgent: let the server answer what it works on, the sweep
+    -- restarts it once nothing is pending (or the request times out).
+    if not c.restart_when_idle then
+      c.restart_when_idle = true
+      kitchen.log(string.format("%s: restarting %s once its gd/gr is answered", s.name, root))
+    end
+    return
+  end
   if c then
     stop_client(s, c, "restart")
   end

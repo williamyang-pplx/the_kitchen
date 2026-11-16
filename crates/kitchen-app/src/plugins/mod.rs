@@ -2559,7 +2559,7 @@ end)
             let fake = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/fake_lsp.py");
             std::fs::write(dir.join("plugin.toml"), format!("name = \"{name}\"\napi = {API_LEVEL}\nfiletypes = [\"py\"]\n")).unwrap();
             let init = format!(
-                "require(\"kitchen.lsp\").define {{\n  name = \"fake\", filetypes = {{ \"py\" }}, language_id = \"python\",\n  root_markers = {{ \"root.marker\" }},\n  cmd = \"exec env FAKE_LOG={} {env} python3 {}\",\n  {spec}\n}}\n",
+                "local lsp = require(\"kitchen.lsp\")\nlocal server = lsp.define {{\n  name = \"fake\", filetypes = {{ \"py\" }}, language_id = \"python\",\n  root_markers = {{ \"root.marker\" }},\n  cmd = \"exec env FAKE_LOG={} {env} python3 {}\",\n  {spec}\n}}\nkitchen.command(\"restart\", function(ctx) lsp.restart(server, \"local\", ctx.root) end)\n",
                 log.display(),
                 fake.display()
             );
@@ -2595,6 +2595,10 @@ end)
 
         fn methods(&self) -> Vec<String> {
             self.received().iter().filter_map(|m| m["method"].as_str().map(String::from)).collect()
+        }
+
+        fn count_method(&self, method: &str) -> usize {
+            self.methods().iter().filter(|m| *m == method).count()
         }
 
         fn plugin_log(&self) -> String {
@@ -2665,6 +2669,19 @@ end)
         assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
         f.wait_for(30, &|f| f.plugin_log().contains("(idle)"));
         f.wait_for(10, &|f| f.plugin_log().contains("fake exited (code 0)"));
+    }
+
+    /// A restart (a venv became ready, uv.lock changed) waits for the gd / gr
+    /// being answered instead of cancelling it.
+    #[test]
+    fn lsp_restart_waits_for_pending_requests() {
+        let Some(f) = FakeLsp::start("", "FAKE_DELAY_MS=3000", &[("root.marker", ""), ("a.py", "x = 1\n")]) else { return };
+        let answer = f.ask("definition", "a.py", 1);
+        f.wait_for(30, &|f| f.count_method("textDocument/definition") == 1);
+        f.host.invoke(&format!("{}.restart", f.name), serde_json::json!({ "root": f.wt.display().to_string() }), false).unwrap();
+        assert!(answer.recv_timeout(Duration::from_secs(10)).unwrap().is_some(), "answered, not cancelled");
+        f.wait_for(20, &|f| f.count_method("initialize") == 2);
+        assert!(!f.methods().iter().any(|m| m == "$/cancelRequest"));
     }
 
     /// One server too many on a host stops the least recently used.
