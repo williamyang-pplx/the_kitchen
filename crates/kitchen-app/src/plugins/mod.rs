@@ -2770,6 +2770,133 @@ end)
         assert!(!f.plugin_log().contains("watching"), "{}", f.plugin_log());
     }
 
+    /// Marker tiers: a pyproject.toml with [tool.ty] up the tree beats the
+    /// nearer one without it (ty's own project rule).
+    #[test]
+    fn lsp_root_tiers_pick_ty_project() {
+        let spec = r#"root_markers = { { { file = "pyproject.toml", contains = "[tool.ty" } }, { "pyproject.toml" } },"#;
+        let files = [("pyproject.toml", "[project]\nname = \"r\"\n\n[tool.ty.src]\nexclude = []\n"), ("sub/pyproject.toml", "[project]\nname = \"s\"\n"), ("sub/a.py", "x = 1\n")];
+        let Some(f) = FakeLsp::start(spec, "", &files) else { return };
+        assert!(f.ask("definition", "sub/a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        let init = f.received().into_iter().find(|m| m["method"] == "initialize").unwrap();
+        assert!(init["params"]["rootUri"].as_str().unwrap().ends_with("/wt"), "{}", init["params"]["rootUri"]);
+    }
+
+    /// `prepare` gives a root its initializationOptions and configuration answers.
+    #[test]
+    fn lsp_prepare_settings_answer_configuration() {
+        let spec = r#"prepare = function(ctx, done) done { settings = { fake = { root = ctx.root } }, init_options = { from = "prepare" } } end,"#;
+        let Some(f) = FakeLsp::start(spec, "FAKE_CONFIG=fake", &[("root.marker", ""), ("a.py", "x = 1\n")]) else { return };
+        assert!(f.ask("definition", "a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        let msgs = f.received();
+        let init = msgs.iter().find(|m| m["method"] == "initialize").unwrap();
+        assert_eq!(init["params"]["initializationOptions"]["from"], "prepare");
+        f.wait_for(10, &|f| f.received().iter().any(|m| m["result"][0]["root"].as_str().is_some_and(|r| r.ends_with("/wt"))));
+    }
+
+    /// The python plugin, with `kitchen` and `kitchen.lsp` stubbed: `kitchen.run`
+    /// answers each script with `RESULT(spec)`; runs, restarts and notices are recorded.
+    fn python_plugin(result: &str) -> mlua::Lua {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+RUNS, NOTICES, RESTARTS = {}, {}, {}
+kitchen = {
+  config = { server = "ty", build_venv = true },
+  log = function() end,
+  notify = function(msg) table.insert(NOTICES, msg) end,
+  run = function(spec, cb) table.insert(RUNS, spec); cb(RESULT(spec)) end,
+}
+package.preload["kitchen.lsp"] = function()
+  return {
+    define = function(spec) SPEC = spec; return "server" end,
+    restart = function(s, host, root) table.insert(RESTARTS, { s, host, root }) end,
+  }
+end
+"#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(result).exec().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/python/init.lua");
+        lua.load(std::fs::read_to_string(path).unwrap()).exec().unwrap();
+        lua
+    }
+
+    const AGI_FACTS: &str = r#"
+FACTS = "src ./src\nsrc pplx/python/apps/aster/src\nextra pplx/rust/libs/plugin-runtime/python\nlock abcdef123456\nrepo agi\nvenv /home/dev/agi/.venv\nhome /home/dev\n"
+function RESULT(spec)
+  if spec.sh:find("git ls%-files") then return { code = 0, stdout = FACTS, stderr = "" } end
+  return { code = BUILD_CODE or 0, stdout = "", stderr = "boom" }
+end
+"#;
+
+    /// ty is told about every import root (absolute, root first) and the
+    /// nearest venv; a venv build starts in the root and restarts ty when done.
+    #[test]
+    fn python_plugin_prepare_builds_ty_settings() {
+        let lua = python_plugin(AGI_FACTS);
+        lua.load(
+            r#"
+local got
+SPEC.prepare({ host = "box", root = "/home/dev/agi", worktree = "/home/dev/agi" }, function(r) got = r end)
+local env = got.settings.ty.configuration.environment
+local roots = table.concat(env.root, ",")
+assert(roots == "/home/dev/agi,/home/dev/agi/src,/home/dev/agi/pplx/python/apps/aster/src,/home/dev/agi/pplx/rust/libs/plugin-runtime/python", roots)
+assert(env.python == "/home/dev/agi/.venv", tostring(env.python))
+assert(got.init_options.configuration.environment.python == env.python)
+assert(SPEC.root_markers[1][2].contains == "[tool.ty")
+local builds = 0
+for _, r in ipairs(RUNS) do
+  if r.sh:find("uv sync") then
+    builds = builds + 1
+    assert(r.cwd == "/home/dev/agi" and r.host == "box")
+    assert(r.sh:find("ty%-venvs/agi%-abcdef123456", 1, false), r.sh)
+  end
+end
+assert(builds == 1, builds)
+assert(#RESTARTS == 1 and RESTARTS[1][2] == "box" and RESTARTS[1][3] == "/home/dev/agi")
+-- Asked again (the restart): the same build isn't started twice.
+SPEC.prepare({ host = "box", root = "/home/dev/agi", worktree = "/home/dev/agi" }, function() end)
+local again = 0
+for _, r in ipairs(RUNS) do if r.sh:find("uv sync") then again = again + 1 end end
+assert(again == 1, again)
+"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    /// A built venv is used as is; a build that another process runs (exit 3)
+    /// stays quiet; a failed one says so once.
+    #[test]
+    fn python_plugin_venv_build_lifecycle() {
+        let lua = python_plugin(&format!("{AGI_FACTS}\nFACTS = FACTS .. \"built /home/dev/.cache/kitchen/ty-venvs/agi-abcdef123456\\n\""));
+        lua.load(
+            r#"
+local got
+SPEC.prepare({ host = "box", root = "/r", worktree = "/r" }, function(r) got = r end)
+assert(got.settings.ty.configuration.environment.python == "/home/dev/.cache/kitchen/ty-venvs/agi-abcdef123456")
+for _, r in ipairs(RUNS) do assert(not r.sh:find("uv sync"), "no build when one is ready") end
+"#,
+        )
+        .exec()
+        .unwrap();
+        let lua = python_plugin(&format!("{AGI_FACTS}\nBUILD_CODE = 3"));
+        lua.load(r#"SPEC.prepare({ host = "box", root = "/r", worktree = "/r" }, function() end); assert(#NOTICES == 0 and #RESTARTS == 0)"#).exec().unwrap();
+        let lua = python_plugin(&format!("{AGI_FACTS}\nBUILD_CODE = 1"));
+        lua.load(
+            r#"
+SPEC.prepare({ host = "box", root = "/r", worktree = "/r" }, function() end)
+SPEC.prepare({ host = "box", root = "/r", worktree = "/r" }, function() end)
+assert(#NOTICES == 1 and NOTICES[1]:find("couldn't build"), NOTICES[1])
+assert(#RESTARTS == 0)
+"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
     /// The bundled python plugin: ty (via uvx) answers gd / gr across files,
     /// including through a method call and into an installed package.
     #[test]

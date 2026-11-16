@@ -15,3 +15,5 @@ diagnostics = false
 max_rss_mb = 6144
 # Stop a server after this many minutes without gd/gr or file events (0: never).
 idle_minutes = 15
+# Build a venv for ty from uv.lock, in ~/.cache/kitchen/ty-venvs (the newest 3 are kept).
+build_venv = true

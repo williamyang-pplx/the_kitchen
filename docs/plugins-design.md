@@ -303,3 +303,12 @@ about LSP:
   `git status` takes 1–2 s on agi, so it runs every ~20 s there) and sends
   `didChangeWatchedFiles`; replays are flagged and kept only for column
   maths; documents beyond 32 are closed.
+* ty treats the agi worktree as one project from any directory (only the
+  root pyproject.toml has `[tool.ty]`), so nearest-marker roots started one
+  whole-repo ty per sub-project, each 1.6–4 GB. Marker tiers follow ty's own
+  rule. The python plugin's `prepare` gives ty absolute import roots (the
+  root, every sub-project's `src/`, `[tool.pyright].extraPaths`: aster's
+  `src/` was invisible to root code) and an environment: a venv it builds
+  from `uv.lock` with `uv sync --frozen --no-install-project` under
+  `~/.cache/kitchen/ty-venvs` (the checkout's own `.venv` had 110 of 1,400
+  packages), keeping the newest 3, the nearest `.venv` until it is ready.

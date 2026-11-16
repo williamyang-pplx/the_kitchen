@@ -2,8 +2,11 @@
 --
 --   local server = require("kitchen.lsp").define {
 --     name = "ty", filetypes = { "py", "pyi" }, language_id = "python",
---     root_markers = { "pyproject.toml", ".git" },
+--     root_markers = { "pyproject.toml", ".git" },    -- or tiers, first match wins:
+--     --   { { "ty.toml", { file = "pyproject.toml", contains = "[tool.ty" } }, { "pyproject.toml" } }
 --     cmd = function(root) return "exec uvx ty server" end,   -- sh script, or an argv table
+--     prepare = function(ctx, done) done { settings = {}, init_options = {} } end,
+--                             -- per root, before its server starts: ctx {host, root, worktree}
 --     settings = {},          -- answers to workspace/configuration, by section
 --     init_options = {},      -- initializationOptions
 --     diagnostics = false,    -- show the server's publishDiagnostics
@@ -189,7 +192,8 @@ local function answer(s, c, msg)
   if msg.method == "workspace/configuration" then
     result = {}
     for i, item in ipairs((msg.params or {}).items or {}) do
-      local v = item.section and s.settings[item.section]
+      -- What `prepare` gave this root wins over the server-wide settings.
+      local v = item.section and ((c.settings or {})[item.section] or s.settings[item.section])
       result[i] = v == nil and json.null or v
     end
     if #result == 0 then
@@ -365,7 +369,8 @@ local function ensure_ticking()
   end, { desc = "language servers: request timeouts, memory, idle servers", first_delay = TICK_SECS })
 end
 
-local function start(s, host, root, realwt)
+local function start(s, host, root, realwt, prep)
+  prep = prep or {}
   local key = host .. "\0" .. root
   local c = s.clients[key]
   if c then
@@ -391,6 +396,7 @@ local function start(s, host, root, realwt)
     key = key, host = host, root = root, realwt = realwt, buf = "", errbuf = "", next_id = 0,
     pending = {}, inflight = {}, ready = false, queue = {}, open = {}, open_order = {}, encoding = "utf-16",
     started = os.time(), last_used = os.time(), polled_at = 0, poll_every = TICK_SECS,
+    settings = prep.settings,
   }
   local spec = {
     host = host,
@@ -421,7 +427,7 @@ local function start(s, host, root, realwt)
     rootUri = uri_of(root),
     rootPath = root,
     workspaceFolders = folder,
-    initializationOptions = s.init_options,
+    initializationOptions = prep.init_options or s.init_options,
     capabilities = {
       general = { positionEncodings = { "utf-32", "utf-16" } },
       textDocument = {
@@ -467,17 +473,28 @@ local function find_root(s, file, cb)
     return
   end
   s.waiting[key] = { cb }
-  local tests = {}
-  for _, m in ipairs(s.root_markers) do
-    table.insert(tests, '[ -e "$d"/' .. q(m) .. " ]")
-  end
-  local script = "d=" .. q(dir) .. "; wt=" .. q(file.worktree) .. [[
-; while :; do
-  if ]] .. table.concat(tests, " || ") .. [[; then break; fi
-  if [ "$d" = "$wt" ] || [ "$d" = / ]; then d="$wt"; break; fi
+  -- Each tier walks up from the file to the worktree; the first tier with a
+  -- match wins, so a marker that names the project beats a nearer one that
+  -- only names a package.
+  local script = "d0=" .. q(dir) .. "; wt=" .. q(file.worktree) .. "; root=\n"
+  for _, tier in ipairs(s.root_tiers) do
+    local tests = {}
+    for _, m in ipairs(tier) do
+      if type(m) == "table" then
+        table.insert(tests, '{ [ -f "$d"/' .. q(m.file) .. " ] && grep -qF -- " .. q(m.contains) .. ' "$d"/' .. q(m.file) .. "; }")
+      else
+        table.insert(tests, '[ -e "$d"/' .. q(m) .. " ]")
+      end
+    end
+    script = script .. [[if [ -z "$root" ]; then d=$d0; while :; do
+  if ]] .. table.concat(tests, " || ") .. [[; then root=$d; break; fi
+  if [ "$d" = "$wt" ] || [ "$d" = / ]; then break; fi
   d=$(dirname "$d")
-done
-echo "$d"; (cd "$wt" 2>/dev/null && pwd -P) || echo "$wt"]]
+done; fi
+]]
+  end
+  script = script .. [[[ -n "$root" ] || root=$wt
+echo "$root"; (cd "$wt" 2>/dev/null && pwd -P) || echo "$wt"]]
   kitchen.run({ sh = script, host = file.host, timeout = 20 }, function(res)
     local root, realwt = res.stdout:match("^([^\n]+)\n([^\n]*)")
     if res.code ~= 0 or not root then
@@ -494,6 +511,38 @@ echo "$d"; (cd "$wt" 2>/dev/null && pwd -P) || echo "$wt"]]
   end)
 end
 
+-- The plugin's `prepare` result for (host, root), asked once and cached.
+local function prepare_root(s, host, root, realwt, cb)
+  if not s.prepare then
+    return cb({})
+  end
+  local key = host .. "\0" .. root
+  if s.prepared[key] then
+    return cb(s.prepared[key])
+  end
+  if s.preparing[key] then
+    table.insert(s.preparing[key], cb)
+    return
+  end
+  s.preparing[key] = { cb }
+  local function done(result)
+    if not s.preparing[key] then
+      return -- called twice
+    end
+    s.prepared[key] = result or {}
+    local waiting = s.preparing[key]
+    s.preparing[key] = nil
+    for _, f in ipairs(waiting) do
+      f(s.prepared[key])
+    end
+  end
+  local ok, err = pcall(s.prepare, { host = host, root = root, worktree = realwt }, done)
+  if not ok then
+    kitchen.log(s.name .. ": prepare failed: " .. tostring(err))
+    done({})
+  end
+end
+
 -- The client for `file`: its project's, or (outside the worktree, e.g. an
 -- installed package we jumped into) the one that last answered on its host.
 local function with_client(s, file, cb)
@@ -502,7 +551,9 @@ local function with_client(s, file, cb)
     return cb(k and s.clients[k])
   end
   find_root(s, file, function(root, realwt)
-    cb(start(s, file.host, root, realwt))
+    prepare_root(s, file.host, root, realwt, function(prep)
+      cb(start(s, file.host, root, realwt, prep))
+    end)
   end)
 end
 
@@ -880,10 +931,14 @@ end
 -- Stop the server at (host, root) and start it again for a document under the
 -- root (its project, environment or many files changed).
 function M.restart(s, host, root)
-  local c = s.clients[host .. "\0" .. root]
+  local key = host .. "\0" .. root
+  local c = s.clients[key]
   if c then
     stop_client(s, c, "restart")
   end
+  -- Ask `prepare` again: its settings may be what changed.
+  s.prepared[key] = nil
+  s.failures[key] = nil
   for key, d in pairs(s.docs) do
     if d.file.host == host and not d.stale and (d.file.abs == root or under(d.file.abs, root)) then
       with_client(s, d.file, function(nc)
@@ -915,6 +970,26 @@ local function on_stop()
   end
 end
 
+-- Root markers as tiers: a flat list of markers is one tier (any marker,
+-- nearest directory); a list of lists is tiers in priority order. A marker
+-- is a file name or { file = name, contains = text }.
+local function tiers_of(markers)
+  local tiered = false
+  for _, m in ipairs(markers) do
+    if type(m) == "table" and m.file == nil then
+      tiered = true
+    end
+  end
+  if not tiered then
+    return { markers }
+  end
+  local tiers = {}
+  for _, m in ipairs(markers) do
+    table.insert(tiers, (type(m) == "table" and m.file == nil) and m or { m })
+  end
+  return tiers
+end
+
 function M.define(spec)
   assert(type(spec.name) == "string", "lsp.define needs name")
   assert(spec.cmd, "lsp.define needs cmd")
@@ -924,7 +999,10 @@ function M.define(spec)
     name = spec.name,
     filetypes = spec.filetypes,
     language_id = spec.language_id or spec.filetypes[1],
-    root_markers = spec.root_markers or { ".git" },
+    root_tiers = tiers_of(spec.root_markers or { ".git" }),
+    prepare = spec.prepare,
+    prepared = {},
+    preparing = {},
     cmd = type(cmd) == "function" and cmd or function()
       return cmd
     end,

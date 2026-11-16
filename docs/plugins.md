@@ -77,7 +77,7 @@ Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen
 
 ## API (level 16)
 
-Level 16: `kitchen.on("stop")` runs before a plugin's processes get EOF and are killed (a local one with its process group), and `kitchen.lsp.define` takes `max_rss_mb` and `idle_minutes` and returns the server (see "Language servers"); `ctx.viewer.col` is where `word` starts, and `ctx.viewer.removed` marks a removed diff row; file events carry `replay`. Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 16: `kitchen.on("stop")` runs before a plugin's processes get EOF and are killed (a local one with its process group), and `kitchen.lsp.define` takes marker tiers, `prepare`, `max_rss_mb` and `idle_minutes` and returns the server (see "Language servers"); `ctx.viewer.col` is where `word` starts, and `ctx.viewer.removed` marks a removed diff row; file events carry `replay`. Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -238,8 +238,9 @@ line or pressed Esc, and doesn't ask on a removed diff row.
 ```lua
 local server = require("kitchen.lsp").define {
   name = "ty", filetypes = { "py", "pyi" }, language_id = "python",
-  root_markers = { "pyproject.toml", "setup.py" },
+  root_markers = { "pyproject.toml", "setup.py" },   -- or tiers, see below
   cmd = function(root) return "exec uvx ty server" end,   -- sh, or an argv table
+  prepare = function(ctx, done) done { settings = {}, init_options = {} } end,
   settings = {},         -- workspace/configuration answers, by section
   diagnostics = false,   -- show publishDiagnostics
   max_rss_mb = 6144,     -- restart a server using more memory (0: no cap)
@@ -249,7 +250,13 @@ local server = require("kitchen.lsp").define {
 
 Starts one server per (host, project root) — the nearest directory with a
 marker, up to the worktree — when the viewer opens a matching file, keeps
-open files in sync, and provides `definition` / `references`. Files outside
+open files in sync, and provides `definition` / `references`. Markers can
+come in tiers, `{ { "ty.toml", { file = "pyproject.toml", contains =
+"[tool.ty" } }, { "pyproject.toml" } }`: each tier walks up to the worktree
+and the first tier with a match wins, so a file that names the project beats
+a nearer one that only names a package. `prepare(ctx, done)` runs once per
+root (`ctx = {host, root, worktree}`) before its server starts; the
+`settings` and `init_options` it passes to `done` are that root's. Files outside
 the worktree (an installed package you jumped into) use the server that
 last answered on that host.
 
