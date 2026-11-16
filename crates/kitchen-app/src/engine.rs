@@ -210,7 +210,37 @@ pub struct ViewEntry {
     /// The PR's page; `ctx.viewer.menu` hands it back to plugin commands.
     #[serde(default)]
     pub url: Option<String>,
+    /// Its code owners approved it: the menu draws a check after its icon.
+    #[serde(default)]
+    pub approved: bool,
+    /// What it waits on (review, an Atlantis apply), drawn in the viewer's
+    /// header while it is on screen.
+    #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
+    pub checks: Vec<Check>,
     pub view: ViewAt,
+}
+
+/// One thing a PR waits on, as the viewer's header shows it: the state's
+/// icon and color, the label, and the note on hover.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct Check {
+    pub state: CheckState,
+    /// e.g. "approved", "atlantis apply needed"
+    pub label: String,
+    /// e.g. GitHub's "Waiting for team review: team-sonar"
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckState {
+    /// Nothing left to do.
+    Done,
+    /// Others (reviewers, a running plan) have to act.
+    Waiting,
+    /// The author has to act.
+    Needed,
 }
 
 /// A PR's state on GitHub, as a menu row's icon.

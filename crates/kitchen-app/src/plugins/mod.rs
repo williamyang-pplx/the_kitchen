@@ -32,7 +32,7 @@ use crate::keybindings::Binding;
 use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
-pub const API_LEVEL: u32 = 14;
+pub const API_LEVEL: u32 = 15;
 /// Events the kitchen hands to the plugins that listen (`kitchen.on`):
 /// `open` (a link typed into ⌘⇧P, with the tab's command ctx), `comment`
 /// (a viewer comment to post), `dashboard` (a workspace's dashboard was shown
@@ -1098,6 +1098,73 @@ mod tests {
         assert!(to_json(pr_of.call(val(serde_json::json!({ "host": "other", "worktree": "/r/air-x" }))).unwrap()).is_null(), "another host's worktree");
         remember.call::<()>((tab("a"), "o/r", listed())).unwrap();
         assert!(to_json(pr_of.call(at()).unwrap()).is_null(), "#1 is merged: nothing live, the mapping goes");
+    }
+
+    /// github: the statuses an open PR waits on (code owners, Atlantis) as
+    /// the header's checks, and the menu's approval check.
+    #[test]
+    fn github_plugin_checks() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"kitchen = { on = function() end, command = function() end, keymap = function() end, json = {},
+                config = { owners_status = "[Blocking] Ownership Requirements", plan_status = "atlantis/plan", apply_status = "" } }"#,
+        )
+        .exec()
+        .unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
+        let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
+        let q: String = m.get::<mlua::Function>("query").unwrap().call(("o/r", lua.to_value(&serde_json::json!([12])).unwrap())).unwrap();
+        assert!(
+            q.contains(r#"commits(last: 1) { nodes { commit { status { owners: context(name: "[Blocking] Ownership Requirements") { state description } plan: context(name: "atlantis/plan") { state description } } } } }"#),
+            "the configured statuses, \"\" left out: {q}"
+        );
+
+        // M.checks(pr) for a PR with these statuses (and review decision).
+        let checks = |state: &str, decision: Option<&str>, statuses: serde_json::Value| -> (bool, Vec<(String, String, String)>) {
+            let pr = serde_json::json!({ "state": state, "reviewDecision": decision, "commits": { "nodes": [{ "commit": { "status": statuses } }] } });
+            // As kitchen.json.decode hands it over: GitHub's nulls are nil.
+            let pr = lua.to_value_with(&pr, mlua::serde::SerializeOptions::new().serialize_none_to_null(false).serialize_unit_to_null(false)).unwrap();
+            let (approved, list): (bool, mlua::Value) = m.get::<mlua::Function>("checks").unwrap().call(pr).unwrap();
+            let list: serde_json::Value = lua.from_value(list).unwrap();
+            let list = list.as_array().cloned().unwrap_or_default(); // {} decodes as an object
+            (approved, list.iter().map(|c| (c["state"].as_str().unwrap().into(), c["label"].as_str().unwrap().into(), c["note"].as_str().unwrap().into())).collect())
+        };
+        let c = |state: &str, label: &str, note: &str| (state.to_string(), label.to_string(), note.to_string());
+        let status = |state: &str, description: &str| serde_json::json!({ "state": state, "description": description });
+
+        let needs_apply = serde_json::json!({
+            "owners": status("SUCCESS", "Ownership review requirements are satisfied"),
+            "plan": status("SUCCESS", "2/2 projects planned successfully."),
+            "gate": status("FAILURE", "Current Atlantis-managed changes still need a confirmed successful apply."),
+        });
+        assert_eq!(
+            checks("OPEN", Some("APPROVED"), needs_apply.clone()),
+            (
+                true,
+                vec![
+                    c("done", "approved", "Ownership review requirements are satisfied"),
+                    c("needed", "atlantis apply needed", "Current Atlantis-managed changes still need a confirmed successful apply.")
+                ]
+            )
+        );
+        assert_eq!(checks("MERGED", Some("APPROVED"), needs_apply), (false, vec![]), "a merged PR waits on nothing");
+        // The owners status wins over GitHub's decision; no plan, no Atlantis check.
+        let waiting = serde_json::json!({ "owners": status("PENDING", "Waiting for team review: team-sonar"), "gate": status("SUCCESS", "No Atlantis-managed changes detected.") });
+        assert_eq!(checks("OPEN", Some("APPROVED"), waiting), (false, vec![c("waiting", "awaiting approval", "Waiting for team review: team-sonar")]));
+        let respond = serde_json::json!({ "owners": status("FAILURE", "Author response needed"), "plan": status("PENDING", "This plan: 1/2 finished") });
+        assert_eq!(
+            checks("OPEN", None, respond),
+            (false, vec![c("needed", "response needed", "Author response needed"), c("waiting", "atlantis planning", "This plan: 1/2 finished")])
+        );
+        let applied = serde_json::json!({ "plan": status("SUCCESS", ""), "gate": status("SUCCESS", "All planned projects had no changes.") });
+        assert_eq!(
+            checks("OPEN", Some("CHANGES_REQUESTED"), applied),
+            (false, vec![c("needed", "changes requested", "GitHub review: changes requested"), c("done", "atlantis up to date", "All planned projects had no changes.")]),
+            "no owners status: GitHub's review decision"
+        );
+        assert_eq!(checks("OPEN", Some("APPROVED"), serde_json::Value::Null), (true, vec![c("done", "approved", "GitHub review: approved")]), "a commit with no statuses");
+        assert_eq!(checks("OPEN", None, serde_json::Value::Null), (false, vec![]), "a repo that requires no review");
     }
 
     /// github ⌘⇧D: a PR's description as the page the viewer renders, its

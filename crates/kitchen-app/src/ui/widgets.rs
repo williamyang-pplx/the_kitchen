@@ -4,7 +4,7 @@
 use egui::text::LayoutJob;
 use egui::{Color32, CornerRadius, Response, RichText, Sense, TextFormat, Ui};
 
-use crate::engine::PrState;
+use crate::engine::{Check, CheckState, PrState};
 use crate::theme;
 
 /// Height of the header row atop the viewer and the plan.
@@ -75,6 +75,55 @@ pub fn pr_icon(painter: &egui::Painter, rect: egui::Rect, state: PrState) {
             painter.circle_filled(at(12.0, 4.0), 0.9 * unit, color);
         }
     }
+}
+
+/// The color of a PR check in `state`: green done, grey waiting on others,
+/// yellow for the author to act.
+pub fn check_color(state: CheckState) -> Color32 {
+    match state {
+        CheckState::Done => theme::GREEN,
+        CheckState::Waiting => theme::MUTED,
+        CheckState::Needed => theme::YELLOW,
+    }
+}
+
+/// The icon of a PR check in `state`, filling the square `rect`: a check
+/// mark (done), a clock (waiting), an exclamation mark in a ring (needed).
+pub fn check_icon(painter: &egui::Painter, rect: egui::Rect, state: CheckState) {
+    let color = check_color(state);
+    let unit = rect.width() / 16.0;
+    let at = |x: f32, y: f32| rect.min + egui::vec2(x, y) * unit;
+    let stroke = egui::Stroke::new(1.75 * unit, color);
+    match state {
+        CheckState::Done => {
+            painter.line_segment([at(2.5, 8.5), at(6.0, 12.0)], stroke);
+            painter.line_segment([at(6.0, 12.0), at(13.5, 4.5)], stroke);
+        }
+        CheckState::Waiting => {
+            painter.circle_stroke(at(8.0, 8.0), 6.25 * unit, stroke);
+            painter.line_segment([at(8.0, 8.0), at(8.0, 4.5)], stroke);
+            painter.line_segment([at(8.0, 8.0), at(10.5, 9.5)], stroke);
+        }
+        CheckState::Needed => {
+            painter.circle_stroke(at(8.0, 8.0), 6.25 * unit, stroke);
+            painter.line_segment([at(8.0, 4.5), at(8.0, 9.0)], stroke);
+            painter.circle_filled(at(8.0, 11.5), 1.0 * unit, color);
+        }
+    }
+}
+
+/// A PR check in a header: its icon and label in its state's color, its
+/// note on hover.
+pub fn check_chip(ui: &mut Ui, check: &Check) -> Response {
+    let color = check_color(check.state);
+    let galley = ui.painter().layout_no_wrap(check.label.clone(), theme::ui_font(theme::TEXT_SMALL), color);
+    let (icon, gap, pad) = (12.0, 5.0, egui::vec2(6.0, 4.0));
+    let size = egui::vec2(icon + gap + galley.size().x, galley.size().y.max(icon)) + 2.0 * pad;
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    let square = egui::Rect::from_center_size(egui::pos2(rect.min.x + pad.x + icon / 2.0, rect.center().y), egui::vec2(icon, icon));
+    check_icon(ui.painter(), square, check.state);
+    ui.painter().galley(egui::pos2(square.max.x + gap, rect.center().y - galley.size().y / 2.0), galley, color);
+    if check.note.is_empty() { resp } else { resp.on_hover_text(&check.note) }
 }
 
 /// A small tinted badge: `color` text on a faint wash of it.

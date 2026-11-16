@@ -5,9 +5,12 @@
 -- reply, on a line that has one) to the PR. Each PR viewed gets a ⌘⇧P entry
 -- (github.pr_<N>) to show it again; github.own_changes shows the tab's own
 -- worktree again. ⌘⇧S lists the PRs in the tab's $KITCHEN_PRS_FILE, one
--- section per stack, then the PRs opened in the tab with ⌘⇧P. ⌘⇧D shows the
--- shown PR's description, rendered as on GitHub, and goes back. ⌘⇧O opens
--- the shown PR (in the ⌘⇧S menu, the row under the cursor) in Chrome.
+-- section per stack, then the PRs opened in the tab with ⌘⇧P; an open PR's
+-- row has a check once its code owners approved it, and the viewer's header
+-- shows what the PR on screen waits on (approval, an Atlantis apply). ⌘⇧D
+-- shows the shown PR's description, rendered as on GitHub, and goes back.
+-- ⌘⇧O opens the shown PR (in the ⌘⇧S menu, the row under the cursor) in
+-- Chrome.
 
 local M = {}
 
@@ -174,21 +177,85 @@ function M.list(lines, slug)
   return out
 end
 
-local FIELDS = "number title url state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions"
+local FIELDS = "number title url state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions reviewDecision"
+
+local function named(s)
+  return s ~= "" and s or nil
+end
+
+-- The commit statuses (on a PR's last commit) that say whether its code
+-- owners approved it, and whether its Atlantis plans ran and still need an
+-- apply, by the alias the query reads them as. An unset or "" name isn't
+-- asked for.
+local STATUSES = { owners = named(kitchen.config.owners_status), plan = named(kitchen.config.plan_status), gate = named(kitchen.config.apply_status) }
+
+local function gql_string(s)
+  return '"' .. (s:gsub('[\\"]', "\\%0")) .. '"'
+end
 
 -- One GraphQL query for PRs `ns` of `slug`, each aliased p<N>.
 function M.query(slug, ns)
   local owner, name = slug:match("^([^/]+)/(.+)$")
+  local contexts = {}
+  for _, alias in ipairs({ "owners", "plan", "gate" }) do
+    if STATUSES[alias] then
+      table.insert(contexts, ("%s: context(name: %s) { state description }"):format(alias, gql_string(STATUSES[alias])))
+    end
+  end
+  local fields = FIELDS
+  if #contexts > 0 then
+    fields = fields .. " commits(last: 1) { nodes { commit { status { " .. table.concat(contexts, " ") .. " } } } }"
+  end
   local parts = {}
   for _, n in ipairs(ns) do
-    table.insert(parts, ("p%d: pullRequest(number: %d) { %s }"):format(n, n, FIELDS))
+    table.insert(parts, ("p%d: pullRequest(number: %d) { %s }"):format(n, n, fields))
   end
   return ('query { repository(owner: "%s", name: "%s") { %s } }'):format(owner, name, table.concat(parts, " "))
 end
 
+-- A status's state as a check's: SUCCESS done, PENDING waiting, else (FAILURE,
+-- ERROR) the author's to act on.
+local function check(status, labels)
+  local state = status.state == "SUCCESS" and "done" or status.state == "PENDING" and "waiting" or "needed"
+  return { state = state, label = labels[state], note = status.description or "" }
+end
+
+-- Whether open PR `p` (a GraphQL node) has its code owners' approval, and
+-- the checks the viewer's header shows for it: the approval (the owners
+-- status, else GitHub's review decision), then Atlantis once it planned
+-- (a failed plan, else the apply gate). A merged or closed PR waits on
+-- nothing.
+function M.checks(p)
+  if p.state ~= "OPEN" then
+    return false, {}
+  end
+  local last = p.commits and p.commits.nodes and p.commits.nodes[1]
+  local st = last and last.commit and last.commit.status or {}
+  local out = {}
+  if st.owners then
+    table.insert(out, check(st.owners, { done = "approved", waiting = "awaiting approval", needed = "response needed" }))
+  else
+    local decision = ({
+      APPROVED = { "done", "approved" },
+      REVIEW_REQUIRED = { "waiting", "awaiting approval" },
+      CHANGES_REQUESTED = { "needed", "changes requested" },
+    })[p.reviewDecision or ""]
+    if decision then
+      table.insert(out, { state = decision[1], label = decision[2], note = "GitHub review: " .. p.reviewDecision:lower():gsub("_", " ") })
+    end
+  end
+  local approved = out[1] ~= nil and out[1].state == "done"
+  if st.plan and st.plan.state ~= "SUCCESS" then
+    table.insert(out, check(st.plan, { waiting = "atlantis planning", needed = "atlantis plan failed" }))
+  elseif st.plan and st.gate then
+    table.insert(out, check(st.gate, { done = "atlantis up to date", waiting = "atlantis applying", needed = "atlantis apply needed" }))
+  end
+  return approved, out
+end
+
 -- One menu row for PR `p` (a GraphQL node) under `section`, with its state
--- (open, draft, merged, closed: the menu draws GitHub's icon for it) and its
--- page (for ⌘⇧O). The
+-- (open, draft, merged, closed: the menu draws GitHub's icon for it), its
+-- page (for ⌘⇧O) and M.checks'. The
 -- open PR whose head is `branch` (checked out in the tab's worktree) is live:
 -- that worktree against its parent (remember_live maps it to the PR, for its
 -- review comments and ⌘M); every other PR is M.view's kitchen-pr-<N> checkout.
@@ -208,12 +275,15 @@ local function row(tab, p, section, place, branch, dflt)
   local state = p.state == "OPEN" and (p.isDraft and "draft" or "open") or (p.state or ""):lower()
   local view = live and { base = "origin/" .. p.baseRefName } or M.view(tab, p.number, p, dflt)
   view.tab = nil
+  local approved, checks = M.checks(p)
   return {
     section = section,
     label = "#" .. p.number .. " " .. (p.title or ""),
     detail = table.concat(detail, " · "),
     state = state ~= "" and state or nil,
     url = p.url,
+    approved = approved,
+    checks = checks,
     view = view,
   }
 end

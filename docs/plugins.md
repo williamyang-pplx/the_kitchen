@@ -75,9 +75,9 @@ enabled = false
 
 Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen-plugins`).
 
-## API (level 14)
+## API (level 15)
 
-Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
+Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
 tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
 tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
 read-only tabs any more, so tabs have no `kind` and `worktree.list` no
@@ -292,7 +292,8 @@ kitchen.on("views", function(ev)   -- ⌘⇧S: the tab's command ctx, plus ev.pr
     entries = {
       { section = "main ← william/a", label = "#12 add retries", detail = "1/2", state = "merged",
         view = { rev = "refs/kitchen/pr/12", name = "kitchen-pr-12", fetch = { … }, base = "origin/main" } },
-      { section = "main ← william/a", label = "#13 use them", detail = "2/2 · live",
+      { section = "main ← william/a", label = "#13 use them", detail = "2/2 · live", state = "open", approved = true,
+        checks = { { state = "needed", label = "atlantis apply needed", note = "…still need a confirmed successful apply." } },
         view = { base = "origin/william/a" } },   -- no rev: the tab's own worktree
     },
   }
@@ -305,7 +306,12 @@ last one (an open menu updates in place). Each entry's `view` takes
 `kitchen.view`'s fields without `tab`. An entry's `state` (`"open"`,
 `"draft"`, `"merged"` or `"closed"`) draws GitHub's icon for the PR before its
 label; its `url` comes back to commands as `ctx.viewer.menu.url` while the
-cursor is on it. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
+cursor is on it. `approved = true` draws a check after that icon. `checks`
+are what the PR waits on, drawn in the viewer's header while its row is on
+screen: each a `state` (`"done"`, `"waiting"` on others, `"needed"` from the
+author), a `label`, and a `note` shown on hover. A viewer on screen sends
+`views` itself too (when it opens, when it shows a view the menu lacks, and
+every 2 minutes), so the header's checks keep up without ⌘⇧S. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.
 Picking a row shows it. A view the tab showed before comes back at once
 from the viewer cache, and its checkout is then refreshed (the viewer is

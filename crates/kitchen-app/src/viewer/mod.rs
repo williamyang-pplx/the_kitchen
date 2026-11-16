@@ -245,6 +245,9 @@ pub struct Viewer {
     answerer: crate::ask_thread::Answerer,
     /// When ⌘⇧S last asked the plugins for the PR menu (until it changes).
     asked: Option<std::time::Instant>,
+    /// When the PR menu was last asked for, by ⌘⇧S or to keep the header's
+    /// checks fresh, and what the viewer showed then.
+    menu_asked: Option<(std::time::Instant, Shown)>,
     /// Since when the code area has been waiting for files.
     loading_since: Option<std::time::Instant>,
 }
@@ -337,6 +340,7 @@ impl Viewer {
             ask_seq: 0,
             answerer: kitchen_core::ask::ask,
             asked: None,
+            menu_asked: None,
             loading_since: None,
         };
         v.load_file_list(false);
@@ -1174,6 +1178,7 @@ impl Viewer {
         self.check_changes();
         self.refresh_overlay();
         self.refresh_view_menu(ui.ctx());
+        self.keep_menu_fresh(ui.ctx());
         // The base may only become known after the file was opened.
         if let (true, Some(p)) = (self.diff, self.current.clone()) {
             self.ensure_base(&p);
@@ -1220,6 +1225,10 @@ impl Viewer {
                 if widgets::flat_button(ui, &label, false).on_hover_text(spaced("Switch PR", Place::Global, Action::ViewMenu)).clicked_by(egui::PointerButton::Primary) {
                     self.open_view_menu();
                 }
+            }
+            // What it waits on (code owners, an Atlantis apply), left to right.
+            for check in self.shown_checks().iter().rev() {
+                widgets::check_chip(ui, check);
             }
         });
         ui.painter().hline(header.x_range(), header.bottom() - 0.5, egui::Stroke::new(1.0, theme::BORDER));

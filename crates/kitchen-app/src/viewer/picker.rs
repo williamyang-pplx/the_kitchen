@@ -27,6 +27,15 @@ const MAX_ROWS: usize = 300;
 
 /// Menu mode: the room an item's icon takes before its label.
 const ICON_SLOT: f32 = 22.0;
+/// Room for the approval check after a PR's icon, in a menu where a row has one.
+const CHECK_SLOT: f32 = 16.0;
+
+/// A menu row's icon: the PR's state, and a check after it once approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowIcon {
+    pub state: PrState,
+    pub approved: bool,
+}
 
 pub struct Picker {
     pub title: String,
@@ -51,7 +60,7 @@ pub struct Picker {
     /// Menu mode: (first item index, header) of each section.
     sections: Vec<(usize, String)>,
     /// Menu mode: the icon drawn before each item's label (by item index).
-    pub icons: Vec<Option<PrState>>,
+    pub icons: Vec<Option<RowIcon>>,
     /// The user moved the cursor (j/k, arrows) since the picker opened.
     pub(crate) moved: bool,
 }
@@ -374,6 +383,8 @@ impl Picker {
             ui.painter().hline(line.x_range(), line.top(), egui::Stroke::new(1.0, theme::BORDER));
             egui::Frame::NONE.inner_margin(egui::Margin::symmetric(6, 6)).show(ui, |ui| {
                 let max = (ui.available_height() - 34.0).max(120.0);
+                // Every PR row keeps room for a check when one has it, so labels line up.
+                let checks = self.icons.iter().flatten().any(|i| i.approved);
                 egui::ScrollArea::vertical().max_height(max).auto_shrink([false, true]).show(ui, |ui| {
                     for (row, (i, pos)) in self.filtered.iter().enumerate() {
                         let (label, detail) = &self.items[*i];
@@ -387,8 +398,9 @@ impl Picker {
                         }
                         let icon = self.icons.get(*i).copied().flatten();
                         let (job, icon) = if self.menu {
-                            let (job, label_at) = numbered(row, self.filtered.len(), label, sel, icon.is_some());
-                            (job, icon.map(|s| (s, label_at)))
+                            let slot = icon.map_or(0.0, |_| if checks { ICON_SLOT + CHECK_SLOT } else { ICON_SLOT });
+                            let (job, label_at) = numbered(row, self.filtered.len(), label, sel, slot);
+                            (job, icon.map(|s| (s, label_at, slot)))
                         } else {
                             (highlighted(label, pos, sel), None)
                         };
@@ -447,7 +459,7 @@ fn footer(moves: Place, choose: &'static str) -> Vec<(String, &'static str)> {
     vec![(select, "select"), (km.hint(Place::Picker, &Cmd::Menu(MenuCmd::Choose), 1), choose), (km.hint(Place::Picker, &Cmd::Menu(MenuCmd::Cancel), 1), "close")]
 }
 
-fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, detail: &str, icon: Option<(PrState, usize)>) -> egui::Response {
+fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, detail: &str, icon: Option<(RowIcon, usize, f32)>) -> egui::Response {
     let width = ui.available_width();
     let pad = egui::vec2(10.0, 5.0);
     let detail = (!detail.is_empty()).then(|| ui.painter().layout_no_wrap(detail.to_string(), theme::ui_font(theme::TEXT_SMALL), if selected { theme::SUBTLE } else { theme::DIM }));
@@ -465,11 +477,14 @@ fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, d
             egui::Color32::TRANSPARENT
         };
         ui.painter().rect_filled(rect, egui::CornerRadius::same(theme::RADIUS), fill);
-        if let Some((state, at)) = icon {
+        if let Some((icon, at, slot)) = icon {
+            // The `slot` before the label: the PR's icon, then (with room for it) the check.
             let right = rect.min.x + pad.x + galley.pos_from_cursor(egui::text::CCursor::new(at)).min.x;
-            let size = 14.0;
-            let square = egui::Rect::from_center_size(egui::pos2(right - ICON_SLOT / 2.0, rect.center().y), egui::vec2(size, size));
-            crate::ui::widgets::pr_icon(ui.painter(), square, state);
+            let square = |x: f32, size: f32| egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(size, size));
+            crate::ui::widgets::pr_icon(ui.painter(), square(right - slot + ICON_SLOT / 2.0, 14.0), icon.state);
+            if icon.approved {
+                crate::ui::widgets::check_icon(ui.painter(), square(right - CHECK_SLOT / 2.0 - 2.0, 12.0), crate::engine::CheckState::Done);
+            }
         }
         ui.painter().galley(rect.min + pad, galley, theme::TEXT);
         if let Some(g) = detail {
@@ -481,15 +496,15 @@ fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, d
 }
 
 /// Row `row` of a menu of `rows`: its number, right-aligned to the widest
-/// so the labels line up, and its label, plain, after an `ICON_SLOT` when
-/// `icon`. Also the label's first character index.
-fn numbered(row: usize, rows: usize, label: &str, selected: bool, icon: bool) -> (egui::text::LayoutJob, usize) {
+/// so the labels line up, and its label, plain, after `slot` points of
+/// icons (none: 0). Also the label's first character index.
+fn numbered(row: usize, rows: usize, label: &str, selected: bool, slot: f32) -> (egui::text::LayoutJob, usize) {
     let mut job = egui::text::LayoutJob::default();
     let font = egui::FontId::monospace(12.5);
-    let number = format!("{:>w$}{}", row + 1, if icon { " " } else { "  " }, w = rows.to_string().len());
+    let number = format!("{:>w$}{}", row + 1, if slot > 0.0 { " " } else { "  " }, w = rows.to_string().len());
     job.append(&number, 0.0, egui::TextFormat { font_id: font.clone(), color: theme::DIM, ..Default::default() });
     let color = if selected { theme::TEXT } else { theme::MUTED };
-    job.append(label, if icon { ICON_SLOT } else { 0.0 }, egui::TextFormat { font_id: font, color, ..Default::default() });
+    job.append(label, slot, egui::TextFormat { font_id: font, color, ..Default::default() });
     (job, number.chars().count())
 }
 
@@ -624,15 +639,17 @@ mod tests {
     /// labels line up.
     #[test]
     fn menu_rows_past_nine_are_numbered() {
-        let text = |row, rows| numbered(row, rows, "#7 a", false, false).0.text;
+        let text = |row, rows| numbered(row, rows, "#7 a", false, 0.0).0.text;
         assert_eq!(text(0, 12), " 1  #7 a");
         assert_eq!(text(9, 12), "10  #7 a");
         assert_eq!(text(11, 12), "12  #7 a");
         assert_eq!(text(2, 3), "3  #7 a", "no padding under 10 rows");
         // With an icon, it takes the second space's place, before the label.
-        let (job, label_at) = numbered(0, 12, "#7 a", false, true);
+        let (job, label_at) = numbered(0, 12, "#7 a", false, ICON_SLOT);
         assert_eq!((job.text.as_str(), label_at), (" 1 #7 a", 3));
         assert_eq!(job.sections[1].leading_space, ICON_SLOT);
+        let (job, _) = numbered(0, 12, "#7 a", false, ICON_SLOT + CHECK_SLOT);
+        assert_eq!(job.sections[1].leading_space, ICON_SLOT + CHECK_SLOT, "room for the approval check");
     }
 
     #[test]

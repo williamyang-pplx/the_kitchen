@@ -6,19 +6,22 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::picker::Picker;
+use super::picker::{Picker, RowIcon};
 use super::{PickerKind, Viewer};
-use crate::engine::{MenuRow, PrState, Shown, View, ViewAt};
+use crate::engine::{Check, MenuRow, Shown, View, ViewAt};
 
 /// How long the menu says "loading PRs…" while it waits for a plugin.
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a viewer on screen asks for its tab's PR menu again, so the
+/// header's checks (approval, Atlantis) keep up with GitHub.
+const MENU_REFRESH: Duration = Duration::from_secs(120);
 
 /// The menu's picker items, section headers, each row's PR state and view,
 /// and the row on screen.
 struct Rows {
     items: Vec<(String, String)>,
     sections: Vec<(usize, String)>,
-    icons: Vec<Option<PrState>>,
+    icons: Vec<Option<RowIcon>>,
     views: Vec<(View, Shown)>,
     current: Option<usize>,
 }
@@ -38,7 +41,7 @@ impl Viewer {
     fn view_menu_rows(&self, menu: Option<&Arc<Vec<MenuRow>>>) -> Rows {
         let shown = self.shown();
         let mut rows = Rows { items: Vec::new(), sections: Vec::new(), icons: Vec::new(), views: Vec::new(), current: None };
-        let push = |rows: &mut Rows, section: &str, label: &str, detail: &str, state: Option<PrState>, view: View, at: Shown| {
+        let push = |rows: &mut Rows, section: &str, label: &str, detail: &str, icon: Option<RowIcon>, view: View, at: Shown| {
             if rows.sections.last().is_none_or(|(_, s)| s != section) {
                 rows.sections.push((rows.items.len(), section.to_string()));
             }
@@ -47,11 +50,12 @@ impl Viewer {
                 rows.current = Some(rows.items.len());
             }
             rows.items.push((format!("{}{label}", if current { "● " } else { "" }), detail.to_string()));
-            rows.icons.push(state);
+            rows.icons.push(icon);
             rows.views.push((view, at));
         };
         for (e, at) in menu.map(|m| m.as_slice()).unwrap_or_default() {
-            push(&mut rows, &e.section, &e.label, &e.detail, e.state, View { tab: self.tab_id.clone(), at: e.view.clone() }, at.clone());
+            let icon = e.state.map(|state| RowIcon { state, approved: e.approved });
+            push(&mut rows, &e.section, &e.label, &e.detail, icon, View { tab: self.tab_id.clone(), at: e.view.clone() }, at.clone());
         }
         // The tab's worktree against its diff base, unless a row already is.
         if let Some((ws, tab)) = self.engine.find_tab(&self.tab_id) {
@@ -71,6 +75,7 @@ impl Viewer {
             return;
         }
         self.asked = self.engine.ask_views(&self.tab_id, self.context()).then(Instant::now);
+        self.menu_asked = Some((Instant::now(), self.shown()));
         let menu = self.engine.views_of(&self.tab_id);
         let rows = self.view_menu_rows(menu.as_ref());
         let mut picker = Picker::menu("PRs", rows.items, rows.sections);
@@ -128,16 +133,45 @@ impl Viewer {
         }
     }
 
+    /// The header's checks (approval, Atlantis) come from the tab's menu,
+    /// so a viewer on screen asks for it without ⌘⇧S: first, again when it
+    /// shows a view the menu lacks (a PR just opened with ⌘⇧P), and every
+    /// `MENU_REFRESH`.
+    pub(super) fn keep_menu_fresh(&mut self, ctx: &egui::Context) {
+        let shown = self.shown();
+        let due = match &self.menu_asked {
+            None => true,
+            Some((at, was)) => at.elapsed() >= MENU_REFRESH || (*was != shown && !self.engine.views_of(&self.tab_id).is_some_and(|m| m.iter().any(|(_, s)| *s == shown))),
+        };
+        if due {
+            self.engine.ask_views(&self.tab_id, self.context());
+            self.menu_asked = Some((Instant::now(), shown));
+        }
+        ctx.request_repaint_after(MENU_REFRESH);
+    }
+
+    /// The row on screen in the tab's menu, when it has that row.
+    fn shown_entry(&self) -> Option<(Arc<Vec<MenuRow>>, usize)> {
+        let menu = self.engine.views_of(&self.tab_id)?;
+        let shown = self.shown();
+        let i = menu.iter().position(|(_, at)| *at == shown)?;
+        Some((menu, i))
+    }
+
     /// The header button for the row on screen: "#123 · 2/3" (its place in
     /// its section), when the tab's menu has that row.
     pub(super) fn shown_entry_label(&self) -> Option<String> {
-        let menu = self.engine.views_of(&self.tab_id)?;
-        let shown = self.shown();
-        let (e, _) = menu.iter().find(|(_, at)| *at == shown)?;
+        let (menu, i) = self.shown_entry()?;
+        let e = &menu[i].0;
         let section: Vec<_> = menu.iter().filter(|(o, _)| o.section == e.section).collect();
-        let at = section.iter().position(|(o, s)| *s == shown && o == e)? + 1;
+        let at = section.iter().position(|(o, _)| std::ptr::eq(o, e))? + 1;
         let name = e.label.split_whitespace().next().unwrap_or(&e.label);
         Some(if section.len() > 1 { format!("{name} · {at}/{}", section.len()) } else { name.to_string() })
+    }
+
+    /// What the row on screen waits on, for the header.
+    pub(super) fn shown_checks(&self) -> Vec<Check> {
+        self.shown_entry().map(|(menu, i)| menu[i].0.checks.clone()).unwrap_or_default()
     }
 }
 
@@ -155,7 +189,7 @@ mod tests {
 
     use super::super::PickerKind;
     use super::*;
-    use crate::engine::ViewSet;
+    use crate::engine::{CheckState, PrState, ViewSet};
     use crate::panels::PanelCmd;
     use crate::test_util::{Harness, TestRepo};
 
@@ -179,8 +213,9 @@ mod tests {
         let h = Harness::new(TestRepo::new("echo 1 > a"));
         let stack = serde_json::json!([
             { "section": "main ← a", "label": "#7 a", "state": "merged", "url": "https://github.com/o/r/pull/7", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
-            { "section": "main ← a", "label": "#8 b", "state": "open", "view": { "base": "origin/a" } },
+            { "section": "main ← a", "label": "#8 b", "state": "open", "approved": true, "view": { "base": "origin/a" } },
         ]);
+        let icon = |state, approved| Some(RowIcon { state, approved });
         set(&h, stack.clone());
         let mut v = h.viewer();
         v.command(PanelCmd::ViewMenu, &h.engine);
@@ -189,7 +224,7 @@ mod tests {
         assert_eq!(rows(&v), vec!["#7 a", "#8 b", "● worktree"]);
         let Some((_, p)) = &v.picker else { unreachable!() };
         assert_eq!(p.filtered[p.selected].0, 2, "cursor on the row shown");
-        assert_eq!(p.icons, vec![Some(PrState::Merged), Some(PrState::Open), None], "each PR's state as its icon");
+        assert_eq!(p.icons, vec![icon(PrState::Merged, false), icon(PrState::Open, true), None], "each PR's state as its icon, a check once approved");
         assert_eq!(v.context()["menu"], serde_json::json!({}), "the worktree row is no entry");
 
         let mut more = stack.as_array().unwrap().clone();
@@ -198,7 +233,7 @@ mod tests {
         h.frame(&mut v);
         assert_eq!(rows(&v), vec!["#7 a", "#8 b", "#9 c", "● worktree"], "an open menu follows kitchen.views");
         let Some((_, p)) = &v.picker else { unreachable!() };
-        assert_eq!(p.icons, vec![Some(PrState::Merged), Some(PrState::Open), None, None], "…its icons too");
+        assert_eq!(p.icons, vec![icon(PrState::Merged, false), icon(PrState::Open, true), None, None], "…its icons too");
 
         for _ in 0..3 {
             h.frame_with(&mut v, vec![key(egui::Key::K), egui::Event::Text("k".into())]);
@@ -276,13 +311,23 @@ mod tests {
             &h,
             serde_json::json!([
                 { "section": "main ← a", "label": "#7 a", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
-                { "section": "main ← a", "label": "#8 b", "view": { "base": "origin/a" } },
-                { "section": "main ← c", "label": "#9 c", "view": { "base": "origin/c" } },
+                { "section": "main ← a", "label": "#8 b", "view": { "base": "origin/a" },
+                  "checks": [{ "state": "waiting", "label": "in review", "note": "Waiting for team review: team-x" }, { "state": "needed", "label": "atlantis apply needed" }] },
+                { "section": "main ← c", "label": "#9 c", "view": { "base": "origin/c" }, "checks": {} },
             ]),
         );
-        let label = |base: &str| Viewer::at(&h.engine, Host::Local, "t", h.repo.path(), base.into()).shown_entry_label();
-        assert_eq!(label("origin/a").as_deref(), Some("#8 · 2/2"));
-        assert_eq!(label("origin/c").as_deref(), Some("#9"), "a stack of one");
-        assert_eq!(label("origin/main"), None, "not a row of the menu");
+        let at = |base: &str| Viewer::at(&h.engine, Host::Local, "t", h.repo.path(), base.into());
+        assert_eq!(at("origin/a").shown_entry_label().as_deref(), Some("#8 · 2/2"));
+        assert_eq!(at("origin/c").shown_entry_label().as_deref(), Some("#9"), "a stack of one");
+        assert_eq!(at("origin/main").shown_entry_label(), None, "not a row of the menu");
+
+        // The header's checks are the shown row's.
+        let checks: Vec<(CheckState, String, String)> = at("origin/a").shown_checks().into_iter().map(|c| (c.state, c.label, c.note)).collect();
+        assert_eq!(
+            checks,
+            vec![(CheckState::Waiting, "in review".into(), "Waiting for team review: team-x".into()), (CheckState::Needed, "atlantis apply needed".into(), String::new())]
+        );
+        assert!(at("origin/c").shown_checks().is_empty(), "an empty Lua table is no checks");
+        assert!(at("origin/main").shown_checks().is_empty());
     }
 }
