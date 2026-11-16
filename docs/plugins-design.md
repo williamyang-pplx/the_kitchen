@@ -312,3 +312,11 @@ about LSP:
   from `uv.lock` with `uv sync --frozen --no-install-project` under
   `~/.cache/kitchen/ty-venvs` (the checkout's own `.venv` had 110 of 1,400
   packages), keeping the newest 3, the nearest `.venv` until it is ready.
+* The text search knew only `def`/`class`, searched every file type
+  (`gd` on a Python name once landed in a TypeScript block of a `.md`
+  file), ranked alphabetically after the current folder, used `\b`/`\s`
+  where macOS `git grep -E` has none, and jumped on a single match. It now
+  walks Python scopes first (locals, parameters, loop targets, `global` /
+  `nonlocal`, a class body only from inside it), finds variables and
+  `self.x` too, searches one language, ranks imported modules and then
+  path distance, and opens a list for anything not certain.

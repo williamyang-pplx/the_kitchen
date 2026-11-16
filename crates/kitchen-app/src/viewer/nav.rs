@@ -1,6 +1,7 @@
 //! `gd` / `gr`: ask a plugin provider (e.g. a language server) and wait for
 //! it; no answer, an error, a self-answer or a timeout falls back to a text
-//! search. Answers that arrive after the user left the spot are dropped.
+//! search, which opens a list unless the scope walk is certain. Answers that
+//! arrive after the user left the spot are dropped.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -17,8 +18,12 @@ use crate::plugins::Location;
 const NAV_TIMEOUT: Duration = Duration::from_secs(20);
 /// Most text-search references listed.
 const MAX_REFS: usize = 500;
-/// Most definition candidate files read per jump (one round trip).
+/// Most `git grep` lines read for references before ranking.
+const MAX_GREP_LINES: usize = 5000;
+/// Most definition candidate files read per jump (one round trip, after ranking).
 const MAX_DEF_FILES: usize = 20;
+/// Most candidate paths listed for ranking.
+const MAX_DEF_CANDIDATES: usize = 2000;
 /// Larger definition candidates are skipped.
 const MAX_DEF_FILE_BYTES: usize = crate::plugins::MAX_TEXT;
 /// Most locations given a preview line.
@@ -168,20 +173,20 @@ impl Viewer {
         true
     }
 
-    /// The text search: no provider, or it had nothing. `gd`: a unique
-    /// definition in this file jumps straight there. `status` says why it runs.
+    /// The text search: no provider, or it had nothing. `gd` on a name the
+    /// scope walk binds in this file jumps straight there; anything else the
+    /// search finds opens a list. `status` says why it runs.
     fn text_search(&mut self, kind: NavKind, name: String, here: Option<Loc>, word_col: Option<usize>, removed: bool, status: Option<String>) {
         if kind == NavKind::Definition && !removed {
             let Some(here) = here.clone() else {
                 self.status = None;
                 return;
             };
-            let local = self.local_defs(&name, &here.path);
-            if let [only] = local.as_slice() {
-                if only.line != here.line {
+            let bound = word_col.zip(self.files.get(&here.path)).and_then(|(col, f)| kitchen_symbols::resolve_local(&here.path, &f.text, here.line, col).map(|d| (d, col)));
+            if let Some((def, col)) = bound {
+                if (def.line, def.col) != (here.line, col) {
                     self.status = None;
-                    let loc = Loc { path: only.path.clone(), line: only.line, col: only.col };
-                    self.record_and_go_raw(loc);
+                    self.record_and_go_raw(Loc { path: here.path.clone(), line: def.line, col: def.col });
                     return;
                 }
             }
@@ -192,12 +197,6 @@ impl Viewer {
         }
         self.nav_status(status.unwrap_or_else(|| format!("searching for {name}…")));
         self.start_grep();
-    }
-
-    /// Definitions of `name` in the loaded file `path`.
-    fn local_defs(&self, name: &str, path: &str) -> Vec<Location> {
-        let Some(f) = self.files.get(path) else { return Vec::new() };
-        f.symbols.iter().filter(|s| s.name == name).map(|s| def_location(path, &f.text, s)).collect()
     }
 
     /// Spawn the text search for the pending query (`Msg::Grep` comes back).
@@ -212,26 +211,24 @@ impl Viewer {
                     self.status = Some((kind.nothing(&name), true));
                     return;
                 };
-                let local = self.local_defs(&name, &here.path);
+                let python = matches!(crate::plugins::filetype_of(&here.path).as_str(), "py" | "pyi");
+                let imports = self.files.get(&here.path).filter(|_| python).map(|f| kitchen_symbols::python_imports(&f.text)).unwrap_or_default();
                 std::thread::spawn(move || {
-                    let mut locs = local;
-                    for l in search_definitions(&host, &wt, &name, &here.path) {
-                        if !locs.iter().any(|k| k.path == l.path && k.line == l.line) {
-                            locs.push(l);
-                        }
-                    }
+                    let mut locs = search_definitions(&host, &wt, &name, &here.path, &imports);
                     // Drop the definition we're standing on (on a removed row
                     // `here` is the next line, which may well be the answer).
                     if !removed {
                         locs.retain(|l| !(l.path == here.path && l.line == here.line));
                     }
-                    let _ = tx.send(Msg::Grep { token, locs });
+                    let _ = tx.send(Msg::Grep { token, locs, capped: false });
                     ctx.request_repaint();
                 });
             }
             NavKind::References => {
+                let from = p.here.as_ref().map(|h| h.path.clone()).unwrap_or_default();
                 std::thread::spawn(move || {
-                    let _ = tx.send(Msg::Grep { token, locs: grep_refs(&host, &wt, &name) });
+                    let (locs, capped) = grep_refs(&host, &wt, &name, &from);
+                    let _ = tx.send(Msg::Grep { token, locs, capped });
                     ctx.request_repaint();
                 });
             }
@@ -271,7 +268,7 @@ impl Viewer {
         match answer {
             Some(locs) => {
                 self.clear_nav_status(&p);
-                self.show_locations(p.kind, &p.name, locs);
+                self.show_locations(p.kind, &p.name, locs, NavSource::Provider);
             }
             None => {
                 let msg = format!("the language server found nothing for {}; searching text…", p.name);
@@ -281,22 +278,24 @@ impl Viewer {
     }
 
     /// The text search's answer.
-    pub(super) fn finish_grep(&mut self, token: u64, locs: Vec<Location>) {
+    pub(super) fn finish_grep(&mut self, token: u64, locs: Vec<Location>, capped: bool) {
         let Some(p) = self.pending_nav.take_if(|p| p.token == token) else { return };
         log::info!(target: "kitchen::nav", "{:?} {}: text search → {} in {:?}", p.kind, p.name, locs.len(), p.started.elapsed());
         self.clear_nav_status(&p);
         if !self.still_here(&p) {
             return;
         }
-        self.show_locations(p.kind, &p.name, locs);
+        self.show_locations(p.kind, &p.name, locs, NavSource::Text { capped });
     }
 
-    fn show_locations(&mut self, kind: NavKind, name: &str, locs: Vec<Location>) {
-        match locs.len() {
-            0 => self.status = Some((kind.nothing(name), true)),
-            1 => self.record_and_go_raw(loc_of(&locs[0])),
+    /// One answer from the provider jumps there; anything else, and any text
+    /// match (it may be another `name` entirely), opens a list.
+    fn show_locations(&mut self, kind: NavKind, name: &str, locs: Vec<Location>, source: NavSource) {
+        match (locs.len(), source) {
+            (0, _) => self.status = Some((kind.nothing(name), true)),
+            (1, NavSource::Provider) => self.record_and_go_raw(loc_of(&locs[0])),
             _ => {
-                let (title, items) = picker_items(kind, name, &locs);
+                let (title, items) = picker_items(kind, name, &locs, source);
                 self.picker = Some((PickerKind::RawLocs(locs.iter().map(loc_of).collect()), Picker::new(title, items)));
             }
         }
@@ -329,11 +328,22 @@ fn loc_of(l: &Location) -> Loc {
     Loc { path: l.path.clone(), line: l.line, col: l.col }
 }
 
-fn picker_items(kind: NavKind, name: &str, locs: &[Location]) -> (String, Vec<(String, String)>) {
-    let title = match kind {
+/// Where a list of locations came from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NavSource {
+    Provider,
+    Text { capped: bool },
+}
+
+fn picker_items(kind: NavKind, name: &str, locs: &[Location], source: NavSource) -> (String, Vec<(String, String)>) {
+    let capped = matches!(source, NavSource::Text { capped: true });
+    let mut title = match kind {
         NavKind::Definition => format!("definitions of {name}"),
-        NavKind::References => format!("{} references to {name}", locs.len()),
+        NavKind::References => format!("{}{} references to {name}", locs.len(), if capped { "+" } else { "" }),
     };
+    if matches!(source, NavSource::Text { .. }) {
+        title.push_str(" (text matches)");
+    }
     let items = locs.iter().map(|l| (format!("{}:{}", l.path, l.line), l.text.as_deref().unwrap_or("").trim().to_string())).collect();
     (title, items)
 }
@@ -347,36 +357,88 @@ fn def_location(path: &str, text: &str, s: &Symbol) -> Location {
     Location { path: path.to_string(), line: s.line, col: chars + 1, text: Some(format!("{} {}", s.kind, s.signature)) }
 }
 
-/// Repo-wide definition search in one round trip: git grep keeps the files
-/// with a line that mentions `name` and a definition keyword, ranks them
-/// (`from`, then its folder, then the rest) and prints the first
-/// [`MAX_DEF_FILES`], each after a `\x1e<nonce> <path>` line. They are parsed here.
-pub(super) fn search_definitions(host: &Host, worktree: &str, name: &str, from: &str) -> Vec<Location> {
-    let nonce = kitchen_core::util::new_id();
-    let from_dir = from.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-    let script = format!(
-        "cd {wt} && N={nonce} && \
-         git -c core.quotePath=false grep -l -I -w -E -e {name} --and -e {keywords} -- \
-         | F={from} D={dir} awk 'BEGIN {{ f = ENVIRON[\"F\"]; d = ENVIRON[\"D\"] }} \
-             {{ p = $0; q = p; if (!sub(/\\/[^\\/]*$/, \"\", q)) q = \"\"; print (p != f) (q != d) \"\\t\" p }}' \
-         | LC_ALL=C sort | cut -f2- \
-         | {{ n=0; while [ \"$n\" -lt {max} ] && IFS= read -r p; do \
-               [ \"$(wc -c < \"$p\" | tr -d ' ')\" -le {bytes} ] || continue; \
-               n=$((n+1)); printf '\\036%s %s\\n' \"$N\" \"$p\"; cat -- \"$p\"; echo; \
-             done; }}",
+/// Repo-wide definition search in two round trips. The first lists the
+/// files of `from`'s language whose lines may define `name`, and the files
+/// of the modules `from` imports; they are ranked here. The second reads
+/// `from` and the top [`MAX_DEF_FILES`] and keeps their definitions of `name`.
+pub(super) fn search_definitions(host: &Host, worktree: &str, name: &str, from: &str, imports: &[String]) -> Vec<Location> {
+    let globs: Vec<String> = kitchen_symbols::globs_for(from).iter().map(|g| shell_quote(g)).collect();
+    let modules: Vec<String> = module_paths(imports).iter().map(|m| shell_quote(m)).collect();
+    let list = format!(
+        "cd {wt} && {{ git -c core.quotePath=false grep -l -I -E {pats} -- {globs} 2>/dev/null | head -n {MAX_DEF_CANDIDATES} | sed 's/^/g /'; {mods} }}",
         wt = shell_quote(worktree),
-        name = shell_quote(&regex::escape(name)),
-        keywords = shell_quote("(def|class|fn|func|function|struct|enum|trait|interface|type|const|let|var|impl|mod|module)"),
-        from = shell_quote(from),
-        dir = shell_quote(from_dir),
-        max = MAX_DEF_FILES,
+        pats = def_patterns(from, name),
+        globs = globs.join(" "),
+        mods = if modules.is_empty() { String::new() } else { format!("git -c core.quotePath=false ls-files -- {} 2>/dev/null | sed 's/^/m /';", modules.join(" ")) },
+    );
+    let Ok(out) = host.sh(&list, None) else { return Vec::new() };
+    let (mut grep, mut imported) = (Vec::new(), Vec::new());
+    for line in out.stdout.lines() {
+        match line.split_once(' ') {
+            Some(("g", p)) => grep.push(p.to_string()),
+            Some(("m", p)) => imported.push(p.to_string()),
+            _ => {}
+        }
+    }
+    let mut paths = vec![from.to_string()];
+    paths.extend(rank_candidates(grep, imported, from).into_iter().filter(|p| p != from).take(MAX_DEF_FILES));
+    let nonce = kitchen_core::util::new_id();
+    let read = format!(
+        "cd {wt} && N={nonce} && for p in {paths}; do [ -f \"$p\" ] || continue; \
+           [ \"$(wc -c < \"$p\" | tr -d ' ')\" -le {bytes} ] || continue; \
+           printf '\\036%s %s\\n' \"$N\" \"$p\"; cat -- \"$p\"; echo; done",
+        wt = shell_quote(worktree),
+        paths = paths.iter().map(|p| shell_quote(p)).collect::<Vec<_>>().join(" "),
         bytes = MAX_DEF_FILE_BYTES,
     );
-    let Ok(out) = host.sh(&script, None) else { return Vec::new() };
+    let Ok(out) = host.sh(&read, None) else { return Vec::new() };
     split_batch(&out.stdout, &nonce)
         .into_iter()
-        .flat_map(|(path, text)| kitchen_symbols::extract(path, text).into_iter().filter(|s| s.name == name).map(|s| def_location(path, text, &s)).collect::<Vec<_>>())
+        .flat_map(|(path, text)| kitchen_symbols::definitions_named(path, text, name).into_iter().map(|s| def_location(path, text, &s)).collect::<Vec<_>>())
         .collect()
+}
+
+/// `git grep -E` arguments for lines that may define `name` in files like
+/// `from`. POSIX classes only: macOS `git grep -E` has no `\b` or `\s`.
+fn def_patterns(from: &str, name: &str) -> String {
+    let n = regex::escape(name);
+    let python = matches!(crate::plugins::filetype_of(from).as_str(), "py" | "pyi");
+    if python {
+        // A name that only appears in a parenthesised multi-line import isn't matched.
+        let pats = [
+            format!("(^|[^[:alnum:]_])(def|class)[[:space:]]+{n}([^[:alnum:]_]|$)"),
+            format!("^[[:space:]]*{n}[[:space:]]*(:[^=]*)?=([^=]|$)"),
+            format!("self\\.{n}[[:space:]]*(:[^=]*)?=([^=]|$)"),
+        ];
+        return pats.iter().map(|p| format!("-e {}", shell_quote(p))).collect::<Vec<_>>().join(" ");
+    }
+    format!("-w -e {} --and -e {}", shell_quote(&n), shell_quote("(def|class|fn|func|function|struct|enum|trait|interface|type|const|let|var|impl|mod|module)"))
+}
+
+/// Pathspecs for the files a Python module may live in: "a.b" ->
+/// `**/a/b.py`, `**/a/b.pyi`, `**/a/b/__init__.py` (any prefix: src layouts).
+fn module_paths(imports: &[String]) -> Vec<String> {
+    imports
+        .iter()
+        .flat_map(|m| {
+            let p = m.replace('.', "/");
+            [format!(":(glob)**/{p}.py"), format!(":(glob)**/{p}.pyi"), format!(":(glob)**/{p}/__init__.py")]
+        })
+        .collect()
+}
+
+/// Order: the files of modules `from` imports, then most leading folders
+/// shared with `from`, then path.
+fn rank_candidates(grep: Vec<String>, imported: Vec<String>, from: &str) -> Vec<String> {
+    let shared = |p: &str| from.split('/').zip(p.split('/')).take_while(|(a, b)| a == b).count();
+    let mut grep = grep;
+    grep.retain(|p| !imported.contains(p));
+    grep.sort_by(|a, b| shared(b).cmp(&shared(a)).then_with(|| a.cmp(b)));
+    let mut out = imported;
+    out.sort();
+    out.dedup();
+    out.extend(grep);
+    out
 }
 
 /// `\x1e<nonce> <path>` header, contents, one newline: (path, contents) per file.
@@ -391,15 +453,24 @@ fn split_batch<'a>(out: &'a str, nonce: &str) -> Vec<(&'a str, &'a str)> {
         .collect()
 }
 
-/// `git grep -w` for `name`: the first [`MAX_REFS`] whole-word occurrences, with their lines.
-fn grep_refs(host: &Host, worktree: &str, name: &str) -> Vec<Location> {
+/// `git grep -w` for `name` in `from`'s language: the current file first,
+/// then its folder, then the rest; and whether more than [`MAX_REFS`] matched.
+fn grep_refs(host: &Host, worktree: &str, name: &str, from: &str) -> (Vec<Location>, bool) {
+    let globs: Vec<String> = kitchen_symbols::globs_for(from).iter().map(|g| shell_quote(g)).collect();
     let script = format!(
-        "git -C {} -c core.quotePath=false grep -n -I -w -F --column --no-color -e {} -- | head -n {MAX_REFS}",
+        "git -C {} -c core.quotePath=false grep -n -I -w -F --column --no-color -e {} -- {} | head -n {MAX_GREP_LINES}",
         shell_quote(worktree),
-        shell_quote(name)
+        shell_quote(name),
+        globs.join(" ")
     );
-    let Ok(out) = host.sh(&script, None) else { return Vec::new() };
-    parse_grep(&out.stdout)
+    let Ok(out) = host.sh(&script, None) else { return (Vec::new(), false) };
+    let mut locs = parse_grep(&out.stdout);
+    let dir = |p: &str| p.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+    let from_dir = dir(from);
+    locs.sort_by_key(|l| if l.path == from { 0 } else if dir(&l.path) == from_dir { 1 } else { 2 });
+    let capped = locs.len() > MAX_REFS;
+    locs.truncate(MAX_REFS);
+    (locs, capped)
 }
 
 fn parse_grep(out: &str) -> Vec<Location> {
@@ -411,7 +482,6 @@ fn parse_grep(out: &str) -> Vec<Location> {
             let chars = text.get(..col.saturating_sub(1)).map(|p| p.chars().count()).unwrap_or(0);
             Some(Location { path: path.to_string(), line, col: chars + 1, text: Some(text.to_string()) })
         })
-        .take(MAX_REFS)
         .collect()
 }
 
@@ -525,13 +595,13 @@ mod tests {
         v.finish_nav(old, Some(vec![Location { path: "m.py".into(), line: 1, col: 1, text: None }]));
         assert_eq!(v.current.as_deref(), Some("n.py"));
 
-        // "Can't tell" references: git grep finds both files, listed in the picker.
+        // "Can't tell" references: git grep finds both files, listed in the picker, the current file first.
         let t = v.start_nav(NavKind::References, "_loader", true);
         v.finish_nav(t, None);
         h.settle(&mut v, &|v| v.picker.is_some());
         let (kind, picker) = v.picker.as_ref().unwrap();
         assert!(matches!(kind, PickerKind::RawLocs(l) if l.len() == 2));
-        assert_eq!(picker.items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["m.py:123", "n.py:3"]);
+        assert_eq!(picker.items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["n.py:3", "m.py:123"]);
     }
 
     fn repo() -> (Harness, Viewer) {
@@ -641,8 +711,9 @@ mod tests {
         assert!(v.on_removed_row(), "{:?}", v.doc.lines[v.vim.line].text);
         assert_eq!(v.context()["removed"], true);
         v.jump_to_def("helper".into());
-        h.settle(&mut v, &|v| v.pending_nav.is_none() && v.pending_goto.is_none());
-        assert!(!v.on_removed_row() && v.current_source_line() == Some(2), "jumped to the def on the next line");
+        h.settle(&mut v, &|v| v.picker.is_some());
+        let (_, picker) = v.picker.as_ref().unwrap();
+        assert_eq!(picker.items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["a.py:2"], "the def on the next line is kept");
     }
 
     /// gd asks about the word it shows: its start, after a tab, and in the outline.
@@ -662,15 +733,17 @@ mod tests {
         assert_eq!(v.word_here(), Some((9, "run".to_string())));
     }
 
-    /// One round trip finds the definitions: ranked from the asking file's
-    /// folder, at most MAX_DEF_FILES files read, big files skipped.
+    /// The definition search: only the asking file's language, variables
+    /// too, imported modules first, then the nearest folders; at most
+    /// MAX_DEF_FILES files read, big files skipped.
     #[test]
     fn repo_wide_definition_search() {
         let mut files: Vec<(String, String)> = vec![
-            ("pkg/a.py".into(), "from b import helper\nhelper()\n".into()),
+            ("pkg/a.py".into(), "from pkg.b import helper\nimport pkg.c\nhelper()\n".into()),
             ("pkg/b.py".into(), "def helper():\n    return 1".into()), // no trailing newline
+            ("pkg/c.py".into(), "helper = 2\n".into()),
             ("c.rs".into(), "fn helper() {}\n".into()),
-            ("top.rs".into(), "\tfn helper() {}\n".into()),
+            ("far/deep/x.py".into(), "class helper:\n    pass\n".into()),
             ("big/huge.py".into(), format!("def helper():\n    pass\n{}", "#\n".repeat(MAX_DEF_FILE_BYTES / 2 + 1))),
         ];
         for i in 0..25 {
@@ -684,17 +757,64 @@ mod tests {
         let d = dir.display().to_string();
         git(&d, "git init -q && git add .");
 
-        let hits = search_definitions(&Host::Local, &d, "helper", "pkg/a.py");
+        let imports = kitchen_symbols::python_imports(&files[0].1);
+        let hits = search_definitions(&Host::Local, &d, "helper", "pkg/a.py", &imports);
         let found: Vec<(&str, usize, usize)> = hits.iter().map(|l| (l.path.as_str(), l.line, l.col)).collect();
-        assert_eq!(found.len(), MAX_DEF_FILES, "{found:?}");
-        assert_eq!(&found[..3], &[("pkg/b.py", 1, 5), ("c.rs", 1, 4), ("top.rs", 1, 5)], "own folder first; raw columns");
+        assert_eq!(&found[..3], &[("pkg/b.py", 1, 5), ("pkg/c.py", 1, 1), ("far/deep/x.py", 1, 7)], "imported modules first, raw columns");
+        assert!(found.len() <= MAX_DEF_FILES, "{found:?}");
+        assert!(!found.iter().any(|f| f.0.ends_with(".rs")), "only Python for a .py file");
         assert!(!found.iter().any(|f| f.0.starts_with("big/")), "files over the limit are skipped");
         assert_eq!(hits[0].text.as_deref(), Some("function def helper():"));
 
-        // A top-level file ranks its top-level neighbours first.
-        let hits = search_definitions(&Host::Local, &d, "helper", "x.rs");
-        assert_eq!(hits.iter().take(2).map(|l| l.path.as_str()).collect::<Vec<_>>(), vec!["c.rs", "top.rs"]);
-        assert!(search_definitions(&Host::Local, &d, "nope", "x.rs").is_empty());
+        // Rust from Rust; nothing for an unknown name.
+        let hits = search_definitions(&Host::Local, &d, "helper", "x.rs", &[]);
+        assert_eq!(hits.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(), vec!["c.rs"]);
+        assert!(search_definitions(&Host::Local, &d, "nope", "x.rs", &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single text match is still a list: it may be another `bar` entirely.
+    #[test]
+    fn text_fallback_opens_a_list_even_for_one_match() {
+        let (h, mut v) = repo();
+        v.open("use.py", Some(3), false);
+        h.settle(&mut v, &|v| v.current_source_line() == Some(3));
+        v.jump_to_def("bar".into());
+        h.settle(&mut v, &|v| v.picker.is_some());
+        let (_, picker) = v.picker.as_ref().unwrap();
+        assert_eq!(picker.items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["a.py:5"]);
+        assert_eq!(picker.title, "definitions of bar (text matches)");
+        assert_eq!(v.current.as_deref(), Some("use.py"));
+    }
+
+    /// A name the scope walk binds in this file jumps there, no search.
+    #[test]
+    fn exact_local_hit_jumps() {
+        let (h, mut v) = harness(&[("f.py", "def f(x):\n    y = x\n    return y\n")]);
+        v.open("f.py", Some(3), false);
+        h.settle(&mut v, &|v| v.files.contains_key("f.py") && v.current_source_line() == Some(3));
+        v.vim.col = 11;
+        v.jump_to_def("y".into());
+        h.settle(&mut v, &|v| v.pending_goto.is_none());
+        assert!(v.pending_nav.is_none(), "no text search");
+        assert_eq!((v.current_source_line(), v.vim.col), (Some(2), 4));
+    }
+
+    #[test]
+    fn grep_refs_ranks_current_folder_first_and_reports_cap() {
+        let many = "foo\n".repeat(MAX_REFS + 1);
+        let files = [("a/x.py", "foo\n"), ("a/y.py", "foo\n"), ("b/z.py", "foo\n"), ("c.rs", "foo\n"), ("m.py", many.as_str())];
+        let dir = std::env::temp_dir().join(format!("kt-refs-{}", kitchen_core::util::new_id()));
+        for (p, t) in &files {
+            std::fs::create_dir_all(dir.join(p).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(p), t).unwrap();
+        }
+        let d = dir.display().to_string();
+        git(&d, "git init -q && git add .");
+        let (locs, capped) = grep_refs(&Host::Local, &d, "foo", "a/y.py");
+        assert_eq!(locs.iter().take(2).map(|l| l.path.as_str()).collect::<Vec<_>>(), vec!["a/y.py", "a/x.py"]);
+        assert!(capped && locs.len() == MAX_REFS);
+        assert!(!locs.iter().any(|l| l.path == "c.rs"), "only Python");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

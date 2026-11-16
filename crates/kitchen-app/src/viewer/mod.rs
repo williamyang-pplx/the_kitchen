@@ -115,7 +115,7 @@ enum Msg {
     File { path: String, result: Result<FileData, String> },
     Base { path: String, data: BaseData },
     /// The text search's answer to nav query `token` (gd and gr).
-    Grep { token: u64, locs: Vec<crate::plugins::Location> },
+    Grep { token: u64, locs: Vec<crate::plugins::Location>, capped: bool },
     Summaries { path: String, map: HashMap<String, String>, error: Option<String> },
     /// Result of a freshness check of `path` (`None`: could not stat).
     Stat { path: String, meta: Option<String> },
@@ -524,7 +524,7 @@ impl Viewer {
                     self.bases.insert(path, data);
                     self.doc_key = None;
                 }
-                Msg::Grep { token, locs } => self.finish_grep(token, locs),
+                Msg::Grep { token, locs, capped } => self.finish_grep(token, locs, capped),
                 Msg::Nav { token, answer } => self.finish_nav(token, answer),
                 Msg::Answer(ans) => self.finish_ask(ans),
                 Msg::Summaries { path, map, error } => {

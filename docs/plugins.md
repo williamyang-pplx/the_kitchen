@@ -231,7 +231,10 @@ an error, a definition that is the asked word itself, or no answer within
 20 s makes the viewer use its text search; `reply({})` means "none". The
 viewer waits for the provider (no text search runs meanwhile), drops an
 answer that arrives after the user opened another file, moved to another
-line or pressed Esc, and doesn't ask on a removed diff row.
+line or pressed Esc, and doesn't ask on a removed diff row. The text search only
+looks at files of the same language. `gd` jumps straight to a name bound in
+the same function or file (a Python scope walk); other matches open a list,
+imported modules first, then the nearest folders.
 
 ### Language servers
 
