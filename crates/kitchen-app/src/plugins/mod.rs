@@ -2955,8 +2955,40 @@ assert(#RESTARTS == 0)
         let _ = std::fs::remove_dir_all(&wt);
     }
 
+    /// ty finds a sub-project's src/ package from code elsewhere in the repo:
+    /// the plugin's import roots (agi: root code importing aster.*).
+    #[test]
+    fn python_lsp_finds_subproject_src() {
+        if std::process::Command::new("uvx").arg("--version").output().is_err() {
+            eprintln!("uvx not installed; skipping");
+            return;
+        }
+        let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+        let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
+        let host = host_with(&engine, vec![repo_plugins]);
+        wait(&|| host.has_provider("references", "py"));
+        let wt = std::env::temp_dir().join(format!("kt-pysub-{}", kitchen_core::util::new_id()));
+        let files = [
+            ("pyproject.toml", "[project]\nname = \"r\"\nversion = \"0\"\n\n[tool.ty.src]\nexclude = []\n"),
+            ("svc/pyproject.toml", "[project]\nname = \"svc\"\nversion = \"0\"\n"),
+            ("svc/src/svcpkg/__init__.py", "VALUE = 1\n"),
+            ("app/main.py", "from svcpkg import VALUE\n\nprint(VALUE)\n"),
+        ];
+        for (p, t) in files {
+            std::fs::create_dir_all(wt.join(p).parent().unwrap()).unwrap();
+            std::fs::write(wt.join(p), t).unwrap();
+        }
+        assert!(std::process::Command::new("sh").arg("-c").arg("git init -q && git add -A").current_dir(&wt).status().unwrap().success());
+        let key = FileKey { host: "local".into(), worktree: wt.display().to_string(), path: "app/main.py".into() };
+        host.file_loaded(key.clone(), Arc::from(files[3].1), false);
+        let defs = ask(&host, "definition", &key, 3, 7).expect("an answer");
+        assert_eq!((defs[0].path.as_str(), defs[0].line), ("svc/src/svcpkg/__init__.py", 1), "{defs:?}");
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
     /// gd / gr through ty over ssh on a real devbox (KT_VIEWER_HOST / KT_VIEWER_WT,
-    /// a checkout of air): aster's rollout runner.
+    /// a checkout of agi): aster's rollout runner. Starts a venv build in the
+    /// devbox's ~/.cache/kitchen/ty-venvs when none is ready.
     #[test]
     #[ignore]
     fn devbox_python_lsp() {
@@ -2965,7 +2997,7 @@ assert(#RESTARTS == 0)
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
         wait(&|| host.has_provider("references", "py"));
-        let key = FileKey { host: h.clone(), worktree: wt, path: "aster/python/aster/worker/rollout_runner.py".into() };
+        let key = FileKey { host: h.clone(), worktree: wt, path: "pplx/python/apps/aster/src/aster/worker/rollout_runner.py".into() };
         let text = kitchen_core::host::Host::parse(&h).read_file(&key.abs()).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         let find = |pat: &str| lines.iter().position(|l| l.contains(pat)).map(|i| (i + 1, lines[i].find(pat).unwrap() + 1)).unwrap();

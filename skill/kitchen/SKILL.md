@@ -130,7 +130,7 @@ Lines and columns are 1-based, columns in characters of the raw line,
 
 In the viewer, `gd` / `gr` (definition / references) come from a plugin's
 language server when one covers the file (the bundled `python` plugin runs ty
-in the project root on the file's host) and fall back to text search.
+for the file's ty project on the file's host) and fall back to text search.
 
 ## Output and errors
 

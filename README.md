@@ -121,7 +121,8 @@ only in the terminal, panel keys (⌘M ⌘O ⌘Enter) only in the viewer or plan
 the rest are global (⌘D: diff in the viewer or plan, the dashboard elsewhere). Terminals get all other keys; the viewer uses vim
 keys (`gd` definition, `gr` references, `Ctrl-o` back, `]d` next diagnostic, …).
 `gd`/`gr` ask a plugin's language server when there is one (Python: ty) and
-fall back to text search; a slow one (over 0.4s) shows the text matches until it answers.
+search text when it has nothing: a name bound in the same function or file
+jumps straight there, other text matches open a list.
 In a terminal, ⌘-click opens the file path or URL under the pointer; ⌘V with
 an image on the clipboard (or dropping files on it) pastes the files' paths,
 which Claude Code attaches (on a devbox the files are first copied to

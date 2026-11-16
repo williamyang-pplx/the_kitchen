@@ -268,7 +268,7 @@ impl Viewer {
         match answer {
             Some(locs) => {
                 self.clear_nav_status(&p);
-                self.show_locations(p.kind, &p.name, locs, NavSource::Provider);
+                self.show_locations(p.kind, &p.name, locs, NavSource::Provider, p.here.as_ref());
             }
             None => {
                 let msg = format!("the language server found nothing for {}; searching text…", p.name);
@@ -285,12 +285,18 @@ impl Viewer {
         if !self.still_here(&p) {
             return;
         }
-        self.show_locations(p.kind, &p.name, locs, NavSource::Text { capped });
+        self.show_locations(p.kind, &p.name, locs, NavSource::Text { capped }, p.here.as_ref());
     }
 
     /// One answer from the provider jumps there; anything else, and any text
-    /// match (it may be another `name` entirely), opens a list.
-    fn show_locations(&mut self, kind: NavKind, name: &str, locs: Vec<Location>, source: NavSource) {
+    /// match (it may be another `name` entirely), opens a list. The only
+    /// reference being the spot asked from is said, not jumped to.
+    fn show_locations(&mut self, kind: NavKind, name: &str, locs: Vec<Location>, source: NavSource, here: Option<&Loc>) {
+        let only_here = kind == NavKind::References && locs.len() == 1 && here.is_some_and(|h| h.path == locs[0].path && h.line == locs[0].line);
+        if only_here {
+            self.status = Some((format!("the only reference to {name} is here"), false));
+            return;
+        }
         match (locs.len(), source) {
             (0, _) => self.status = Some((kind.nothing(name), true)),
             (1, NavSource::Provider) => self.record_and_go_raw(loc_of(&locs[0])),
@@ -344,17 +350,44 @@ fn picker_items(kind: NavKind, name: &str, locs: &[Location], source: NavSource)
     if matches!(source, NavSource::Text { .. }) {
         title.push_str(" (text matches)");
     }
-    let items = locs.iter().map(|l| (format!("{}:{}", l.path, l.line), l.text.as_deref().unwrap_or("").trim().to_string())).collect();
+    let items = locs
+        .iter()
+        .map(|l| {
+            let shared = locs.iter().filter(|o| o.path == l.path && o.line == l.line).count() > 1;
+            (picker_label(l, shared), l.text.as_deref().unwrap_or("").trim().to_string())
+        })
+        .collect();
     (title, items)
 }
 
+/// `file:line` first (the picker cuts long labels at the end), then the
+/// folder: `b.py:12  pkg/sub/`. `with_col` adds the column, for two hits on
+/// one line. Paths outside the worktree keep only their last two folders.
+fn picker_label(l: &Location, with_col: bool) -> String {
+    let (dir, file) = l.path.rsplit_once('/').unwrap_or(("", &l.path));
+    let mut label = format!("{file}:{}", l.line);
+    if with_col {
+        label.push_str(&format!(":{}", l.col));
+    }
+    if !dir.is_empty() {
+        let shown = if dir.starts_with('/') {
+            let parts: Vec<&str> = dir.rsplit('/').take(2).collect();
+            format!("…/{}", parts.into_iter().rev().collect::<Vec<_>>().join("/"))
+        } else {
+            dir.to_string()
+        };
+        label.push_str(&format!("  {shown}/"));
+    }
+    label
+}
+
 /// A symbol in `text` (the file at `path`) as a location: 1-based raw column,
-/// and `kind signature` as its preview.
+/// and its first line (`def f(x):`, `X = 1`) as the preview.
 fn def_location(path: &str, text: &str, s: &Symbol) -> Location {
     let line = text.lines().nth(s.line.saturating_sub(1)).unwrap_or("");
     // Symbol columns are 0-based bytes.
     let chars = line.get(..s.col).map(|p| p.chars().count()).unwrap_or(s.col);
-    Location { path: path.to_string(), line: s.line, col: chars + 1, text: Some(format!("{} {}", s.kind, s.signature)) }
+    Location { path: path.to_string(), line: s.line, col: chars + 1, text: Some(s.signature.clone()) }
 }
 
 /// Repo-wide definition search in two round trips. The first lists the
@@ -764,7 +797,7 @@ mod tests {
         assert!(found.len() <= MAX_DEF_FILES, "{found:?}");
         assert!(!found.iter().any(|f| f.0.ends_with(".rs")), "only Python for a .py file");
         assert!(!found.iter().any(|f| f.0.starts_with("big/")), "files over the limit are skipped");
-        assert_eq!(hits[0].text.as_deref(), Some("function def helper():"));
+        assert_eq!(hits[0].text.as_deref(), Some("def helper():"));
 
         // Rust from Rust; nothing for an unknown name.
         let hits = search_definitions(&Host::Local, &d, "helper", "x.rs", &[]);
@@ -816,6 +849,40 @@ mod tests {
         assert!(capped && locs.len() == MAX_REFS);
         assert!(!locs.iter().any(|l| l.path == "c.rs"), "only Python");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn loc(path: &str, line: usize, col: usize) -> Location {
+        Location { path: path.into(), line, col, text: None }
+    }
+
+    #[test]
+    fn picker_labels_put_file_and_line_first() {
+        let (_, items) = picker_items(NavKind::Definition, "x", &[loc("pplx/python/apps/aster/src/aster/common/env.py", 12, 1), loc("top.py", 3, 1), loc("/Users/me/.venv/lib/python3.12/site-packages/httpx/_client.py", 40, 5)], NavSource::Provider);
+        let labels: Vec<&str> = items.iter().map(|i| i.0.as_str()).collect();
+        assert_eq!(labels, vec!["env.py:12  pplx/python/apps/aster/src/aster/common/", "top.py:3", "_client.py:40  …/site-packages/httpx/"]);
+    }
+
+    #[test]
+    fn duplicate_line_rows_show_columns() {
+        let (_, items) = picker_items(NavKind::References, "s", &[loc("a.py", 8, 11), loc("a.py", 8, 25), loc("a.py", 9, 1)], NavSource::Provider);
+        assert_eq!(items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["a.py:8:11", "a.py:8:25", "a.py:9"]);
+    }
+
+    #[test]
+    fn capped_references_title_says_500_plus() {
+        let locs: Vec<Location> = (1..=MAX_REFS).map(|i| loc("a.py", i, 1)).collect();
+        assert_eq!(picker_items(NavKind::References, "x", &locs, NavSource::Text { capped: true }).0, "500+ references to x (text matches)");
+        assert_eq!(picker_items(NavKind::References, "x", &locs[..2], NavSource::Provider).0, "2 references to x");
+    }
+
+    /// `gr` whose only result is the spot asked from says so instead of jumping in place.
+    #[test]
+    fn single_reference_at_cursor_does_not_jump() {
+        let (_h, mut v) = repo();
+        let t = v.start_nav(NavKind::References, "foo", true);
+        v.finish_nav(t, Some(vec![loc("use.py", 2, 1)]));
+        assert_eq!(status(&v), Some("the only reference to foo is here"));
+        assert!(v.picker.is_none() && v.back.is_empty());
     }
 
     #[test]

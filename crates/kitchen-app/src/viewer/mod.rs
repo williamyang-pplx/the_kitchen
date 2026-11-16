@@ -1209,15 +1209,11 @@ impl Viewer {
         };
         header_ui.label(widgets::path_job(&path, 12.5));
         header_ui.add_space(theme::SPACE_XS);
-        let (mode, color) = match (self.browsing, self.outline, self.diff) {
-            (true, ..) => ("FOLDER", theme::PURPLE),
-            (_, true, _) => ("OUTLINE", theme::CYAN),
-            _ if self.render_shown.is_some() => ("RENDERED", theme::YELLOW),
-            (_, _, true) => ("DIFF", theme::GREEN),
-            _ => ("FILE", theme::CYAN),
-        };
+        // Files outside the worktree (an installed package) never have a base.
+        let has_base = self.current.as_ref().is_some_and(|p| !p.starts_with('/'));
+        let (mode, color) = mode_pill(self.browsing, self.outline, self.render_shown.is_some(), self.diff, has_base);
         widgets::pill(&mut header_ui, mode, color);
-        if self.diff && !self.outline && !self.browsing {
+        if mode == "DIFF" {
             let (a, d) = self.doc.changed_count();
             header_ui.add_space(theme::SPACE_XS);
             header_ui.label(RichText::new(format!("+{a}")).font(theme::ui_font_semibold(theme::TEXT_SMALL)).color(theme::GREEN));
@@ -1356,7 +1352,7 @@ impl Viewer {
                 editor: self.editor.as_mut(),
                 focused,
                 font_size,
-                two_gutters: self.diff && !self.outline && !self.browsing,
+                two_gutters: self.diff && !self.outline && !self.browsing && self.current.as_ref().is_some_and(|p| !p.starts_with('/')),
                 relative: cx.engine.settings().relative_line_numbers,
                 overlay,
                 repo: repo.as_deref(),
@@ -1938,6 +1934,18 @@ fn kind_color(kind: &str) -> egui::Color32 {
     }
 }
 
+/// The header pill for the viewer's mode. DIFF needs a file that can have a
+/// base: one outside the worktree (an installed package) is a plain FILE.
+fn mode_pill(browsing: bool, outline: bool, rendered: bool, diff: bool, has_base: bool) -> (&'static str, egui::Color32) {
+    match (browsing, outline, diff && has_base) {
+        (true, ..) => ("FOLDER", theme::PURPLE),
+        (_, true, _) => ("OUTLINE", theme::CYAN),
+        _ if rendered => ("RENDERED", theme::YELLOW),
+        (_, _, true) => ("DIFF", theme::GREEN),
+        _ => ("FILE", theme::CYAN),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1950,6 +1958,14 @@ mod tests {
 
     fn cf(path: &str, status: char, old: Option<&str>) -> ChangedFile {
         ChangedFile { path: path.into(), old_path: old.map(String::from), status, added: 0, removed: 0 }
+    }
+
+    #[test]
+    fn mode_pill_needs_a_base() {
+        assert_eq!(mode_pill(false, false, false, true, true).0, "DIFF");
+        assert_eq!(mode_pill(false, false, false, true, false).0, "FILE", "a file outside the worktree");
+        assert_eq!(mode_pill(false, true, false, true, true).0, "OUTLINE");
+        assert_eq!(mode_pill(true, false, false, true, true).0, "FOLDER");
     }
 
     #[test]
