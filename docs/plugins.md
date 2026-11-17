@@ -78,7 +78,7 @@ Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen
 ## API (level 16)
 
 A manifest's `api = N` is the level it needs: a kitchen with a lower level
-refuses the plugin (logged). `kitchen.api_level` is the running kitchen's.
+refuses the plugin (logged).
 Besides `kitchen.lint` and `kitchen.lsp` (below), `require("kitchen.util")`
 has the helpers the bundled plugins share (`q` shell quoting, `shell_path`,
 `human`, `basename`, `sh`, `why`, `hosts`); see
