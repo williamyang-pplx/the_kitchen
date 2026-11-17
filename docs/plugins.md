@@ -308,7 +308,6 @@ kitchen.on("views", function(ev)   -- ⌘⇧S: the tab's command ctx, plus ev.pr
       { section = "main ← william/a", label = "#12 add retries", detail = "1/2", state = "merged",
         view = { rev = "refs/kitchen/pr/12", name = "kitchen-pr-12", fetch = { … }, base = "origin/main" } },
       { section = "main ← william/a", label = "#13 use them", detail = "2/2 · live", state = "open", approved = true,
-        checks = { { state = "needed", label = "atlantis apply needed", note = "…still need a confirmed successful apply." } },
         reviewers = { { state = "waiting", name = "pplx_aster", team = true, status = "requested", members = { "Paul Fryzel", "@max" } },
                       { state = "done", name = "@al", status = "approved" } },
         gates = { { state = "needed", label = "atlantis/apply-gate", note = "…still need a confirmed successful apply." } },
@@ -324,17 +323,16 @@ last one (an open menu updates in place). Each entry's `view` takes
 `kitchen.view`'s fields without `tab`. An entry's `state` (`"open"`,
 `"draft"`, `"merged"` or `"closed"`) draws GitHub's icon for the PR before its
 label; its `url` comes back to commands as `ctx.viewer.menu.url` while the
-cursor is on it. `approved = true` draws a check after that icon. `checks`
-are what the PR waits on, drawn in the viewer's header while its row is on
-screen: each a `state` (`"done"`, `"waiting"` on others, `"needed"` from the
-author), a `label`, and a `note` shown on hover. `reviewers` are listed atop
-the viewer's file list while its row is on screen: each a `state` (as a
-check's), a `name` (`team = true` draws it in that team's own color), a
+cursor is on it. `approved = true` draws a check after that icon. While
+its row is on screen, the viewer's file list opens with its `reviewers`:
+each a `state` (`"done"`, `"waiting"` on others, `"needed"` from the
+author), a `name` (`team = true` draws it in that team's own color), a
 `status` beside it, and `members` (a team's: their count below it, the names
-on hover). `gates` follow under "Checks", shaped like `checks`: what blocks
-the PR's merge, or one done row saying nothing does. A viewer on screen sends
-`views` itself too (when it opens, when it shows a view the menu lacks, and
-every 2 minutes), so the header's checks keep up without ⌘⇧S. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
+on hover). Its `gates` follow under "Checks": what blocks the PR's merge,
+each a `state`, a `label`, and a `note` shown on hover, or one done row
+saying nothing does. A viewer on screen sends `views` itself too (when it
+opens, when it shows a view the menu lacks, and every 2 minutes), so these
+keep up without ⌘⇧S. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.
 Picking a row shows it. A view the tab showed before comes back at once
 from the viewer cache, and its checkout is then refreshed (the viewer is

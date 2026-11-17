@@ -1,15 +1,12 @@
 name = "github"
 version = "0.1.0"
-description = "Review a GitHub PR in the current tab: paste its link into ⌘⇧P to see its diff and review comments; ⌘M posts to the PR; ⌘⇧S switches between the tab's PRs (a check on approved ones); the viewer's header shows what the PR waits on (code owners, an Atlantis apply), and its file list the PR's reviewers (a team's members on hover) and the checks blocking its merge; ⌘⇧D shows the PR's description; ⌘⇧O opens it in Chrome"
+description = "Review a GitHub PR in the current tab: paste its link into ⌘⇧P to see its diff and review comments; ⌘M posts to the PR; ⌘⇧S switches between the tab's PRs (a check on approved ones); the viewer's file list shows the PR's reviewers (a team's members on hover) and the checks blocking its merge; ⌘⇧D shows the PR's description; ⌘⇧O opens it in Chrome"
 api = 12
 
 [config]
 # Where gh lives when the kitchen was started from Finder (minimal PATH).
 path = "/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin"
-# Commit statuses (ppl-ai/agi's) that say whether a PR's code owners approved
-# it and whether its Atlantis plans ran and still need an apply. A PR without
-# the owners status falls back to GitHub's review decision; one without the
-# plan status shows no Atlantis check. Set one to "" to stop asking for it.
+# The commit status (ppl-ai/agi's) that says whether a PR's code owners
+# approved it, for the check on approved PRs in ⌘⇧S. A PR without it falls
+# back to GitHub's review decision; "" stops asking for it.
 owners_status = "[Blocking] Ownership Requirements"
-plan_status = "atlantis/plan"
-apply_status = "atlantis/apply-gate"

@@ -213,10 +213,6 @@ pub struct ViewEntry {
     /// Its code owners approved it: the menu draws a check after its icon.
     #[serde(default)]
     pub approved: bool,
-    /// What it waits on (review, an Atlantis apply), drawn in the viewer's
-    /// header while it is on screen.
-    #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
-    pub checks: Vec<Check>,
     /// Its reviewers, listed atop the viewer's file list while it is on screen.
     #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
     pub reviewers: Vec<Reviewer>,
@@ -246,14 +242,14 @@ pub struct Reviewer {
     pub members: Vec<String>,
 }
 
-/// One thing a PR waits on, as the viewer's header shows it: the state's
-/// icon and color, the label, and the note on hover.
+/// A check on a PR, as the file list's Checks show it: the state's icon,
+/// the label, and the note on hover.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Check {
     pub state: CheckState,
-    /// e.g. "approved", "atlantis apply needed"
+    /// e.g. "atlantis/apply-gate", "all 4 required checks passed"
     pub label: String,
-    /// e.g. GitHub's "Waiting for team review: team-sonar"
+    /// e.g. the status's "Waiting for team review: team-sonar"
     #[serde(default)]
     pub note: String,
 }

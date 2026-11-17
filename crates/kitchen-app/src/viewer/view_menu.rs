@@ -13,7 +13,7 @@ use crate::engine::{Check, MenuRow, Reviewer, Shown, View, ViewAt};
 /// How long the menu says "loading PRs…" while it waits for a plugin.
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a viewer on screen asks for its tab's PR menu again, so the
-/// header's checks (approval, Atlantis) keep up with GitHub.
+/// file list's reviewers and checks keep up with GitHub.
 const MENU_REFRESH: Duration = Duration::from_secs(120);
 
 /// The menu's picker items, section headers, each row's PR state and view,
@@ -126,7 +126,7 @@ impl Viewer {
         }
     }
 
-    /// The header's checks (approval, Atlantis) come from the tab's menu,
+    /// The file list's reviewers and checks come from the tab's menu,
     /// so a viewer on screen asks for it without ⌘⇧S: first, again when it
     /// shows a view the menu lacks (a PR just opened with ⌘⇧P), and every
     /// `MENU_REFRESH`.
@@ -160,11 +160,6 @@ impl Viewer {
         let at = section.iter().position(|(o, _)| std::ptr::eq(o, e))? + 1;
         let name = e.label.split_whitespace().next().unwrap_or(&e.label);
         Some(if section.len() > 1 { format!("{name} · {at}/{}", section.len()) } else { name.to_string() })
-    }
-
-    /// What the row on screen waits on, for the header.
-    pub(super) fn shown_checks(&self) -> Vec<Check> {
-        self.shown_entry().map(|(menu, i)| menu[i].0.checks.clone()).unwrap_or_default()
     }
 
     /// The reviewers of the row on screen and the checks blocking it, for
@@ -311,10 +306,9 @@ mod tests {
             serde_json::json!([
                 { "section": "main ← a", "label": "#7 a", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
                 { "section": "main ← a", "label": "#8 b", "view": { "base": "origin/a" },
-                  "checks": [{ "state": "waiting", "label": "in review", "note": "Waiting for team review: team-x" }, { "state": "needed", "label": "atlantis apply needed" }],
                   "reviewers": [{ "state": "waiting", "name": "team-x", "team": true, "status": "requested", "members": ["Al", "@bo"] }, { "state": "done", "name": "@cy", "status": "approved", "members": {} }],
                   "gates": [{ "state": "needed", "label": "lint", "note": "2 errors" }] },
-                { "section": "main ← c", "label": "#9 c", "view": { "base": "origin/c" }, "checks": {}, "reviewers": {}, "gates": {} },
+                { "section": "main ← c", "label": "#9 c", "view": { "base": "origin/c" }, "reviewers": {}, "gates": {} },
             ]),
         );
         let at = |base: &str| Viewer::at(&h.engine, Host::Local, "t", h.repo.path(), base.into());
@@ -322,16 +316,7 @@ mod tests {
         assert_eq!(at("origin/c").shown_entry_label().as_deref(), Some("#9"), "a stack of one");
         assert_eq!(at("origin/main").shown_entry_label(), None, "not a row of the menu");
 
-        // The header's checks are the shown row's.
-        let checks: Vec<(CheckState, String, String)> = at("origin/a").shown_checks().into_iter().map(|c| (c.state, c.label, c.note)).collect();
-        assert_eq!(
-            checks,
-            vec![(CheckState::Waiting, "in review".into(), "Waiting for team review: team-x".into()), (CheckState::Needed, "atlantis apply needed".into(), String::new())]
-        );
-        assert!(at("origin/c").shown_checks().is_empty(), "an empty Lua table is no checks");
-        assert!(at("origin/main").shown_checks().is_empty());
-
-        // So are the file list's reviewers and checks.
+        // The file list's reviewers and checks are the shown row's.
         let (reviewers, gates) = at("origin/a").shown_review();
         let reviewers: Vec<(CheckState, String, bool, String, Vec<String>)> = reviewers.into_iter().map(|r| (r.state, r.name, r.team, r.status, r.members)).collect();
         assert_eq!(
@@ -344,5 +329,6 @@ mod tests {
         assert_eq!(gates.into_iter().map(|g| (g.state, g.label, g.note)).collect::<Vec<_>>(), vec![(CheckState::Needed, "lint".into(), "2 errors".into())]);
         let (reviewers, gates) = at("origin/c").shown_review();
         assert!(reviewers.is_empty() && gates.is_empty(), "an empty Lua table is none");
+        assert_eq!(at("origin/main").shown_review(), (vec![], vec![]), "not a row of the menu");
     }
 }

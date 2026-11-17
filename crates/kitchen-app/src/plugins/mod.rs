@@ -1110,15 +1110,15 @@ mod tests {
         assert!(to_json(pr_of.call(at()).unwrap()).is_null(), "#1 is merged: nothing live, the mapping goes");
     }
 
-    /// github: the statuses an open PR waits on (code owners, Atlantis) as
-    /// the header's checks, and the menu's approval check.
+    /// github: the query, the menu's approval check, and the file list's
+    /// reviewers and checks.
     #[test]
-    fn github_plugin_checks() {
+    fn github_plugin_review() {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
         lua.load(
             r#"kitchen = { on = function() end, command = function() end, keymap = function() end, json = {},
-                config = { owners_status = "[Blocking] Ownership Requirements", plan_status = "atlantis/plan", apply_status = "" } }"#,
+                config = { owners_status = "[Blocking] Ownership Requirements" } }"#,
         )
         .exec()
         .unwrap();
@@ -1127,60 +1127,30 @@ mod tests {
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let q: String = m.get::<mlua::Function>("query").unwrap().call(("o/r", lua.to_value(&serde_json::json!([12])).unwrap())).unwrap();
         assert!(
-            q.contains(r#"commits(last: 1) { nodes { commit { status { owners: context(name: "[Blocking] Ownership Requirements") { state description } plan: context(name: "atlantis/plan") { state description } } statusCheckRollup {"#),
-            "the configured statuses, \"\" left out: {q}"
+            q.contains(r#"commits(last: 1) { nodes { commit { status { owners: context(name: "[Blocking] Ownership Requirements") { state } } statusCheckRollup {"#),
+            "the owners status: {q}"
         );
         assert!(q.contains("isRequired(pullRequestNumber: 12)"), "required for this PR: {q}");
-
-        // M.checks(pr) for a PR with these statuses (and review decision).
-        let checks = |state: &str, decision: Option<&str>, statuses: serde_json::Value| -> (bool, Vec<(String, String, String)>) {
-            let pr = serde_json::json!({ "state": state, "reviewDecision": decision, "commits": { "nodes": [{ "commit": { "status": statuses } }] } });
-            // As kitchen.json.decode hands it over: GitHub's nulls are nil.
-            let pr = lua.to_value_with(&pr, mlua::serde::SerializeOptions::new().serialize_none_to_null(false).serialize_unit_to_null(false)).unwrap();
-            let (approved, list): (bool, mlua::Value) = m.get::<mlua::Function>("checks").unwrap().call(pr).unwrap();
-            let list: serde_json::Value = lua.from_value(list).unwrap();
-            let list = list.as_array().cloned().unwrap_or_default(); // {} decodes as an object
-            (approved, list.iter().map(|c| (c["state"].as_str().unwrap().into(), c["label"].as_str().unwrap().into(), c["note"].as_str().unwrap().into())).collect())
-        };
-        let c = |state: &str, label: &str, note: &str| (state.to_string(), label.to_string(), note.to_string());
-        let status = |state: &str, description: &str| serde_json::json!({ "state": state, "description": description });
-
-        let needs_apply = serde_json::json!({
-            "owners": status("SUCCESS", "Ownership review requirements are satisfied"),
-            "plan": status("SUCCESS", "2/2 projects planned successfully."),
-            "gate": status("FAILURE", "Current Atlantis-managed changes still need a confirmed successful apply."),
-        });
-        assert_eq!(
-            checks("OPEN", Some("APPROVED"), needs_apply.clone()),
-            (
-                true,
-                vec![
-                    c("done", "approved", "Ownership review requirements are satisfied"),
-                    c("needed", "atlantis apply needed", "Current Atlantis-managed changes still need a confirmed successful apply.")
-                ]
-            )
-        );
-        assert_eq!(checks("MERGED", Some("APPROVED"), needs_apply), (false, vec![]), "a merged PR waits on nothing");
-        // The owners status wins over GitHub's decision; no plan, no Atlantis check.
-        let waiting = serde_json::json!({ "owners": status("PENDING", "Waiting for team review: team-sonar"), "gate": status("SUCCESS", "No Atlantis-managed changes detected.") });
-        assert_eq!(checks("OPEN", Some("APPROVED"), waiting), (false, vec![c("waiting", "awaiting approval", "Waiting for team review: team-sonar")]));
-        let respond = serde_json::json!({ "owners": status("FAILURE", "Author response needed"), "plan": status("PENDING", "This plan: 1/2 finished") });
-        assert_eq!(
-            checks("OPEN", None, respond),
-            (false, vec![c("needed", "response needed", "Author response needed"), c("waiting", "atlantis planning", "This plan: 1/2 finished")])
-        );
-        let applied = serde_json::json!({ "plan": status("SUCCESS", ""), "gate": status("SUCCESS", "All planned projects had no changes.") });
-        assert_eq!(
-            checks("OPEN", Some("CHANGES_REQUESTED"), applied),
-            (false, vec![c("needed", "changes requested", "GitHub review: changes requested"), c("done", "atlantis up to date", "All planned projects had no changes.")]),
-            "no owners status: GitHub's review decision"
-        );
-        assert_eq!(checks("OPEN", Some("APPROVED"), serde_json::Value::Null), (true, vec![c("done", "approved", "GitHub review: approved")]), "a commit with no statuses");
-        assert_eq!(checks("OPEN", None, serde_json::Value::Null), (false, vec![]), "a repo that requires no review");
         assert!(q.contains("reviewRequests(first: 20)") && q.contains("latestOpinionatedReviews(first: 20)"), "the reviewers too: {q}");
 
+        // M.approved(pr): the owners status, else GitHub's review decision.
+        let approved = |state: &str, decision: Option<&str>, owners: Option<&str>| -> bool {
+            let status = owners.map(|o| serde_json::json!({ "owners": { "state": o } }));
+            let pr = serde_json::json!({ "state": state, "reviewDecision": decision, "commits": { "nodes": [{ "commit": { "status": status } }] } });
+            // As kitchen.json.decode hands it over: GitHub's nulls are nil.
+            let pr = lua.to_value_with(&pr, mlua::serde::SerializeOptions::new().serialize_none_to_null(false).serialize_unit_to_null(false)).unwrap();
+            m.get::<mlua::Function>("approved").unwrap().call(pr).unwrap()
+        };
+        assert!(approved("OPEN", Some("REVIEW_REQUIRED"), Some("SUCCESS")), "the owners status wins");
+        assert!(!approved("OPEN", Some("APPROVED"), Some("PENDING")));
+        assert!(approved("OPEN", Some("APPROVED"), None), "no owners status: GitHub's decision");
+        assert!(!approved("OPEN", Some("CHANGES_REQUESTED"), None));
+        assert!(!approved("OPEN", None, None), "a repo that requires no review");
+        assert!(!approved("MERGED", Some("APPROVED"), Some("SUCCESS")), "a merged PR waits on nothing");
+        let c = |state: &str, label: &str, note: &str| (state.to_string(), label.to_string(), note.to_string());
+
         // M.reviewers: whom the PR waits on and heard from, a team with its
-        // members (not the author), and the approval check's label names them.
+        // members (not the author).
         let pr_with = |decision: &str, extra: serde_json::Value| {
             let mut pr = serde_json::json!({ "state": "OPEN", "reviewDecision": decision, "author": { "login": "me" } });
             pr.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
@@ -1194,11 +1164,6 @@ mod tests {
             let name = |r: &serde_json::Value| if r["team"] == true { format!("+{}", s(&r["name"])) } else { s(&r["name"]) };
             list.iter().map(|r| (s(&r["state"]), name(r), s(&r["status"]), r["members"].as_array().map(|a| a.iter().map(s).collect()).unwrap_or_default())).collect()
         };
-        let approval = |pr: mlua::Value| -> (String, String) {
-            let (_, list): (bool, mlua::Value) = m.get::<mlua::Function>("checks").unwrap().call(pr).unwrap();
-            let list: serde_json::Value = lua.from_value(list).unwrap();
-            (list[0]["label"].as_str().unwrap().into(), list[0]["note"].as_str().unwrap().into())
-        };
         let r = |state: &str, name: &str, status: &str, members: &[&str]| (state.to_string(), name.to_string(), status.to_string(), members.iter().map(|m| m.to_string()).collect::<Vec<_>>());
         let team = serde_json::json!({ "slug": "pplx_aster", "members": {
             "nodes": [{ "login": "me", "name": "Me" }, { "login": "paul", "name": "Paul F" }, { "login": "max", "name": null }] } });
@@ -1209,7 +1174,7 @@ mod tests {
             { "asCodeOwner": false, "requestedReviewer": { "slug": "solo", "members": { "nodes": [{ "login": "me" }] } } },
         ] } });
         assert_eq!(
-            reviewers(pr_with("REVIEW_REQUIRED", requested.clone())),
+            reviewers(pr_with("REVIEW_REQUIRED", requested)),
             vec![
                 r("waiting", "+pplx_aster", "requested · code owner", &["Paul F", "@max"]),
                 r("waiting", "@dan", "requested", &[]),
@@ -1217,17 +1182,10 @@ mod tests {
             ],
             "a bot (no login, no slug) is left out"
         );
-        assert_eq!(
-            approval(pr_with("REVIEW_REQUIRED", requested)),
-            ("awaiting approval · pplx_aster, @dan +1".into(), "GitHub review: review required".into())
-        );
         let reviewed = serde_json::json!({ "latestOpinionatedReviews": { "nodes": [
             { "state": "APPROVED", "author": { "login": "paul" } }, { "state": "CHANGES_REQUESTED", "author": { "login": "max" } }, { "state": "COMMENTED", "author": { "login": "x" } },
         ] } });
-        assert_eq!(reviewers(pr_with("CHANGES_REQUESTED", reviewed.clone())), vec![r("done", "@paul", "approved", &[]), r("needed", "@max", "changes requested", &[])]);
-        assert_eq!(approval(pr_with("CHANGES_REQUESTED", reviewed.clone())).0, "changes requested · @max");
-        assert_eq!(approval(pr_with("APPROVED", reviewed)).0, "approved · @paul");
-        assert_eq!(approval(pr_with("APPROVED", serde_json::json!({}))), ("approved".into(), "GitHub review: approved".into()), "no reviewers: as before");
+        assert_eq!(reviewers(pr_with("CHANGES_REQUESTED", reviewed)), vec![r("done", "@paul", "approved", &[]), r("needed", "@max", "changes requested", &[])]);
 
         // M.gates: the required checks keeping the PR from merging, failed
         // first, or one row once they all passed.

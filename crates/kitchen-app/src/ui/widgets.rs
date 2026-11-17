@@ -4,7 +4,7 @@
 use egui::text::LayoutJob;
 use egui::{Color32, CornerRadius, Response, RichText, Sense, TextFormat, Ui};
 
-use crate::engine::{Check, CheckState, PrState};
+use crate::engine::{CheckState, PrState};
 use crate::theme;
 
 /// Height of the header row atop the viewer and the plan.
@@ -110,20 +110,6 @@ pub fn check_icon(painter: &egui::Painter, rect: egui::Rect, state: CheckState) 
             painter.circle_filled(at(8.0, 11.5), 1.0 * unit, color);
         }
     }
-}
-
-/// A PR check in a header: its icon and label in its state's color, its
-/// note on hover.
-pub fn check_chip(ui: &mut Ui, check: &Check) -> Response {
-    let color = check_color(check.state);
-    let galley = ui.painter().layout_no_wrap(check.label.clone(), theme::ui_font(theme::TEXT_SMALL), color);
-    let (icon, gap, pad) = (12.0, 5.0, egui::vec2(6.0, 4.0));
-    let size = egui::vec2(icon + gap + galley.size().x, galley.size().y.max(icon)) + 2.0 * pad;
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-    let square = egui::Rect::from_center_size(egui::pos2(rect.min.x + pad.x + icon / 2.0, rect.center().y), egui::vec2(icon, icon));
-    check_icon(ui.painter(), square, check.state);
-    ui.painter().galley(egui::pos2(square.max.x + gap, rect.center().y - galley.size().y / 2.0), galley, color);
-    if check.note.is_empty() { resp } else { resp.on_hover_text(&check.note) }
 }
 
 /// A small tinted badge: `color` text on a faint wash of it.

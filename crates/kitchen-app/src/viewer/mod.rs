@@ -229,8 +229,8 @@ pub struct Viewer {
     answerer: crate::ask_thread::Answerer,
     /// When ⌘⇧S last asked the plugins for the PR menu (until it changes).
     asked: Option<std::time::Instant>,
-    /// When the PR menu was last asked for, by ⌘⇧S or to keep the header's
-    /// checks fresh, and what the viewer showed then.
+    /// When the PR menu was last asked for, by ⌘⇧S or to keep the file
+    /// list's reviewers and checks fresh, and what the viewer showed then.
     menu_asked: Option<(std::time::Instant, Shown)>,
     /// Since when the code area has been waiting for files.
     loading_since: Option<std::time::Instant>,
@@ -1210,10 +1210,6 @@ impl Viewer {
                 if widgets::flat_button(ui, &label, false).on_hover_text(keybindings::with_key_spaced("Switch PR", Place::Global, Action::ViewMenu)).clicked_by(egui::PointerButton::Primary) {
                     self.open_view_menu();
                 }
-            }
-            // What it waits on (code owners, an Atlantis apply), left to right.
-            for check in self.shown_checks().iter().rev() {
-                widgets::check_chip(ui, check);
             }
         });
         ui.painter().hline(header.x_range(), header.bottom() - 0.5, egui::Stroke::new(1.0, theme::BORDER));
