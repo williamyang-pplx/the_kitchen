@@ -8,7 +8,7 @@ use kitchen_core::ask;
 
 use super::code_view::{Block, Editor};
 use super::{Msg, Viewer};
-use crate::ask_thread::Thread;
+use crate::ask_thread::{self, Thread};
 use crate::plugins::decor::Side;
 
 pub(super) struct Ask {
@@ -39,7 +39,7 @@ impl Viewer {
         let (first, last) = (self.row_line(start, false).1.unwrap_or(start + 1), self.row_line(end, true).1.unwrap_or(end + 1));
         let what = if end > start || last > first { format!("lines {first}–{last}") } else { format!("line {last}") };
         let who = self.engine.find_tab(&self.tab_id).map_or_else(|| self.engine.settings().ask_model, |_| "the agent".into());
-        let label = crate::ask_thread::ask_label(&format!("Ask {who} about {what}"));
+        let label = ask_thread::ask_label(&format!("Ask {who} about {what}"));
         self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true, follow_up: false });
     }
 
@@ -52,14 +52,9 @@ impl Viewer {
             return;
         };
         if let Some(id) = self.follow_up.take() {
-            let (tx, ctx, answer) = (self.tx.clone(), self.engine.ctx.clone(), self.answerer);
-            let Some(a) = self.asks.iter_mut().find(|a| a.thread.id == id) else { return };
-            let sent = a.thread.follow_up(&text, answer, move |ans| {
-                let _ = tx.send(Msg::Answer(ans));
-                ctx.request_repaint();
-            });
+            let sent = ask_thread::follow_up(self.asks.iter_mut().map(|a| &mut a.thread), id, &text, self.answerer, self.tx.clone(), Msg::Answer, self.engine.ctx.clone());
             if let Err(why) = sent {
-                self.status = Some((why.into(), true));
+                self.status = Some((why, true));
                 self.follow_up = Some(id);
                 self.editor = Some(ed);
             }
@@ -86,22 +81,9 @@ impl Viewer {
             let source = source.unwrap_or_default();
             let q = ask::Question { root: &root, path: &path, first, last: line, base: side == Side::Old, quote: &quote, source: &source, text: &text };
             let result = answer(&asker, &ask::Prompt::File(q)).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Msg::Answer(crate::ask_thread::Answer { id, asker, result }));
+            let _ = tx.send(Msg::Answer(ask_thread::Answer { id, asker, result }));
             ctx.request_repaint();
         });
-    }
-
-    pub(super) fn finish_ask(&mut self, ans: crate::ask_thread::Answer) {
-        match self.asks.iter_mut().find(|a| a.thread.id == ans.id) {
-            Some(a) => {
-                if ans.result.is_ok() {
-                    self.offered = Some(ans.id);
-                }
-                a.thread.finish(ans.asker, ans.result);
-            }
-            // Closed while it was being answered.
-            None => crate::ask_thread::discard(ans),
-        }
     }
 
     /// The follow-up field of thread `id`, under its cards.
@@ -123,7 +105,7 @@ impl Viewer {
         if focused && self.editor.is_none() && self.vim.anchor.is_none() && self.asks_on_cursor().contains(&id) {
             self.open_follow_up(id);
         } else {
-            self.status = Some((crate::ask_thread::answered_note(), false));
+            self.status = Some((ask_thread::answered_note(), false));
         }
     }
 
@@ -153,8 +135,6 @@ impl Viewer {
     /// Esc: close the threads about the cursor line.
     pub(super) fn close_asks(&mut self) {
         let shut = self.asks_on_cursor();
-        let (closed, kept) = std::mem::take(&mut self.asks).into_iter().partition(|a| shut.contains(&a.thread.id));
-        self.asks = kept;
-        crate::ask_thread::close(closed.into_iter().map(|a: Ask| a.thread));
+        ask_thread::close(&mut self.asks, &shut, |a| &mut a.thread);
     }
 }

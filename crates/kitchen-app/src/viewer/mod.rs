@@ -526,7 +526,7 @@ impl Viewer {
                 }
                 Msg::Grep { token, locs, capped } => self.finish_grep(token, locs, capped),
                 Msg::Nav { token, answer } => self.finish_nav(token, answer),
-                Msg::Answer(ans) => self.finish_ask(ans),
+                Msg::Answer(ans) => crate::ask_thread::finish(self.asks.iter_mut().map(|a| &mut a.thread), &mut self.offered, ans),
                 Msg::Summaries { path, map, error } => {
                     self.summary_pending.remove(&path);
                     if let Some(e) = error {
@@ -576,6 +576,7 @@ impl Viewer {
     }
 
     fn open(&mut self, path: &str, line: Option<usize>, record: bool) {
+        self.outline = false;
         if record {
             if let Some(here) = self.here() {
                 if self.back.last() != Some(&here) {
@@ -605,7 +606,6 @@ impl Viewer {
             // An explicit line beats a first change still waiting for the base.
             self.hunk_goto = None;
         }
-        self.outline = self.outline && line.is_none();
         self.ensure_loaded(path);
         if self.diff {
             self.ensure_base(path);
@@ -663,13 +663,12 @@ impl Viewer {
             let select = if e.label == "../" { Some(self.dir.clone()) } else { None };
             self.browse(&e.path, select);
         } else {
-            self.outline = false;
             self.open(&e.path, None, true);
         }
     }
 
     fn goto_loc(&mut self, loc: Loc) {
-        // A line, so a changed file doesn't go to its first change (and the outline closes).
+        // A line, so a changed file doesn't go to its first change.
         self.open(&loc.path, Some(loc.line), false);
         self.pending_goto = Some((loc.line, loc.col));
     }
@@ -724,7 +723,6 @@ impl Viewer {
 
     fn open_changed(&mut self, i: usize, record: bool) {
         let Some(path) = self.changed.get(i).map(|c| c.path.clone()) else { return };
-        self.outline = false;
         self.open(&path, None, record);
         self.list_scroll = true;
     }
@@ -764,8 +762,8 @@ impl Viewer {
                 | VimAction::OpenAllFolds
                 | VimAction::CloseAllFolds
                     if self.browsing => {}
-                VimAction::JumpToDef(name) => self.jump_to_def(name),
-                VimAction::References(name) => self.find_references(name),
+                VimAction::JumpToDef(name) => self.nav(nav::NavKind::Definition, name),
+                VimAction::References(name) => self.nav(nav::NavKind::References, name),
                 VimAction::JumpBack => self.jump_back(),
                 VimAction::JumpForward => self.jump_forward(),
                 VimAction::Enter if self.open_fold_at(self.vim.line) => {}
@@ -1063,7 +1061,7 @@ impl Viewer {
 
     // ------------------------------------------------------------ panel API
 
-    pub fn command(&mut self, cmd: PanelCmd, _engine: &Arc<Engine>) {
+    pub fn command(&mut self, cmd: PanelCmd) {
         match cmd {
             PanelCmd::Comment => self.start_comment(),
             PanelCmd::Ask => self.start_ask(),
@@ -1153,7 +1151,6 @@ impl Viewer {
                     }
                     Some(p) => {
                         let p = p.strip_prefix(&format!("{}/", self.worktree)).map(String::from).unwrap_or(p);
-                        self.outline = false;
                         self.open(&p, line, true);
                     }
                     None => self.open_file_picker(),
@@ -1284,7 +1281,6 @@ impl Viewer {
             Some(PickerResult::Chosen(i)) => match self.picker.take() {
                 Some((PickerKind::Files, picker)) => {
                     let path = picker.items[i].0.clone();
-                    self.outline = false;
                     self.open(&path, None, true);
                 }
                 Some((PickerKind::Defs(locs), _)) => self.record_and_go(locs[i].clone()),
@@ -1449,7 +1445,6 @@ impl Viewer {
                 return;
             }
             let p = c.path.clone();
-            self.outline = false;
             self.open(&p, None, true);
             return;
         }
@@ -1467,7 +1462,6 @@ impl Viewer {
             self.list_cursor = pr + pos;
             self.list_scroll = true;
         } else {
-            self.outline = false;
             self.open(&e.path, None, true);
         }
     }
@@ -1600,22 +1594,17 @@ impl Viewer {
                 });
             });
             ui.add_space(2.0);
-            let f = |col, size| egui::TextFormat { font_id: theme::ui_font(size), color: col, ..Default::default() };
             for r in &rows {
                 let indent = r.depth as f32 * 12.0;
-                let mut job = egui::text::LayoutJob::default();
                 let Some(i) = r.file else {
-                    job.append(&r.label, indent, f(theme::SUBTLE, theme::TEXT_SMALL));
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(&r.label, indent, egui::TextFormat { font_id: theme::ui_font(theme::TEXT_SMALL), color: theme::SUBTLE, ..Default::default() });
                     list_row(ui, false, job);
                     continue;
                 };
                 let c = &self.changed[i];
                 let open = cur == Some(i);
-                job.append(&format!("{} ", c.status), indent, egui::TextFormat { font_id: egui::FontId::monospace(10.5), color: status_color(c.status), ..Default::default() });
-                job.append(&r.label, 0.0, f(if open { theme::TEXT } else { theme::MUTED }, theme::TEXT_BODY));
-                job.append(&format!("+{}", c.added), 8.0, f(theme::GREEN.gamma_multiply(0.75), theme::TEXT_SMALL));
-                job.append(&format!("−{}", c.removed), 4.0, f(theme::RED.gamma_multiply(0.75), theme::TEXT_SMALL));
-                let resp = row(ui, open && self.list_focus, open, job).on_hover_text(&c.path);
+                let resp = row(ui, open && self.list_focus, open, changed_row(c, &r.label, indent, open)).on_hover_text(&c.path);
                 if scroll && open {
                     resp.scroll_to_me(None);
                 }
@@ -1668,13 +1657,7 @@ impl Viewer {
             for (i, c) in self.changed.iter().enumerate() {
                 let open = self.current.as_deref() == Some(c.path.as_str()) && !self.browsing;
                 let name = c.path.rsplit('/').next().unwrap_or(&c.path);
-                let mut job = egui::text::LayoutJob::default();
-                let f = |col, size| egui::TextFormat { font_id: theme::ui_font(size), color: col, ..Default::default() };
-                job.append(&format!("{} ", c.status), 0.0, egui::TextFormat { font_id: egui::FontId::monospace(10.5), color: status_color(c.status), ..Default::default() });
-                job.append(name, 0.0, f(if open { theme::TEXT } else { theme::MUTED }, theme::TEXT_BODY));
-                job.append(&format!("+{}", c.added), 8.0, f(theme::GREEN.gamma_multiply(0.75), theme::TEXT_SMALL));
-                job.append(&format!("−{}", c.removed), 4.0, f(theme::RED.gamma_multiply(0.75), theme::TEXT_SMALL));
-                let r = row(ui, cursor == Some(i), open, job).on_hover_text(&c.path);
+                let r = row(ui, cursor == Some(i), open, changed_row(c, name, 0.0, open)).on_hover_text(&c.path);
                 if scroll && cursor == Some(i) {
                     r.scroll_to_me(None);
                 }
@@ -1734,7 +1717,6 @@ impl Viewer {
     }
 }
 
-/// Git status letter colors: added and deleted stand out, modified stays quiet.
 /// "CHANGED FILES  n" and the lines the changes add and remove in all.
 fn changed_header(ui: &mut Ui, changed: &[ChangedFile]) -> egui::Response {
     let mut job = widgets::section_label(&format!("Changed files  {}", changed.len()), theme::SUBTLE);
@@ -1750,6 +1732,19 @@ fn diff_totals(changed: &[ChangedFile]) -> (u64, u64) {
     changed.iter().fold((0, 0), |(a, r), c| (a + u64::from(c.added), r + u64::from(c.removed)))
 }
 
+/// A changed file's row, `indent` in: its status letter, `name` (bright
+/// when `open`) and the lines it adds and removes.
+fn changed_row(c: &ChangedFile, name: &str, indent: f32, open: bool) -> egui::text::LayoutJob {
+    let f = |col, size| egui::TextFormat { font_id: theme::ui_font(size), color: col, ..Default::default() };
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&format!("{} ", c.status), indent, egui::TextFormat { font_id: egui::FontId::monospace(10.5), color: status_color(c.status), ..Default::default() });
+    job.append(name, 0.0, f(if open { theme::TEXT } else { theme::MUTED }, theme::TEXT_BODY));
+    job.append(&format!("+{}", c.added), 8.0, f(theme::GREEN.gamma_multiply(0.75), theme::TEXT_SMALL));
+    job.append(&format!("−{}", c.removed), 4.0, f(theme::RED.gamma_multiply(0.75), theme::TEXT_SMALL));
+    job
+}
+
+/// Git status letter colors: added and deleted stand out, modified stays quiet.
 fn status_color(status: char) -> egui::Color32 {
     match status {
         'A' => theme::GREEN,
@@ -1801,7 +1796,6 @@ fn parent_dir(path: &str) -> &str {
     path.trim_end_matches('/').rsplit_once('/').map(|(d, _)| d).unwrap_or("")
 }
 
-/// Rows of folder `dir`: `../`, subfolders, then files (both sorted).
 /// Tracked files of `worktree` while its index checksum is `index`, shared
 /// by every viewer on it.
 fn tracked_files(host: &Host, worktree: &str, index: &str) -> anyhow::Result<Arc<Vec<String>>> {
@@ -1843,6 +1837,7 @@ fn merge_all(tracked: &Arc<Vec<String>>, changed: &[ChangedFile]) -> Arc<Vec<Str
     Arc::new(all)
 }
 
+/// Rows of folder `dir`: `../`, subfolders, then files (both sorted).
 fn dir_entries(all: &[String], dir: &str) -> Vec<Entry> {
     let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
     let mut dirs: Vec<&str> = Vec::new();
@@ -2038,7 +2033,7 @@ mod tests {
         h.settle(&mut v, &|v| v.files_state.is_some());
         h.frame(&mut v);
         assert_eq!(v.dir, "aster", "no changes: default folder");
-        v.command(PanelCmd::FocusList, &h.engine);
+        v.command(PanelCmd::FocusList);
         h.frame(&mut v);
         // Rows: ../ a/ b/ top.py — the cursor starts on a/.
         assert_eq!(v.list_cursor, 1);
@@ -2054,7 +2049,7 @@ mod tests {
         h.text(&mut v, "j");
         h.text(&mut v, "l");
         assert_eq!(v.current.as_deref(), Some("aster/top.py"));
-        v.command(PanelCmd::FocusCode, &h.engine);
+        v.command(PanelCmd::FocusCode);
         assert!(!v.list_focus);
     }
 
@@ -2066,7 +2061,7 @@ mod tests {
             let mut v = h.viewer();
             h.settle(&mut v, &|v| v.files_state.is_some());
             h.frame(&mut v);
-            v.command(PanelCmd::FocusList, &h.engine);
+            v.command(PanelCmd::FocusList);
             h.frame(&mut v);
             // Rows: ../ a/ top.py — the cursor starts on a/.
             assert_eq!(v.list_cursor, 1);
@@ -2088,12 +2083,12 @@ mod tests {
         let h = Harness::new(TestRepo::new("mkdir -p aster && echo 1 > aster/x.py"));
         let mut v = h.viewer();
         h.settle(&mut v, &|v| v.files_state.is_some());
-        v.command(PanelCmd::FocusList, &h.engine);
+        v.command(PanelCmd::FocusList);
         h.frame(&mut v);
         assert_eq!(v.key_focus(), KeyFocus::FileList);
         let p = crate::keybindings::Binding::parse("cmd+shift+l", &[]).unwrap().0[0];
         assert_eq!(crate::keybindings::current().lookup(v.key_focus(), None, &p), Some(&Cmd::App(Action::FocusCode)));
-        v.command(PanelCmd::FocusCode, &h.engine);
+        v.command(PanelCmd::FocusCode);
         assert_eq!(v.key_focus(), KeyFocus::Viewer);
     }
 
@@ -2149,12 +2144,12 @@ mod tests {
         assert_eq!(v.current.as_deref(), Some("src/deep/er/b.rs"), "opens on the first changed file");
         assert!(v.doc.hunk_starts().contains(&v.vim.line), "cursor on its first change");
         // ⌘⇧J: next changed file, cursor on its first change (line 2 of a.rs).
-        v.command(PanelCmd::NextFile, &h.engine);
+        v.command(PanelCmd::NextFile);
         settle(&mut v);
         assert_eq!(v.current.as_deref(), Some("src/a.rs"));
         assert_eq!(v.current_source_line(), Some(2));
         // The deleted file shows as removed lines.
-        v.command(PanelCmd::NextFile, &h.engine);
+        v.command(PanelCmd::NextFile);
         settle(&mut v);
         assert_eq!(v.current.as_deref(), Some("old.txt"));
         assert_eq!(v.doc.changed_count(), (0, 1));
@@ -2165,7 +2160,7 @@ mod tests {
         assert_eq!(v.current.as_deref(), Some("src/a.rs"));
         assert_eq!(v.current_source_line(), Some(7));
         // The tree list: j/k open files straight away; `a` toggles the folder list.
-        v.command(PanelCmd::FocusList, &h.engine);
+        v.command(PanelCmd::FocusList);
         h.text(&mut v, "k");
         assert_eq!(v.current.as_deref(), Some("src/deep/er/b.rs"));
         h.text(&mut v, "G");
@@ -2175,9 +2170,9 @@ mod tests {
         h.text(&mut v, "a");
         assert!(v.tree_mode());
         // ⌘B hides and shows the list.
-        v.command(PanelCmd::ToggleFiles, &h.engine);
+        v.command(PanelCmd::ToggleFiles);
         assert!(!v.show_files && !v.list_focus);
-        v.command(PanelCmd::ToggleFiles, &h.engine);
+        v.command(PanelCmd::ToggleFiles);
         assert!(v.show_files);
     }
 
@@ -2224,7 +2219,7 @@ mod tests {
         let h = Harness::new(TestRepo::new("seq 1 60 > a.rs"));
         h.repo.sh("seq 1 60 | sed -e 's/^10$/ten/' > a.rs && git commit -qam change");
         let mut v = h.viewer();
-        v.command(PanelCmd::Open { path: Some("a.rs".into()), line: Some(6), diff: Some(true) }, &h.engine);
+        v.command(PanelCmd::Open { path: Some("a.rs".into()), line: Some(6), diff: Some(true) });
         h.settle(&mut v, &|v| v.bases.contains_key("a.rs") && v.pending_goto.is_none() && v.doc.lines.iter().any(|l| l.new_no == Some(6)));
         h.frame(&mut v);
         assert_eq!(v.current_source_line(), Some(6));
@@ -2268,9 +2263,9 @@ mod tests {
         h.text(&mut v, "zR");
         h.frame(&mut v);
         assert!(folds(&v).is_empty());
-        v.command(PanelCmd::ToggleDiff, &h.engine);
+        v.command(PanelCmd::ToggleDiff);
         h.frame(&mut v);
-        v.command(PanelCmd::ToggleDiff, &h.engine);
+        v.command(PanelCmd::ToggleDiff);
         settle(&mut v);
         assert!(v.diff && folds(&v).is_empty());
     }
@@ -2301,24 +2296,24 @@ end)"#,
         engine.set_plugins(crate::plugins::PluginHost::start(engine, vec![plugins.clone(), plugins.join("md")]));
         let mut v = h.viewer();
         h.settle(&mut v, &|v| v.current.as_deref() == Some("README.md") && v.bases.contains_key("README.md") && engine.plugins().unwrap().list().len() == 2);
-        v.command(PanelCmd::Render(None), engine);
+        v.command(PanelCmd::Render(None));
         h.settle(&mut v, &|v| v.render_shown.is_some());
         let rows: Vec<(LineKind, Option<usize>, &str, bool)> = v.doc.lines.iter().map(|l| (l.kind, l.new_no, l.text.as_str(), l.render.is_some())).collect();
         assert_eq!(rows, vec![(LineKind::Added, Some(1), "# T  line *one* line two", true), (LineKind::Removed, None, "old para", false)], "the document is one row");
         // ⌘M on it comments on all of its lines.
         v.place_cursor(4, 0);
         assert_eq!(v.vim.line, 0, "line 4 is in the document's row");
-        v.command(PanelCmd::Comment, engine);
+        v.command(PanelCmd::Comment);
         assert!(v.editor.as_ref().unwrap().label.starts_with("Comment on lines 1–4"));
         h.frame(&mut v);
         h.text(&mut v, "nice");
-        v.command(PanelCmd::Submit, engine);
+        v.command(PanelCmd::Submit);
         h.frame(&mut v);
         h.settle(&mut v, &|v| !v.comment_blocks().is_empty());
         let (block, _) = v.comment_blocks().remove(0);
         assert_eq!((block.after, block.body.as_str()), (Some(0), "nice|new:4|1|# T\n\nline *one*\nline two"), "the source lines are quoted");
         // Back to text: the comment stays on its line.
-        v.command(PanelCmd::Render(None), engine);
+        v.command(PanelCmd::Render(None));
         h.settle(&mut v, &|v| v.render_shown.is_none() && v.doc.lines.iter().all(|l| l.render.is_none()));
         let row = v.comment_blocks()[0].0.after.unwrap();
         assert_eq!(v.doc.lines[row].new_no, Some(4));
@@ -2348,11 +2343,11 @@ end)"#,
         h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none() && !engine.plugins().unwrap().listeners("comment").is_empty());
         // The first change starts with the removed `b`: a base-side line.
         assert_eq!(v.doc.lines[v.vim.line].text, "b");
-        v.command(PanelCmd::Comment, engine);
+        v.command(PanelCmd::Comment);
         assert!(v.editor.is_some());
         h.frame(&mut v);
         h.text(&mut v, "why?");
-        v.command(PanelCmd::Submit, engine);
+        v.command(PanelCmd::Submit);
         h.frame(&mut v);
         assert!(v.editor.is_none(), "submitted");
         h.settle(&mut v, &|v| !v.comment_blocks().is_empty());
@@ -2361,11 +2356,11 @@ end)"#,
         assert_eq!(block.body, "why?|old:2|nil|-");
         assert_eq!((block.repo.as_deref(), block.replies[0].body.as_str()), (Some("o/r"), "+1"), "a thread's card");
         // ⌘M on the commented row replies to it.
-        v.command(PanelCmd::Comment, engine);
+        v.command(PanelCmd::Comment);
         assert!(v.editor.as_ref().unwrap().label.starts_with("Reply to @me"));
         h.frame(&mut v);
         h.text(&mut v, "ok");
-        v.command(PanelCmd::Submit, engine);
+        v.command(PanelCmd::Submit);
         h.frame(&mut v);
         h.settle(&mut v, &|v| v.comment_blocks().first().is_some_and(|(b, _)| b.body.ends_with("|c1")));
         let _ = std::fs::remove_dir_all(&plugins);
@@ -2375,7 +2370,6 @@ end)"#,
     fn questions_are_answered_under_their_line() {
         let h = Harness::new(TestRepo::new("printf 'a\\nb\\nc\\n' > a.py"));
         h.repo.sh("printf 'a\\nB\\nc\\n' > a.py && git commit -qam change");
-        let engine = &h.engine;
         let mut v = h.viewer();
         v.answerer = |a, p| match p {
             kitchen_core::ask::Prompt::File(q) => Ok(format!("{}|{}|{}:{}-{}|{}|{}|{}", a.model, a.session.is_some(), q.path, q.first, q.last, q.base, q.quote, q.text)),
@@ -2387,7 +2381,7 @@ end)"#,
         assert_eq!(v.doc.lines[v.vim.line].text, "b");
         h.text(&mut v, "V");
         h.text(&mut v, "j");
-        v.command(PanelCmd::Ask, engine);
+        v.command(PanelCmd::Ask);
         assert!(v.editor.as_ref().is_some_and(|e| e.ask && e.label.starts_with("Ask the agent about lines")), "{:?}", v.editor.as_ref().map(|e| &e.label));
         h.frame(&mut v);
         h.text(&mut v, "why?");
@@ -2417,7 +2411,7 @@ end)"#,
         h.settle(&mut v, &follow_up);
         h.key(&mut v, egui::Key::Escape);
         assert!(v.editor.is_none() && v.ask_blocks().len() == 2, "Esc in the field keeps the thread");
-        v.command(PanelCmd::Ask, engine);
+        v.command(PanelCmd::Ask);
         assert!(follow_up(&v));
         h.key(&mut v, egui::Key::Escape);
         // An answer that lands while the cursor is elsewhere opens nothing.
@@ -2429,7 +2423,7 @@ end)"#,
         h.key(&mut v, egui::Key::Escape);
         assert_eq!(v.ask_blocks().len(), 2);
         // Elsewhere ⌘⇧A asks a new question.
-        v.command(PanelCmd::Ask, engine);
+        v.command(PanelCmd::Ask);
         assert!(v.editor.as_ref().is_some_and(|e| e.label.starts_with("Ask the agent")));
         h.key(&mut v, egui::Key::Escape);
         v.cursor_to_row(row);
@@ -2454,7 +2448,7 @@ end)"#,
             out.textures_delta.clear();
         };
         frame(&mut v, vec![]);
-        v.command(PanelCmd::FilePicker, &engine);
+        v.command(PanelCmd::FilePicker);
         for _ in 0..3 {
             frame(&mut v, vec![]);
         }

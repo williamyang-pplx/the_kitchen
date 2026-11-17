@@ -156,16 +156,7 @@ impl PlanView {
                     }
                     Err(e) => self.status = Some((e, true)),
                 },
-                Msg::Answer(ans) => match self.asks.iter_mut().find(|a| a.thread.id == ans.id) {
-                    Some(a) => {
-                        if ans.result.is_ok() {
-                            self.offered = Some(ans.id);
-                        }
-                        a.thread.finish(ans.asker, ans.result);
-                    }
-                    // Closed while it was being answered.
-                    None => ask_thread::discard(ans),
-                },
+                Msg::Answer(ans) => ask_thread::finish(self.asks.iter_mut().map(|a| &mut a.thread), &mut self.offered, ans),
             }
         }
     }
@@ -224,7 +215,7 @@ impl PlanView {
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
         let what = if end > start { format!("lines {}–{}", start + 1, end + 1) } else { format!("line {}", start + 1) };
         let who = self.engine.find_tab(&self.tab_id).map_or_else(|| self.engine.settings().ask_model, |_| "the planning agent".into());
-        let label = crate::ask_thread::ask_label(&format!("Ask {who} about {what}"));
+        let label = ask_thread::ask_label(&format!("Ask {who} about {what}"));
         self.editor = Some(Editor { start, end, text: String::new(), label, needs_focus: true, ask: true, follow_up: false });
     }
 
@@ -238,14 +229,9 @@ impl PlanView {
             return;
         }
         if let Some(id) = self.follow_up.take() {
-            let (tx, ctx, answer) = (self.tx.clone(), self.engine.ctx.clone(), self.answerer);
-            let Some(a) = self.asks.iter_mut().find(|a| a.thread.id == id) else { return };
-            let sent = a.thread.follow_up(&text, answer, move |ans| {
-                let _ = tx.send(Msg::Answer(ans));
-                ctx.request_repaint();
-            });
+            let sent = ask_thread::follow_up(self.asks.iter_mut().map(|a| &mut a.thread), id, &text, self.answerer, self.tx.clone(), Msg::Answer, self.engine.ctx.clone());
             if let Err(why) = sent {
-                self.status = Some((why.into(), true));
+                self.status = Some((why, true));
                 self.follow_up = Some(id);
                 self.editor = Some(ed);
             }
@@ -296,7 +282,7 @@ impl PlanView {
         if focused && self.editor.is_none() && self.vim.anchor.is_none() && self.asks_on_cursor().contains(&id) {
             self.open_follow_up(id);
         } else {
-            self.status = Some((crate::ask_thread::answered_note(), false));
+            self.status = Some((ask_thread::answered_note(), false));
         }
     }
 
@@ -328,7 +314,7 @@ impl PlanView {
         self.reload_comments();
     }
 
-    pub fn command(&mut self, cmd: PanelCmd, _engine: &Arc<Engine>) {
+    pub fn command(&mut self, cmd: PanelCmd) {
         match cmd {
             PanelCmd::Comment => {
                 if self.doc.lines.is_empty() {
@@ -472,9 +458,7 @@ impl PlanView {
             if out.actions.iter().any(|a| matches!(a, VimAction::Escape)) {
                 // Esc: close the threads under the cursor line.
                 let shut = self.asks_on_cursor();
-                let (closed, kept): (Vec<PlanAsk>, _) = std::mem::take(&mut self.asks).into_iter().partition(|a| shut.contains(&a.thread.id));
-                self.asks = kept;
-                ask_thread::close(closed.into_iter().map(|a| a.thread));
+                ask_thread::close(&mut self.asks, &shut, |a| &mut a.thread);
                 self.status = None;
             }
         }
@@ -556,7 +540,7 @@ mod tests {
         // The agent writes the next plan into the same file.
         let later = std::time::SystemTime::now() + Duration::from_secs(5);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
-        p.command(PanelCmd::Reload, &engine);
+        p.command(PanelCmd::Reload);
         settle(&ctx, &engine, &mut p, &|p| p.comments.len() == 1);
         assert_eq!(ids(&p), [open], "the resolved one is the old plan's");
         assert_eq!(engine.current_plan_comments("t").unwrap().iter().map(|c| c.id).collect::<Vec<_>>(), [open]);
@@ -576,7 +560,7 @@ mod tests {
         settle(&ctx, &engine, &mut p, &|p| p.doc.lines.len() == 3);
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("jV".into())]);
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("j".into())]);
-        p.command(PanelCmd::Ask, &engine);
+        p.command(PanelCmd::Ask);
         assert!(p.editor.as_ref().is_some_and(|e| e.ask && e.label.starts_with("Ask the planning agent about lines 2–3")), "{:?}", p.editor.as_ref().map(|e| &e.label));
         frame(&ctx, &engine, &mut p, Vec::new());
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("why LRU?".into())]);
@@ -593,7 +577,7 @@ mod tests {
         frame(&ctx, &engine, &mut p, key(egui::Key::Escape));
         assert!(p.editor.is_none() && ask(&p).is_some());
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("k".into())]);
-        p.command(PanelCmd::Ask, &engine);
+        p.command(PanelCmd::Ask);
         assert!(follow_up(&p), "{:?}", p.editor.as_ref().map(|e| &e.label));
         frame(&ctx, &engine, &mut p, Vec::new());
         frame(&ctx, &engine, &mut p, vec![egui::Event::Text("how big?".into())]);

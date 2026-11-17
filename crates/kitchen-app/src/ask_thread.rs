@@ -4,6 +4,7 @@
 //! cursor is still on the thread's lines); ⌘⇧A on them opens it again. Esc
 //! on them closes the thread and deletes its session (see `kitchen_core::ask`).
 
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use kitchen_core::ask::{self, Asker, Prompt};
@@ -40,13 +41,8 @@ impl Thread {
         Thread { id, asker: None, turns: vec![Turn { question: question.to_string(), asked: Instant::now(), answer: None }] }
     }
 
-    pub fn pending(&self) -> bool {
+    fn pending(&self) -> bool {
         self.turns.last().is_some_and(|t| t.answer.is_none())
-    }
-
-    /// The first question.
-    pub fn question(&self) -> &str {
-        &self.turns[0].question
     }
 
     /// Why a follow-up can't be asked now, if it can't.
@@ -63,31 +59,8 @@ impl Thread {
 
     /// The follow-up field, under the thread's cards at doc row `row`.
     pub fn editor(&self, row: usize) -> Editor {
-        let label = ask_label(&format!("Follow up on “{}”", self.question()));
+        let label = ask_label(&format!("Follow up on “{}”", self.turns[0].question));
         Editor { start: row, end: row, text: String::new(), label, needs_focus: true, ask: true, follow_up: true }
-    }
-
-    /// Ask `text` in the thread on a worker; `send` gets the answer.
-    /// `Err`: why it can't be asked now.
-    pub fn follow_up(&mut self, text: &str, answer: Answerer, send: impl FnOnce(Answer) + Send + 'static) -> Result<(), String> {
-        if let Some(why) = self.blocked() {
-            return Err(why);
-        }
-        let Some(asker) = self.asker.clone() else { return Err(failed()) };
-        self.turns.push(Turn { question: text.to_string(), asked: Instant::now(), answer: None });
-        let (id, text) = (self.id, text.to_string());
-        std::thread::spawn(move || {
-            let result = answer(&asker, &Prompt::FollowUp(&text)).map_err(|e| format!("{e:#}"));
-            send(Answer { id, asker, result });
-        });
-        Ok(())
-    }
-
-    pub fn finish(&mut self, asker: Asker, result: Result<String, String>) {
-        self.asker.get_or_insert(asker);
-        if let Some(t) = self.turns.last_mut() {
-            t.answer = Some(result);
-        }
     }
 
     /// The cards under row `after`, oldest first. Asks for a repaint while
@@ -103,17 +76,48 @@ impl Thread {
     }
 }
 
-/// Delete the threads' sessions, on a worker.
-pub fn close(threads: impl IntoIterator<Item = Thread>) {
-    let askers: Vec<Asker> = threads.into_iter().filter_map(|t| t.asker).collect();
-    if !askers.is_empty() {
-        std::thread::spawn(move || askers.iter().for_each(ask::close));
+/// Put `ans` in its thread among `threads`, and offer a follow-up
+/// (`offered`) if it's an answer.
+pub fn finish<'a>(threads: impl IntoIterator<Item = &'a mut Thread>, offered: &mut Option<u64>, ans: Answer) {
+    let Some(t) = threads.into_iter().find(|t| t.id == ans.id) else {
+        // Closed while it was being answered.
+        std::thread::spawn(move || ask::close(&ans.asker));
+        return;
+    };
+    if ans.result.is_ok() {
+        *offered = Some(ans.id);
+    }
+    t.asker.get_or_insert(ans.asker);
+    if let Some(turn) = t.turns.last_mut() {
+        turn.answer = Some(ans.result);
     }
 }
 
-/// An answer for a thread that was closed while it was being answered.
-pub fn discard(answer: Answer) {
-    std::thread::spawn(move || ask::close(&answer.asker));
+/// Ask `text` in thread `id` of `threads` (if still open) on a worker; the
+/// answer comes back on `tx` as `msg`. `Err`: why it can't be asked now.
+pub fn follow_up<'a, M: Send + 'static>(threads: impl IntoIterator<Item = &'a mut Thread>, id: u64, text: &str, answer: Answerer, tx: Sender<M>, msg: fn(Answer) -> M, ctx: egui::Context) -> Result<(), String> {
+    let Some(t) = threads.into_iter().find(|t| t.id == id) else { return Ok(()) };
+    if let Some(why) = t.blocked() {
+        return Err(why);
+    }
+    let Some(asker) = t.asker.clone() else { return Err(failed()) };
+    t.turns.push(Turn { question: text.to_string(), asked: Instant::now(), answer: None });
+    let text = text.to_string();
+    std::thread::spawn(move || {
+        let result = answer(&asker, &Prompt::FollowUp(&text)).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(msg(Answer { id, asker, result }));
+        ctx.request_repaint();
+    });
+    Ok(())
+}
+
+/// Close the threads among `asks` (`thread` gets an ask's) whose ids are in
+/// `shut`, and delete their sessions on a worker.
+pub fn close<T>(asks: &mut Vec<T>, shut: &[u64], thread: impl Fn(&mut T) -> &mut Thread) {
+    let askers: Vec<Asker> = asks.extract_if(.., |a| shut.contains(&thread(a).id)).filter_map(|mut a| thread(&mut a).asker.take()).collect();
+    if !askers.is_empty() {
+        std::thread::spawn(move || askers.iter().for_each(ask::close));
+    }
 }
 
 /// "{what} — Enter asks · Esc cancels", with the live `[input]` keys.

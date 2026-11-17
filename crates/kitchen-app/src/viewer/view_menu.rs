@@ -93,16 +93,9 @@ impl Viewer {
     /// moved on its row), and stops saying "loading" once a plugin answered
     /// or `ASK_TIMEOUT` passed.
     pub(super) fn refresh_view_menu(&mut self, ctx: &egui::Context) {
-        if !matches!(self.picker, Some((PickerKind::Views { .. }, _))) {
-            return;
-        }
-        let latest = self.engine.views_of(&self.tab_id);
         let Some((PickerKind::Views { menu, .. }, _)) = &self.picker else { return };
-        let changed = match (menu, &latest) {
-            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-            (a, b) => a.is_some() != b.is_some(),
-        };
-        if changed {
+        let latest = self.engine.views_of(&self.tab_id);
+        if !super::opt_ptr_eq(menu, &latest) {
             self.asked = None;
             let rows = self.view_menu_rows(latest.as_ref());
             if let Some((PickerKind::Views { menu, views }, picker)) = &mut self.picker {
@@ -218,7 +211,7 @@ mod tests {
         let icon = |state, approved| Some(RowIcon { state, approved });
         set(&h, stack.clone());
         let mut v = h.viewer();
-        v.command(PanelCmd::ViewMenu, &h.engine);
+        v.command(PanelCmd::ViewMenu);
         h.frame(&mut v);
         // The worktree row stays: the live row diffs against origin/a, the viewer against origin/main.
         assert_eq!(rows(&v), vec!["#7 a", "#8 b", "● worktree"]);
@@ -247,9 +240,9 @@ mod tests {
         assert_eq!(picked.at.name.as_deref(), Some("kitchen-pr-7"));
         assert!(!v.menu_open());
         assert_eq!(v.context()["menu"], serde_json::Value::Null, "no menu, no row");
-        v.command(PanelCmd::ViewMenu, &h.engine);
+        v.command(PanelCmd::ViewMenu);
         assert!(v.menu_open());
-        v.command(PanelCmd::ViewMenu, &h.engine);
+        v.command(PanelCmd::ViewMenu);
         assert!(!v.menu_open(), "⌘⇧S again closes it");
     }
 
@@ -273,7 +266,7 @@ mod tests {
         let pr = |n: u32| serde_json::json!({ "section": "main ← a", "label": format!("#{n}"), "view": { "rev": format!("refs/kitchen/pr/{n}"), "name": format!("kitchen-pr-{n}") } });
         set(&h, serde_json::json!([pr(7), pr(8)]));
         let mut v = h.viewer();
-        v.command(PanelCmd::ViewMenu, &h.engine);
+        v.command(PanelCmd::ViewMenu);
         h.frame(&mut v);
         assert_eq!(cursor(&v), "● worktree");
         h.frame_with(&mut v, vec![key(egui::Key::K), egui::Event::Text("k".into())]);
@@ -282,8 +275,8 @@ mod tests {
         h.frame(&mut v);
         assert_eq!(cursor(&v), "#8", "the plugin's answer doesn't take the cursor back");
 
-        v.command(PanelCmd::ViewMenu, &h.engine);
-        v.command(PanelCmd::ViewMenu, &h.engine);
+        v.command(PanelCmd::ViewMenu);
+        v.command(PanelCmd::ViewMenu);
         h.frame(&mut v);
         set(&h, serde_json::json!([pr(7)]));
         h.frame(&mut v);
@@ -296,7 +289,7 @@ mod tests {
     fn picking_the_shown_row_says_so() {
         let h = Harness::new(TestRepo::new("echo 1 > a"));
         let mut v = h.viewer();
-        v.command(PanelCmd::ViewMenu, &h.engine);
+        v.command(PanelCmd::ViewMenu);
         h.frame(&mut v);
         assert!(h.frame_with(&mut v, vec![key(egui::Key::Enter)]).is_none(), "nothing to switch to");
         assert!(!v.menu_open());
