@@ -14,7 +14,6 @@ use super::input::{key_bytes, paste_bytes, sgr_mouse};
 use super::{GridSize, Listener, TermSession};
 use crate::keybindings::{ClickCmd, Place};
 use crate::links::{self, Link};
-use crate::plugins::LinkEntry;
 use crate::theme;
 
 const PAD: f32 = 6.0;
@@ -23,18 +22,11 @@ pub struct TerminalView<'a> {
     session: &'a mut TermSession,
     font_size: f32,
     has_focus: bool,
-    plugin_links: &'a [LinkEntry],
 }
 
 impl<'a> TerminalView<'a> {
     pub fn new(session: &'a mut TermSession) -> Self {
-        Self { session, font_size: 13.0, has_focus: false, plugin_links: &[] }
-    }
-
-    /// Plugin link rules to match on ⌘-hover (built-ins are always on).
-    pub fn links(mut self, rules: &'a [LinkEntry]) -> Self {
-        self.plugin_links = rules;
-        self
+        Self { session, font_size: 13.0, has_focus: false }
     }
 
     pub fn font_size(mut self, size: f32) -> Self {
@@ -50,7 +42,7 @@ impl<'a> TerminalView<'a> {
 
     /// The widget's response, and the link ⌘-clicked this frame.
     pub fn show(self, ui: &mut Ui) -> (Response, Option<Link>) {
-        let TerminalView { session, font_size, has_focus, plugin_links } = self;
+        let TerminalView { session, font_size, has_focus } = self;
         let rect = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let font = FontId::monospace(font_size);
@@ -84,7 +76,7 @@ impl<'a> TerminalView<'a> {
         let km = crate::keybindings::current();
         let mods = ui.input(|i| i.modifiers);
         let hovered = match resp.hover_pos() {
-            Some(pos) if km.held(Place::Terminal, ClickCmd::OpenLink, mods) => hovered_link(session, &geom, pos, plugin_links),
+            Some(pos) if km.held(Place::Terminal, ClickCmd::OpenLink, mods) => hovered_link(session, &geom, pos),
             _ => None,
         };
         if hovered.is_some() {
@@ -139,7 +131,7 @@ struct HoveredLink {
 
 /// The link under `pos`: the cell's OSC 8 hyperlink first, else
 /// `links::link_at` on the logical line (wrapped rows joined).
-fn hovered_link(session: &TermSession, geom: &Geom, pos: Pos2, plugin_links: &[LinkEntry]) -> Option<HoveredLink> {
+fn hovered_link(session: &TermSession, geom: &Geom, pos: Pos2) -> Option<HoveredLink> {
     let term = session.term.lock();
     let (col, row, _) = geom.cell_at(pos);
     let offset = term.grid().display_offset() as i32;
@@ -155,7 +147,7 @@ fn hovered_link(session: &TermSession, geom: &Geom, pos: Pos2, plugin_links: &[L
             (links::from_uri(h.uri()), lo..hi + 1)
         }
         None => {
-            let m = links::link_at(&text, points[i].0, plugin_links)?;
+            let m = links::link_at(&text, points[i].0)?;
             let lo = points.partition_point(|(b, _)| *b < m.range.start);
             let hi = points.partition_point(|(b, _)| *b < m.range.end);
             (m.link, lo..hi)
@@ -764,7 +756,7 @@ mod tests {
             let (text, points) = logical_line(&term, point);
             assert!(text.starts_with("see aster/longname.py:4"), "{text:?}");
             let i = points.partition_point(|(_, p)| *p <= point) - 1;
-            let m = links::link_at(&text, points[i].0, &[]).unwrap();
+            let m = links::link_at(&text, points[i].0).unwrap();
             assert_eq!(m.link, Link::File(links::FileRef { path: "aster/longname.py".into(), line: Some(4) }));
         }
         let (text, _) = logical_line(&term, Point::new(Line(3), Column(0)));

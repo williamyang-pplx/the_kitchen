@@ -56,8 +56,6 @@ struct Entry {
     binding: Binding,
     cmd: Cmd,
     origin: Origin,
-    /// Plugin chords limited to one filetype (`kitchen.keymap {filetype=…}`).
-    filetype: Option<String>,
 }
 
 /// The merged keymap. Immutable; a reload builds a new one.
@@ -204,7 +202,7 @@ impl Keymap {
             let binding = Binding::parse(k, &self.leader).map_err(at)?;
             let list = self.places.entry(place).or_default();
             if !list.iter().any(|e| e.binding == binding && e.cmd == def.cmd) {
-                list.push(Entry { binding, cmd: def.cmd.clone(), origin, filetype: None });
+                list.push(Entry { binding, cmd: def.cmd.clone(), origin });
             }
         }
         Ok(())
@@ -323,17 +321,15 @@ impl Keymap {
     }
 
     /// The command `press` is bound to from `focus` outward: the first place
-    /// in the chain that binds it; there, an entry for `filetype` beats a
-    /// generic one.
-    pub fn lookup(&self, focus: KeyFocus, filetype: Option<&str>, press: &Press) -> Option<&Cmd> {
+    /// in the chain that binds it.
+    pub fn lookup(&self, focus: KeyFocus, press: &Press) -> Option<&Cmd> {
         focus.chain().iter().find_map(|place| {
             self.places
                 .get(place)
                 .into_iter()
                 .flatten()
                 .filter(|e| e.binding.0.len() == 1 && e.binding.0[0] == *press)
-                .filter(|e| e.filetype.as_deref().is_none_or(|f| Some(f) == filetype))
-                .min_by_key(|e| (e.filetype.is_none(), e.origin.rank()))
+                .min_by_key(|e| e.origin.rank())
                 .map(|e| &e.cmd)
         })
     }
@@ -404,17 +400,17 @@ impl Keymap {
     pub fn with_plugins(&self, reg: &Registry) -> Keymap {
         let mut km = self.clone();
         for c in reg.chords.iter().filter(|c| !self.user_plugins.contains_key(&c.command)) {
-            km.push(c.when.place(), Entry { binding: c.chord.clone(), cmd: Cmd::Plugin(c.command.clone()), origin: Origin::Plugin, filetype: c.filetype.clone() });
+            km.push(c.when.place(), Entry { binding: c.chord.clone(), cmd: Cmd::Plugin(c.command.clone()), origin: Origin::Plugin });
         }
         for m in reg.viewer_maps.iter().filter(|m| !self.user_plugins.contains_key(&m.command)) {
             if let Some(binding) = self.leader_map(&m.keys) {
-                km.push(Place::Viewer, Entry { binding, cmd: Cmd::Plugin(m.command.clone()), origin: Origin::Plugin, filetype: None });
+                km.push(Place::Viewer, Entry { binding, cmd: Cmd::Plugin(m.command.clone()), origin: Origin::Plugin });
             }
         }
         for (command, bindings) in &self.user_plugins {
-            let mut places: Vec<(Place, Option<String>)> = reg.chords.iter().filter(|c| c.command == *command).map(|c| (c.when.place(), c.filetype.clone())).collect();
+            let mut places: Vec<Place> = reg.chords.iter().filter(|c| c.command == *command).map(|c| c.when.place()).collect();
             if reg.viewer_maps.iter().any(|m| m.command == *command) {
-                places.push((Place::Viewer, None));
+                places.push(Place::Viewer);
             }
             places.dedup();
             if places.is_empty() {
@@ -423,7 +419,7 @@ impl Keymap {
                 }
                 continue;
             }
-            for (place, filetype) in places {
+            for place in places {
                 for b in bindings {
                     if !b.is_chord() && matches!(place, Place::Global | Place::Terminal) {
                         note(format!("[plugins] {command:?}: {:?} is a sequence, and only chords work in [{}]", b.label(), place.section()));
@@ -435,7 +431,7 @@ impl Keymap {
                     if !taken.is_empty() {
                         note(format!("[plugins] {command:?} takes {} from [{}] {}", b.label(), place.section(), taken.join(", ")));
                     }
-                    list.push(Entry { binding: b.clone(), cmd: Cmd::Plugin(command.clone()), origin: Origin::UserPlugin, filetype: filetype.clone() });
+                    list.push(Entry { binding: b.clone(), cmd: Cmd::Plugin(command.clone()), origin: Origin::UserPlugin });
                 }
             }
         }
@@ -711,16 +707,16 @@ mod tests {
     #[test]
     fn a_user_line_replaces_and_takes_keys() {
         let (km, notes) = Keymap::load(DEFAULTS, Some("[terminal]\nnew_tab = [\"cmd+n\"]\n")).unwrap();
-        assert_eq!(km.lookup(KeyFocus::Terminal, None, &chord("cmd+n")), Some(&Cmd::App(Action::NewTab)));
-        assert_eq!(km.lookup(KeyFocus::Viewer, None, &chord("cmd+n")), Some(&Cmd::App(Action::NewWorkspace)));
-        assert_eq!(km.lookup(KeyFocus::Terminal, None, &chord("cmd+t")), None, "the line replaces ⌘T");
+        assert_eq!(km.lookup(KeyFocus::Terminal, &chord("cmd+n")), Some(&Cmd::App(Action::NewTab)));
+        assert_eq!(km.lookup(KeyFocus::Viewer, &chord("cmd+n")), Some(&Cmd::App(Action::NewWorkspace)));
+        assert_eq!(km.lookup(KeyFocus::Terminal, &chord("cmd+t")), None, "the line replaces ⌘T");
         assert_eq!(notes.len(), 0, "⌘N is [global]'s, not [terminal]'s: no default lost it");
         let (km, notes) = Keymap::load(DEFAULTS, Some("[global]\nquit = [\"cmd+n\"]\n")).unwrap();
-        assert_eq!(km.lookup(KeyFocus::Terminal, None, &chord("cmd+n")), Some(&Cmd::App(Action::Quit)));
+        assert_eq!(km.lookup(KeyFocus::Terminal, &chord("cmd+n")), Some(&Cmd::App(Action::Quit)));
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(km.keys(Place::Global, &Cmd::App(Action::NewWorkspace)).is_empty());
         let km = Keymap::with_user("[vim]\ndown = []\n");
-        assert_eq!(km.lookup(KeyFocus::Viewer, None, &Press::Char('j')), None);
+        assert_eq!(km.lookup(KeyFocus::Viewer, &Press::Char('j')), None);
         assert!(km.hint(Place::Vim, &Cmd::Vim(VimCmd::Down), 2).is_empty());
     }
 
@@ -748,14 +744,14 @@ mod tests {
     #[test]
     fn the_innermost_place_wins() {
         let km = Keymap::defaults();
-        assert_eq!(km.lookup(KeyFocus::Viewer, None, &chord("cmd+d")), Some(&Cmd::App(Action::ToggleDiff)));
-        assert_eq!(km.lookup(KeyFocus::Terminal, None, &chord("cmd+d")), Some(&Cmd::App(Action::Dashboard)));
-        assert_eq!(km.lookup(KeyFocus::FileList, None, &chord("cmd+shift+l")), Some(&Cmd::App(Action::FocusCode)));
-        assert_eq!(km.lookup(KeyFocus::FileList, None, &Press::Char('j')), Some(&Cmd::List(ListCmd::Down)));
-        assert_eq!(km.lookup(KeyFocus::Viewer, None, &Press::Char('j')), Some(&Cmd::Vim(VimCmd::Down)));
-        assert_eq!(km.lookup(KeyFocus::Dialog, None, &chord("cmd+n")), None, "dialogs take no global chords");
+        assert_eq!(km.lookup(KeyFocus::Viewer, &chord("cmd+d")), Some(&Cmd::App(Action::ToggleDiff)));
+        assert_eq!(km.lookup(KeyFocus::Terminal, &chord("cmd+d")), Some(&Cmd::App(Action::Dashboard)));
+        assert_eq!(km.lookup(KeyFocus::FileList, &chord("cmd+shift+l")), Some(&Cmd::App(Action::FocusCode)));
+        assert_eq!(km.lookup(KeyFocus::FileList, &Press::Char('j')), Some(&Cmd::List(ListCmd::Down)));
+        assert_eq!(km.lookup(KeyFocus::Viewer, &Press::Char('j')), Some(&Cmd::Vim(VimCmd::Down)));
+        assert_eq!(km.lookup(KeyFocus::Dialog, &chord("cmd+n")), None, "dialogs take no global chords");
         let enter = Press::Key { key: Key::Enter, mods: Default::default() };
-        assert_eq!(km.lookup(KeyFocus::ViewerInput, None, &enter), Some(&Cmd::Field(FieldCmd::Submit)));
+        assert_eq!(km.lookup(KeyFocus::ViewerInput, &enter), Some(&Cmd::Field(FieldCmd::Submit)));
     }
 
     #[test]
@@ -763,23 +759,23 @@ mod tests {
         use crate::plugins::{ChordEntry, CommandEntry, ViewerMap, When};
         let mut reg = Registry::default();
         reg.commands.push(CommandEntry { plugin: "p".into(), name: "p.x".into(), desc: String::new(), remote: false });
-        reg.chords.push(ChordEntry { plugin: "p".into(), chord: Binding::parse("cmd+shift+y", &[]).unwrap(), command: "p.x".into(), when: When::Viewer, filetype: None });
+        reg.chords.push(ChordEntry { plugin: "p".into(), chord: Binding::parse("cmd+shift+y", &[]).unwrap(), command: "p.x".into(), when: When::Viewer });
         reg.viewer_maps.push(ViewerMap { plugin: "p".into(), keys: "e".into(), command: "p.e".into() });
         let km = Keymap::defaults().with_plugins(&reg);
         let y = chord("cmd+shift+y");
-        assert_eq!(km.lookup(KeyFocus::Viewer, None, &y), Some(&Cmd::Plugin("p.x".into())));
-        assert_eq!(km.lookup(KeyFocus::Terminal, None, &y), None);
+        assert_eq!(km.lookup(KeyFocus::Viewer, &y), Some(&Cmd::Plugin("p.x".into())));
+        assert_eq!(km.lookup(KeyFocus::Terminal, &y), None);
         assert_eq!(km.sequences(KeyFocus::Viewer).exact(&[Press::Char('\\'), Press::Char('e')]), Some(&Cmd::Plugin("p.e".into())));
         assert_eq!(km.sequences(KeyFocus::FileList).exact(&[Press::Char('\\'), Press::Char('e')]), None, "no leader maps in the list");
 
         let km = Keymap::with_user("[plugins]\n\"p.x\" = [\"cmd+shift+u\"]\n\"p.e\" = [\"<leader>q\"]\n").with_plugins(&reg);
-        assert_eq!(km.lookup(KeyFocus::Viewer, None, &y), None);
-        assert_eq!(km.lookup(KeyFocus::Viewer, None, &chord("cmd+shift+u")), Some(&Cmd::Plugin("p.x".into())));
+        assert_eq!(km.lookup(KeyFocus::Viewer, &y), None);
+        assert_eq!(km.lookup(KeyFocus::Viewer, &chord("cmd+shift+u")), Some(&Cmd::Plugin("p.x".into())));
         assert_eq!(km.sequences(KeyFocus::Viewer).exact(&[Press::Char('\\'), Press::Char('q')]), Some(&Cmd::Plugin("p.e".into())));
         assert_eq!(km.plugin_keys()["p.e"], vec!["\\q"]);
         // Your [plugins] line may take a built-in key.
         let km = Keymap::with_user("[plugins]\n\"p.x\" = [\"cmd+p\"]\n").with_plugins(&reg);
-        assert_eq!(km.lookup(KeyFocus::Viewer, None, &chord("cmd+p")), Some(&Cmd::Plugin("p.x".into())));
+        assert_eq!(km.lookup(KeyFocus::Viewer, &chord("cmd+p")), Some(&Cmd::Plugin("p.x".into())));
     }
 
     #[test]
@@ -806,11 +802,11 @@ mod tests {
         let mut live = Live::new();
         let mut last_err = None;
         assert_eq!(reload(&path, &mut live, &mut last_err), None, "no file: the defaults");
-        assert_eq!(live.effective.lookup(KeyFocus::Terminal, None, &chord("cmd+t")), Some(&Cmd::App(Action::NewTab)));
+        assert_eq!(live.effective.lookup(KeyFocus::Terminal, &chord("cmd+t")), Some(&Cmd::App(Action::NewTab)));
 
         std::fs::write(&path, "[terminal]\nnew_tab = [\"cmd+y\"]\n").unwrap();
         assert_eq!(reload(&path, &mut live, &mut last_err), None);
-        assert_eq!(live.effective.lookup(KeyFocus::Terminal, None, &chord("cmd+y")), Some(&Cmd::App(Action::NewTab)));
+        assert_eq!(live.effective.lookup(KeyFocus::Terminal, &chord("cmd+y")), Some(&Cmd::App(Action::NewTab)));
         let good = live.base.clone();
         assert_eq!(reload(&path, &mut live, &mut last_err), None);
         assert!(Arc::ptr_eq(&good, &live.base), "unchanged: not reread");

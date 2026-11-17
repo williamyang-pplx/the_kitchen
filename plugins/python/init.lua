@@ -189,7 +189,6 @@ server = lsp.define {
   },
   cmd = command,
   prepare = prepare,
-  diagnostics = kitchen.config.diagnostics == true,
   max_rss_mb = kitchen.config.max_rss_mb,
   idle_minutes = kitchen.config.idle_minutes,
   -- pyright-family servers ask for these; others ignore them.

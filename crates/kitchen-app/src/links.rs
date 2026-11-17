@@ -1,14 +1,12 @@
 //! Links in terminal text: what a ⌘-click on a span of a line opens.
-//! Rules, first match covering the pointer wins: plugin rules
-//! (`kitchen.link`), URLs, file paths. OSC 8 hyperlinks are checked before all
-//! of these by the terminal (they live on the cells, not in the text).
+//! Rules, first match covering the pointer wins: URLs, file paths. OSC 8
+//! hyperlinks are checked before these by the terminal (they live on the
+//! cells, not in the text).
 
 use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
-
-use crate::plugins::LinkEntry;
 
 /// A file reference as printed: path plus optional 1-based line. A trailing
 /// `:col` is matched (so it is not part of the path) but dropped: the viewer
@@ -25,8 +23,6 @@ pub struct FileRef {
 pub enum Link {
     File(FileRef),
     Url(String),
-    /// A plugin rule matched: run `command` (`<plugin>.<name>`) with the match.
-    Plugin { command: String, text: String, groups: Vec<Option<String>> },
 }
 
 /// A link and the byte range of the line it covers.
@@ -45,14 +41,8 @@ static FILE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:~/|\.{1,2}/|/)?[\w.@+-]+(?:/[\w.@+-]+)*/?(?::(\d+)(?::\d+)?|#L(\d+))?").unwrap());
 
 /// The link covering byte `at` of `line`, if any.
-pub fn link_at(line: &str, at: usize, plugin_rules: &[LinkEntry]) -> Option<LinkMatch> {
+pub fn link_at(line: &str, at: usize) -> Option<LinkMatch> {
     let covers = |r: &Range<usize>| r.start <= at && at < r.end;
-    for rule in plugin_rules {
-        let Some(caps) = rule.regex.captures_iter(line).find(|c| covers(&c.get(0).unwrap().range())) else { continue };
-        let m = caps.get(0).unwrap();
-        let groups = caps.iter().skip(1).map(|g| g.map(|g| g.as_str().to_string())).collect();
-        return Some(LinkMatch { range: m.range(), link: Link::Plugin { command: rule.command.clone(), text: m.as_str().to_string(), groups } });
-    }
     if let Some(m) = URL.find_iter(line).find(|m| covers(&m.range())) {
         let url = trim_url(m.as_str());
         let range = m.start()..m.start() + url.len();
@@ -167,27 +157,16 @@ mod tests {
             ("see aster/foo.py:42 now", 1, None),
         ];
         for (line, at, want) in cases {
-            assert_eq!(link_at(line, *at, &[]).map(|m| m.link), *want, "line={line:?} at={at}");
+            assert_eq!(link_at(line, *at).map(|m| m.link), *want, "line={line:?} at={at}");
         }
     }
 
     #[test]
     fn match_range_covers_the_suffix() {
-        let m = link_at("x aster/foo.py:42 y", 3, &[]).unwrap();
+        let m = link_at("x aster/foo.py:42 y", 3).unwrap();
         assert_eq!(m.range, 2..17);
-        let m = link_at("ends in foo.py.", 9, &[]).unwrap();
+        let m = link_at("ends in foo.py.", 9).unwrap();
         assert_eq!(m.range, 8..14);
-    }
-
-    #[test]
-    fn plugin_rules_win() {
-        let rules = [LinkEntry { plugin: "t".into(), regex: Regex::new(r"AI-(\d+)").unwrap(), command: "t.open".into() }];
-        let m = link_at("fix AI-9586 soon", 6, &rules).unwrap();
-        assert_eq!(m.range, 4..11);
-        assert_eq!(m.link, Link::Plugin { command: "t.open".into(), text: "AI-9586".into(), groups: vec![Some("9586".into())] });
-        let rules = [LinkEntry { plugin: "t".into(), regex: Regex::new(r"https://linear\.app/\S+").unwrap(), command: "t.l".into() }];
-        assert!(matches!(link_at("https://linear.app/x", 3, &rules).unwrap().link, Link::Plugin { .. }));
-        assert_eq!(link_at("https://example.com", 3, &rules).unwrap().link, Link::Url("https://example.com".into()));
     }
 
     #[test]

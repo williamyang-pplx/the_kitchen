@@ -99,7 +99,7 @@ impl Dialog {
     pub fn show(&mut self, ctx: &egui::Context, engine: &Arc<Engine>) -> DialogOutcome {
         let km = keybindings::current();
         let esc = ctx.input_mut(|i| {
-            let p = keybindings::presses(i).into_iter().find(|p| km.lookup(KeyFocus::Dialog, None, p) == Some(&Cmd::Field(FieldCmd::Cancel)));
+            let p = keybindings::presses(i).into_iter().find(|p| km.lookup(KeyFocus::Dialog, p) == Some(&Cmd::Field(FieldCmd::Cancel)));
             p.is_some_and(|p| keybindings::take(i, &p, true))
         });
         if esc {
@@ -166,7 +166,7 @@ fn field<'t>(text: &'t mut String, hint: &str) -> egui::TextEdit<'t> {
 /// `[dialog]` submit key presses it too, and the field still sees it).
 fn buttons(ui: &mut egui::Ui, label: &str, can: bool, on_yes: impl FnOnce()) -> DialogOutcome {
     let km = keybindings::current();
-    let enter = ui.input(|i| keybindings::presses(i).iter().any(|p| km.lookup(KeyFocus::Dialog, None, p) == Some(&Cmd::Field(FieldCmd::Submit)) && keybindings::pressed(i, p, false)));
+    let enter = ui.input(|i| keybindings::presses(i).iter().any(|p| km.lookup(KeyFocus::Dialog, p) == Some(&Cmd::Field(FieldCmd::Submit)) && keybindings::pressed(i, p, false)));
     let key = km.hint(Place::Dialog, &Cmd::Field(FieldCmd::Submit), 1);
     let label = if key.is_empty() { label.to_string() } else { format!("{label}  {key}") };
     let mut out = DialogOutcome::Open;

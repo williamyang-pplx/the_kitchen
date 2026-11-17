@@ -9,8 +9,6 @@ filetypes = ["py", "pyi"]
 server = "ty"
 # A custom server command (sh, run in the project root); overrides `server`.
 cmd = ""
-# Show the server's type errors as diagnostics (ruff already lints).
-diagnostics = false
 # Restart a server whose processes use more than this many MB (0: no cap).
 max_rss_mb = 6144
 # Stop a server after this many minutes without gd/gr or file events (0: never).

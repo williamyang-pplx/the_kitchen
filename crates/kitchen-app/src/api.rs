@@ -90,7 +90,7 @@ struct Target {
 /// can't overwrite a plugin's own sets; devbox callers may not reload
 /// plugins and may only run commands marked `remote = true`.
 fn plugin_dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Caller, remote: bool) -> Result<Value> {
-    use crate::plugins::decor::{self, FileKey, Kind};
+    use crate::plugins::decor::{FileKey, Kind};
     let host = engine.plugins().cloned().ok_or_else(|| anyhow!("plugins are not running"))?;
     #[derive(Deserialize)]
     struct DecorParams {
@@ -120,7 +120,7 @@ fn plugin_dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &C
     let ext = |ns: &str| format!("ext.{}", ns.trim_start_matches("ext."));
     match method {
         "plugin.list" => Ok(serde_json::to_value(host.list())?),
-        "plugin.timers" => Ok(serde_json::to_value(host.timers_info())?),
+        "plugin.timers" => Ok(serde_json::to_value(host.timers.list())?),
         "plugin.reload" => {
             if remote {
                 bail!("plugin.reload is only allowed from this mac");
@@ -151,13 +151,11 @@ fn plugin_dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &C
                 Value::Null => Value::Array(Vec::new()),
                 v => v,
             };
-            match d.kind.as_deref().map(Kind::parse) {
-                None | Some(Some(Kind::Diagnostics)) => host.decor.set_diagnostics(&key, &ns, decor::parse_diagnostics(items).map_err(|e| anyhow!(e))?, d.version),
-                Some(Some(Kind::Highlights)) => host.decor.set_highlights(&key, &ns, decor::parse_highlights(items).map_err(|e| anyhow!(e))?, d.version),
-                Some(Some(Kind::Comments)) => host.decor.set_comments(&key, &ns, decor::parse_comments(items).map_err(|e| anyhow!(e))?),
-                Some(Some(Kind::Render)) => host.decor.set_render(&key, &ns, decor::parse_render(items).map_err(|e| anyhow!(e))?, d.version),
-                Some(None) => bail!("kind is diagnostics, highlights, comments or render"),
-            }
+            let kind = match d.kind.as_deref() {
+                None => Kind::Diagnostics,
+                Some(k) => Kind::parse(k).ok_or_else(|| anyhow!("kind is diagnostics, highlights, comments or render"))?,
+            };
+            host.decor.set_kind(kind, &key, &ns, items, d.version).map_err(|e| anyhow!(e))?;
             engine.ctx.request_repaint();
             Ok(json!({ "ns": ns, "path": key.path }))
         }

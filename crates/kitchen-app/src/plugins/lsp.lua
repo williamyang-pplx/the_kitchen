@@ -4,29 +4,27 @@
 --     name = "ty", filetypes = { "py", "pyi" }, language_id = "python",
 --     root_markers = { "pyproject.toml", ".git" },    -- or tiers, first match wins:
 --     --   { { "ty.toml", { file = "pyproject.toml", contains = "[tool.ty" } }, { "pyproject.toml" } }
---     cmd = function(root) return "exec uvx ty server" end,   -- sh script, or an argv table
+--     cmd = function(root) return "exec uvx ty server" end,   -- a sh script
 --     prepare = function(ctx, done) done { settings = {}, init_options = {} } end,
 --                             -- per root, before its server starts: ctx {host, root, worktree}
 --     settings = {},          -- answers to workspace/configuration, by section
---     init_options = {},      -- initializationOptions
---     diagnostics = false,    -- show the server's publishDiagnostics
 --     max_rss_mb = 6144,      -- restart a server using more memory (0: no cap)
 --     idle_minutes = 15,      -- stop a server nobody asked for that long (0: never)
 --   }
 --
--- One server per (host, project root), started on the host where the code
--- lives when the viewer opens a matching file. The server answers the
--- viewer's `gd` (definition) and `gr` (references). A request replaces the
--- older one of its method. While servers run, a sweep every few seconds
--- cancels requests nobody waits for any more, restarts servers over their
--- memory cap, stops idle ones, and keeps a few per host. It also tells
--- servers which files changed on disk (an agent's edit, a checkout): it polls
--- git status and mtimes, because the viewer only watches the file it shows.
+-- One define per plugin. One server per (host, project root), started on
+-- the host where the code lives when the viewer opens a matching file. The
+-- server answers the viewer's `gd` (definition) and `gr` (references). A
+-- request replaces the older one of its method. While servers run, a sweep
+-- every few seconds cancels requests nobody waits for any more, restarts
+-- servers over their memory cap, stops idle ones, and keeps a few per host.
+-- It also tells servers which files changed on disk (an agent's edit, a
+-- checkout): it polls git status and mtimes, because the viewer only watches
+-- the file it shows.
 
 local M = {}
 
-local servers = {} -- every define()d server, in order
-local provided = false
+local server -- the define()d server
 local ticking = false
 local tick -- the sweep, below
 
@@ -54,10 +52,6 @@ end
 
 local function dirname(p)
   return p:match("^(.*)/[^/]*$") or "/"
-end
-
-local function filetype_of(path)
-  return (path:match("%.([%w_]+)$") or ""):lower()
 end
 
 local function uri_of(path)
@@ -213,29 +207,9 @@ local function answer(s, c, msg)
   send(c, { id = msg.id, result = result })
 end
 
-local function on_notification(s, c, msg)
+local function on_notification(s, msg)
   local p = msg.params or {}
-  if msg.method == "textDocument/publishDiagnostics" and s.diagnostics then
-    local doc = s.docs[c.host .. "\0" .. path_of(p.uri or "")]
-    if not doc then
-      return
-    end
-    local items = {}
-    for _, d in ipairs(p.diagnostics or {}) do
-      local st, en = d.range.start, d.range["end"]
-      local l1, l2 = line_of(doc.text, st.line + 1), line_of(doc.text, en.line + 1)
-      table.insert(items, {
-        line = st.line + 1,
-        col = from_units(l1, st.character, c.encoding) + 1,
-        end_line = en.line + 1,
-        end_col = from_units(l2, en.character, c.encoding) + 1,
-        severity = d.severity or 1,
-        message = d.message or "",
-        code = d.code and tostring(d.code) or nil,
-      })
-    end
-    kitchen.diagnostics.set(doc.file, items, { version = doc.kversion, ns = s.name })
-  elseif msg.method == "window/showMessage" and p.type == 1 then
+  if msg.method == "window/showMessage" and p.type == 1 then
     kitchen.log(s.name .. ": " .. tostring(p.message))
   end
 end
@@ -261,7 +235,7 @@ local function on_data(s, c, data)
       elseif msg.method and msg.id ~= nil then
         answer(s, c, msg)
       elseif msg.method then
-        on_notification(s, c, msg)
+        on_notification(s, msg)
       elseif msg.id ~= nil then
         local p = c.pending[msg.id]
         c.pending[msg.id] = nil
@@ -301,16 +275,8 @@ local function on_stderr(s, c, chunk)
   end
 end
 
--- Stop a server on purpose: its requests are cancelled, it is told to exit,
--- and the sweep kills it if it is still there after KILL_GRACE_SECS.
-local function stop_client(s, c, why)
-  if c.stopping then
-    return
-  end
-  c.stopping = why
-  if s.clients[c.key] == c then
-    s.clients[c.key] = nil
-  end
+-- Cancel every request the server works on and tell it to exit.
+local function cancel_and_exit(c, why)
   local ids = {}
   for id in pairs(c.pending) do
     table.insert(ids, id)
@@ -321,6 +287,19 @@ local function stop_client(s, c, why)
   if c.ready then
     send(c, { method = "exit" })
   end
+end
+
+-- Stop a server on purpose: its requests are cancelled, it is told to exit,
+-- and the sweep kills it if it is still there after KILL_GRACE_SECS.
+local function stop_client(s, c, why)
+  if c.stopping then
+    return
+  end
+  c.stopping = why
+  if s.clients[c.key] == c then
+    s.clients[c.key] = nil
+  end
+  cancel_and_exit(c, why)
   c.proc:close()
   c.kill_at = os.time() + KILL_GRACE_SECS
   table.insert(s.stopped, c)
@@ -357,15 +336,7 @@ end
 
 -- The server command, printing its pid first (the shell then execs into the
 -- server, so that is the server's pid) for the memory check.
-local function wrap_cmd(cmd)
-  local script = cmd
-  if type(cmd) == "table" then
-    local words = {}
-    for _, w in ipairs(cmd) do
-      table.insert(words, q(w))
-    end
-    script = "exec " .. table.concat(words, " ")
-  end
+local function wrap_cmd(script)
   return "echo kitchen-lsp-pid $$ >&2; " .. script
 end
 
@@ -399,8 +370,8 @@ local function start(s, host, root, realwt, prep)
       end
     end
   end
-  if lru and count >= s.max_servers then
-    stop_client(s, lru, "more than " .. s.max_servers .. " servers on " .. host)
+  if lru and count >= MAX_SERVERS then
+    stop_client(s, lru, "more than " .. MAX_SERVERS .. " servers on " .. host)
   end
   c = {
     key = key, host = host, root = root, realwt = realwt, buf = "", errbuf = "", next_id = 0,
@@ -437,7 +408,7 @@ local function start(s, host, root, realwt, prep)
     rootUri = uri_of(root),
     rootPath = root,
     workspaceFolders = folder,
-    initializationOptions = prep.init_options or s.init_options,
+    initializationOptions = prep.init_options or json.null,
     capabilities = {
       general = { positionEncodings = { "utf-32", "utf-16" } },
       textDocument = {
@@ -623,21 +594,12 @@ local function to_loc(s, c, file, x)
   return { path = path, line = line, col = ch + 1 }
 end
 
-local function server_for(ft)
-  for _, s in ipairs(servers) do
-    for _, f in ipairs(s.filetypes) do
-      if f == ft then
-        return s
-      end
-    end
-  end
-end
-
+-- The host only asks about the server's filetypes.
 local function query(method, ctx, reply)
+  local s = server
   local v = ctx.viewer or {}
   local file = v.file
-  local s = file and v.line and server_for(filetype_of(file.path))
-  if not s then
+  if not (file and v.line) then
     return reply(nil)
   end
   with_client(s, file, function(c)
@@ -689,8 +651,8 @@ local function query(method, ctx, reply)
 end
 
 local function on_file(ev)
-  local s = server_for(ev.filetype)
-  if not s then
+  local s = server
+  if not s.wants[ev.filetype] then
     return
   end
   local text = ev.text()
@@ -700,8 +662,8 @@ local function on_file(ev)
   local key = ev.file.host .. "\0" .. ev.file.abs
   local d = s.docs[key]
   if ev.replay == true then
-    -- Re-sent after a reload, maybe stale: kept for column maths and
-    -- diagnostics, never opened on a server, and no server is started.
+    -- Re-sent after a reload, maybe stale: kept for column maths, never
+    -- opened on a server, and no server is started.
     if not d then
       s.docs[key] = { file = ev.file, text = text, v = 1, kversion = ev.version, stale = true }
     end
@@ -907,37 +869,36 @@ end
 
 tick = function()
   local now = os.time()
-  for _, s in ipairs(servers) do
-    for _, c in pairs(s.clients) do
-      local late = {}
-      for id, p in pairs(c.pending) do
-        if NAV[p.method] and now - p.sent >= s.request_timeout then
-          table.insert(late, id)
-        end
-      end
-      for _, id in ipairs(late) do
-        cancel(c, id, "no answer in " .. s.request_timeout .. "s")
-      end
-      if c.restart_when_idle and not busy(c) then
-        M.restart(s, c.host, c.root)
-      elseif s.idle_minutes > 0 and now - c.last_used >= s.idle_minutes * 60 then
-        stop_client(s, c, "idle")
-      else
-        poll_changes(s, c)
+  local s = server
+  for _, c in pairs(s.clients) do
+    local late = {}
+    for id, p in pairs(c.pending) do
+      if NAV[p.method] and now - p.sent >= s.request_timeout then
+        table.insert(late, id)
       end
     end
-    check_rss(s)
-    local still = {}
-    for _, c in ipairs(s.stopped) do
-      if not c.exited then
-        if now >= c.kill_at then
-          c.proc:kill()
-        end
-        table.insert(still, c)
-      end
+    for _, id in ipairs(late) do
+      cancel(c, id, "no answer in " .. s.request_timeout .. "s")
     end
-    s.stopped = still
+    if c.restart_when_idle and not busy(c) then
+      M.restart(s, c.host, c.root)
+    elseif s.idle_minutes > 0 and now - c.last_used >= s.idle_minutes * 60 then
+      stop_client(s, c, "idle")
+    else
+      poll_changes(s, c)
+    end
   end
+  check_rss(s)
+  local still = {}
+  for _, c in ipairs(s.stopped) do
+    if not c.exited then
+      if now >= c.kill_at then
+        c.proc:kill()
+      end
+      table.insert(still, c)
+    end
+  end
+  s.stopped = still
 end
 
 -- Stop the server at (host, root) and start it again for a document under the
@@ -975,19 +936,8 @@ end
 -- The plugin unloads: cancel what servers still work on and tell them to
 -- exit; the host then closes their stdin and kills what is left.
 local function on_stop()
-  for _, s in ipairs(servers) do
-    for _, c in pairs(s.clients) do
-      local ids = {}
-      for id in pairs(c.pending) do
-        table.insert(ids, id)
-      end
-      for _, id in ipairs(ids) do
-        cancel(c, id, "unload")
-      end
-      if c.ready then
-        send(c, { method = "exit" })
-      end
-    end
+  for _, c in pairs(server.clients) do
+    cancel_and_exit(c, "unload")
   end
 end
 
@@ -1012,6 +962,7 @@ local function tiers_of(markers)
 end
 
 function M.define(spec)
+  assert(not server, "lsp.define: one server per plugin")
   assert(type(spec.name) == "string", "lsp.define needs name")
   assert(spec.cmd, "lsp.define needs cmd")
   assert(type(spec.filetypes) == "table" and #spec.filetypes > 0, "lsp.define needs filetypes")
@@ -1019,6 +970,7 @@ function M.define(spec)
   local s = {
     name = spec.name,
     filetypes = spec.filetypes,
+    wants = {},
     language_id = spec.language_id or spec.filetypes[1],
     root_tiers = tiers_of(spec.root_markers or { ".git" }),
     prepare = spec.prepare,
@@ -1028,12 +980,9 @@ function M.define(spec)
       return cmd
     end,
     settings = spec.settings or {},
-    init_options = spec.init_options or json.null,
-    diagnostics = spec.diagnostics == true,
     max_rss_mb = tonumber(spec.max_rss_mb) or 6144,
     idle_minutes = tonumber(spec.idle_minutes) or 15,
     request_timeout = tonumber(spec.request_timeout) or REQUEST_TIMEOUT,
-    max_servers = tonumber(spec.max_servers) or MAX_SERVERS,
     stopped = {},
     rss_busy = {},
     clients = {},
@@ -1043,29 +992,20 @@ function M.define(spec)
     last = {},
     failures = {},
   }
-  table.insert(servers, s)
-  local fts = {}
-  for _, sv in ipairs(servers) do
-    for _, f in ipairs(sv.filetypes) do
-      table.insert(fts, f)
-    end
+  for _, f in ipairs(spec.filetypes) do
+    s.wants[f] = true
   end
+  server = s
   kitchen.provide("definition", function(ctx, reply)
     query("textDocument/definition", ctx, reply)
-  end, { filetypes = fts })
+  end, { filetypes = s.filetypes })
   kitchen.provide("references", function(ctx, reply)
     query("textDocument/references", ctx, reply)
-  end, { filetypes = fts })
-  if not provided then
-    provided = true
-    kitchen.on("file_opened", on_file)
-    kitchen.on("file_changed", on_file)
-    kitchen.on("stop", on_stop)
-  end
+  end, { filetypes = s.filetypes })
+  kitchen.on("file_opened", on_file)
+  kitchen.on("file_changed", on_file)
+  kitchen.on("stop", on_stop)
   return s
 end
-
--- For tests and plugins that want the plumbing.
-M._line_of, M._to_units, M._from_units, M._uri_of, M._path_of = line_of, to_units, from_units, uri_of, path_of
 
 return M

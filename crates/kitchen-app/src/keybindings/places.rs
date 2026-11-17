@@ -149,9 +149,7 @@ impl When {
     pub fn place(self) -> Place {
         match self {
             When::Any => Place::Global,
-            When::Terminal => Place::Terminal,
             When::Viewer => Place::Viewer,
-            When::Plan => Place::Plan,
         }
     }
 }

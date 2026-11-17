@@ -242,7 +242,7 @@ impl Vim {
     pub fn feed(&mut self, press: Press, km: &Keymap, focus: KeyFocus, now: Instant, lines: &[String], view: Viewport, intercept: &mut dyn FnMut(VimCmd, Option<usize>, usize) -> bool) -> Vec<VimAction> {
         self.message = None;
         if let Some((mut q, fwd)) = self.search_input.take() {
-            match km.lookup(focus.input(), None, &press) {
+            match km.lookup(focus.input(), &press) {
                 Some(Cmd::Field(FieldCmd::Cancel)) => {}
                 Some(Cmd::Field(FieldCmd::Submit)) => {
                     let q = if q.is_empty() { self.search.as_ref().map(|s| s.0.clone()).unwrap_or_default() } else { q };

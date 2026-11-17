@@ -98,8 +98,8 @@ kitchen.on("dashboard", function(ev) end)     -- a dashboard was shown / hidden 
 
 `ev.file = {host, worktree, path, abs}` identifies the file (pass it back to
 `diagnostics.set`); `ev.filetype` (extension), `ev.version` (content hash),
-`ev.lines`, `ev.text()` (contents; nil above 2 MB). Only files matching the
-manifest's `filetypes` are sent. After a reload, the files viewers hold (the
+`ev.text()` (contents; nil above 2 MB). Only files matching the manifest's
+`filetypes` are sent. After a reload, the files viewers hold (the
 newest 64) are sent again with `ev.replay = true`: their text may be older than
 the file on disk.
 
@@ -107,7 +107,7 @@ the file on disk.
 
 ```lua
 kitchen.command(name, fn(ctx), { desc = "…", remote = false })  -- → "<plugin>.<name>"
-kitchen.keymap("cmd+shift+y", target, { when = "viewer", filetype = "py" })
+kitchen.keymap("cmd+shift+y", target, { when = "viewer" })
 kitchen.keymap("viewer", "<leader>xy", target)   -- <leader> then 1–3 keys, viewer normal mode
 ```
 
@@ -120,8 +120,8 @@ is `{host, worktree, path, abs}` like `ev.file`, `word` the identifier under
 where it starts. While the ⌘⇧S menu is up (a plugin chord still fires then), `menu` is
 the `{label, section, url}` of the `kitchen.views` entry under its cursor, `{}`
 on the tab's worktree row.
-Chords need cmd, alt or ctrl. `when`: `any` (default), `terminal`, `viewer`, `plan`;
-ctrl-only chords aren't allowed in terminals. `remote = true` lets
+Chords need cmd, alt or ctrl. `when`: `any` (default) or `viewer`;
+ctrl-only chords need `viewer` (terminals keep them). `remote = true` lets
 `kitchenctl plugin run` from a devbox run the command.
 
 `kitchen.keymap` sets a command's *default* keys. `[plugins]` in
@@ -132,28 +132,6 @@ default may not take a key a built-in binds where the chord applies, or an
 `[edit]` key (the call errors); a keybindings.toml reload that makes one
 collide drops it with the same error. The defaults are in
 `crates/kitchen-app/assets/keybindings.toml`.
-
-### Links
-
-```lua
-kitchen.link("AI-(\\d+)", function(ctx)    -- ⌘-click "AI-9586" in a terminal
-  kitchen.run({ cmd = { "open", "https://linear.app/team/issue/AI-" .. ctx.link.groups[1] } })
-end)
-kitchen.link("PR-\\d+", "open_pr")        -- or a command name
-```
-
-⌘-clicking a match in a terminal tab runs `target` (a command name or a
-function) with the command `ctx` plus `ctx.link = {text, groups}` (`groups`
-are the capture groups, nil for one that didn't take part). The pattern is
-Rust regex syntax, not a Lua pattern; a bad one makes `kitchen.link` error.
-The kitchen matches the text itself, so Lua only runs on a click.
-
-Rules are tried in order, first match under the pointer wins: OSC 8
-hyperlinks, then plugin rules (in registration order), then the built-ins:
-http(s) URLs (opened in the browser) and file paths (`path`, `path:line`,
-`path:line:col`, `path#Lline`; opened in the viewer). A plugin rule shadows the
-built-ins on the text it matches, so keep it no looser than its handler can
-resolve.
 
 ### Diagnostics and highlights
 
@@ -200,10 +178,10 @@ dropped. Non-interactive ssh shells have a minimal PATH — prefer
 local p = kitchen.spawn {
   sh = "exec my-server --stdio", host = ctx.host, cwd = root,   -- or cmd = {…}
   on_stdout = function(chunk) end,   -- raw bytes, as they arrive
-  on_stderr = function(chunk) end,   -- default: lines go to the plugin log
+  on_stderr = function(chunk) end,   -- dropped without one
   on_exit = function(code) end,
 }
-p:write(bytes)   p:close()   -- close stdin      p:kill()   p:alive()   p.id
+p:write(bytes)   p:close()   -- close stdin      p:kill()
 ```
 
 No timeout; at most 8 per plugin. Reloading or stopping the plugin runs its
@@ -239,18 +217,18 @@ imported modules first, then the nearest folders.
 local server = require("kitchen.lsp").define {
   name = "ty", filetypes = { "py", "pyi" }, language_id = "python",
   root_markers = { "pyproject.toml", "setup.py" },   -- or tiers, see below
-  cmd = function(root) return "exec uvx ty server" end,   -- sh, or an argv table
+  cmd = function(root) return "exec uvx ty server" end,   -- a sh script
   prepare = function(ctx, done) done { settings = {}, init_options = {} } end,
   settings = {},         -- workspace/configuration answers, by section
-  diagnostics = false,   -- show publishDiagnostics
   max_rss_mb = 6144,     -- restart a server using more memory (0: no cap)
   idle_minutes = 15,     -- stop a server nobody used for that long (0: never)
 }
 ```
 
-Starts one server per (host, project root) — the nearest directory with a
-marker, up to the worktree — when the viewer opens a matching file, keeps
-open files in sync, and provides `definition` / `references`. Markers can
+A plugin defines one server. It starts one per (host, project root) — the
+nearest directory with a marker, up to the worktree — when the viewer opens a
+matching file, keeps open files in sync, and provides `definition` /
+`references`. Markers can
 come in tiers, `{ { "ty.toml", { file = "pyproject.toml", contains =
 "[tool.ty" } }, { "pyproject.toml" } }`: each tier walks up to the worktree
 and the first tier with a match wins, so a file that names the project beats
@@ -283,15 +261,14 @@ and restarts one, once it isn't answering a `gd` / `gr`. See `plugins/python/ini
 
 ```lua
 require("kitchen.lint").define {
-  filetypes = { "py" },                                   -- default: manifest's
   sh = function(ev) return "ruff check --output-format=json --stdin-filename " .. ev.file.path .. " -" end,
   parse = function(res, ev) return { {line=…, col=…, message=…, severity=…} } end,
 }
 ```
 
-Runs on every `file_opened`/`file_changed` on the file's host, in its
-worktree, with the viewer's text on stdin; results for superseded versions
-are dropped. See `plugins/ruff/init.lua`.
+Runs on every `file_opened`/`file_changed` (the manifest's filetypes) on the
+file's host, in its worktree, with the viewer's text on stdin; results for
+superseded versions are dropped. See `plugins/ruff/init.lua`.
 
 ### Views
 
@@ -453,7 +430,6 @@ kitchen.dashboard.set(ws_id, {          -- replaces this plugin's sections there
       { label = "the_kitchen-notifications", value = "1.9G", mark = true },
   } },
 })
-kitchen.dashboard.clear(ws_id_or_nil)
 kitchen.dashboard.showing()             -- ids of workspaces whose dashboard is on screen
 kitchen.on("dashboard", function(ev) end)  -- ev = { workspace, open }
 ```

@@ -1,18 +1,14 @@
 -- kitchen.lint: declarative linters (like nvim-lint / SublimeLinter).
 --
 --   require("kitchen.lint").define {
---     name = "ruff",                      -- namespace (default: the plugin's name)
---     filetypes = { "py" },               -- default: the manifest's filetypes
---     cmd = function(ev) return { "ruff", "check", "-" } end,   -- or
---     sh  = function(ev) return "ruff check -" end,             -- shell script
---     stdin = true,                       -- pipe the viewer's text (default true)
+--     sh  = function(ev) return "ruff check -" end,   -- shell script; gets the viewer's text on stdin
 --     timeout = 30,                       -- seconds
 --     parse = function(res, ev) return { {line=, col=, message=, severity=} } end,
 --   }
 --
 -- Runs on the file's host (the devbox for devbox workspaces) in its
--- worktree, on every file_opened / file_changed. A result for an older
--- version of a file is dropped.
+-- worktree, on every file_opened / file_changed of the manifest's
+-- filetypes. A result for an older version of a file is dropped.
 local M = {}
 
 local function key(f)
@@ -21,26 +17,17 @@ end
 
 function M.define(spec)
   assert(type(spec.parse) == "function", "kitchen.lint.define: parse(res, ev) is required")
-  assert(spec.cmd or spec.sh, "kitchen.lint.define: cmd(ev) or sh(ev) is required")
+  assert(spec.sh, "kitchen.lint.define: sh(ev) is required")
   local latest = {}
-  local wanted = nil
-  if spec.filetypes then
-    wanted = {}
-    for _, ft in ipairs(spec.filetypes) do wanted[ft] = true end
-  end
-  local ns = spec.name and spec.name ~= kitchen.name and spec.name or nil
 
   local function lint(ev)
-    if wanted and not wanted[ev.filetype] then return end
     local k = key(ev.file)
     latest[k] = ev.version
-    local job = { host = ev.file.host, cwd = ev.file.worktree, timeout = spec.timeout }
-    if spec.stdin ~= false then job.stdin = ev.text() or "" end
-    if spec.sh then job.sh = spec.sh(ev) else job.cmd = spec.cmd(ev) end
+    local job = { host = ev.file.host, cwd = ev.file.worktree, timeout = spec.timeout, stdin = ev.text() or "", sh = spec.sh(ev) }
     kitchen.run(job, function(res)
       if latest[k] ~= ev.version then return end -- superseded by a newer version
       if res.timed_out then
-        kitchen.log((spec.name or kitchen.name) .. ": timed out on " .. ev.file.path)
+        kitchen.log(kitchen.name .. ": timed out on " .. ev.file.path)
         return
       end
       local ok, items = pcall(spec.parse, res, ev)
@@ -49,7 +36,7 @@ function M.define(spec)
         return
       end
       if items == nil then return end
-      kitchen.diagnostics.set(ev.file, items, { version = ev.version, ns = ns })
+      kitchen.diagnostics.set(ev.file, items, { version = ev.version })
     end)
   end
 

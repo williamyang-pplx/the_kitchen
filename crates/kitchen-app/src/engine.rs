@@ -980,14 +980,6 @@ impl Engine {
                 }
                 Ok(())
             }),
-            Link::Plugin { command, text, groups } => {
-                let Some(plugins) = self.plugins() else { return };
-                let mut ctx = crate::plugins::command_context(self, &tab_id, None);
-                ctx["link"] = serde_json::json!({ "text": text, "groups": groups });
-                if let Err(e) = plugins.invoke(&command, ctx, false) {
-                    self.toast_err(format!("{e:#}"));
-                }
-            }
         }
     }
 

@@ -28,16 +28,8 @@ pub struct Section {
     /// Shown dimmed next to the title (e.g. "measured 15:20").
     #[serde(default)]
     pub note: Option<String>,
-    #[serde(default, deserialize_with = "rows")]
+    #[serde(default, deserialize_with = "super::decor::list_or_empty_table")]
     pub rows: Vec<Row>,
-}
-
-/// Rows, where an empty Lua table (`{}`, which reaches us as a JSON object) is no rows.
-fn rows<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Row>, D::Error> {
-    match serde_json::Value::deserialize(d)? {
-        serde_json::Value::Object(m) if m.is_empty() => Ok(Vec::new()),
-        v => serde_json::from_value(v).map_err(serde::de::Error::custom),
-    }
 }
 
 /// One workspace's sections, by plugin, in the order plugins first set them.
@@ -62,20 +54,15 @@ impl DashboardStore {
         by_ws.insert(ws.to_string(), Arc::new(next));
     }
 
-    /// Drop `plugin`'s sections on `ws`, or on every workspace.
-    pub fn clear(&self, plugin: &str, ws: Option<&str>) {
+    /// The plugin unloaded: drop its sections on every workspace.
+    pub fn clear_owner(&self, plugin: &str) {
         let mut by_ws = lock(&self.by_ws);
-        for (id, sections) in by_ws.iter_mut() {
-            if ws.is_none_or(|w| w == id) && sections.iter().any(|(p, _)| p == plugin) {
+        for sections in by_ws.values_mut() {
+            if sections.iter().any(|(p, _)| p == plugin) {
                 *sections = Arc::new(sections.iter().filter(|(p, _)| p != plugin).cloned().collect());
             }
         }
         by_ws.retain(|_, s| !s.is_empty());
-    }
-
-    /// The plugin unloaded.
-    pub fn clear_owner(&self, plugin: &str) {
-        self.clear(plugin, None);
     }
 
     pub fn get(&self, ws: &str) -> Option<Arc<WorkspaceSections>> {
@@ -110,10 +97,8 @@ mod tests {
         d.set("disk", "w2", vec![section("Disk")]);
         let w1 = d.get("w1").unwrap();
         assert_eq!(w1.iter().map(|(p, s)| (p.as_str(), s[0].title.as_str())).collect::<Vec<_>>(), [("disk", "Disk 2"), ("prune", "Prune")]);
-        d.clear("disk", Some("w1"));
-        assert_eq!(d.get("w1").unwrap().len(), 1);
-        assert!(d.get("w2").is_some());
         d.clear_owner("disk");
+        assert_eq!(d.get("w1").unwrap().len(), 1);
         assert!(d.get("w2").is_none());
         assert!(d.set_showing("w1", true) && !d.set_showing("w1", true));
         assert_eq!(d.showing(), ["w1"]);

@@ -2071,7 +2071,7 @@ mod tests {
         h.frame(&mut v);
         assert_eq!(v.key_focus(), KeyFocus::FileList);
         let p = crate::keybindings::Binding::parse("cmd+shift+l", &[]).unwrap().0[0];
-        assert_eq!(crate::keybindings::current().lookup(v.key_focus(), None, &p), Some(&Cmd::App(Action::FocusCode)));
+        assert_eq!(crate::keybindings::current().lookup(v.key_focus(), &p), Some(&Cmd::App(Action::FocusCode)));
         v.command(PanelCmd::FocusCode);
         assert_eq!(v.key_focus(), KeyFocus::Viewer);
     }
