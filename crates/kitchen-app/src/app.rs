@@ -834,38 +834,14 @@ impl KitchenApp {
         }
     }
 
+    /// The tabs scroll sideways (trackpad, wheel) when they don't fit, so
+    /// they never run under the Plan / Viewer / dashboard buttons on the
+    /// right; dragging a tab moves it.
     fn tab_strip(&mut self, ui: &mut Ui, ws: &Workspace) {
         let strip = ui.max_rect();
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.add_space(theme::SPACE_S);
-            let sel = ws.selected().map(|t| t.row.id.clone());
-            for (i, tab) in ws.tabs.iter().enumerate() {
-                let is_sel = sel.as_deref() == Some(&tab.row.id);
-                let title: String = tab.row.title.chars().take(32).collect();
-                let kind = if tab.in_main_checkout(ws) { theme::TAB_READ } else { theme::TAB_EDIT };
-                let resp = tab_button(ui, strip, Some(i + 1), &title, Some(kind), is_sel, tab.unread, false).on_hover_text(format!(
-                    "{}\n{}",
-                    tab.row.worktree,
-                    tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
-                ));
-                if resp.clicked_by(egui::PointerButton::Primary) {
-                    self.engine.select_tab(&tab.row.id);
-                    self.dashboard.remove(&ws.row.id);
-                }
-                if keybindings::current().clicked(Place::Global, places::ClickCmd::CloseTab, &resp, ui.input(|i| i.modifiers)) {
-                    self.dialog = Some(Dialog::confirm_close(tab));
-                }
-            }
-            for p in &ws.pending {
-                let title: String = p.title.chars().take(32).collect();
-                tab_button(ui, strip, None, &format!("⋯ {title}"), None, p.focus, false, true).on_hover_text("fetching origin and preparing the worktree…");
-            }
-            ui.add_space(theme::SPACE_XS);
-            let tip = [("New edit tab", Action::NewTab), ("New read tab", Action::NewMainCheckoutTab)].map(|(what, a)| with_key_spaced(what, Place::Terminal, a)).join("\n");
-            if icon_button(ui, strip, "+").on_hover_text(tip).clicked_by(egui::PointerButton::Primary) {
-                self.run_action(Action::NewTab);
-            }
+            // The full strip height, so the buttons center on the tabs.
+            ui.set_min_height(strip.height());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 ui.add_space(theme::SPACE_S);
@@ -887,8 +863,111 @@ impl KitchenApp {
                         }
                     }
                 }
+                ui.add_space(theme::SPACE_M);
+                // The rest of the strip, left to right: the tabs, then "+".
+                // Top-aligned: the tabs fill the strip's height and hang from its top.
+                ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                    ui.add_space(theme::SPACE_S);
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.style_mut().always_scroll_the_only_direction = true;
+                    let plus_w = theme::SPACE_XS + 2.0 + 26.0;
+                    egui::ScrollArea::horizontal()
+                        .id_salt("tab-strip")
+                        .max_width((ui.available_width() - plus_w).max(0.0))
+                        .auto_shrink([true, false])
+                        .show(ui, |ui| ui.horizontal(|ui| self.tabs(ui, strip, ws)));
+                    ui.add_space(theme::SPACE_XS);
+                    let tip = [("New edit tab", Action::NewTab), ("New read tab", Action::NewMainCheckoutTab)].map(|(what, a)| with_key_spaced(what, Place::Terminal, a)).join("\n");
+                    if icon_button(ui, strip, "+").on_hover_text(tip).clicked_by(egui::PointerButton::Primary) {
+                        self.run_action(Action::NewTab);
+                    }
+                });
             });
         });
+    }
+
+    /// The tab buttons inside the strip's scroll area. A newly selected tab
+    /// (or one being created) is scrolled into view.
+    fn tabs(&mut self, ui: &mut Ui, strip: egui::Rect, ws: &Workspace) {
+        let sel = ws.selected().map(|t| t.row.id.clone());
+        let focus = ws.pending.iter().rev().find(|p| p.focus).map(|p| p.id.clone()).or(sel.clone());
+        let revealed = ui.id().with("revealed");
+        let reveal = ui.data_mut(|d| d.get_temp::<Option<String>>(revealed) != Some(focus.clone()));
+        ui.data_mut(|d| d.insert_temp(revealed, focus.clone()));
+        let reveal = |resp: &egui::Response, id: &str| {
+            if reveal && focus.as_deref() == Some(id) {
+                resp.scroll_to_me(None);
+            }
+        };
+        let mut rects = Vec::with_capacity(ws.tabs.len());
+        // (index, released this frame) of the tab being dragged.
+        let mut drag: Option<(usize, bool)> = None;
+        for (i, tab) in ws.tabs.iter().enumerate() {
+            let is_sel = sel.as_deref() == Some(&tab.row.id);
+            let title: String = tab.row.title.chars().take(32).collect();
+            let kind = if tab.in_main_checkout(ws) { theme::TAB_READ } else { theme::TAB_EDIT };
+            let resp = tab_button(ui, strip, Some(i + 1), &title, Some(kind), is_sel, tab.unread, false).on_hover_text(format!(
+                "{}\n{}",
+                tab.row.worktree,
+                tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
+            ));
+            rects.push(resp.rect);
+            reveal(&resp, &tab.row.id);
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                drag = Some((i, false));
+            } else if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                drag = Some((i, true));
+            }
+            if resp.clicked_by(egui::PointerButton::Primary) {
+                self.engine.select_tab(&tab.row.id);
+                self.dashboard.remove(&ws.row.id);
+            }
+            if keybindings::current().clicked(Place::Global, places::ClickCmd::CloseTab, &resp, ui.input(|i| i.modifiers)) {
+                self.dialog = Some(Dialog::confirm_close(tab));
+            }
+        }
+        for p in &ws.pending {
+            let title: String = p.title.chars().take(32).collect();
+            let resp = tab_button(ui, strip, None, &format!("⋯ {title}"), None, p.focus, false, true).on_hover_text("fetching origin and preparing the worktree…");
+            reveal(&resp, &p.id);
+        }
+        if let Some((from, released)) = drag {
+            self.tab_drag(ui, ws, &rects, from, released);
+        }
+    }
+
+    /// Drag-to-reorder in the tab strip: draw the drop line while dragging
+    /// (scrolling when the pointer nears either end), move the tab on release.
+    fn tab_drag(&mut self, ui: &Ui, ws: &Workspace, rects: &[egui::Rect], from: usize, released: bool) {
+        let Some(pointer) = ui.ctx().pointer_interact_pos() else { return };
+        let slot = rects.iter().position(|r| pointer.x < r.center().x).unwrap_or(rects.len());
+        if released {
+            if slot != from && slot != from + 1 {
+                if let Err(e) = self.engine.move_tab(&ws.tabs[from].row.id, slot) {
+                    self.engine.toast_err(format!("{e:#}"));
+                }
+            }
+            return;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let x = match rects.get(slot) {
+            Some(r) => r.left() - 1.0,
+            None => rects[rects.len() - 1].right() + 1.0,
+        };
+        ui.painter().vline(x, rects[from].y_range().shrink(6.0), egui::Stroke::new(2.0, theme::ACCENT));
+        const EDGE: f32 = 40.0;
+        let view = ui.clip_rect();
+        let step = if pointer.x < view.left() + EDGE {
+            8.0
+        } else if pointer.x > view.right() - EDGE {
+            -8.0
+        } else {
+            0.0
+        };
+        if step != 0.0 {
+            ui.scroll_with_delta_animation(egui::vec2(step, 0.0), egui::style::ScrollAnimation::none());
+            ui.ctx().request_repaint();
+        }
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
@@ -1259,7 +1338,7 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str
     job.append(title, if number.is_some() { 7.0 } else { 0.0 }, fmt(title_font, title_color));
     let galley = ui.painter().layout_job(job);
     let dot = if unread { 12.0 } else { 0.0 };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 28.0 + dot, strip.height()), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 28.0 + dot, strip.height()), Sense::click_and_drag());
     let top = egui::CornerRadius { nw: theme::RADIUS, ne: theme::RADIUS, sw: 0, se: 0 };
     if selected {
         ui.painter().rect_filled(rect, top, theme::BG);

@@ -1228,6 +1228,24 @@ impl Engine {
         self.select_tab(&next);
     }
 
+    /// Tab strip drag: move tab `id` to insertion slot `to` (0..=len, in its
+    /// workspace's current order), then persist every tab's position.
+    pub fn move_tab(&self, id: &str, to: usize) -> Result<()> {
+        let order = {
+            let mut st = self.state();
+            let w = st.workspaces.iter_mut().find(|w| w.tabs.iter().any(|t| t.row.id == id)).context("no such tab")?;
+            let from = w.tabs.iter().position(|t| t.row.id == id).context("no such tab")?;
+            let tab = w.tabs.remove(from);
+            w.tabs.insert(if to > from { to - 1 } else { to }.min(w.tabs.len()), tab);
+            for (i, t) in w.tabs.iter_mut().enumerate() {
+                t.row.position = i as i64;
+            }
+            w.tabs.iter().map(|t| (t.row.id.clone(), t.row.position)).collect::<Vec<_>>()
+        };
+        self.repaint();
+        self.db().reorder_tabs(&order)
+    }
+
     pub fn rename_tab(&self, tab_id: &str, title: &str) -> Result<()> {
         let row = {
             let mut st = self.state();
@@ -1751,6 +1769,23 @@ mod tests {
         e.restore_tab(TabRow { worktree: "/r".into(), ..tab("r2", "w", 7) }).unwrap();
         e.close_tab("r2").unwrap();
         assert_eq!(e.take_closed(&e.workspace("w").unwrap()).unwrap().id, "r2");
+    }
+
+    #[test]
+    fn move_tabs() {
+        let e = engine_with(&["w"]);
+        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+            let row = TabRow { id: id.to_string(), workspace_id: "w".into(), title: id.to_string(), worktree: format!("/r-{id}"), branch: None, tmux_session: format!("kt-test-move-{id}"), position: i as i64, agent: false, agent_session: None };
+            e.restore_tab(row).unwrap();
+        }
+        let tabs = |e: &Engine| e.workspace("w").unwrap().tabs.iter().map(|t| t.row.id.clone()).collect::<Vec<_>>();
+        e.move_tab("a", 3).unwrap();
+        assert_eq!(tabs(&e), ["b", "c", "a", "d"]);
+        e.move_tab("d", 0).unwrap();
+        assert_eq!(tabs(&e), ["d", "b", "c", "a"]);
+        e.move_tab("b", 4).unwrap();
+        assert_eq!(tabs(&e), ["d", "c", "a", "b"]);
+        assert_eq!(e.db().tabs("w").unwrap().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["d", "c", "a", "b"], "the order survives a restart");
     }
 
     /// A revived agent tab resumes the session its agent last reported
