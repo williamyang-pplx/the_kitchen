@@ -72,6 +72,8 @@ end
 --   on_default 0|1 HEAD is an ancestor of `default_ref`
 -- The reflog counts by the time in its last entry, not the file's mtime:
 -- `git gc` (which a fetch may start) rewrites every worktree's reflog.
+-- The reflog is read first: when it says touched, the files are not listed
+-- (on a big worktree that took minutes, only to keep it anyway).
 -- It fails (non-zero, before any output) when a git listing fails, so a
 -- broken probe keeps the worktree instead of reading as "not touched".
 function M.probe_sh(minutes, default_ref)
@@ -84,11 +86,14 @@ function M.probe_sh(minutes, default_ref)
     -- "<old> <new> <name> <<email>> <time> <tz>\t<message>"; no reflog: 0
     [[r=$(tail -n 1 "$h" 2>/dev/null | sed -n 's/^[^>]*> \([0-9][0-9]*\) .*/\1/p')]],
     "[ $((${r:-0} + " .. minutes * 60 .. ')) -gt "$(date +%s)" ] && t=1 || t=',
-    [[git ls-files -z -m -o --exclude-standard > "$l"]],
-    [[git diff --cached -z --name-only >> "$l"]],
+    -- (set -e still applies inside the if: a failed listing fails the probe)
+    'if [ -z "$t" ]; then',
+    [[  git ls-files -z -m -o --exclude-standard > "$l"]],
+    [[  git diff --cached -z --name-only >> "$l"]],
     -- paths before primaries (BSD find insists); deleted files just error;
     -- no paths, no find (GNU's would look at ".")
-    [[[ -n "$t" ] || t=$(xargs -0 sh -c '[ $# = 0 ] || find "$@" -maxdepth 0 -mmin -]] .. minutes .. [[ -print 2>/dev/null; true' _ < "$l" | head -n1)]],
+    [[  t=$(xargs -0 sh -c '[ $# = 0 ] || find "$@" -maxdepth 0 -mmin -]] .. minutes .. [[ -print 2>/dev/null; true' _ < "$l" | head -n1)]],
+    "fi",
     [[if [ -n "$t" ]; then echo "touched 1"; else echo "touched 0"; fi]],
     -- for-each-ref --contains walks every ref, so only when detached
     [[if git symbolic-ref -q HEAD >/dev/null || [ -n "$(git for-each-ref --contains HEAD --count=1)" ]; then echo "contained 1"; else echo "contained 0"; fi]],

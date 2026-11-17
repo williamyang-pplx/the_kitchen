@@ -1383,6 +1383,14 @@ mod tests {
         assert!(probe(&wt).1.starts_with("touched 0\n"), "an old edit");
 
         assert_eq!(probe(&det).1, "touched 1\ncontained 0\non_default 0\n", "a commit on no ref");
+        // A fresh reflog settles it before the files are listed: with an
+        // index git can't read, the probe still answers. With an old reflog
+        // the listing runs, fails, and so does the probe (the worktree stays).
+        run(&wt, "git checkout -q -b fresh && printf broken > \"$(git rev-parse --git-path index)\"");
+        assert_eq!(probe(&wt), (true, "touched 1\ncontained 1\non_default 1\n".into()), "no listing after a fresh checkout");
+        backdate(&wt);
+        let (ok, out) = probe(&wt);
+        assert!(!ok && out.is_empty(), "an old reflog: the listing runs and fails ({out})");
         let (ok, out) = probe(&std::env::temp_dir().display().to_string());
         assert!(!ok && out.is_empty(), "outside a repo: fail, print nothing ({out})");
         let _ = std::fs::remove_dir_all(&wt);
