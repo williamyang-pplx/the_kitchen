@@ -1567,8 +1567,10 @@ impl Viewer {
         let rows = changes_tree::rows(&paths);
         let mut clicked: Option<usize> = None;
         let mut all = false;
+        let reviewers = self.shown_reviewers();
         egui::ScrollArea::vertical().id_salt(("changes", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(theme::SPACE_S);
+            reviewers_section(ui, &reviewers);
             ui.horizontal(|ui| {
                 ui.add_space(theme::SPACE_M);
                 changed_header(ui, &self.changed);
@@ -1629,8 +1631,10 @@ impl Viewer {
         let scroll = std::mem::take(&mut self.list_scroll);
         let mut clicked: Option<usize> = None;
         let mut browse: Option<String> = None;
+        let reviewers = self.shown_reviewers();
         egui::ScrollArea::vertical().id_salt(("files", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(theme::SPACE_S);
+            reviewers_section(ui, &reviewers);
             if !self.changed.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(theme::SPACE_M);
@@ -1699,6 +1703,44 @@ impl Viewer {
             self.browse(&d, select);
         }
     }
+}
+
+/// "REVIEWERS", then each reviewer of the PR on screen: its state's icon,
+/// name and status, and a team's members wrapped below. Nothing without any.
+fn reviewers_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer]) {
+    if reviewers.is_empty() {
+        return;
+    }
+    let pad = theme::SPACE_M;
+    ui.horizontal(|ui| {
+        ui.add_space(pad);
+        ui.label(widgets::section_label("Reviewers", theme::SUBTLE));
+    });
+    ui.add_space(2.0);
+    let icon = 12.0;
+    let indent = pad + icon + theme::SPACE_XS;
+    for r in reviewers {
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            let (square, _) = ui.allocate_exact_size(egui::vec2(icon, icon), egui::Sense::hover());
+            widgets::check_icon(ui.painter(), square, r.state);
+            let mut job = egui::text::LayoutJob::default();
+            let f = |font, color| egui::TextFormat { font_id: font, color, ..Default::default() };
+            job.append(&r.name, 0.0, f(theme::ui_font(theme::TEXT_BODY), theme::TEXT));
+            if !r.status.is_empty() {
+                job.append(&r.status, 6.0, f(theme::ui_font(theme::TEXT_SMALL), widgets::check_color(r.state)));
+            }
+            ui.label(job);
+        });
+        if !r.members.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.add(egui::Label::new(RichText::new(r.members.join(", ")).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE)).wrap());
+            });
+        }
+        ui.add_space(2.0);
+    }
+    ui.add_space(theme::SPACE_S);
 }
 
 /// "CHANGED FILES  n" and the lines the changes add and remove in all.

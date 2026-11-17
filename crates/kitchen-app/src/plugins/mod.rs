@@ -1178,41 +1178,53 @@ mod tests {
         assert_eq!(checks("OPEN", None, serde_json::Value::Null), (false, vec![]), "a repo that requires no review");
         assert!(q.contains("reviewRequests(first: 20)") && q.contains("latestOpinionatedReviews(first: 20)"), "the reviewers too: {q}");
 
-        // The approval check names its reviewers; its note lists each
-        // requested team's members (not the author) to know whom to ping.
-        let approval = |decision: &str, extra: serde_json::Value| -> (String, String) {
+        // M.reviewers: whom the PR waits on and heard from, a team with its
+        // members (not the author), and the approval check's label names them.
+        let pr_with = |decision: &str, extra: serde_json::Value| {
             let mut pr = serde_json::json!({ "state": "OPEN", "reviewDecision": decision, "author": { "login": "me" } });
             pr.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            let pr = lua.to_value_with(&pr, mlua::serde::SerializeOptions::new().serialize_none_to_null(false).serialize_unit_to_null(false)).unwrap();
+            lua.to_value_with(&pr, mlua::serde::SerializeOptions::new().serialize_none_to_null(false).serialize_unit_to_null(false)).unwrap()
+        };
+        let reviewers = |pr: mlua::Value| -> Vec<(String, String, String, Vec<String>)> {
+            let list: serde_json::Value = lua.from_value(m.get::<mlua::Function>("reviewers").unwrap().call(pr).unwrap()).unwrap();
+            let list = list.as_array().cloned().unwrap_or_default();
+            let s = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+            list.iter().map(|r| (s(&r["state"]), s(&r["name"]), s(&r["status"]), r["members"].as_array().map(|a| a.iter().map(s).collect()).unwrap_or_default())).collect()
+        };
+        let approval = |pr: mlua::Value| -> (String, String) {
             let (_, list): (bool, mlua::Value) = m.get::<mlua::Function>("checks").unwrap().call(pr).unwrap();
             let list: serde_json::Value = lua.from_value(list).unwrap();
             (list[0]["label"].as_str().unwrap().into(), list[0]["note"].as_str().unwrap().into())
         };
+        let r = |state: &str, name: &str, status: &str, members: &[&str]| (state.to_string(), name.to_string(), status.to_string(), members.iter().map(|m| m.to_string()).collect::<Vec<_>>());
         let team = serde_json::json!({ "slug": "pplx_aster", "members": { "totalCount": 53,
             "nodes": [{ "login": "me", "name": "Me" }, { "login": "paul", "name": "Paul F" }, { "login": "max", "name": null }] } });
         let requested = serde_json::json!({ "reviewRequests": { "nodes": [
             { "asCodeOwner": true, "requestedReviewer": team },
-            { "asCodeOwner": false, "requestedReviewer": { "login": "dan", "name": "dan" } },
+            { "asCodeOwner": false, "requestedReviewer": { "login": "dan", "name": "Dan" } },
             { "asCodeOwner": false, "requestedReviewer": {} },
             { "asCodeOwner": false, "requestedReviewer": { "slug": "solo", "members": { "totalCount": 1, "nodes": [{ "login": "me" }] } } },
         ] } });
         assert_eq!(
-            approval("REVIEW_REQUIRED", requested),
-            (
-                "awaiting approval · pplx_aster, @dan +1".into(),
-                "GitHub review: review required\n\npplx_aster (code owner): Paul F @paul, @max, +50 more\nsolo: no members besides the author\nrequested: @dan".into()
-            ),
+            reviewers(pr_with("REVIEW_REQUIRED", requested.clone())),
+            vec![
+                r("waiting", "pplx_aster", "requested · code owner", &["Paul F", "@max", "+50 more"]),
+                r("waiting", "@dan", "requested", &[]),
+                r("waiting", "solo", "requested", &[]),
+            ],
             "a bot (no login, no slug) is left out"
         );
-        let reviewed = serde_json::json!({ "latestOpinionatedReviews": { "nodes": [
-            { "state": "APPROVED", "author": { "login": "paul" } }, { "state": "CHANGES_REQUESTED", "author": { "login": "max" } },
-        ] } });
         assert_eq!(
-            approval("CHANGES_REQUESTED", reviewed.clone()),
-            ("changes requested · @max".into(), "GitHub review: changes requested\n\napproved: @paul\nchanges requested: @max".into())
+            approval(pr_with("REVIEW_REQUIRED", requested)),
+            ("awaiting approval · pplx_aster, @dan +1".into(), "GitHub review: review required".into())
         );
-        assert_eq!(approval("APPROVED", reviewed).0, "approved · @paul");
-        assert_eq!(approval("APPROVED", serde_json::json!({})), ("approved".into(), "GitHub review: approved".into()), "no reviewers: as before");
+        let reviewed = serde_json::json!({ "latestOpinionatedReviews": { "nodes": [
+            { "state": "APPROVED", "author": { "login": "paul" } }, { "state": "CHANGES_REQUESTED", "author": { "login": "max" } }, { "state": "COMMENTED", "author": { "login": "x" } },
+        ] } });
+        assert_eq!(reviewers(pr_with("CHANGES_REQUESTED", reviewed.clone())), vec![r("done", "@paul", "approved", &[]), r("needed", "@max", "changes requested", &[])]);
+        assert_eq!(approval(pr_with("CHANGES_REQUESTED", reviewed.clone())).0, "changes requested · @max");
+        assert_eq!(approval(pr_with("APPROVED", reviewed)).0, "approved · @paul");
+        assert_eq!(approval(pr_with("APPROVED", serde_json::json!({}))), ("approved".into(), "GitHub review: approved".into()), "no reviewers: as before");
     }
 
     /// github ⌘⇧D: a PR's description as the page the viewer renders, its

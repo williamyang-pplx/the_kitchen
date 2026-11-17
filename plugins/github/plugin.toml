@@ -1,6 +1,6 @@
 name = "github"
 version = "0.1.0"
-description = "Review a GitHub PR in the current tab: paste its link into ⌘⇧P to see its diff and review comments; ⌘M posts to the PR; ⌘⇧S switches between the tab's PRs (a check on approved ones); the viewer's header shows what the PR waits on (code owners, named, with their members on hover; an Atlantis apply); ⌘⇧D shows the PR's description; ⌘⇧O opens it in Chrome"
+description = "Review a GitHub PR in the current tab: paste its link into ⌘⇧P to see its diff and review comments; ⌘M posts to the PR; ⌘⇧S switches between the tab's PRs (a check on approved ones); the viewer's header shows what the PR waits on (code owners, an Atlantis apply), and its file list the PR's reviewers with each team's members; ⌘⇧D shows the PR's description; ⌘⇧O opens it in Chrome"
 api = 12
 
 [config]

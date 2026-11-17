@@ -217,7 +217,26 @@ pub struct ViewEntry {
     /// header while it is on screen.
     #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
     pub checks: Vec<Check>,
+    /// Its reviewers, listed atop the viewer's file list while it is on screen.
+    #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
+    pub reviewers: Vec<Reviewer>,
     pub view: ViewAt,
+}
+
+/// One reviewer of a PR, as the file list shows it: the state's icon, the
+/// name, the status, and a team's members (whom to ping) below.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct Reviewer {
+    /// Waiting: asked to review; done: approved; needed: asked for changes.
+    pub state: CheckState,
+    /// e.g. "pplx_aster", "@al"
+    pub name: String,
+    /// e.g. "requested · code owner", "approved"
+    #[serde(default)]
+    pub status: String,
+    /// A team's members, e.g. "Paul Fryzel", "@max", "+3 more".
+    #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
+    pub members: Vec<String>,
 }
 
 /// One thing a PR waits on, as the viewer's header shows it: the state's

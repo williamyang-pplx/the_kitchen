@@ -309,6 +309,8 @@ kitchen.on("views", function(ev)   -- ⌘⇧S: the tab's command ctx, plus ev.pr
         view = { rev = "refs/kitchen/pr/12", name = "kitchen-pr-12", fetch = { … }, base = "origin/main" } },
       { section = "main ← william/a", label = "#13 use them", detail = "2/2 · live", state = "open", approved = true,
         checks = { { state = "needed", label = "atlantis apply needed", note = "…still need a confirmed successful apply." } },
+        reviewers = { { state = "waiting", name = "pplx_aster", status = "requested", members = { "Paul Fryzel", "@max" } },
+                      { state = "done", name = "@al", status = "approved" } },
         view = { base = "origin/william/a" } },   -- no rev: the tab's own worktree
     },
   }
@@ -324,7 +326,9 @@ label; its `url` comes back to commands as `ctx.viewer.menu.url` while the
 cursor is on it. `approved = true` draws a check after that icon. `checks`
 are what the PR waits on, drawn in the viewer's header while its row is on
 screen: each a `state` (`"done"`, `"waiting"` on others, `"needed"` from the
-author), a `label`, and a `note` shown on hover. A viewer on screen sends
+author), a `label`, and a `note` shown on hover. `reviewers` are listed atop
+the viewer's file list while its row is on screen: each a `state` (as a
+check's), a `name`, a `status` beside it, and `members` (a team's) below. A viewer on screen sends
 `views` itself too (when it opens, when it shows a view the menu lacks, and
 every 2 minutes), so the header's checks keep up without ⌘⇧S. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.

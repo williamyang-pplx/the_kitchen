@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use super::picker::{Picker, RowIcon};
 use super::{PickerKind, Viewer};
-use crate::engine::{Check, MenuRow, Shown, View, ViewAt};
+use crate::engine::{Check, MenuRow, Reviewer, Shown, View, ViewAt};
 
 /// How long the menu says "loading PRs…" while it waits for a plugin.
 const ASK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -166,6 +166,11 @@ impl Viewer {
     pub(super) fn shown_checks(&self) -> Vec<Check> {
         self.shown_entry().map(|(menu, i)| menu[i].0.checks.clone()).unwrap_or_default()
     }
+
+    /// The reviewers of the row on screen, for the file list.
+    pub(super) fn shown_reviewers(&self) -> Vec<Reviewer> {
+        self.shown_entry().map(|(menu, i)| menu[i].0.reviewers.clone()).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -305,8 +310,9 @@ mod tests {
             serde_json::json!([
                 { "section": "main ← a", "label": "#7 a", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
                 { "section": "main ← a", "label": "#8 b", "view": { "base": "origin/a" },
-                  "checks": [{ "state": "waiting", "label": "in review", "note": "Waiting for team review: team-x" }, { "state": "needed", "label": "atlantis apply needed" }] },
-                { "section": "main ← c", "label": "#9 c", "view": { "base": "origin/c" }, "checks": {} },
+                  "checks": [{ "state": "waiting", "label": "in review", "note": "Waiting for team review: team-x" }, { "state": "needed", "label": "atlantis apply needed" }],
+                  "reviewers": [{ "state": "waiting", "name": "team-x", "status": "requested", "members": ["Al", "@bo"] }, { "state": "done", "name": "@cy", "status": "approved", "members": {} }] },
+                { "section": "main ← c", "label": "#9 c", "view": { "base": "origin/c" }, "checks": {}, "reviewers": {} },
             ]),
         );
         let at = |base: &str| Viewer::at(&h.engine, Host::Local, "t", h.repo.path(), base.into());
@@ -322,5 +328,16 @@ mod tests {
         );
         assert!(at("origin/c").shown_checks().is_empty(), "an empty Lua table is no checks");
         assert!(at("origin/main").shown_checks().is_empty());
+
+        // So are the file list's reviewers.
+        let reviewers: Vec<(CheckState, String, String, Vec<String>)> = at("origin/a").shown_reviewers().into_iter().map(|r| (r.state, r.name, r.status, r.members)).collect();
+        assert_eq!(
+            reviewers,
+            vec![
+                (CheckState::Waiting, "team-x".into(), "requested".into(), vec!["Al".into(), "@bo".into()]),
+                (CheckState::Done, "@cy".into(), "approved".into(), vec![]),
+            ]
+        );
+        assert!(at("origin/c").shown_reviewers().is_empty(), "an empty Lua table is no reviewers");
     }
 }
