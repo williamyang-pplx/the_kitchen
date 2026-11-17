@@ -331,4 +331,51 @@ mod tests {
         assert!(reviewers.is_empty() && gates.is_empty(), "an empty Lua table is none");
         assert_eq!(at("origin/main").shown_review(), (vec![], vec![]), "not a row of the menu");
     }
+
+    /// Hovering a reviewer team in the file list shows its members.
+    #[test]
+    fn hovering_a_team_lists_its_members() {
+        let h = Harness::new(TestRepo::new("echo 1 > a"));
+        set(
+            &h,
+            serde_json::json!([{ "section": "main ← a", "label": "#8 b", "view": { "base": "origin/a" },
+              "reviewers": [{ "state": "waiting", "name": "team-x", "team": true, "status": "requested", "members": ["Zed Member", "@bo"] }] }]),
+        );
+        let mut v = Viewer::at(&h.engine, Host::Local, "t", h.repo.path(), "origin/a".into());
+        // A frame `dt` seconds after the last, with `events`; whether any
+        // painted text has `needle`.
+        let mut now = 0.0;
+        let mut frame = |dt: f64, events: Vec<egui::Event>, needle: &str| -> bool {
+            now += dt;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))), time: Some(now), events, ..Default::default() };
+            let mut out = h.ctx.run_ui(input, |ui| {
+                let mut cx = crate::panels::PanelCtx { engine: &h.engine, focused: true, clicked: false, view: None };
+                v.ui(ui, &mut cx);
+            });
+            out.textures_delta.clear();
+            out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Text(t) if t.galley.text().contains(needle)))
+        };
+        for _ in 0..5 {
+            frame(0.1, vec![], "");
+        }
+        // Whether hovering `pos` (coming from the code, still for 2 s) shows
+        // the team's members.
+        let shows = |frame: &mut dyn FnMut(f64, Vec<egui::Event>, &str) -> bool, pos: egui::Pos2| {
+            frame(0.1, vec![egui::Event::PointerMoved(egui::pos2(700.0, 600.0))], "");
+            frame(2.0, vec![], "");
+            frame(0.1, vec![egui::Event::PointerMoved(pos)], "");
+            frame(0.1, vec![], "");
+            frame(2.0, vec![], "");
+            // A tooltip's first frame only sizes it; the next one paints it.
+            frame(0.1, vec![], "Zed Member")
+        };
+        // Find the team's name: sweep the top of the file list.
+        let y = (30..200).step_by(4).map(|y| y as f32).find(|&y| shows(&mut frame, egui::pos2(60.0, y))).expect("hovering the team's name lists its members");
+        assert!(frame(0.1, vec![], "team-x"), "the team row is drawn");
+        // The rest of its row works too: the state icon, the empty space after
+        // the status, and the member count under it.
+        assert!(shows(&mut frame, egui::pos2(18.0, y)), "hovering the team's icon lists its members");
+        assert!(shows(&mut frame, egui::pos2(230.0, y)), "and the space right of its status");
+        assert!(shows(&mut frame, egui::pos2(18.0, y + 18.0)), "and the line under it");
+    }
 }

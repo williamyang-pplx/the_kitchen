@@ -1763,9 +1763,9 @@ impl Viewer {
 
 /// The PR on screen's "REVIEWERS": each one's state icon, name (a team's in
 /// its own color) and status, and under a team how many members it has, the
-/// names on hover. Then its "CHECKS": those blocking its merge, each one's
-/// description on hover, or one row saying they all passed. Nothing for a
-/// view that isn't an open PR.
+/// names on hover anywhere on its rows. Then its "CHECKS": those blocking its
+/// merge, each one's description on hover, or one row saying they all passed.
+/// Nothing for a view that isn't an open PR.
 fn review_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer], gates: &[crate::engine::Check]) {
     let pad = theme::SPACE_M;
     let icon = 12.0;
@@ -1782,9 +1782,16 @@ fn review_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer], gates: &[c
             ui.add_space(pad);
             let (square, _) = ui.allocate_exact_size(egui::vec2(icon, icon), egui::Sense::hover());
             widgets::check_icon(ui.painter(), square, state);
-            ui.label(job)
-        })
-        .inner
+            ui.label(job);
+        });
+    };
+    // `tip` on hover anywhere from `top` down to here, the list's full width.
+    let hover = |ui: &mut Ui, top: f32, key: &str, tip: &str| {
+        if tip.is_empty() {
+            return;
+        }
+        let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+        ui.interact(rect, ui.id().with(("review", key)), egui::Sense::hover()).on_hover_text(tip);
     };
     let f = |size, color| egui::TextFormat { font_id: theme::ui_font(size), color, ..Default::default() };
     if !reviewers.is_empty() {
@@ -1795,17 +1802,16 @@ fn review_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer], gates: &[c
             if !r.status.is_empty() {
                 job.append(&r.status, 6.0, f(theme::TEXT_SMALL, widgets::check_color(r.state)));
             }
-            let row = line(ui, r.state, job);
+            let top = ui.cursor().top();
+            line(ui, r.state, job);
             if !r.members.is_empty() {
                 let n = r.members.len();
-                let count = ui.horizontal(|ui| {
+                ui.horizontal(|ui| {
                     ui.add_space(pad + icon + ui.spacing().item_spacing.x);
-                    ui.label(RichText::new(format!("{n} member{}", if n == 1 { "" } else { "s" })).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE))
+                    ui.label(RichText::new(format!("{n} member{}", if n == 1 { "" } else { "s" })).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE));
                 });
-                let names = r.members.join("\n");
-                row.on_hover_text(&names);
-                count.inner.on_hover_text(&names);
             }
+            hover(ui, top, &r.name, &r.members.join("\n"));
             ui.add_space(2.0);
         }
         ui.add_space(theme::SPACE_S);
@@ -1816,10 +1822,9 @@ fn review_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer], gates: &[c
             let mut job = egui::text::LayoutJob::default();
             let color = if g.state == crate::engine::CheckState::Done { widgets::check_color(g.state) } else { theme::TEXT };
             job.append(&g.label, 0.0, f(theme::TEXT_SMALL, color));
-            let row = line(ui, g.state, job);
-            if !g.note.is_empty() {
-                row.on_hover_text(&g.note);
-            }
+            let top = ui.cursor().top();
+            line(ui, g.state, job);
+            hover(ui, top, &g.label, &g.note);
         }
         ui.add_space(theme::SPACE_S);
     }
