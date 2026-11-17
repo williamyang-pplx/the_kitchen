@@ -2280,7 +2280,6 @@ name = "kitchen-symbols"
 version = "0.1.0"
 dependencies = [
  "regex",
- "serde",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",

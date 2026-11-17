@@ -45,3 +45,13 @@ impl Default for Settings {
         }
     }
 }
+
+impl Settings {
+    pub fn bootstrap_options(&self) -> kitchen_core::bootstrap::Options {
+        kitchen_core::bootstrap::Options {
+            dotfiles_local: self.dotfiles_local.clone(),
+            dotfiles_remote_url: self.dotfiles_remote_url.clone(),
+            dotfiles_remote_dir: self.dotfiles_remote_dir.clone(),
+        }
+    }
+}

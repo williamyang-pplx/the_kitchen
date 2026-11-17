@@ -2,7 +2,7 @@
 //!
 //! Every subcommand maps to exactly one API method (see [`Cli::to_call`]),
 //! except the few that run without the app: `guide`, `version`, and the
-//! hidden `__relay` / `__index` / `__agent-stopped` / `__agent-session` helpers.
+//! hidden `__relay` / `__agent-stopped` / `__agent-session` helpers.
 
 use std::path::PathBuf;
 
@@ -98,9 +98,6 @@ pub enum Command {
     /// Devbox side of the API tunnel (started by the app over ssh).
     #[command(name = "__relay", hide = true)]
     Relay,
-    /// Print symbols of a file as JSON (used by the viewer on devboxes).
-    #[command(name = "__index", hide = true)]
-    Index { paths: Vec<PathBuf> },
     /// Claude Code Stop hook (hook JSON on stdin): `notify`, unless background
     /// subagents are still running.
     #[command(name = "__agent-stopped", hide = true)]
@@ -415,14 +412,6 @@ pub enum DebugCmd {
     Keys { keys: String },
 }
 
-/// cmux-style aliases that clap cannot express: `kitchenctl --skill` = `guide`.
-pub fn normalize_args(mut argv: Vec<String>) -> Vec<String> {
-    if argv.get(1).map(String::as_str) == Some("--skill") {
-        argv[1] = "guide".into();
-    }
-    argv
-}
-
 /// What a command needs done.
 #[derive(Debug, PartialEq)]
 pub enum Call {
@@ -431,7 +420,6 @@ pub enum Call {
     Guide,
     Version,
     Relay,
-    Index(Vec<PathBuf>),
     /// Nothing to do (exit 0).
     Skip,
 }
@@ -589,7 +577,6 @@ impl Cli {
             }
             Command::Debug(DebugCmd::Keys { keys }) => api("debug.keys", json!({"keys": keys})),
             Command::Relay => Call::Relay,
-            Command::Index { paths } => Call::Index(paths.clone()),
         })
     }
 }
@@ -686,8 +673,6 @@ mod tests {
     fn rpc_passthrough_and_local_commands() {
         assert_eq!(api_call(&["rpc", "tab.list", "{\"workspace\":\"1\"}"]), ("tab.list".into(), json!({"workspace": "1"})));
         assert_eq!(call(&["guide"]), Call::Guide);
-        let argv = normalize_args(vec!["kitchenctl".into(), "--skill".into()]);
-        assert_eq!(Cli::try_parse_from(argv).unwrap().to_call().unwrap(), Call::Guide);
         assert_eq!(call(&["__relay"]), Call::Relay);
         assert!(Cli::try_parse_from(["kitchenctl", "--json", "ping"]).unwrap().json);
         assert!(Cli::try_parse_from(["kitchenctl", "ping", "--json"]).unwrap().json, "--json is global");

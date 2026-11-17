@@ -565,15 +565,9 @@ impl Engine {
     pub fn bootstrap_workspace(self: &Arc<Self>, ws_id: &str) -> Result<()> {
         let ws = self.workspace(ws_id).context("no such workspace")?;
         self.set_ws_status(ws_id, Some("syncing dotfiles…"), None);
-        let settings = self.settings();
-        let report = kitchen_core::bootstrap::bootstrap_host(&ws.host(), &kitchen_core::bootstrap::Options {
-            dotfiles_local: settings.dotfiles_local.clone(),
-            dotfiles_remote_url: settings.dotfiles_remote_url.clone(),
-            dotfiles_remote_dir: settings.dotfiles_remote_dir.clone(),
-        });
-        match report {
-            Ok(r) => {
-                for w in &r.warnings {
+        match kitchen_core::bootstrap::bootstrap_host(&ws.host(), &self.settings().bootstrap_options()) {
+            Ok(warnings) => {
+                for w in &warnings {
                     self.toast_err(format!("{}: {w}", ws.row.name));
                 }
                 self.set_ws_status(ws_id, None, None);
@@ -1295,7 +1289,7 @@ impl Engine {
         let command = resume_command(&row, &self.settings());
         let env = tab_env(&ws.row, &row, &host);
         self.set_pending(ws_id, PendingTab { id: row.id.clone(), title: row.title.clone(), focus: true });
-        let started = Tmux::new(&host).new_session(&row.tmux_session, &row.worktree, &env, command.as_deref());
+        let started = Tmux::new(&host).new_session_with_setup(&row.tmux_session, &row.worktree, &env, command.as_deref(), None);
         self.clear_pending(ws_id, &row.id);
         if let Err(e) = started {
             self.closed.lock().unwrap().push(row);
@@ -1812,7 +1806,7 @@ mod tests {
 
         e.set_agent_session("a", "0b7e-41").unwrap();
         assert!(command(&e).ends_with(" --resume 0b7e-41"), "{}", command(&e));
-        assert_eq!(e.db().tab("a").unwrap().unwrap().agent_session.as_deref(), Some("0b7e-41"));
+        assert_eq!(e.db().tabs("w").unwrap()[0].agent_session.as_deref(), Some("0b7e-41"));
 
         assert_eq!(resume_command(&TabRow { agent: false, ..row }, &settings), None);
     }

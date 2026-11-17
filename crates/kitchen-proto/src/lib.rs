@@ -53,8 +53,6 @@ pub struct Caller {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
 }
 
 impl Caller {
@@ -62,7 +60,6 @@ impl Caller {
         Self {
             workspace_id: std::env::var(ENV_WORKSPACE).ok().filter(|s| !s.is_empty()),
             tab_id: std::env::var(ENV_TAB).ok().filter(|s| !s.is_empty()),
-            cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
         }
     }
 }

@@ -5,7 +5,6 @@
 //! siblings of the main checkout named `<repo>-<slug>`.
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 
 use crate::host::Host;
 use crate::util::shell_quote;
@@ -35,12 +34,11 @@ pub struct Repo<'a> {
     pub path: &'a str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
     pub path: String,
     pub head: String,
     pub branch: Option<String>,
-    pub detached: bool,
 }
 
 /// What [`Repo::checkout_worktree`] puts in a worktree.
@@ -52,7 +50,7 @@ pub enum Checkout<'a> {
     Detached(&'a str),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedFile {
     /// Path in the new tree.
     pub path: String,
@@ -102,13 +100,9 @@ impl<'a> Repo<'a> {
         self.git(&["rev-parse", "--git-dir"]).is_ok()
     }
 
-    pub fn origin_url(&self) -> Result<String> {
-        Ok(self.git(&["remote", "get-url", "origin"])?.trim().to_string())
-    }
-
     /// `owner/name` for a GitHub origin, if origin is on GitHub.
     pub fn github_slug(&self) -> Option<String> {
-        parse_github_slug(&self.origin_url().ok()?)
+        parse_github_slug(&self.git(&["remote", "get-url", "origin"]).ok()?)
     }
 
     pub fn fetch(&self) -> Result<()> {
@@ -143,13 +137,6 @@ impl<'a> Repo<'a> {
 
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
         Ok(parse_worktree_porcelain(&self.git(&["worktree", "list", "--porcelain"])?))
-    }
-
-    /// New branch off the freshly fetched default branch, in its own worktree.
-    pub fn add_worktree_new_branch(&self, branch: &str, path: &str, base: &str) -> Result<Worktree> {
-        let start = format!("origin/{base}");
-        self.git(&["worktree", "add", "--no-track", "-b", branch, path, &start])?;
-        self.describe(path)
     }
 
     /// Worktree with `to` checked out, after fetching `fetch` refspecs
@@ -395,15 +382,6 @@ true"#,
         Ok(out.lines().any(|l| l.starts_with("multi-pack-index written")))
     }
 
-    pub fn describe(&self, path: &str) -> Result<Worktree> {
-        // git reports canonical paths (e.g. /private/var on macOS); ask it.
-        let top = self.git_in(path, &["rev-parse", "--show-toplevel"])?.trim().to_string();
-        self.worktrees()?
-            .into_iter()
-            .find(|w| w.path == path || w.path == top)
-            .with_context(|| format!("worktree {path} missing after creation"))
-    }
-
     pub fn remove_worktree(&self, path: &str, force: bool) -> Result<()> {
         let mut args = vec!["worktree", "remove"];
         if force {
@@ -527,7 +505,6 @@ fn gunzip_if_gzipped(bytes: Vec<u8>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Shell lines printing `KT_PATH=`/`KT_HEAD=`/`KT_BRANCH=` for [`parse_report`].
 /// Shell (run in the repo) for [`Repo::index_packs`]; prints
 /// "multi-pack-index written (N packs)" when it wrote it.
 fn index_packs_snippet() -> &'static str {
@@ -541,6 +518,7 @@ if [ "$n" -ge {UNINDEXED_PACKS} ]; then {NICE} git multi-pack-index write >/dev/
     })
 }
 
+/// Shell lines printing `KT_PATH=`/`KT_HEAD=`/`KT_BRANCH=` for [`parse_report`].
 fn report_snippet(dir: &str) -> String {
     format!(
         r#"echo "KT_PATH=$(git -C {dir} rev-parse --show-toplevel)"; echo "KT_HEAD=$(git -C {dir} rev-parse --verify --quiet HEAD)"; echo "KT_BRANCH=$(git -C {dir} symbolic-ref --quiet --short HEAD)""#
@@ -548,7 +526,7 @@ fn report_snippet(dir: &str) -> String {
 }
 
 fn parse_report(out: &str) -> Result<Worktree> {
-    let mut wt = Worktree { path: String::new(), head: String::new(), branch: None, detached: false };
+    let mut wt = Worktree { path: String::new(), head: String::new(), branch: None };
     for line in out.lines() {
         if let Some(v) = line.strip_prefix("KT_PATH=") {
             wt.path = v.to_string();
@@ -558,7 +536,6 @@ fn parse_report(out: &str) -> Result<Worktree> {
             wt.branch = Some(v.to_string()).filter(|b| !b.is_empty());
         }
     }
-    wt.detached = wt.branch.is_none();
     if wt.path.is_empty() {
         bail!("worktree script produced no path: {out}");
     }
@@ -583,7 +560,7 @@ pub fn parse_github_slug(url: &str) -> Option<String> {
 pub fn parse_worktree_porcelain(s: &str) -> Vec<Worktree> {
     let mut out = Vec::new();
     for block in s.split("\n\n") {
-        let mut wt = Worktree { path: String::new(), head: String::new(), branch: None, detached: false };
+        let mut wt = Worktree { path: String::new(), head: String::new(), branch: None };
         for line in block.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
                 wt.path = p.to_string();
@@ -591,8 +568,6 @@ pub fn parse_worktree_porcelain(s: &str) -> Vec<Worktree> {
                 wt.head = h.to_string();
             } else if let Some(b) = line.strip_prefix("branch ") {
                 wt.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
-            } else if line == "detached" {
-                wt.detached = true;
             }
         }
         if !wt.path.is_empty() {
@@ -696,7 +671,7 @@ mod tests {
         let w = parse_worktree_porcelain(s);
         assert_eq!(w.len(), 2);
         assert_eq!(w[0].branch.as_deref(), Some("main"));
-        assert!(w[1].detached);
+        assert!(w[1].branch.is_none());
     }
 
     #[test]
@@ -780,10 +755,6 @@ mod tests {
         let repo = Repo::new(&host, &repo_path);
         repo.fetch().unwrap();
         assert_eq!(repo.default_branch().unwrap(), "main");
-
-        let edit = repo.sibling_path("feature");
-        let wt = repo.add_worktree_new_branch("william/feature", &edit, "main").unwrap();
-        assert_eq!(wt.branch.as_deref(), Some("william/feature"));
 
         sh(root, "cd origin && echo three > c.txt && git add . && git commit -qm more");
         repo.fetch().unwrap();
@@ -882,7 +853,7 @@ mod tests {
         assert_eq!(wt.path, i.path, "branch reused where it is");
         let det = repo.sibling_path("dirty-detached");
         let (wt, _) = repo.checkout_worktree(&det, Checkout::Detached("origin/main"), &[]).unwrap();
-        assert!(wt.detached && exists(&format!("{det}/n.txt")) && spares.iter().all(|s| exists(s)), "detached: fresh checkout");
+        assert!(wt.branch.is_none() && exists(&format!("{det}/n.txt")) && spares.iter().all(|s| exists(s)), "detached: fresh checkout");
         repo.ensure_spare_worktree("main", false).unwrap();
         for s in &spares {
             assert_eq!(std::fs::read_to_string(format!("{s}/n.txt")).unwrap(), "nine\n", "{s} refreshed");
@@ -1039,7 +1010,7 @@ mod tests {
         let det = repo.sibling_path("kitchen-pr-8");
         let specs = ["+refs/pull/7/head:refs/kitchen/pr/7".to_string()];
         let (wt, moved) = repo.checkout_worktree(&det, Checkout::Detached("refs/kitchen/pr/7"), &specs).unwrap();
-        assert!(moved && wt.detached && exists(&format!("{det}/p.txt")));
+        assert!(moved && wt.branch.is_none() && exists(&format!("{det}/p.txt")));
         std::fs::write(format!("{det}/p.txt"), "edited\n").unwrap();
         sh(root, "cd origin && git checkout -q pr && git update-ref refs/pull/7/head HEAD && git checkout -q main");
         assert!(repo.checkout_worktree(&det, Checkout::Detached("refs/kitchen/pr/7"), &specs).unwrap_err().to_string().contains("exit 13"));

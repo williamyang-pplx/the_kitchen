@@ -89,16 +89,8 @@ fn main() -> eframe::Result {
 /// (pull dotfiles, relink skills, update kitchenctl, start its relay).
 fn startup(engine: &Arc<engine::Engine>) {
     engine.spawn("local setup", |e| {
-        let s = e.settings();
-        let report = kitchen_core::bootstrap::bootstrap_host(
-            &kitchen_core::host::Host::Local,
-            &kitchen_core::bootstrap::Options {
-                dotfiles_local: s.dotfiles_local.clone(),
-                dotfiles_remote_url: s.dotfiles_remote_url.clone(),
-                dotfiles_remote_dir: s.dotfiles_remote_dir.clone(),
-            },
-        )?;
-        for w in report.warnings {
+        let warnings = kitchen_core::bootstrap::bootstrap_host(&kitchen_core::host::Host::Local, &e.settings().bootstrap_options())?;
+        for w in warnings {
             e.toast_err(format!("local setup: {w}"));
         }
         Ok(())

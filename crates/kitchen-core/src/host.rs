@@ -8,11 +8,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 
 use crate::util::{shell_join, shell_quote};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Host {
     Local,
     Ssh(String),
@@ -110,26 +109,6 @@ impl Host {
         match self {
             Host::Local => std::fs::read_to_string(path).with_context(|| format!("read {path}")),
             Host::Ssh(_) => self.run_ok(&["cat", "--", path], None),
-        }
-    }
-
-    pub fn write_file(&self, path: &str, contents: &str) -> Result<()> {
-        match self {
-            Host::Local => {
-                if let Some(parent) = std::path::Path::new(path).parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(path, contents).with_context(|| format!("write {path}"))
-            }
-            Host::Ssh(_) => {
-                let script = format!(
-                    "mkdir -p \"$(dirname {p})\" && cat > {p}",
-                    p = shell_quote(path)
-                );
-                self.run_with_stdin(&["sh", "-c", &script], None, Some(contents.as_bytes()))?
-                    .into_result("write remote file")
-                    .map(|_| ())
-            }
         }
     }
 

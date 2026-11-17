@@ -2,12 +2,8 @@
 //!
 //! Tree-sitter parses Python, Rust, TypeScript/TSX, JavaScript and Go; other
 //! files get a line-based regex fallback. Used for the viewer's outline mode
-//! and jump-to-definition. Compiled into `kitchenctl` too, so a devbox can
-//! index its own checkout (`kitchenctl __index`).
+//! and jump-to-definition.
 
-use std::collections::HashMap;
-
-use serde::{Deserialize, Serialize};
 use tree_sitter::{Language, Node, Parser, Point, Tree};
 
 /// Python's `keyword.kwlist` plus the soft keywords `match`, `case` and `type`.
@@ -38,7 +34,7 @@ const GO_KEYWORDS: &[&str] = &[
 /// Python comprehensions: each is a scope whose `for` targets stay inside it.
 const PY_COMPREHENSIONS: &[&str] = &["list_comprehension", "set_comprehension", "dictionary_comprehension", "generator_expression"];
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
     pub name: String,
     /// `class`, `function`, `method`, `struct`, `enum`, `trait`, `impl`,
@@ -277,41 +273,6 @@ fn fallback(source: &str) -> Vec<Symbol> {
         }
     }
     out
-}
-
-/// Symbols of many files, searchable by name.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct Index {
-    /// path -> symbols in that file.
-    pub files: HashMap<String, Vec<Symbol>>,
-}
-
-impl Index {
-    pub fn add(&mut self, path: &str, source: &str) {
-        self.files.insert(path.to_string(), extract(path, source));
-    }
-
-    pub fn len(&self) -> usize {
-        self.files.values().map(Vec::len).sum()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Where `name` is defined, as (path, symbol): `from_path` first, then files
-/// in the same directory, then the rest of the repo (alphabetical).
-pub fn definitions<'a>(index: &'a Index, name: &str, from_path: &str) -> Vec<(&'a str, &'a Symbol)> {
-    let dir = |p: &str| p.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
-    let from_dir = dir(from_path);
-    let mut hits: Vec<(&str, &Symbol)> = index
-        .files
-        .iter()
-        .flat_map(|(p, syms)| syms.iter().filter(|s| s.name == name).map(move |s| (p.as_str(), s)))
-        .collect();
-    hits.sort_by_key(|(p, s)| (*p != from_path, dir(p) != from_dir, p.to_string(), s.line));
-    hits
 }
 
 /// Definitions of `name` for the fallback search: [`extract`]'s symbols plus
@@ -770,17 +731,6 @@ mod tests {
     fn fallback_languages() {
         let src = "module Foo\n  class Bar\n    def baz\n    end\n  end\nend\n";
         assert_eq!(names(&extract("a.rb", src)), ["Foo:module:1", "Bar:class:2", "baz:function:3"]);
-    }
-
-    #[test]
-    fn definition_ranking() {
-        let mut idx = Index::default();
-        idx.add("src/a.py", "def f():\n    pass\n");
-        idx.add("src/b.py", "def f():\n    pass\n");
-        idx.add("lib/c.py", "def f():\n    pass\n");
-        let d = definitions(&idx, "f", "src/b.py");
-        assert_eq!(d.iter().map(|(p, _)| *p).collect::<Vec<_>>(), ["src/b.py", "src/a.py", "lib/c.py"]);
-        assert!(definitions(&idx, "nope", "x").is_empty());
     }
 
     #[test]

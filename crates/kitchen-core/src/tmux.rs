@@ -58,13 +58,9 @@ impl<'a> Tmux<'a> {
     ///
     /// Everything runs as one script on the host — one ssh round trip for a
     /// devbox — including waiting for the shell prompt, since keystrokes
-    /// typed while a shell is still initializing get discarded.
-    pub fn new_session(&self, name: &str, cwd: &str, env: &[(String, String)], command: Option<&str>) -> Result<()> {
-        self.new_session_with_setup(name, cwd, env, command, None)
-    }
-
-    /// [`Tmux::new_session`], running the shell snippet `setup` first in the
-    /// same round trip (e.g. writing a prompt file the command reads).
+    /// typed while a shell is still initializing get discarded. The shell
+    /// snippet `setup` (if any) runs first in the same round trip (e.g.
+    /// writing a prompt file the command reads).
     pub fn new_session_with_setup(
         &self,
         name: &str,
@@ -143,17 +139,9 @@ impl<'a> Tmux<'a> {
         self.tmux(&args)
     }
 
-    /// Names of live kitchen sessions on this host.
-    pub fn list_kitchen_sessions(&self) -> Result<Vec<String>> {
-        let out = self.host.run(&[TMUX[0], TMUX[1], TMUX[2], "list-sessions", "-F", "#{session_name}"], None)?;
-        if !out.ok() {
-            return Ok(Vec::new()); // no server running
-        }
-        Ok(out.stdout.lines().filter(|l| l.starts_with(SESSION_PREFIX)).map(String::from).collect())
-    }
 }
 
-/// Shell script behind [`Tmux::new_session`].
+/// Shell script behind [`Tmux::new_session_with_setup`].
 fn new_session_script(name: &str, cwd: &str, env: &[(String, String)], command: Option<&str>) -> String {
     let t = format!("tmux -L {SOCKET_NAME}");
     let s = shell_quote(name);
@@ -197,7 +185,7 @@ mod tests {
         let t = Tmux::new(&Host::Local);
         let name = session_name("test", &crate::util::new_id());
         let env = vec![("KITCHEN_TEST_VAR".to_string(), "hello-kitchen".to_string())];
-        t.new_session(&name, "/tmp", &env, Some("echo \"$KITCHEN_TEST_VAR\"")).unwrap();
+        t.new_session_with_setup(&name, "/tmp", &env, Some("echo \"$KITCHEN_TEST_VAR\""), None).unwrap();
         assert!(t.has_session(&name));
         let shows = |line: &str| {
             let mut screen = String::new();
@@ -211,7 +199,6 @@ mod tests {
             Err(screen)
         };
         shows("hello-kitchen").unwrap();
-        assert!(t.list_kitchen_sessions().unwrap().contains(&name));
 
         // A live session is left alone; a dead one comes back running the command.
         assert!(t.ensure_session(&name, "/tmp", &env, Some("echo typed-$((40+2))")).unwrap());
