@@ -133,22 +133,15 @@ pub struct Question<'a> {
 }
 
 pub fn build_prompt(q: &Question) -> String {
-    let (from, ctx) = excerpt(q.source, q.first.max(1), MAX_CONTEXT);
-    let to = from + ctx.lines().count().saturating_sub(1);
-    let lines = if q.last > q.first { format!("lines {}–{}", q.first, q.last) } else { format!("line {}", q.first) };
     let side = if q.base { " (removed by this change; the numbers are the old file's)" } else { "" };
-    format!(
-        "A developer reading `{path}` (in `{root}`) in a code viewer asks a question about {lines}{side}:\n\
-         ```\n{quote}\n```\n\n\
-         Question: {text}\n\n\
-         Answer in plain text (no Markdown headings or bold), briefly: a few sentences, \
-         or a short code snippet if that answers it best. You may read other files of the \
-         repository if the answer needs them; do not change anything.\n\n\
-         File `{path}`, lines {from}–{to}:\n```\n{ctx}\n```\n",
-        root = q.root,
-        path = q.path,
-        quote = q.quote,
-        text = q.text,
+    question_prompt(
+        &format!("A developer reading `{}` (in `{}`) in a code viewer asks a question about {}{side}", q.path, q.root, lines(q.first, q.last)),
+        q.quote,
+        q.text,
+        "You may read other files of the repository if the answer needs them; do not change anything.",
+        &format!("File `{}`", q.path),
+        q.source,
+        q.first,
     )
 }
 
@@ -164,22 +157,35 @@ pub struct PlanQuestion<'a> {
 }
 
 pub fn build_plan_prompt(q: &PlanQuestion) -> String {
-    let (from, ctx) = excerpt(q.plan, q.first.max(1), MAX_CONTEXT);
+    question_prompt(
+        &format!("William is reviewing an implementation plan an agent wrote, `{}`, and asks a question about {}", q.path, lines(q.first, q.last)),
+        q.quote,
+        q.text,
+        "If you wrote the plan, say why it says what it says. You may read files of the repository if the answer needs them; do not change anything.",
+        &format!("Plan `{}`", q.path),
+        q.plan,
+        q.first,
+    )
+}
+
+/// `line 3` or `lines 3–5`.
+fn lines(first: usize, last: usize) -> String {
+    if last > first { format!("lines {first}–{last}") } else { format!("line {first}") }
+}
+
+/// A question's first message: `intro` (who asks about which lines), the
+/// asked lines, the question, how to answer (`may_read`: what it may look
+/// at), and `doc`'s lines around line `first`, headed `heading`.
+fn question_prompt(intro: &str, quote: &str, text: &str, may_read: &str, heading: &str, doc: &str, first: usize) -> String {
+    let (from, ctx) = excerpt(doc, first.max(1), MAX_CONTEXT);
     let to = from + ctx.lines().count().saturating_sub(1);
-    let lines = if q.last > q.first { format!("lines {}–{}", q.first, q.last) } else { format!("line {}", q.first) };
     format!(
-        "William is reviewing an implementation plan an agent wrote, `{path}`, and asks a \
-         question about {lines}:\n\
+        "{intro}:\n\
          ```\n{quote}\n```\n\n\
          Question: {text}\n\n\
          Answer in plain text (no Markdown headings or bold), briefly: a few sentences, \
-         or a short code snippet if that answers it best. If you wrote the plan, say why it \
-         says what it says. You may read files of the repository if the answer needs them; \
-         do not change anything.\n\n\
-         Plan `{path}`, lines {from}–{to}:\n```\n{ctx}\n```\n",
-        path = q.path,
-        quote = q.quote,
-        text = q.text,
+         or a short code snippet if that answers it best. {may_read}\n\n\
+         {heading}, lines {from}–{to}:\n```\n{ctx}\n```\n"
     )
 }
 

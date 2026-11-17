@@ -21,50 +21,41 @@ pub struct Options {
     pub dotfiles_remote_dir: String,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Report {
-    pub linked: usize,
-    pub warnings: Vec<String>,
-    pub cli_installed: bool,
-}
-
 /// Tools a workspace host must have. Missing ones are reported, never installed.
 const REQUIRED_TOOLS: &[&str] = &["git", "tmux"];
 const OPTIONAL_TOOLS: &[&str] = &["claude", "gh"];
 
-pub fn bootstrap_host(host: &Host, opts: &Options) -> Result<Report> {
-    let mut report = Report::default();
+/// Set up `host`; returns the warnings to show.
+pub fn bootstrap_host(host: &Host, opts: &Options) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     host.sh_ok("mkdir -p \"$HOME/.kitchen\" && chmod 700 \"$HOME/.kitchen\"", None)?;
     let dotfiles = match host {
         Host::Local => opts.dotfiles_local.clone(),
         Host::Ssh(_) => {
             let dir = host.expand_home(&opts.dotfiles_remote_dir)?;
-            sync_dotfiles(host, &dir, &opts.dotfiles_remote_url, &mut report)?;
+            sync_dotfiles(host, &dir, &opts.dotfiles_remote_url, &mut warnings)?;
             dir
         }
     };
-    link_skills(host, &dotfiles, &mut report)?;
-    import_bazelrc(host, &dotfiles, &mut report)?;
-    probe_tools(host, &mut report)?;
+    link_skills(host, &dotfiles, &mut warnings)?;
+    import_bazelrc(host, &dotfiles, &mut warnings)?;
+    probe_tools(host, &mut warnings)?;
     if host.is_local() {
         // An isolated test kitchen (KITCHEN_STATE_DIR) must not repoint the real install.
         if std::env::var_os("KITCHEN_STATE_DIR").is_none() {
-            if let Err(e) = link_local_cli(&mut report) {
-                report.warnings.push(format!("kitchenctl not linked: {e:#}"));
+            if let Err(e) = link_local_cli(&mut warnings) {
+                warnings.push(format!("kitchenctl not linked: {e:#}"));
             }
         }
-    } else {
-        match install_cli(host) {
-            Ok(installed) => report.cli_installed = installed,
-            Err(e) => report.warnings.push(format!("kitchenctl not installed: {e:#}")),
-        }
+    } else if let Err(e) = install_cli(host) {
+        warnings.push(format!("kitchenctl not installed: {e:#}"));
     }
-    Ok(report)
+    Ok(warnings)
 }
 
 /// Point `~/.local/bin/kitchenctl` at the kitchenctl built next to the app.
 /// Never replaces a real file, only a missing entry or an existing symlink.
-fn link_local_cli(report: &mut Report) -> Result<()> {
+fn link_local_cli(warnings: &mut Vec<String>) -> Result<()> {
     let exe = std::env::current_exe()?;
     let Some(cli) = exe.parent().map(|d| d.join("kitchenctl")).filter(|p| p.exists()) else {
         return Ok(()); // not built alongside the app (e.g. a bare `cargo run`)
@@ -79,18 +70,17 @@ fn link_local_cli(report: &mut Report) -> Result<()> {
             std::fs::remove_file(&dest)?;
         }
         Ok(_) => {
-            report.warnings.push(format!("{} is not a symlink; left alone", dest.display()));
+            warnings.push(format!("{} is not a symlink; left alone", dest.display()));
             return Ok(());
         }
         Err(_) => std::fs::create_dir_all(dest.parent().expect("has parent"))?,
     }
     std::os::unix::fs::symlink(&cli, &dest)?;
-    report.cli_installed = true;
     Ok(())
 }
 
 /// `git pull` the dotfiles checkout, cloning it first when missing.
-pub fn sync_dotfiles(host: &Host, dir: &str, url: &str, report: &mut Report) -> Result<()> {
+pub fn sync_dotfiles(host: &Host, dir: &str, url: &str, warnings: &mut Vec<String>) -> Result<()> {
     let d = shell_quote(dir);
     let script = format!(
         "if [ -d {d}/.git ]; then git -C {d} pull --ff-only --quiet 2>&1 || echo 'WARN dotfiles pull failed (local changes?)'; \
@@ -98,17 +88,16 @@ pub fn sync_dotfiles(host: &Host, dir: &str, url: &str, report: &mut Report) -> 
         u = shell_quote(url)
     );
     let out = host.sh_ok(&script, None).context("sync dotfiles")?;
-    collect_warnings(&out, report);
+    collect_warnings(&out, warnings);
     Ok(())
 }
 
 /// Symlink `<dotfiles>/skills/*/*` into `~/.claude/skills` and `~/.codex/skills`.
-pub fn link_skills(host: &Host, dotfiles: &str, report: &mut Report) -> Result<()> {
+pub fn link_skills(host: &Host, dotfiles: &str, warnings: &mut Vec<String>) -> Result<()> {
     let script = format!(
         r#"set -u
 DOT={dot}
 [ -d "$DOT/skills" ] || {{ echo "WARN no skills directory in $DOT"; exit 0; }}
-n=0
 for root in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
   mkdir -p "$root"
   for src in "$DOT"/skills/*/*/; do
@@ -123,26 +112,20 @@ for root in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
     else
       ln -s "$src" "$dest"
     fi
-    n=$((n+1))
   done
 done
-echo "LINKED $n""#,
+true"#,
         dot = shell_quote(dotfiles)
     );
     let out = host.sh_ok(&script, None).context("link skills")?;
-    for line in out.lines() {
-        if let Some(n) = line.strip_prefix("LINKED ") {
-            report.linked = n.trim().parse().unwrap_or(0);
-        }
-    }
-    collect_warnings(&out, report);
+    collect_warnings(&out, warnings);
     Ok(())
 }
 
 /// Make `~/.bazelrc` `try-import` the dotfiles `bazelrc` (the shared remote
 /// cache), as the dotfiles `install.sh` does, so every repo and worktree on
 /// the host gets it. Appends the line once; the rest of the file is left alone.
-pub fn import_bazelrc(host: &Host, dotfiles: &str, report: &mut Report) -> Result<()> {
+pub fn import_bazelrc(host: &Host, dotfiles: &str, warnings: &mut Vec<String>) -> Result<()> {
     let line = shell_quote(&format!("try-import {dotfiles}/bazelrc"));
     let script = format!(
         "grep -qxF {line} \"$HOME/.bazelrc\" 2>/dev/null || \
@@ -150,27 +133,27 @@ pub fn import_bazelrc(host: &Host, dotfiles: &str, report: &mut Report) -> Resul
          || echo 'WARN could not update ~/.bazelrc'"
     );
     let out = host.sh_ok(&script, None).context("import bazelrc")?;
-    collect_warnings(&out, report);
+    collect_warnings(&out, warnings);
     Ok(())
 }
 
-fn probe_tools(host: &Host, report: &mut Report) -> Result<()> {
+fn probe_tools(host: &Host, warnings: &mut Vec<String>) -> Result<()> {
     let all: Vec<&str> = REQUIRED_TOOLS.iter().chain(OPTIONAL_TOOLS).copied().collect();
     let script = format!("for t in {}; do command -v \"$t\" >/dev/null 2>&1 || echo \"MISSING $t\"; done; true", all.join(" "));
     let out = host.sh_ok(&script, None)?;
     for line in out.lines() {
         if let Some(t) = line.strip_prefix("MISSING ") {
             let hint = if REQUIRED_TOOLS.contains(&t) { "required" } else { "some features disabled" };
-            report.warnings.push(format!("{t} not found on {} ({hint})", host.label()));
+            warnings.push(format!("{t} not found on {} ({hint})", host.label()));
         }
     }
     Ok(())
 }
 
-fn collect_warnings(out: &str, report: &mut Report) {
+fn collect_warnings(out: &str, warnings: &mut Vec<String>) {
     for line in out.lines() {
         if let Some(w) = line.strip_prefix("WARN ") {
-            report.warnings.push(w.to_string());
+            warnings.push(w.to_string());
         }
     }
 }
@@ -203,7 +186,7 @@ pub fn cli_binary_candidates(triple: &str) -> Vec<std::path::PathBuf> {
 
 /// Copy the matching Linux `kitchenctl` to `~/.kitchen/bin` on a devbox and
 /// link it into `~/.local/bin`. Skips the upload when the hash matches.
-pub fn install_cli(host: &Host) -> Result<bool> {
+pub fn install_cli(host: &Host) -> Result<()> {
     let arch = host.run_ok(&["uname", "-m"], None)?;
     let triple = linux_triple(&arch).with_context(|| format!("unsupported devbox arch {}", arch.trim()))?;
     let local = cli_binary_candidates(triple)
@@ -214,7 +197,7 @@ pub fn install_cli(host: &Host) -> Result<bool> {
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let remote_hash = host.sh("cat \"$HOME/.kitchen/bin/kitchenctl.hash\" 2>/dev/null", None)?.stdout;
     if remote_hash.trim() == hash {
-        return Ok(false);
+        return Ok(());
     }
     let script = format!(
         "set -e; mkdir -p \"$HOME/.kitchen/bin\" \"$HOME/.local/bin\"; \
@@ -224,7 +207,7 @@ pub fn install_cli(host: &Host) -> Result<bool> {
          printf %s {hash} > \"$HOME/.kitchen/bin/kitchenctl.hash\""
     );
     host.run_with_stdin(&["sh", "-c", &script], None, Some(&bytes))?.into_result("upload kitchenctl")?;
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -251,23 +234,24 @@ mod tests {
         let script_host = Host::Local;
         let dot_s = dot.display().to_string();
         let run = || {
-            let mut r = Report::default();
+            let mut warnings = Vec::new();
             let _home = HOME_LOCK.lock().unwrap();
             let old = std::env::var("HOME").unwrap();
             // SAFETY: test-only; HOME_LOCK serializes the tests that set HOME.
             unsafe { std::env::set_var("HOME", &home) };
-            let res = link_skills(&script_host, &dot_s, &mut r);
+            let res = link_skills(&script_host, &dot_s, &mut warnings);
             unsafe { std::env::set_var("HOME", old) };
             res.unwrap();
-            r
+            warnings
         };
-        let r1 = run();
-        let r2 = run();
-        assert_eq!(r1.linked, 3, "alpha into .claude and .codex, blocker into .codex only");
-        assert_eq!(r2.linked, 3);
-        let link = std::fs::read_link(home.join(".claude/skills/alpha")).unwrap();
-        assert_eq!(link, dot.join("skills/cat/alpha"));
-        assert!(r1.warnings.iter().any(|w| w.contains("blocker")), "{:?}", r1.warnings);
+        let w1 = run();
+        run();
+        // alpha into .claude and .codex, blocker into .codex only.
+        for (link, src) in [(".claude/skills/alpha", "alpha"), (".codex/skills/alpha", "alpha"), (".codex/skills/blocker", "blocker")] {
+            assert_eq!(std::fs::read_link(home.join(link)).unwrap(), dot.join("skills/cat").join(src), "{link}");
+        }
+        assert!(!home.join(".claude/skills/blocker").is_symlink());
+        assert!(w1.iter().any(|w| w.contains("blocker")), "{w1:?}");
         assert!(!home.join(".claude/skills/not-a-skill").exists());
     }
 
@@ -280,14 +264,14 @@ mod tests {
         let old = std::env::var("HOME").unwrap();
         // SAFETY: test-only; HOME_LOCK serializes the tests that set HOME.
         unsafe { std::env::set_var("HOME", home) };
-        let mut r = Report::default();
-        let res = import_bazelrc(&Host::Local, "/dot files", &mut r).and_then(|_| import_bazelrc(&Host::Local, "/dot files", &mut r));
+        let mut warnings = Vec::new();
+        let res = import_bazelrc(&Host::Local, "/dot files", &mut warnings).and_then(|_| import_bazelrc(&Host::Local, "/dot files", &mut warnings));
         unsafe { std::env::set_var("HOME", old) };
         res.unwrap();
         let rc = std::fs::read_to_string(home.join(".bazelrc")).unwrap();
         assert!(rc.starts_with("startup --max_idle_secs=600\n"), "{rc}");
         assert_eq!(rc.matches("try-import /dot files/bazelrc\n").count(), 1, "{rc}");
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

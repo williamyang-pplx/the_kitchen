@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::util::now;
 
@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS tabs (
     worktree     TEXT NOT NULL,
     branch       TEXT,
     tmux_session TEXT NOT NULL UNIQUE,
-    plan_file    TEXT,
     position     INTEGER NOT NULL,
     agent        INTEGER NOT NULL DEFAULT 1,  -- the kitchen started Claude Code in it (not --no-agent / --command)
     agent_session TEXT,                       -- that agent's latest session id, resumed if the tmux session dies
@@ -96,7 +95,7 @@ pub struct Db {
     conn: Connection,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceRow {
     pub id: String,
     pub name: String,
@@ -105,11 +104,10 @@ pub struct WorkspaceRow {
     pub github_slug: Option<String>,
     pub default_branch: Option<String>,
     pub position: i64,
-    #[serde(default)]
     pub pinned: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TabRow {
     pub id: String,
     pub workspace_id: String,
@@ -136,7 +134,7 @@ impl TabRow {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PlanComment {
     pub id: i64,
     pub tab_id: String,
@@ -151,7 +149,7 @@ pub struct PlanComment {
     pub resolved_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Notification {
     pub id: i64,
     pub workspace_id: Option<String>,
@@ -296,10 +294,6 @@ impl Db {
         Ok(st.query_map([workspace_id], tab_from)?.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn tab(&self, id: &str) -> Result<Option<TabRow>> {
-        Ok(self.conn.query_row(&format!("SELECT {TAB_COLS} FROM tabs WHERE id = ?1"), [id], tab_from).optional()?)
-    }
-
     pub fn insert_tab(&self, t: &TabRow) -> Result<()> {
         self.conn.execute(
             "INSERT INTO tabs (id, workspace_id, kind, title, worktree, branch, tmux_session, position, agent, agent_session, created_at)
@@ -363,16 +357,10 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// `state` is `sent` or `resolved`; its time is stamped too.
     pub fn set_plan_comment_state(&self, id: i64, state: &str) -> Result<bool> {
-        let col = match state {
-            "sent" => "sent_at",
-            "resolved" => "resolved_at",
-            _ => "created_at",
-        };
-        let n = self.conn.execute(
-            &format!("UPDATE plan_comments SET state = ?2, {col} = CASE WHEN ?2 = 'open' THEN {col} ELSE ?3 END WHERE id = ?1"),
-            params![id, state, now()],
-        )?;
+        let col = if state == "sent" { "sent_at" } else { "resolved_at" };
+        let n = self.conn.execute(&format!("UPDATE plan_comments SET state = ?2, {col} = ?3 WHERE id = ?1"), params![id, state, now()])?;
         Ok(n > 0)
     }
 
@@ -510,9 +498,9 @@ mod tests {
         db.insert_tab(&tab).unwrap();
         assert_eq!(db.tabs("a").unwrap(), vec![tab.clone()]);
         db.set_tab_agent_session("t1", "s-1").unwrap();
-        assert_eq!(db.tab("t1").unwrap().unwrap().agent_session.as_deref(), Some("s-1"));
+        assert_eq!(db.tabs("a").unwrap()[0].agent_session.as_deref(), Some("s-1"));
         db.delete_workspace("a").unwrap();
-        assert!(db.tab("t1").unwrap().is_none(), "tabs cascade with their workspace");
+        assert!(db.tabs("a").unwrap().is_empty(), "tabs cascade with their workspace");
     }
 
     #[test]
@@ -554,7 +542,7 @@ mod tests {
         let db = Db::init(conn).unwrap();
         assert_eq!(db.plan_comments("t").unwrap()[0].plan_path, None, "old comments name no plan");
         assert!(!db.workspaces().unwrap()[0].pinned);
-        let tab = db.tab("t").unwrap().expect("old tabs still read");
+        let tab = db.tabs("a").unwrap().pop().expect("old tabs still read");
         assert!(tab.agent && tab.agent_session.is_none(), "old tabs count as agent tabs");
     }
 

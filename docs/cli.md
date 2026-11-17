@@ -41,7 +41,7 @@ app is not reachable.
 | `ping` | `system.ping` | |
 | `version` | — | no app needed |
 | `identify` | `system.identify` | caller workspace/tab, worktree, branch, plan file; focused ids |
-| `guide` (`--skill`) | — | agent guide markdown; `--json` → `{topic, format, content}` |
+| `guide` | — | agent guide markdown; `--json` → `{topic, format, content}` |
 | `rpc <method> [json]` | any | raw call |
 | `workspace list` / `ls` | `workspace.list` | workspaces with tabs |
 | `workspace current` | `workspace.current` | |
@@ -71,8 +71,7 @@ app is not reachable.
 | `debug screenshot PATH` | `debug.screenshot` | PNG of the window (works for a hidden kitchen too, see [testing.md](testing.md)) |
 | `debug keys KEYS` | `debug.keys` | type into the focused pane: `gd`, `<cmd-p>main<cr>` |
 
-Hidden helpers: `__relay` (devbox tunnel, above) and `__index` (symbol
-extraction for devbox viewers; not wired up yet — it exits with an error).
+Hidden helper: `__relay` (devbox tunnel, above).
 
 ## Building for devboxes
 

@@ -21,7 +21,7 @@ const EXIT_API: u8 = 1;
 const EXIT_UNREACHABLE: u8 = 3;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse_from(cli::normalize_args(std::env::args().collect()));
+    let cli = Cli::parse();
     let call = match cli.to_call() {
         Ok(c) => c,
         Err(e) => {
@@ -74,11 +74,6 @@ fn main() -> ExitCode {
             }
         }
         Call::Skip => ExitCode::SUCCESS,
-        Call::Index(paths) => {
-            // Symbol extraction lives in kitchen-symbols; not wired into the CLI yet.
-            eprintln!("kitchenctl __index: symbol indexing is not available in this build ({} paths)", paths.len());
-            ExitCode::from(EXIT_API)
-        }
         Call::Api { method, params } => {
             let socket = cli.socket.clone().unwrap_or_else(kitchen_proto::default_socket_path);
             match client::call(&socket, &method, params) {

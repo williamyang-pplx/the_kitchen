@@ -179,13 +179,14 @@ mod tests {
         let w = tmp.path().display().to_string();
         std::process::Command::new("git").args(["init", "-q", &w]).status().unwrap();
         assert_eq!(current_plan(&Host::Local, &w, "a"), None);
-        Host::Local.write_file(&plan_file_for(&w, "a"), "# p").unwrap();
+        let mode = format!("{w}/{}/jolly-otter.md", plans_dir("a"));
+        std::fs::create_dir_all(std::path::Path::new(&mode).parent().unwrap()).unwrap();
+        std::fs::write(plan_file_for(&w, "a"), "# p").unwrap();
         let doc = current_plan(&Host::Local, &w, "a").expect("plan.md");
         assert_eq!(doc.path, plan_file_for(&w, "a"));
         assert!((doc.modified - crate::util::now()).abs() < 60, "{doc:?}");
         assert_eq!(current_plan(&Host::Local, &w, "b"), None, "another tab's plan");
-        let mode = format!("{w}/{}/jolly-otter.md", plans_dir("a"));
-        Host::Local.write_file(&mode, "# m").unwrap();
+        std::fs::write(&mode, "# m").unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         std::fs::File::options().write(true).open(&mode).unwrap().set_modified(later).unwrap();
         assert_eq!(current_plan(&Host::Local, &w, "a").unwrap().path, mode, "the newer file");
