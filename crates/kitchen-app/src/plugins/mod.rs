@@ -1176,6 +1176,43 @@ mod tests {
         );
         assert_eq!(checks("OPEN", Some("APPROVED"), serde_json::Value::Null), (true, vec![c("done", "approved", "GitHub review: approved")]), "a commit with no statuses");
         assert_eq!(checks("OPEN", None, serde_json::Value::Null), (false, vec![]), "a repo that requires no review");
+        assert!(q.contains("reviewRequests(first: 20)") && q.contains("latestOpinionatedReviews(first: 20)"), "the reviewers too: {q}");
+
+        // The approval check names its reviewers; its note lists each
+        // requested team's members (not the author) to know whom to ping.
+        let approval = |decision: &str, extra: serde_json::Value| -> (String, String) {
+            let mut pr = serde_json::json!({ "state": "OPEN", "reviewDecision": decision, "author": { "login": "me" } });
+            pr.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let pr = lua.to_value_with(&pr, mlua::serde::SerializeOptions::new().serialize_none_to_null(false).serialize_unit_to_null(false)).unwrap();
+            let (_, list): (bool, mlua::Value) = m.get::<mlua::Function>("checks").unwrap().call(pr).unwrap();
+            let list: serde_json::Value = lua.from_value(list).unwrap();
+            (list[0]["label"].as_str().unwrap().into(), list[0]["note"].as_str().unwrap().into())
+        };
+        let team = serde_json::json!({ "slug": "pplx_aster", "members": { "totalCount": 53,
+            "nodes": [{ "login": "me", "name": "Me" }, { "login": "paul", "name": "Paul F" }, { "login": "max", "name": null }] } });
+        let requested = serde_json::json!({ "reviewRequests": { "nodes": [
+            { "asCodeOwner": true, "requestedReviewer": team },
+            { "asCodeOwner": false, "requestedReviewer": { "login": "dan", "name": "dan" } },
+            { "asCodeOwner": false, "requestedReviewer": {} },
+            { "asCodeOwner": false, "requestedReviewer": { "slug": "solo", "members": { "totalCount": 1, "nodes": [{ "login": "me" }] } } },
+        ] } });
+        assert_eq!(
+            approval("REVIEW_REQUIRED", requested),
+            (
+                "awaiting approval · pplx_aster, @dan +1".into(),
+                "GitHub review: review required\n\npplx_aster (code owner): Paul F @paul, @max, +50 more\nsolo: no members besides the author\nrequested: @dan".into()
+            ),
+            "a bot (no login, no slug) is left out"
+        );
+        let reviewed = serde_json::json!({ "latestOpinionatedReviews": { "nodes": [
+            { "state": "APPROVED", "author": { "login": "paul" } }, { "state": "CHANGES_REQUESTED", "author": { "login": "max" } },
+        ] } });
+        assert_eq!(
+            approval("CHANGES_REQUESTED", reviewed.clone()),
+            ("changes requested · @max".into(), "GitHub review: changes requested\n\napproved: @paul\nchanges requested: @max".into())
+        );
+        assert_eq!(approval("APPROVED", reviewed).0, "approved · @paul");
+        assert_eq!(approval("APPROVED", serde_json::json!({})), ("approved".into(), "GitHub review: approved".into()), "no reviewers: as before");
     }
 
     /// github ⌘⇧D: a PR's description as the page the viewer renders, its

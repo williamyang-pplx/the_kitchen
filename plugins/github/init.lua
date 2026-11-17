@@ -7,7 +7,9 @@
 -- worktree again. ⌘⇧S lists the PRs in the tab's $KITCHEN_PRS_FILE, one
 -- section per stack, then the PRs opened in the tab with ⌘⇧P; an open PR's
 -- row has a check once its code owners approved it, and the viewer's header
--- shows what the PR on screen waits on (approval, an Atlantis apply). ⌘⇧D
+-- shows what the PR on screen waits on: approval, naming the teams and people
+-- asked to review (hover for each team's members, to know whom to ping),
+-- and an Atlantis apply. ⌘⇧D
 -- shows the shown PR's description, rendered as on GitHub, and goes back.
 -- ⌘⇧O opens the shown PR (in the ⌘⇧S menu, the row under the cursor) in
 -- Chrome.
@@ -176,6 +178,10 @@ function M.list(lines, slug)
 end
 
 local FIELDS = "number title url state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions reviewDecision"
+  .. " author { login }"
+  .. " reviewRequests(first: 20) { nodes { asCodeOwner requestedReviewer {"
+  .. " ... on User { login name } ... on Team { slug members(first: 50) { totalCount nodes { login name } } } } } }"
+  .. " latestOpinionatedReviews(first: 20) { nodes { state author { login } } }"
 
 local function named(s)
   return s ~= "" and s or nil
@@ -218,11 +224,75 @@ local function check(status, labels)
   return { state = state, label = labels[state], note = status.description or "" }
 end
 
+-- "Paul Fryzel @paulfryzel", or "@paulfryzel" for a user with no name.
+local function person(u)
+  local name = (u.name or "") ~= "" and u.name ~= u.login and u.name .. " " or ""
+  return name .. "@" .. u.login
+end
+
+-- The reviewers of PR `p` (a GraphQL node), as GitHub's Reviewers box lists
+-- them. `who[state]` names those the approval check in that state is about:
+-- waiting, the teams and people asked to review; done, who approved; needed,
+-- who asked for changes. `lines` are for its note: each requested team with
+-- its members (the author left out), so you know whom to ping, then the
+-- requested people and the reviews.
+function M.reviewers(p)
+  local author = p.author and p.author.login
+  local who, lines, people = { waiting = {}, done = {}, needed = {} }, {}, {}
+  for _, r in ipairs(p.reviewRequests and p.reviewRequests.nodes or {}) do
+    local rv = r.requestedReviewer or {}
+    local owner = r.asCodeOwner and " (code owner)" or ""
+    if rv.slug then
+      table.insert(who.waiting, rv.slug)
+      local all = rv.members or {}
+      local members = {}
+      for _, u in ipairs(all.nodes or {}) do
+        if u.login ~= author then
+          table.insert(members, person(u))
+        end
+      end
+      local more = (all.totalCount or 0) - #(all.nodes or {})
+      if more > 0 then
+        table.insert(members, "+" .. more .. " more")
+      end
+      table.insert(lines, rv.slug .. owner .. ": " .. (#members > 0 and table.concat(members, ", ") or "no members besides the author"))
+    elseif rv.login then
+      table.insert(who.waiting, "@" .. rv.login)
+      table.insert(people, person(rv) .. owner)
+    end
+  end
+  if #people > 0 then
+    table.insert(lines, "requested: " .. table.concat(people, ", "))
+  end
+  for _, rv in ipairs(p.latestOpinionatedReviews and p.latestOpinionatedReviews.nodes or {}) do
+    local state = ({ APPROVED = "done", CHANGES_REQUESTED = "needed" })[rv.state]
+    if state and rv.author and rv.author.login then
+      table.insert(who[state], "@" .. rv.author.login)
+    end
+  end
+  if #who.done > 0 then
+    table.insert(lines, "approved: " .. table.concat(who.done, ", "))
+  end
+  if #who.needed > 0 then
+    table.insert(lines, "changes requested: " .. table.concat(who.needed, ", "))
+  end
+  return who, lines
+end
+
+-- "a", "a, b", "a, b +2".
+local function few(names)
+  if #names <= 2 then
+    return table.concat(names, ", ")
+  end
+  return names[1] .. ", " .. names[2] .. " +" .. (#names - 2)
+end
+
 -- Whether open PR `p` (a GraphQL node) has its code owners' approval, and
 -- the checks the viewer's header shows for it: the approval (the owners
--- status, else GitHub's review decision), then Atlantis once it planned
--- (a failed plan, else the apply gate). A merged or closed PR waits on
--- nothing.
+-- status, else GitHub's review decision; its label names whom it waits on
+-- or heard from, its note adds M.reviewers' lines), then Atlantis once it
+-- planned (a failed plan, else the apply gate). A merged or closed PR waits
+-- on nothing.
 function M.checks(p)
   if p.state ~= "OPEN" then
     return false, {}
@@ -242,7 +312,17 @@ function M.checks(p)
       table.insert(out, { state = decision[1], label = decision[2], note = "GitHub review: " .. p.reviewDecision:lower():gsub("_", " ") })
     end
   end
-  local approved = out[1] ~= nil and out[1].state == "done"
+  local approval = out[1]
+  if approval then
+    local who, lines = M.reviewers(p)
+    if #who[approval.state] > 0 then
+      approval.label = approval.label .. " · " .. few(who[approval.state])
+    end
+    if #lines > 0 then
+      approval.note = (approval.note ~= "" and approval.note .. "\n\n" or "") .. table.concat(lines, "\n")
+    end
+  end
+  local approved = approval ~= nil and approval.state == "done"
   if st.plan and st.plan.state ~= "SUCCESS" then
     table.insert(out, check(st.plan, { waiting = "atlantis planning", needed = "atlantis plan failed" }))
   elseif st.plan and st.gate then
