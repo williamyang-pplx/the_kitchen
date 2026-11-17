@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use egui::{Align, Color32, Layout, Modifiers, RichText, Sense, Ui};
+use egui::{Align, Color32, Layout, RichText, Sense, Ui};
 
 use crate::attach;
 use crate::engine::{Engine, Shown, Tab, UiCommand, View, Workspace};
@@ -132,7 +132,7 @@ impl KitchenApp {
 
     // ------------------------------------------------------------ terminals
 
-    fn ensure_terminal(&mut self, ctx: &egui::Context, ws: &Workspace, tab: &Tab) {
+    fn ensure_terminal(&mut self, ctx: &egui::Context, tab: &Tab) {
         let id = tab.row.id.clone();
         let needs_prepare = match self.slots.get(&id) {
             None => true,
@@ -155,7 +155,6 @@ impl KitchenApp {
             let _ = tx.send((id, r));
             ctx2.request_repaint();
         });
-        let _ = ws;
     }
 
     fn poll_attach(&mut self, ctx: &egui::Context) {
@@ -305,14 +304,14 @@ impl KitchenApp {
                     engine.refill_spare(&ws.row.id, true);
                     self.dialog = Some(Dialog::new_tab(false));
                 } else {
-                    engine.toast_err(with_key("create a workspace first", Place::Global, Action::NewWorkspace));
+                    engine.toast_err(keybindings::with_key("create a workspace first", Place::Global, Action::NewWorkspace));
                 }
             }
             Action::NewMainCheckoutTab => {
                 if ws.is_some() {
                     self.dialog = Some(Dialog::new_tab(true));
                 } else {
-                    engine.toast_err(with_key("create a workspace first", Place::Global, Action::NewWorkspace));
+                    engine.toast_err(keybindings::with_key("create a workspace first", Place::Global, Action::NewWorkspace));
                 }
             }
             Action::RenameTab => {
@@ -479,10 +478,7 @@ impl KitchenApp {
     fn viewer_key(&self, tab_id: &str) -> Option<(String, Shown)> {
         let shown = match self.shown.get(tab_id) {
             Some(s) => s.clone(),
-            None => {
-                let (ws, tab) = self.engine.find_tab(tab_id)?;
-                (tab.row.worktree.clone(), tab.diff_base(&ws))
-            }
+            None => self.engine.find_tab(tab_id).map(|(ws, tab)| own_view(&ws, &tab))?,
         };
         Some((tab_id.to_string(), shown))
     }
@@ -621,8 +617,7 @@ impl KitchenApp {
                     }
                     Some(PaletteItem::Diagnostics) => {
                         if let Some(tab) = self.selected_tab_id() {
-                            self.set_side(SideKind::Viewer);
-                            self.set_focus(Focus::Side);
+                            self.open_side_for(&tab, SideKind::Viewer);
                             self.panel_command_for(&tab, SideKind::Viewer, PanelCmd::Diagnostics);
                         }
                     }
@@ -638,9 +633,7 @@ impl KitchenApp {
 
     fn side_command(&mut self, cmd: PanelCmd) {
         let Some(kind) = self.side() else { return };
-        let Some(tab) = self.engine.selected_workspace().and_then(|w| w.selected().map(|t| t.row.id.clone())) else {
-            return;
-        };
+        let Some(tab) = self.selected_tab_id() else { return };
         self.panel_command_for(&tab, kind, cmd);
     }
 
@@ -678,11 +671,7 @@ impl KitchenApp {
                 let height = if status.is_empty() { 46.0 } else { 62.0 };
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click_and_drag());
                 rects.push(rect);
-                if resp.dragged_by(egui::PointerButton::Primary) {
-                    drag = Some((i, false));
-                } else if resp.drag_stopped_by(egui::PointerButton::Primary) {
-                    drag = Some((i, true));
-                }
+                drag = drag_of(&resp, i).or(drag);
                 let card = rect.shrink2(egui::vec2(8.0, 1.0));
                 if drag.is_some_and(|(d, _)| d == i) || (resp.hovered() && !is_sel) {
                     ui.painter().rect_filled(card, theme::RADIUS as f32, theme::HOVER);
@@ -748,8 +737,12 @@ impl KitchenApp {
                     }
                 });
             }
+            // Drag-to-reorder; drops stay inside the dragged workspace's
+            // group (pinned or unpinned).
             if let Some((from, released)) = drag {
-                self.workspace_drag(ui, &workspaces, &rects, pinned_count, from, released);
+                let pinned = workspaces[from].row.pinned;
+                let clamp = |slot: usize| if pinned { slot.min(pinned_count) } else { slot.clamp(pinned_count, rects.len()) };
+                self.reorder(ui, &rects, false, (from, released), clamp, |slot| self.engine.move_workspace(&workspaces[from].row.id, slot));
             }
             if workspaces.is_empty() {
                 header(ui, "Workspaces");
@@ -761,28 +754,32 @@ impl KitchenApp {
         });
     }
 
-    /// Drag-to-reorder in the sidebar: draw the drop line while dragging,
-    /// move the workspace on release. Drops stay inside the dragged
-    /// workspace's group (pinned or unpinned).
-    fn workspace_drag(&mut self, ui: &Ui, workspaces: &[Workspace], rects: &[egui::Rect], pinned_count: usize, from: usize, released: bool) {
-        let Some(pointer) = ui.ctx().pointer_interact_pos() else { return };
-        let slot = rects.iter().position(|r| pointer.y < r.center().y).unwrap_or(rects.len());
-        let slot = if workspaces[from].row.pinned { slot.min(pinned_count) } else { slot.clamp(pinned_count, rects.len()) };
+    /// Drag-to-reorder `from` among `rects` (along x when `horizontal`, else
+    /// y), `released` this frame or not: while dragging, the grabbing cursor
+    /// and the drop line; on release, `move_to` the slot under the pointer
+    /// (as `clamp` limits it) unless that leaves it where it is. Returns the
+    /// pointer while dragging.
+    fn reorder(&self, ui: &Ui, rects: &[egui::Rect], horizontal: bool, (from, released): (usize, bool), clamp: impl FnOnce(usize) -> usize, move_to: impl FnOnce(usize) -> anyhow::Result<()>) -> Option<egui::Pos2> {
+        let pointer = ui.ctx().pointer_interact_pos()?;
+        let slot = clamp(rects.iter().position(|r| if horizontal { pointer.x < r.center().x } else { pointer.y < r.center().y }).unwrap_or(rects.len()));
         if released {
             if slot != from && slot != from + 1 {
-                if let Err(e) = self.engine.move_workspace(&workspaces[from].row.id, slot) {
+                if let Err(e) = move_to(slot) {
                     self.engine.toast_err(format!("{e:#}"));
                 }
             }
-            return;
+            return None;
         }
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        let y = match rects.get(slot) {
-            Some(r) => r.top(),
-            None => rects[rects.len() - 1].bottom(),
-        };
-        let x = rects[from].x_range().shrink(8.0);
-        ui.painter().hline(x, y, egui::Stroke::new(2.0, theme::ACCENT));
+        let stroke = egui::Stroke::new(2.0, theme::ACCENT);
+        if horizontal {
+            let x = rects.get(slot).map_or_else(|| rects[rects.len() - 1].right() + 1.0, |r| r.left() - 1.0);
+            ui.painter().vline(x, rects[from].y_range().shrink(6.0), stroke);
+        } else {
+            let y = rects.get(slot).map_or_else(|| rects[rects.len() - 1].bottom(), |r| r.top());
+            ui.painter().hline(rects[from].x_range().shrink(8.0), y, stroke);
+        }
+        Some(pointer)
     }
 
     /// The strip behind the transparent macOS title bar: where you are
@@ -855,7 +852,7 @@ impl KitchenApp {
                     (SideKind::Viewer, "Viewer", Action::ToggleViewer, Action::ToggleFiles),
                 ] {
                     let on = self.focus() == Focus::Side && self.side() == Some(kind) && !self.dashboard.contains(&ws.row.id);
-                    if widgets::flat_button(ui, label, on).on_hover_text(with_key_spaced(label, Place::Global, keys)).clicked_by(egui::PointerButton::Primary) {
+                    if widgets::flat_button(ui, label, on).on_hover_text(keybindings::with_key_spaced(label, Place::Global, keys)).clicked_by(egui::PointerButton::Primary) {
                         if on {
                             self.set_focus(Focus::Terminal);
                         } else {
@@ -877,7 +874,7 @@ impl KitchenApp {
                         .auto_shrink([true, false])
                         .show(ui, |ui| ui.horizontal(|ui| self.tabs(ui, strip, ws)));
                     ui.add_space(theme::SPACE_XS);
-                    let tip = [("New edit tab", Action::NewTab), ("New read tab", Action::NewMainCheckoutTab)].map(|(what, a)| with_key_spaced(what, Place::Terminal, a)).join("\n");
+                    let tip = [("New edit tab", Action::NewTab), ("New read tab", Action::NewMainCheckoutTab)].map(|(what, a)| keybindings::with_key_spaced(what, Place::Terminal, a)).join("\n");
                     if icon_button(ui, strip, "+").on_hover_text(tip).clicked_by(egui::PointerButton::Primary) {
                         self.run_action(Action::NewTab);
                     }
@@ -906,18 +903,14 @@ impl KitchenApp {
             let is_sel = sel.as_deref() == Some(&tab.row.id);
             let title: String = tab.row.title.chars().take(32).collect();
             let kind = if tab.in_main_checkout(ws) { theme::TAB_READ } else { theme::TAB_EDIT };
-            let resp = tab_button(ui, strip, Some(i + 1), &title, Some(kind), is_sel, tab.unread, false).on_hover_text(format!(
+            let resp = tab_button(ui, strip, Some(i + 1), &title, Some(kind), is_sel, tab.unread).on_hover_text(format!(
                 "{}\n{}",
                 tab.row.worktree,
                 tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
             ));
             rects.push(resp.rect);
             reveal(&resp, &tab.row.id);
-            if resp.dragged_by(egui::PointerButton::Primary) {
-                drag = Some((i, false));
-            } else if resp.drag_stopped_by(egui::PointerButton::Primary) {
-                drag = Some((i, true));
-            }
+            drag = drag_of(&resp, i).or(drag);
             if resp.clicked_by(egui::PointerButton::Primary) {
                 self.engine.select_tab(&tab.row.id);
                 self.dashboard.remove(&ws.row.id);
@@ -928,33 +921,12 @@ impl KitchenApp {
         }
         for p in &ws.pending {
             let title: String = p.title.chars().take(32).collect();
-            let resp = tab_button(ui, strip, None, &format!("⋯ {title}"), None, p.focus, false, true).on_hover_text("fetching origin and preparing the worktree…");
+            let resp = tab_button(ui, strip, None, &format!("⋯ {title}"), None, p.focus, false).on_hover_text("fetching origin and preparing the worktree…");
             reveal(&resp, &p.id);
         }
-        if let Some((from, released)) = drag {
-            self.tab_drag(ui, ws, &rects, from, released);
-        }
-    }
-
-    /// Drag-to-reorder in the tab strip: draw the drop line while dragging
-    /// (scrolling when the pointer nears either end), move the tab on release.
-    fn tab_drag(&mut self, ui: &Ui, ws: &Workspace, rects: &[egui::Rect], from: usize, released: bool) {
-        let Some(pointer) = ui.ctx().pointer_interact_pos() else { return };
-        let slot = rects.iter().position(|r| pointer.x < r.center().x).unwrap_or(rects.len());
-        if released {
-            if slot != from && slot != from + 1 {
-                if let Err(e) = self.engine.move_tab(&ws.tabs[from].row.id, slot) {
-                    self.engine.toast_err(format!("{e:#}"));
-                }
-            }
-            return;
-        }
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        let x = match rects.get(slot) {
-            Some(r) => r.left() - 1.0,
-            None => rects[rects.len() - 1].right() + 1.0,
-        };
-        ui.painter().vline(x, rects[from].y_range().shrink(6.0), egui::Stroke::new(2.0, theme::ACCENT));
+        // Drag-to-reorder, scrolling while the pointer nears either end.
+        let Some((from, released)) = drag else { return };
+        let Some(pointer) = self.reorder(ui, &rects, true, (from, released), |slot| slot, |slot| self.engine.move_tab(&ws.tabs[from].row.id, slot)) else { return };
         const EDGE: f32 = 40.0;
         let view = ui.clip_rect();
         let step = if pointer.x < view.left() + EDGE {
@@ -1028,7 +1000,7 @@ impl KitchenApp {
         // The keys' column; a longer key list wraps inside it.
         const KEYS_W: f32 = 72.0;
         let area = egui::Area::new(egui::Id::new("shortcuts")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0)).show(ctx, |ui| {
-            widgets::overlay_frame().inner_margin(egui::Margin::same(theme::SPACE_XL as i8)).show(ui, |ui| {
+            widgets::overlay_frame().show(ui, |ui| {
                 ui.set_width(WIDTH);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Keyboard shortcuts").font(theme::ui_font_semibold(theme::TEXT_TITLE)).color(theme::TEXT));
@@ -1077,14 +1049,11 @@ impl KitchenApp {
     }
 
     fn terminal_area(&mut self, ui: &mut Ui, ws: &Workspace, tab: &Tab) {
-        self.ensure_terminal(ui.ctx(), ws, tab);
+        self.ensure_terminal(ui.ctx(), tab);
         let font_size = self.engine.settings().font_size;
         let focused = self.focus() == Focus::Terminal && self.dialog.is_none() && self.palette.is_none();
         match self.slots.get_mut(&tab.row.id) {
             Some(TermSlot::Live(session)) => {
-                if session.take_bell() {
-                    // A bell in a background tab marks it unread.
-                }
                 let reg = self.engine.plugins().map(|p| p.registry());
                 let rules = reg.as_ref().map(|r| &r.links[..]).unwrap_or(&[]);
                 // Breathing room between the text and the window chrome.
@@ -1190,7 +1159,7 @@ impl KitchenApp {
     }
 
     fn drop_stale_state(&mut self) {
-        let live: std::collections::HashSet<String> =
+        let live: HashSet<String> =
             self.engine.workspaces().iter().flat_map(|w| w.tabs.iter().map(|t| t.row.id.clone())).collect();
         self.slots.retain(|id, _| live.contains(id));
         self.viewers.retain(|(id, _), _| live.contains(id));
@@ -1320,11 +1289,11 @@ fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
 
 /// A tab in the strip, as tall as the strip: the selected one takes the
 /// content's color, so it reads as the top of what is shown below.
-/// `kind`: the tab's color (edit or read tab); None for a pending tab.
-#[allow(clippy::too_many_arguments)]
-fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str, kind: Option<Color32>, selected: bool, unread: bool, pending: bool) -> egui::Response {
+/// `number`: None for a pending tab (drawn in italics). `kind`: the tab's
+/// color (edit or read tab); None for a pending tab.
+fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str, kind: Option<Color32>, selected: bool, unread: bool) -> egui::Response {
     let mut job = egui::text::LayoutJob::default();
-    let fmt = |font: egui::FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: Align::Center, italics: pending, ..Default::default() };
+    let fmt = |font: egui::FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: Align::Center, italics: number.is_none(), ..Default::default() };
     if let Some(n) = number {
         job.append(&n.to_string(), 0.0, fmt(theme::ui_font(theme::TEXT_SMALL), theme::DIM));
     }
@@ -1347,7 +1316,7 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str
         let outline = egui::Rect::from_min_max(rect.min + egui::vec2(0.75, 0.75), rect.max + egui::vec2(-0.75, 8.0));
         ui.painter().with_clip_rect(rect).rect_stroke(outline, top, egui::Stroke::new(1.5, kind.unwrap_or(theme::ACCENT)), egui::StrokeKind::Middle);
     } else if resp.hovered() {
-        ui.painter().rect_filled(rect.shrink2(egui::vec2(0.0, 0.0)), top, theme::HOVER);
+        ui.painter().rect_filled(rect, top, theme::HOVER);
     }
     let text_color = if resp.hovered() && !selected { kind.unwrap_or(theme::MUTED) } else { title_color };
     let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
@@ -1363,6 +1332,12 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str
     resp
 }
 
+/// (i, released this frame) while the primary button drags `resp`, and as it lets go.
+fn drag_of(resp: &egui::Response, i: usize) -> Option<(usize, bool)> {
+    let (held, released) = (resp.dragged_by(egui::PointerButton::Primary), resp.drag_stopped_by(egui::PointerButton::Primary));
+    (held || released).then_some((i, !held))
+}
+
 /// A small square button holding one glyph.
 fn icon_button(ui: &mut Ui, strip: egui::Rect, glyph: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, strip.height()), Sense::click());
@@ -1373,22 +1348,6 @@ fn icon_button(ui: &mut Ui, strip: egui::Rect, glyph: &str) -> egui::Response {
     let color = if resp.hovered() { theme::TEXT } else { theme::SUBTLE };
     ui.painter().text(square.center(), egui::Align2::CENTER_CENTER, glyph, theme::ui_font(16.0), color);
     resp
-}
-
-/// "{what} ({key})", or just `what` when the action has no key.
-fn with_key(what: &str, place: Place, a: Action) -> String {
-    match keybindings::hint(place, a) {
-        k if k.is_empty() => what.to_string(),
-        k => format!("{what} ({k})"),
-    }
-}
-
-/// "{what}  {key}" (a tooltip), or just `what`.
-fn with_key_spaced(what: &str, place: Place, a: Action) -> String {
-    match keybindings::hint(place, a) {
-        k if k.is_empty() => what.to_string(),
-        k => format!("{what}  {k}"),
-    }
 }
 
 /// The ⌘/ list: per place, its bound actions (keys, what) in file order,
@@ -1451,22 +1410,24 @@ fn write_png(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-#[allow(dead_code)]
-fn _assert_modifiers(_: Modifiers) {}
-
 /// The viewer `tab` shows, created on its worktree and diff base if none. A
 /// free function over just the fields it needs, so a caller can keep
 /// `&self.engine` borrowed for a `PanelCtx`.
 fn tab_viewer<'a>(viewers: &'a mut HashMap<(String, Shown), Viewer>, shown: &HashMap<String, Shown>, engine: &Arc<Engine>, ws: &Workspace, tab: &Tab) -> &'a mut Viewer {
-    let key = shown.get(&tab.row.id).cloned().unwrap_or_else(|| (tab.row.worktree.clone(), tab.diff_base(ws)));
+    let key = shown.get(&tab.row.id).cloned().unwrap_or_else(|| own_view(ws, tab));
     viewers.entry((tab.row.id.clone(), key.clone())).or_insert_with(|| Viewer::at(engine, ws.host(), &tab.row.id, key.0, key.1))
+}
+
+/// What a tab's viewer shows until one is picked: its worktree vs its diff base.
+fn own_view(ws: &Workspace, tab: &Tab) -> Shown {
+    (tab.row.worktree.clone(), tab.diff_base(ws))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::{self, TestRepo};
-    use egui::Key;
+    use egui::{Key, Modifiers};
 
     #[test]
     fn shortcuts_list_reads_the_keymap() {

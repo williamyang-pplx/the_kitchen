@@ -42,22 +42,6 @@ use highlight::Spans;
 use picker::{Picker, PickerResult};
 use vim::{Vim, VimAction, VimCmd};
 
-/// "{what} ({key})", or `what` when the action has no key.
-fn with_key(what: &str, place: Place, a: Action) -> String {
-    match keybindings::hint(place, a) {
-        k if k.is_empty() => what.to_string(),
-        k => format!("{what} ({k})"),
-    }
-}
-
-/// "{what}  {key}" for a tooltip, or `what`.
-fn spaced(what: &str, place: Place, a: Action) -> String {
-    match keybindings::hint(place, a) {
-        k if k.is_empty() => what.to_string(),
-        k => format!("{what}  {k}"),
-    }
-}
-
 /// "]c / [c": the commands' first keys, or `none` when none has one.
 fn keys_or(cmds: &[(Place, Cmd)], none: &str) -> String {
     let km = keybindings::current();
@@ -731,7 +715,7 @@ impl Viewer {
 
     fn step_hunk(&mut self, fwd: bool) {
         if !self.diff {
-            self.status = Some((with_key(&format!("{} move between changes in diff mode", keys_or(&[(Place::Vim, VimCmd::NextHunk.into()), (Place::Vim, VimCmd::PrevHunk.into())], "the hunk keys")), Place::Panel, Action::ToggleDiff), false));
+            self.status = Some((keybindings::with_key(&format!("{} move between changes in diff mode", keys_or(&[(Place::Vim, VimCmd::NextHunk.into()), (Place::Vim, VimCmd::PrevHunk.into())], "the hunk keys")), Place::Panel, Action::ToggleDiff), false));
             return;
         }
         let starts = self.doc.hunk_starts();
@@ -981,7 +965,7 @@ impl Viewer {
     fn set_all_folds(&mut self, open: bool) {
         let diff = !self.outline && self.doc_key.as_ref().is_some_and(|k| k.1);
         let Some(path) = self.current.clone().filter(|_| diff) else {
-            self.status = Some((with_key("folds are for diffs", Place::Panel, Action::ToggleDiff), false));
+            self.status = Some((keybindings::with_key("folds are for diffs", Place::Panel, Action::ToggleDiff), false));
             return;
         };
         if self.editor.is_some() {
@@ -1221,12 +1205,12 @@ impl Viewer {
         }
         header_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(theme::SPACE_S);
-            if widgets::flat_button(ui, "File list", self.show_files).on_hover_text(spaced("Show / hide the file list", Place::Global, Action::ToggleFiles)).clicked_by(egui::PointerButton::Primary) {
+            if widgets::flat_button(ui, "File list", self.show_files).on_hover_text(keybindings::with_key_spaced("Show / hide the file list", Place::Global, Action::ToggleFiles)).clicked_by(egui::PointerButton::Primary) {
                 self.show_files = !self.show_files;
             }
             // Which of the tab's PRs is on screen; a click switches.
             if let Some(label) = self.shown_entry_label() {
-                if widgets::flat_button(ui, &label, false).on_hover_text(spaced("Switch PR", Place::Global, Action::ViewMenu)).clicked_by(egui::PointerButton::Primary) {
+                if widgets::flat_button(ui, &label, false).on_hover_text(keybindings::with_key_spaced("Switch PR", Place::Global, Action::ViewMenu)).clicked_by(egui::PointerButton::Primary) {
                     self.open_view_menu();
                 }
             }

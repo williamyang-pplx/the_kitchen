@@ -143,18 +143,28 @@ fn parse_chord(s: &str) -> Result<Option<Press>, String> {
     let Some((last, mods)) = parts.split_last().filter(|(l, m)| !l.is_empty() && !m.is_empty() && m.iter().all(|p| !p.is_empty())) else { return Ok(None) };
     let mut m = Mods::default();
     for p in mods {
-        match p.trim().to_ascii_lowercase().as_str() {
-            "cmd" | "command" | "super" => m.cmd = true,
-            "shift" => m.shift = true,
-            "alt" | "opt" | "option" | "meta" => m.alt = true,
-            "ctrl" | "control" => m.ctrl = true,
-            _ if mods.len() == 1 && p.chars().count() == 1 => return Ok(None), // `a+b` typed
-            other => return Err(format!("unknown modifier {other:?} in {s:?}")),
+        match add_modifier(&mut m, p) {
+            Ok(()) => {}
+            Err(_) if mods.len() == 1 && p.chars().count() == 1 => return Ok(None), // `a+b` typed
+            Err(other) => return Err(format!("unknown modifier {other:?} in {s:?}")),
         }
     }
     let name = last.trim();
     let key = parse_key(&name.to_ascii_lowercase()).ok_or_else(|| format!("unknown key {name:?} in {s:?}"))?;
     Ok(Some(press(key, m, s)?))
+}
+
+/// Set the modifier `name` (`cmd`, `opt`, …) in `m`. Err: `name` trimmed
+/// and lowercased, when it names no modifier.
+fn add_modifier(m: &mut Mods, name: &str) -> Result<(), String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "cmd" | "command" | "super" => m.cmd = true,
+        "shift" => m.shift = true,
+        "alt" | "opt" | "option" | "meta" => m.alt = true,
+        "ctrl" | "control" => m.ctrl = true,
+        other => return Err(other.to_string()),
+    }
+    Ok(())
 }
 
 /// The press `key` with `m` stands for, as `presses` reports it.
@@ -258,13 +268,7 @@ impl MouseBinding {
         };
         let mut m = Mods::default();
         for p in mods {
-            match p.to_ascii_lowercase().as_str() {
-                "cmd" | "command" | "super" => m.cmd = true,
-                "shift" => m.shift = true,
-                "alt" | "opt" | "option" | "meta" => m.alt = true,
-                "ctrl" | "control" => m.ctrl = true,
-                other => return Err(format!("unknown modifier {other:?} in {s:?}")),
-            }
+            add_modifier(&mut m, p).map_err(|other| format!("unknown modifier {other:?} in {s:?}"))?;
         }
         Ok(MouseBinding { mods: m, button })
     }

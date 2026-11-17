@@ -43,7 +43,6 @@ impl Dimensions for GridSize {
 #[derive(Default)]
 struct Shared {
     clipboard: Mutex<Option<String>>,
-    bell: AtomicBool,
     exited: AtomicBool,
 }
 
@@ -57,7 +56,7 @@ pub struct Listener {
 impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
         match event {
-            TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {}
+            TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange | TermEvent::Bell => {}
             TermEvent::Title(_) | TermEvent::ResetTitle => {}
             TermEvent::ClipboardStore(_, text) => *self.shared.clipboard.lock().unwrap() = Some(text),
             TermEvent::PtyWrite(text) => {
@@ -65,7 +64,6 @@ impl EventListener for Listener {
                     let _ = s.send(Msg::Input(Cow::Owned(text.into_bytes())));
                 }
             }
-            TermEvent::Bell => self.shared.bell.store(true, Ordering::Relaxed),
             TermEvent::ChildExit(_) | TermEvent::Exit => self.shared.exited.store(true, Ordering::Relaxed),
             TermEvent::ClipboardLoad(..) | TermEvent::ColorRequest(..) | TermEvent::TextAreaSizeRequest(..) => {}
         }
@@ -163,10 +161,6 @@ impl TermSession {
     /// Text the program asked to put on the clipboard (OSC 52, e.g. tmux copy-mode).
     pub fn take_clipboard(&self) -> Option<String> {
         self.shared.clipboard.lock().unwrap().take()
-    }
-
-    pub fn take_bell(&self) -> bool {
-        self.shared.bell.swap(false, Ordering::Relaxed)
     }
 
     pub fn size(&self) -> GridSize {

@@ -4,10 +4,9 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use egui::Color32;
 
-pub const BACKGROUND: Color32 = Color32::from_rgb(0x1a, 0x1b, 0x26);
+use crate::theme;
+
 pub const FOREGROUND: Color32 = Color32::WHITE;
-pub const CURSOR: Color32 = Color32::from_rgb(0xc0, 0xca, 0xf5);
-pub const SELECTION: Color32 = Color32::from_rgb(0x33, 0x46, 0x7c);
 
 /// Tokyo-night-ish ANSI 0..15.
 const ANSI: [Color32; 16] = [
@@ -63,8 +62,8 @@ pub fn resolve(color: Color, overrides: &Colors) -> Color32 {
             }
             match n {
                 NamedColor::Foreground | NamedColor::BrightForeground => FOREGROUND,
-                NamedColor::Background => BACKGROUND,
-                NamedColor::Cursor => CURSOR,
+                NamedColor::Background => theme::BG,
+                NamedColor::Cursor => theme::TEXT,
                 NamedColor::DimForeground => dim(FOREGROUND),
                 NamedColor::DimBlack => dim(ANSI[0]),
                 NamedColor::DimRed => dim(ANSI[1]),

@@ -64,6 +64,9 @@ pub const RADIUS_S: u8 = 4;
 pub const RADIUS: u8 = 6;
 pub const RADIUS_L: u8 = 10;
 
+/// Under windows, dialogs and popups that float over the app.
+pub const WINDOW_SHADOW: Shadow = Shadow { offset: [0, 10], blur: 32, spread: 0, color: Color32::from_black_alpha(120) };
+
 /// System fonts used as fallbacks so box drawing, symbols and CJK render.
 const FALLBACKS: &[(&str, &str)] = &[
     ("apple-symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
@@ -88,11 +91,6 @@ pub fn ui_font(size: f32) -> FontId {
 /// Semibold `ui_font`, for status lines, badges and section headers.
 pub fn ui_font_semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("ui-semibold".into()))
-}
-
-/// Bold `ui_font`, for workspace names and dialog headings.
-pub fn ui_font_bold(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("ui-bold".into()))
 }
 
 pub fn install(ctx: &egui::Context) {
@@ -138,7 +136,7 @@ pub fn install(ctx: &egui::Context) {
         s.spacing.window_margin = egui::Margin::same(SPACE_L as i8);
         s.spacing.menu_margin = egui::Margin::same(6);
         s.interaction.selectable_labels = false;
-        s.text_styles.insert(egui::TextStyle::Heading, ui_font_bold(TEXT_HEADING));
+        s.text_styles.insert(egui::TextStyle::Heading, FontId::new(TEXT_HEADING, FontFamily::Name("ui-bold".into())));
         s.text_styles.insert(egui::TextStyle::Body, ui_font(TEXT_BODY));
         s.text_styles.insert(egui::TextStyle::Button, ui_font(TEXT_BODY));
         s.text_styles.insert(egui::TextStyle::Small, ui_font(TEXT_SMALL));
@@ -162,7 +160,7 @@ fn visuals() -> Visuals {
     v.text_cursor.stroke = Stroke::new(2.0, ACCENT);
     v.window_corner_radius = CornerRadius::same(RADIUS_L);
     v.window_stroke = Stroke::new(1.0, BORDER);
-    v.window_shadow = Shadow { offset: [0, 10], blur: 32, spread: 0, color: Color32::from_black_alpha(120) };
+    v.window_shadow = WINDOW_SHADOW;
     v.window_highlight_topmost = false;
     v.menu_corner_radius = CornerRadius::same(8);
     v.popup_shadow = Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(100) };

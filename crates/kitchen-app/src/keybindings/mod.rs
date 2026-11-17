@@ -521,6 +521,22 @@ pub fn labelled(what: &str, hints: &[(Place, Cmd, &str)]) -> String {
     }
 }
 
+/// "{what} ({key})", or just `what` when the action has no key.
+pub fn with_key(what: &str, place: Place, a: app::Action) -> String {
+    match hint(place, a) {
+        k if k.is_empty() => what.to_string(),
+        k => format!("{what} ({k})"),
+    }
+}
+
+/// "{what}  {key}" (a tooltip), or just `what`.
+pub fn with_key_spaced(what: &str, place: Place, a: app::Action) -> String {
+    match hint(place, a) {
+        k if k.is_empty() => what.to_string(),
+        k => format!("{what}  {k}"),
+    }
+}
+
 /// Run `f` with `km` as this thread's `current()`. Plugin threads don't see
 /// it; in tests `refresh_plugins` only acts on a thread with an override, so
 /// parallel plugin hosts never leak chords into other tests.

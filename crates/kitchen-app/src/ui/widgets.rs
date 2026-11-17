@@ -178,8 +178,8 @@ pub fn overlay_frame() -> egui::Frame {
         .fill(theme::OVERLAY)
         .stroke(egui::Stroke::new(1.0, theme::BORDER))
         .corner_radius(CornerRadius::same(theme::RADIUS_L))
-        .shadow(egui::Shadow { offset: [0, 10], blur: 32, spread: 0, color: Color32::from_black_alpha(120) })
-        .inner_margin(egui::Margin::same(theme::SPACE_L as i8))
+        .shadow(theme::WINDOW_SHADOW)
+        .inner_margin(egui::Margin::same(theme::SPACE_XL as i8))
 }
 
 /// A centered title, an optional line under it, and the keys to press

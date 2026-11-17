@@ -4,7 +4,7 @@
 //! each devbox the app keeps one `ssh <alias> kitchenctl __relay` running.
 //! The relay listens on the devbox's `~/.kitchen/kitchen.sock` and sends each
 //! request line to us as a [`RelayFrame`] on its stdout; we answer through
-//! [`api::handle_line`] and write the response frame to its stdin. When the
+//! [`api::handle_line_from`] and write the response frame to its stdin. When the
 //! app exits, the relay's stdin closes and it cleans up after itself.
 
 use std::collections::HashSet;

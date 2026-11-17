@@ -283,7 +283,7 @@ pub struct Engine {
     db: Mutex<Db>,
     state: Mutex<State>,
     ui_cmds: Mutex<Vec<UiCommand>>,
-    settings: Mutex<Settings>,
+    settings: Settings,
     /// Tabs whose tmux session was just created: the first attach can skip
     /// the "does the session still exist?" round trip.
     fresh_sessions: Mutex<std::collections::HashSet<String>>,
@@ -318,7 +318,7 @@ impl Engine {
             db: Mutex::new(db),
             state: Mutex::new(state),
             ui_cmds: Mutex::new(Vec::new()),
-            settings: Mutex::new(settings),
+            settings,
             fresh_sessions: Mutex::new(Default::default()),
             opening: Mutex::new(Default::default()),
             closed: Mutex::new(Vec::new()),
@@ -345,7 +345,7 @@ impl Engine {
     }
 
     pub fn settings(&self) -> Settings {
-        self.settings.lock().unwrap().clone()
+        self.settings.clone()
     }
 
     fn repaint(&self) {
@@ -679,10 +679,10 @@ impl Engine {
             .expect("spawn thread");
     }
 
-    fn set_pending(&self, ws_id: &str, tab: Option<PendingTab>) {
+    fn set_pending(&self, ws_id: &str, tab: PendingTab) {
         let mut st = self.state();
-        if let (Some(w), Some(t)) = (st.workspaces.iter_mut().find(|w| w.row.id == ws_id), tab) {
-            w.pending.push(t);
+        if let Some(w) = st.workspaces.iter_mut().find(|w| w.row.id == ws_id) {
+            w.pending.push(tab);
         }
         drop(st);
         self.repaint();
@@ -856,7 +856,7 @@ impl Engine {
             .or_else(|| label.map(String::from))
             .or_else(|| branch.map(String::from))
             .unwrap_or_else(|| "new tab".into());
-        self.set_pending(ws_id, Some(PendingTab { id: tab_id.clone(), title: pending_title, focus }));
+        self.set_pending(ws_id, PendingTab { id: tab_id.clone(), title: pending_title, focus });
         let result = (|| -> Result<TabRow> {
             // New-branch tabs start from origin/<default> as the spare warmer
             // last fetched it (at most SPARE_REFRESH old, usually fresher:
@@ -1294,7 +1294,7 @@ impl Engine {
         }
         let command = resume_command(&row, &self.settings());
         let env = tab_env(&ws.row, &row, &host);
-        self.set_pending(ws_id, Some(PendingTab { id: row.id.clone(), title: row.title.clone(), focus: true }));
+        self.set_pending(ws_id, PendingTab { id: row.id.clone(), title: row.title.clone(), focus: true });
         let started = Tmux::new(&host).new_session(&row.tmux_session, &row.worktree, &env, command.as_deref());
         self.clear_pending(ws_id, &row.id);
         if let Err(e) = started {

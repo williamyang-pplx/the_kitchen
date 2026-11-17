@@ -9,12 +9,13 @@ use alacritty_terminal::vte::ansi::CursorShape;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, CornerRadius, EventFilter, FontId, Modifiers, PointerButton, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 
-use super::colors::{self, BACKGROUND, CURSOR, SELECTION};
+use super::colors;
 use super::input::{key_bytes, paste_bytes, sgr_mouse};
 use super::{GridSize, Listener, TermSession};
 use crate::keybindings::{ClickCmd, Place};
 use crate::links::{self, Link};
 use crate::plugins::LinkEntry;
+use crate::theme;
 
 const PAD: f32 = 6.0;
 
@@ -196,10 +197,6 @@ fn logical_line(term: &alacritty_terminal::Term<Listener>, point: Point) -> (Str
 }
 
 /// The cursor's viewport cell when it is visible on the live screen.
-fn live_cursor(session: &TermSession) -> Option<(usize, usize)> {
-    cursor_of(&session.term.lock())
-}
-
 fn cursor_of(term: &alacritty_terminal::Term<super::Listener>) -> Option<(usize, usize)> {
     if term.grid().display_offset() != 0 || !term.mode().contains(TermMode::SHOW_CURSOR) {
         return None;
@@ -234,7 +231,7 @@ fn handle_keyboard(ui: &mut Ui, session: &mut TermSession) {
                 if ui.input(|i| i.modifiers.mac_cmd) {
                     continue;
                 }
-                let cursor = live_cursor(session);
+                let cursor = cursor_of(&session.term.lock());
                 let cols = session.size().cols;
                 session.predictor.typed(&text, cursor, cols);
                 session.write(text.into_bytes());
@@ -362,7 +359,7 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
 
 fn paint(ui: &mut Ui, rect: Rect, session: &mut TermSession, geom: &Geom, font: &FontId, focused: bool, link_cells: Option<&[(usize, usize, usize)]>) {
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
+    painter.rect_filled(rect, CornerRadius::ZERO, theme::BG);
 
     let term_arc = session.term.clone();
     let term = term_arc.lock();
@@ -418,7 +415,7 @@ fn paint(ui: &mut Ui, rect: Rect, session: &mut TermSession, geom: &Geom, font: 
             fg = bg;
         }
         if selection.map(|s| s.contains(indexed.point)).unwrap_or(false) {
-            bg = SELECTION;
+            bg = theme::SELECTION;
             default_bg = false;
         }
         let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
@@ -492,24 +489,24 @@ fn paint(ui: &mut Ui, rect: Rect, session: &mut TermSession, geom: &Geom, font: 
         let r = geom.cell_rect(cursor.point.column.0.min(geom.cols - 1), cursor_row as usize, 1);
         match (focused, cursor.shape) {
             (true, CursorShape::Beam) => {
-                painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(2.0, r.height())), CornerRadius::ZERO, CURSOR);
+                painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(2.0, r.height())), CornerRadius::ZERO, theme::TEXT);
             }
             (true, CursorShape::Underline) => {
                 painter.rect_filled(
                     Rect::from_min_size(Pos2::new(r.min.x, r.max.y - 2.0), Vec2::new(r.width(), 2.0)),
                     CornerRadius::ZERO,
-                    CURSOR,
+                    theme::TEXT,
                 );
             }
             (true, _) => {
-                painter.rect_filled(r, CornerRadius::ZERO, CURSOR.gamma_multiply(0.75));
+                painter.rect_filled(r, CornerRadius::ZERO, theme::TEXT.gamma_multiply(0.75));
                 let c = term.grid()[cursor.point].c;
                 if c != ' ' {
-                    painter.text(r.left_top(), egui::Align2::LEFT_TOP, c, font.clone(), BACKGROUND);
+                    painter.text(r.left_top(), egui::Align2::LEFT_TOP, c, font.clone(), theme::BG);
                 }
             }
             (false, _) => {
-                painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, CURSOR), egui::StrokeKind::Inside);
+                painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, theme::TEXT), egui::StrokeKind::Inside);
             }
         }
     }
@@ -730,7 +727,7 @@ mod devbox_typing {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             assert!(!s.predictor.pending(), "every prediction confirmed");
-            let row = live_cursor(&s).unwrap().0;
+            let row = cursor_of(&s.term.lock()).unwrap().0;
             let text: String = {
                 let t = s.term.lock();
                 (0..t.columns()).map(|c| t.grid()[Point::new(Line(row as i32), Column(c))].c).collect()
@@ -795,7 +792,7 @@ mod tests {
             };
             let mut link = None;
             let mut out = ctx.run_ui(input, |ui| {
-                egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                     link = TerminalView::new(&mut session).focused(true).show(ui).1;
                 });
             });

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use egui::{Color32, RichText, Ui};
+use egui::{RichText, Ui};
 
 use crate::engine::{Engine, Workspace};
 use crate::plugins::dashboard::{Row, Section};
@@ -66,10 +66,6 @@ fn heading(ui: &mut Ui, title: &str, note: Option<&str>) {
         }
     });
     ui.add_space(theme::SPACE_XS + 2.0);
-}
-
-fn small(text: impl Into<String>, color: Color32) -> RichText {
-    RichText::new(text.into()).font(theme::ui_font(theme::TEXT_BODY)).color(color)
 }
 
 /// "3h 5m", "42s".
@@ -135,7 +131,7 @@ pub fn timer_when(t: &TimerInfo, now: f64) -> String {
 fn timers(ui: &mut Ui, list: &[TimerInfo], ws: &str, now: f64) {
     heading(ui, "Timers", None);
     if list.is_empty() {
-        ui.label(small("no plugin timers", theme::SUBTLE));
+        ui.label(RichText::new("no plugin timers").font(theme::ui_font(theme::TEXT_BODY)).color(theme::SUBTLE));
     }
     for (i, t) in list.iter().enumerate() {
         if i > 0 {

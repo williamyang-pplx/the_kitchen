@@ -26,8 +26,8 @@ pub enum DialogOutcome {
 pub enum Dialog {
     NewWorkspace(NewWorkspace),
     NewTab(NewTabDialog),
-    ConfirmCloseTab { id: String, title: String },
-    ConfirmCloseWorkspace { id: String, name: String },
+    /// Closing a tab, or (`workspace`) removing a workspace.
+    ConfirmClose { workspace: bool, id: String, name: String },
     Rename(Rename),
 }
 
@@ -35,7 +35,7 @@ pub struct NewWorkspace {
     name: String,
     host_idx: usize,
     repo: String,
-    hosts: Arc<Mutex<Vec<HostChoice>>>,
+    hosts: Vec<HostChoice>,
     repos: Arc<Mutex<HashMap<String, Vec<String>>>>,
     requested: std::collections::HashSet<String>,
     first_frame: bool,
@@ -65,12 +65,11 @@ pub struct NewTabDialog {
 
 impl Dialog {
     pub fn new_workspace() -> Dialog {
-        let hosts = Arc::new(Mutex::new(ssh_hosts()));
         Dialog::NewWorkspace(NewWorkspace {
             name: String::new(),
             host_idx: 0,
             repo: String::new(),
-            hosts,
+            hosts: ssh_hosts(),
             repos: Arc::new(Mutex::new(HashMap::new())),
             requested: Default::default(),
             first_frame: true,
@@ -82,11 +81,11 @@ impl Dialog {
     }
 
     pub fn confirm_close(tab: &Tab) -> Dialog {
-        Dialog::ConfirmCloseTab { id: tab.row.id.clone(), title: tab.row.title.clone() }
+        Dialog::ConfirmClose { workspace: false, id: tab.row.id.clone(), name: tab.row.title.clone() }
     }
 
     pub fn confirm_close_workspace(ws: &Workspace) -> Dialog {
-        Dialog::ConfirmCloseWorkspace { id: ws.row.id.clone(), name: ws.row.name.clone() }
+        Dialog::ConfirmClose { workspace: true, id: ws.row.id.clone(), name: ws.row.name.clone() }
     }
 
     pub fn rename_tab(tab: &Tab) -> Dialog {
@@ -108,7 +107,7 @@ impl Dialog {
         }
         let mut outcome = DialogOutcome::Open;
         egui::Modal::new(egui::Id::new("kitchen-dialog"))
-            .frame(widgets::overlay_frame().inner_margin(egui::Margin::same(theme::SPACE_XL as i8)))
+            .frame(widgets::overlay_frame())
             .backdrop_color(egui::Color32::from_black_alpha(140))
             .show(ctx, |ui| {
                 ui.set_width(FIELD_WIDTH);
@@ -116,35 +115,26 @@ impl Dialog {
                     Dialog::NewWorkspace(d) => d.ui(ui, engine),
                     Dialog::NewTab(d) => d.ui(ui, engine),
                     Dialog::Rename(d) => d.ui(ui, engine),
-                    Dialog::ConfirmCloseTab { id, title } => confirm(
-                        ui,
-                        &format!("Close tab “{title}”?"),
-                        "Its tmux session (and any agent running in it) ends. The worktree and branch stay on disk.",
-                        "Close tab",
-                        || {
-                            let id = id.clone();
-                            engine.spawn("close tab", move |e| e.close_tab(&id));
-                        },
-                    ),
-                    Dialog::ConfirmCloseWorkspace { id, name } => confirm(
-                        ui,
-                        &format!("Remove workspace “{name}”?"),
-                        "All its tabs' tmux sessions end. Repos and worktrees stay on disk.",
-                        "Remove",
-                        || {
-                            let id = id.clone();
-                            engine.spawn("remove workspace", move |e| e.close_workspace(&id));
-                        },
-                    ),
+                    Dialog::ConfirmClose { workspace, id, name } => {
+                        let (title, body, yes) = if *workspace {
+                            (format!("Remove workspace “{name}”?"), "All its tabs' tmux sessions end. Repos and worktrees stay on disk.", "Remove")
+                        } else {
+                            (format!("Close tab “{name}”?"), "Its tmux session (and any agent running in it) ends. The worktree and branch stay on disk.", "Close tab")
+                        };
+                        let (workspace, id) = (*workspace, id.clone());
+                        heading(ui, &title, Some(body));
+                        buttons(ui, yes, true, || {
+                            if workspace {
+                                engine.spawn("remove workspace", move |e| e.close_workspace(&id));
+                            } else {
+                                engine.spawn("close tab", move |e| e.close_tab(&id));
+                            }
+                        })
+                    }
                 };
             });
         outcome
     }
-}
-
-fn confirm(ui: &mut egui::Ui, title: &str, body: &str, yes: &str, on_yes: impl FnOnce()) -> DialogOutcome {
-    heading(ui, title, Some(body));
-    buttons(ui, yes, true, on_yes)
 }
 
 /// A dialog's title, and the sentence under it.
@@ -206,7 +196,7 @@ fn focus_select_all(ui: &egui::Ui, field: &egui::Response, text: &str) {
 impl NewWorkspace {
     fn ui(&mut self, ui: &mut egui::Ui, engine: &Arc<Engine>) -> DialogOutcome {
         heading(ui, "New workspace", Some("A repository on this mac or on a devbox. Devbox setup pulls your dotfiles and links skills."));
-        let hosts = self.hosts.lock().unwrap().clone();
+        let hosts = &self.hosts;
         let host = hosts.get(self.host_idx).cloned().unwrap_or(HostChoice { alias: "local".into(), devbox: false });
 
         field_label(ui, "Location");
@@ -406,7 +396,7 @@ mod tests {
             let engine = Engine::new(ctx.clone(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
             let km = crate::keybindings::Keymap::with_user("[dialog]\nsubmit = [\"<C-s>\"]\ncancel = [\"<C-g>\"]\n");
             let got = crate::keybindings::with_keymap(km, || {
-                let mut step = |dialog: &mut Dialog, events: Vec<egui::Event>| {
+                let step = |dialog: &mut Dialog, events: Vec<egui::Event>| {
                     let mut outcome = DialogOutcome::Closed;
                     let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| outcome = dialog.show(ui.ctx(), &engine));
                     out.textures_delta.clear();

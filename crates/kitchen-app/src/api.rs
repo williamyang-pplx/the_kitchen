@@ -45,16 +45,11 @@ fn serve_conn(engine: &Arc<Engine>, stream: UnixStream) {
         if line.trim().is_empty() {
             continue;
         }
-        let resp = handle_line(engine, &line);
+        let resp = handle_line_from(engine, &line, false);
         if kitchen_proto::write_line(&mut writer, &resp).is_err() {
             break;
         }
     }
-}
-
-/// Parse and answer one request line from the local socket.
-pub fn handle_line(engine: &Arc<Engine>, line: &str) -> Response {
-    handle_line_from(engine, line, false)
 }
 
 /// Parse and answer one request line. `remote`: it came through a devbox
@@ -487,7 +482,6 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             let events = crate::plugins::keys::parse_sequence(&a.keys).map_err(|e| anyhow!(e))?;
             let n = events.len();
             engine.push_ui(UiCommand::Keys(events));
-            engine.ctx.request_repaint();
             Ok(json!({"events": n}))
         }
 
