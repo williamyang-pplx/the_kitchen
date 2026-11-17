@@ -39,9 +39,7 @@ function M.parse(text)
   end
 end
 
-local function q(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-end
+local q = require("kitchen.util").q
 
 local function gh(args, cb)
   local quoted = {}

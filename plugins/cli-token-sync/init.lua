@@ -23,30 +23,15 @@
 
 local M = {}
 
+local util = require("kitchen.util")
+local why = util.why
+
 M.sources = {
   shipyard = require("sources.shipyard"),
   buildkite = require("sources.buildkite"),
 }
 
 local MIN_LEFT = 60 -- s: a token closer to expiry than this stays home
-
--- The distinct devbox hosts of `workspaces` (kitchen.workspaces()), in
--- first-seen order, and host → list of workspace ids (for per-workspace
--- dashboard stats). "local" workspaces are skipped.
-function M.hosts(workspaces)
-  local hosts, ws_of = {}, {}
-  for _, ws in ipairs(workspaces or {}) do
-    local h = ws.host
-    if h and h ~= "local" then
-      if not ws_of[h] then
-        ws_of[h] = {}
-        table.insert(hosts, h)
-      end
-      table.insert(ws_of[h], ws.id)
-    end
-  end
-  return hosts, ws_of
-end
 
 -- Whether `row`'s token (a MAC_PY report row) is worth sending at `now`: an
 -- access token with more than MIN_LEFT seconds left, or no expiry.
@@ -89,19 +74,6 @@ function M.problem(src, row, login_exp, now, warn_days)
     return label .. ": the mac's " .. src.title .. " login ends " .. os.date("!%Y-%m-%d %H:%M UTC", login_exp) .. "; " .. how .. " before then"
   end
   return nil
-end
-
--- A failed job's reason, for logs and toasts: stderr only, one line, at most
--- 200 characters. Never stdout: MAC_PY prints the tokens there.
-local function why(res)
-  if res.timed_out then
-    return "timed out"
-  end
-  local text = (res.stderr or ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
-  if text == "" then
-    text = "exit " .. tostring(res.code)
-  end
-  return text:sub(1, 200)
 end
 
 local warned = {} -- key → the message toasted while that problem stands
@@ -204,21 +176,12 @@ local function mac_side(src, window, warn_days, stats)
   return M.payload(src, report, now)
 end
 
-local manual = false -- the next pass was asked for with cli-token-sync.run
-local tried = {} -- host → true once a pass of this load has started with it
-
 -- One pass (see the header). Returns the dashboard stats and per-workspace
 -- stats { [ws_id] = { pushed = <sources> } or { failed = "…" } }.
-local function pass()
-  local was_manual = manual
-  manual = false
-  for _, host in ipairs((M.hosts(kitchen.workspaces()))) do
-    tried[host] = true
-  end
-
+local function pass(was_manual)
   local window = math.max(1, tonumber(kitchen.config.refresh_minutes) or 15) * 60
   local warn_days = tonumber(kitchen.config.warn_days) or 7
-  local hosts, ws_of = M.hosts(kitchen.workspaces())
+  local hosts, ws_of = util.hosts(kitchen.workspaces())
   local stats, pushed, failed = { hosts = #hosts, pushed = 0, failed = 0 }, {}, {}
   for _, src in ipairs(enabled()) do
     local payload = mac_side(src, window, warn_days, stats)
@@ -251,33 +214,11 @@ local function pass()
   return stats, per_ws
 end
 
--- The kitchen runs it on schedule and never starts one while another runs.
-local timer = kitchen.every("pass", math.max(1, tonumber(kitchen.config.interval_minutes) or 5) * 60, pass, {
+util.sync_schedule {
+  pass = pass,
   desc = "refresh the mac's CLI logins and push their access tokens to every devbox",
+  run_desc = "refresh the mac's CLI logins and push them to the devboxes now",
   first_delay = 40,
-})
-
--- A newly opened devbox workspace gets the tokens within NEW_HOST_POLL
--- seconds, not at the next pass. Each host counts once per load (so a box
--- that can't be reached doesn't start a pass every tick), and a reload
--- counts every host as new.
-local NEW_HOST_POLL = 10
-kitchen.every("new-hosts", NEW_HOST_POLL, function()
-  for _, host in ipairs((M.hosts(kitchen.workspaces()))) do
-    if not tried[host] then
-      timer:run() -- false while a pass runs; then the next tick asks again
-      return { new_host = host }
-    end
-  end
-  return {}
-end, { desc = "start a pass when a devbox workspace opens", first_delay = 55 }) -- after the first pass's 40 s
-
-kitchen.command("run", function()
-  manual = true
-  if not timer:run() then
-    manual = false
-    kitchen.notify("cli-token-sync: a pass is already running")
-  end
-end, { desc = "refresh the mac's CLI logins and push them to the devboxes now" })
+}
 
 return M

@@ -50,24 +50,11 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   outline mode with model-written summaries.
 - **Plugins** (neovim-style Lua in `~/.kitchen/plugins/`): commands, keys,
   viewer diagnostics/highlights, `gd`/`gr` providers, and jobs or
-  long-running processes (language servers) on the tab's devbox. Ships with
-  `ruff` (Python lint), `python` (`gd` / `gr` from the ty language server),
-  `github` (PR review via ⌘⇧P), `markdown` (⌘⇧V renders a Markdown file in
-  the viewer; ⌘M still comments on it), `todo`, `prune-worktrees`
-  (hourly, removes worktrees that no tab or tmux pane uses and that nobody
-  touched for 2 days; branches stay), `bazel-cache` (every 30 minutes, keeps
-  `~/bazel-cache` on the mac and each devbox under 30G: drops the output bases
-  of removed worktrees, then the least recently used cache entries, never under
-  a running build), `mcp-token-sync` (every 5 minutes, pushes the mac's MCP
-  OAuth tokens, e.g. Slack's, to each open devbox, and to a newly opened one
-  within 10 seconds, so Claude there stays logged in), `cli-token-sync`
-  (every 5 minutes, refreshes the mac's `bin/shipyard` and `bin/bk` logins and
-  pushes their access tokens to each open devbox, so Shipyard and Buildkite
-  there need no login) and `dashboard`. ⌘⇧P is the command palette.
+  long-running processes (language servers) on the tab's devbox. ⌘⇧P is the
+  command palette. The bundled plugins and the API: [docs/plugins.md](docs/plugins.md).
 - **Dashboard** (⌘D, or the grid at the right end of the tab strip): each
   plugin timer's runs (last fired, next due, stats), and the workspace's
   worktrees, disk and RAM on its host, from the `dashboard` plugin.
-  See [docs/plugins.md](docs/plugins.md).
 - **`kitchenctl`**: the public CLI, so agents can do everything you do from
   the keyboard. See [docs/cli.md](docs/cli.md) or run `kitchenctl guide`.
 
@@ -90,13 +77,11 @@ kitchen; `KITCHEN_HIDDEN=1` keeps a test kitchen off the screen, see
 a tab's session comes back in its worktree with its agent resuming the
 conversation it was in.
 
-### Agent skill
+### Agent guide
 
 Every agent the kitchen starts gets the `kitchenctl` guide in its context:
 a SessionStart hook runs `kitchenctl guide` (on this mac and on devboxes),
-so nothing needs installing. The same text ships as `skill/kitchen/SKILL.md`
-for agents started outside the kitchen; regenerate it with
-`scripts/sync-skill.py`.
+so nothing needs installing.
 
 ## Keybindings
 
@@ -140,5 +125,12 @@ replaces them, e.g. `"github.description" = ["cmd+shift+d"]`.
 | `crates/kitchen-core` | hosts (local/ssh), git worktrees, tmux, SQLite, bootstrap |
 | `crates/kitchen-proto` | wire types shared by app and CLI |
 | `crates/kitchen-symbols` | symbol extraction for the viewer |
-| `docs/design.md` | architecture |
 | `docs/cli.md` | CLI and API reference |
+| `docs/plugins.md` | plugins: the bundled ones, the Lua API, design notes |
+| `docs/testing.md` | running a hidden test kitchen |
+
+## Threads
+
+`Engine` (Arc, short locks) is shared by the UI thread, API connection threads and
+background jobs. Slow work never holds a lock. The UI owns terminals and panel state;
+the engine asks it to do UI things through `UiCommand`s.

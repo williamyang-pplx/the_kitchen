@@ -20,24 +20,13 @@ local M = {}
 
 local GIB = 1024 * 1024 -- KiB
 
-local function basename(path)
-  return path:match("[^/]+$") or path
-end
+local util = require("kitchen.util")
+local basename, shell_path, human = util.basename, util.shell_path, util.human
 
 -- A repo contents entry's "<hash>/<uuid>", how output bases' links and
 -- entries are matched (so differently spelled roots agree).
 local function key(path)
   return path:match("[^/]+/[^/]+$") or path
-end
-
--- The config root → a shell word: a leading ~ becomes "$HOME", and it's
--- double-quoted so it can't split (`$`, `"`, `\` and backquotes escaped).
-function M.shell_path(p)
-  local home, rest = "", p
-  if p == "~" or p:sub(1, 2) == "~/" then
-    home, rest = "$HOME", p:sub(2)
-  end
-  return '"' .. home .. rest:gsub('[%$"\\`]', "\\%0") .. '"'
 end
 
 -- Shell (POSIX sh) that defines `st` (prints "<mtime> <path>" for each file
@@ -78,7 +67,7 @@ pins() { find "$1/external" -mindepth 1 -maxdepth 1 -type l -exec readlink {} + 
 --   disk <kib>                                root/disk
 -- A missing root prints just df. Fails (non-zero) when df or ps fails.
 function M.scan_sh(root)
-  return PRELUDE .. "r=" .. M.shell_path(root) .. "\n" .. [[
+  return PRELUDE .. "r=" .. shell_path(root) .. "\n" .. [[
 v=$r; while [ ! -e "$v" ]; do v=$(dirname "$v"); done
 d=$(df -Pk "$v" | awk 'NR==2 {printf "df %d %d\n", $2, $4}')
 [ -n "$d" ] || exit 1
@@ -309,7 +298,7 @@ function M.evict_sh(p, root, idle_minutes)
     table.insert(lines, it.kind .. " " .. it.path)
   end
   local idle = math.floor((idle_minutes or 30) * 60)
-  local script = PRELUDE .. "r=" .. M.shell_path(root) .. "\npids='" .. table.concat(pids, " ") .. "'\nidle=" .. idle .. "\n" .. [[
+  local script = PRELUDE .. "r=" .. shell_path(root) .. "\npids='" .. table.concat(pids, " ") .. "'\nidle=" .. idle .. "\n" .. [[
 # (by folder name: Bazel passes the server its output base with symlinks resolved)
 in_root() { servers | awk -v h="$1" '{ for (i = 2; i <= NF; i++) if ($i ~ /^--output_base=/) { n = split($i, a, "/"); if (a[n] == h) f = 1 } } END { exit !f }'; }
 pf=$(mktemp); trap 'rm -f "$pf"' EXIT
@@ -379,16 +368,6 @@ function M.parse_evict(stdout)
   return r
 end
 
--- KiB → "1.9G", "512M", "40K" (as the dashboard plugin's).
-function M.human(k)
-  if k >= GIB then
-    return string.format("%.1fG", k / GIB)
-  elseif k >= 1024 then
-    return string.format("%.0fM", k / 1024)
-  end
-  return string.format("%.0fK", k)
-end
-
 -- (a failed scan's stdout runs to megabytes: the end says why it stopped)
 local function why(res)
   if res.timed_out then
@@ -422,9 +401,9 @@ local function clean_host(host, cfg)
   end
   local p = M.plan(scan, cfg, os.time())
   local free = scan.df.size > 0 and string.format("%.0f%%", scan.df.avail / scan.df.size * 100) or "?"
-  local stats = { cache = M.human(p.total_kib), free = free }
+  local stats = { cache = human(p.total_kib), free = free }
   if p.blocked then
-    log("over budget (" .. p.over .. "), " .. M.human(p.pinned_kib) .. " of the repo cache kept:", p.blocked)
+    log("over budget (" .. p.over .. "), " .. human(p.pinned_kib) .. " of the repo cache kept:", p.blocked)
     stats.blocked = p.blocked
   end
   if #p.evict == 0 then
@@ -443,7 +422,7 @@ local function clean_host(host, cfg)
       freed = freed + it.kib
       counts[it.kind] = (counts[it.kind] or 0) + 1
       if it.kind == "base" then
-        log("removed output base", it.path, "(" .. M.human(it.kib) .. ")")
+        log("removed output base", it.path, "(" .. human(it.kib) .. ")")
       end
     end
   end
@@ -463,8 +442,8 @@ local function clean_host(host, cfg)
       table.insert(parts, counts[kind] .. " " .. kind)
     end
   end
-  log("cache " .. stats.cache .. ", " .. free .. " free" .. (p.over and " (over: " .. p.over .. ")" or "") .. ": freed " .. M.human(freed) .. (#parts > 0 and " (" .. table.concat(parts, ", ") .. ")" or ""))
-  stats.freed = M.human(freed)
+  log("cache " .. stats.cache .. ", " .. free .. " free" .. (p.over and " (over: " .. p.over .. ")" or "") .. ": freed " .. human(freed) .. (#parts > 0 and " (" .. table.concat(parts, ", ") .. ")" or ""))
+  stats.freed = human(freed)
   -- Still over: the plan fell short, or something it counted on wasn't freed.
   return stats, freed, p.over ~= nil and p.short_kib + p.freed_kib - freed > 0
 end
@@ -494,7 +473,7 @@ local function pass()
       end
       if freed > 0 then
         freed_all = freed_all + freed
-        table.insert(freed_on, M.human(freed) .. " on " .. host)
+        table.insert(freed_on, human(freed) .. " on " .. host)
       end
       if short then
         table.insert(short_on, host .. " (" .. stats.cache .. ", " .. stats.free .. " free" .. (stats.blocked and ", " .. stats.blocked or "") .. ")")
@@ -505,7 +484,7 @@ local function pass()
       totals.failed = totals.failed + 1
     end
   end
-  totals.freed = M.human(freed_all)
+  totals.freed = human(freed_all)
   local per_ws = {}
   for _, ws in ipairs(kitchen.workspaces()) do
     per_ws[ws.id] = by_host[ws.host]

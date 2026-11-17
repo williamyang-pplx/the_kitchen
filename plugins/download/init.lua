@@ -6,28 +6,15 @@
 -- once it has arrived. So the devbox side knows a file made it when it's gone
 -- from the outbox, and a failed pull leaves it there for the next one.
 
-local M = {}
+local util = require("kitchen.util")
+local q, shell_path = util.q, util.shell_path
 
 local SSH = "ssh -o BatchMode=yes -o ConnectTimeout=15"
 
-local function q(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-end
-
--- A config path → a shell word: a leading ~ becomes "$HOME", the rest is
--- double-quoted with `$`, `"`, `\` and backquotes escaped.
-function M.shell_path(p)
-  local home, rest = "", p
-  if p == "~" or p:sub(1, 2) == "~/" then
-    home, rest = "$HOME", p:sub(2)
-  end
-  return '"' .. home .. rest:gsub('[%$"\\`]', "\\%0") .. '"'
-end
-
 -- Shell, run on the mac, that pulls host:<outbox>/ into <dest>/<host>/ and
 -- then drops the outbox's emptied folders on the devbox.
-function M.pull_sh(host, dest, outbox)
-  local into = M.shell_path(dest .. "/" .. host)
+local function pull_sh(host, dest, outbox)
+  local into = shell_path(dest .. "/" .. host)
   return table.concat({
     "set -e",
     "mkdir -p " .. into,
@@ -38,7 +25,7 @@ end
 
 -- The files rsync -v listed: the lines between "Transfer starting" and the
 -- blank line before its totals, minus folders (they end in /).
-function M.pulled(stdout)
+local function pulled(stdout)
   local files, listing = {}, false
   for line in (stdout .. "\n"):gmatch("([^\n]*)\n") do
     if line:match("^Transfer starting") then
@@ -66,14 +53,14 @@ kitchen.command("pull", function(ctx)
   end
   busy[host] = true
   local into = cfg.dest .. "/" .. host
-  kitchen.run({ sh = M.pull_sh(host, cfg.dest, cfg.outbox), timeout = cfg.timeout }, function(res)
+  kitchen.run({ sh = pull_sh(host, cfg.dest, cfg.outbox), timeout = cfg.timeout }, function(res)
     busy[host] = nil
     if res.code ~= 0 then
       kitchen.log(res.stderr)
       kitchen.notify(("download from %s failed: %s"):format(host, res.timed_out and "timed out" or res.stderr), "error")
       return
     end
-    local files = M.pulled(res.stdout)
+    local files = pulled(res.stdout)
     if #files == 0 then
       kitchen.notify(("download: %s's ~/%s is empty"):format(host, cfg.outbox), "warn")
       return
@@ -81,9 +68,7 @@ kitchen.command("pull", function(ctx)
     local shown = #files == 1 and (into .. "/" .. files[1]) or into
     kitchen.notify(#files == 1 and ("downloaded " .. shown) or ("downloaded %d files to %s"):format(#files, into))
     if cfg.reveal then
-      kitchen.run({ sh = (#files == 1 and "open -R " or "open ") .. M.shell_path(shown) })
+      kitchen.run({ sh = (#files == 1 and "open -R " or "open ") .. shell_path(shown) })
     end
   end)
 end, { desc = "pull the devbox's ~/outbox down to ~/Downloads/devbox/<host>", remote = true })
-
-return M

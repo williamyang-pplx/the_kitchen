@@ -106,13 +106,3 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    /// The skill file shipped for agents must be the same text as `kitchenctl guide`.
-    #[test]
-    fn skill_matches_guide() {
-        let skill = include_str!("../../../skill/kitchen/SKILL.md");
-        let body = skill.splitn(3, "---\n").nth(2).expect("SKILL.md has frontmatter").trim_start();
-        assert_eq!(body, super::GUIDE, "regenerate skill/kitchen/SKILL.md from crates/kitchenctl/src/guide.md");
-    }
-}

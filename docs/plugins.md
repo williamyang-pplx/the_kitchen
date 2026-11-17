@@ -3,7 +3,7 @@
 A plugin is a folder of Lua. It can add commands, keybindings, viewer
 diagnostics/highlights and `gd`/`gr` answers, and run any program — one-shot
 or long-running (a language server) — locally or on the tab's devbox.
-Design and rationale: [plugins-design.md](plugins-design.md).
+Why it works this way: [Design notes](#design-notes).
 
 ## Quick start
 
@@ -36,7 +36,7 @@ Run commands from **⌘⇧P** (command palette), their keys, or
 
 Examples in the repo's `plugins/`: `ruff` (Python lint), `python` (`gd`/`gr`
 via the ty language server), `github` (PR review via ⌘⇧P),
-`markdown` (⌘⇧V renders `.md` files in the viewer), `todo` (highlights), `hello` (commands, keys, jobs), `prune-worktrees` (a
+`markdown` (⌘⇧V renders `.md` files in the viewer), `todo` (highlights), `prune-worktrees` (a
 `kitchen.every` timer; removes worktrees with no tab or tmux pane that were
 untouched for `idle_hours`, 6 by default), `bazel-cache` (keeps the Bazel
 caches on each workspace's host under `max_gb`, or above `min_free_percent` free, evicting
@@ -77,15 +77,12 @@ Extra plugin folders: settings `plugin_dirs` (e.g. `~/Documents/dotfiles/kitchen
 
 ## API (level 16)
 
-Level 16: `kitchen.on("stop")` runs before a plugin's processes get EOF and are killed (a local one with its process group), and `kitchen.lsp.define` takes marker tiers, `prepare`, `max_rss_mb` and `idle_minutes` and returns the server (see "Language servers"); `ctx.viewer.col` is where `word` starts, and `ctx.viewer.removed` marks a removed diff row; file events carry `replay`. Level 15: `kitchen.views` entries take `approved` and `checks` (see "Views"). Level 14: viewer maps are written `<leader>…` only (the `\x` spelling is gone), and `kitchen.keymap` sets a command's default keys, which `[plugins]` in `~/.kitchen/keybindings.toml` replaces (see "Commands and keys"). Level 13: `kitchen.views` entries take `state` and `url`, and `ctx.viewer.menu` is the ⌘⇧S menu's row under the cursor (see "Views"). Level 12: comment items take `replies` and `repo` (see "Comments"); render rows are Markdown only (`text`, `spans` and the style keys are gone). Level 11: `kitchen.views` and the `views` event (the ⌘⇧S PR menu, see "Views"). Level 10: render rows take `markdown` and `lang`. Level 9 added `kitchen.render` (see "Renderings"). Level 8: `kitchen.view` replaces `kitchen.tab_open` (a PR is shown in a
-tab's viewer, not opened as a tab), and `open` comes from ⌘⇧P with the
-tab's command ctx. Level 7: `kitchen.tab_open` takes a `branch` (or a `rev`); there are no
-read-only tabs any more, so tabs have no `kind` and `worktree.list` no
-"readonly" role. Level 6 added `kitchen.every`, `kitchen.dashboard` and the `dashboard` event
-(see "Timers" and "Dashboard"). Level 5 added `kitchen.link` (see "Links"). Level 4 added `kitchen.comments`, the `comment` event and
-`kitchen.workspaces()` (see "Comments"). Level 3 added `kitchen.tab_open` and the `open` event. Level 2 added `kitchen.spawn`, `kitchen.provide`, `kitchen.json.null`,
-`kitchen.lsp`, and `ctx.viewer.file` / `word`; `ctx.viewer.col` became a raw
-column. Plugins written for level 1 keep working.
+A manifest's `api = N` is the level it needs: a kitchen with a lower level
+refuses the plugin (logged). `kitchen.api_level` is the running kitchen's.
+Besides `kitchen.lint` and `kitchen.lsp` (below), `require("kitchen.util")`
+has the helpers the bundled plugins share (`q` shell quoting, `shell_path`,
+`human`, `basename`, `sh`, `why`, `hosts`); see
+`crates/kitchen-app/src/plugins/util.lua`.
 
 ### Events
 
@@ -492,3 +489,70 @@ Without Lua, any process can push diagnostics (they land in `ext.<ns>`):
 ```
 kitchenctl decor set app/main.py --ns mytool --items '[{"line":3,"message":"boom"}]'
 ```
+
+## Design notes
+
+The reasons behind the API, for whoever changes the host. History is in git.
+
+* **The host owns rendering.** Plugins push data into namespaced,
+  replaceable sets (neovim namespaces, Sublime `add_regions(key)`, VS Code
+  `DiagnosticCollection`), and the host tracks every registration, so an
+  unload or reload cleans up without the plugin's help. Decorations are never
+  baked into `Doc`: per file the viewer keeps an overlay (spans, underlines,
+  signs, virtual text) rebuilt only when the file's decoration generation or
+  hash changes, and `CodeView` applies it while painting visible rows. The UI
+  reads a per-file `Arc<FileDecor>` only when an atomic generation changed.
+* **Plugin code never runs on the UI thread.** mlua with a vendored Lua 5.4,
+  one Lua state per plugin on its own thread, so a hang stays in its plugin.
+  WASM was deferred (edit → recompile, can't use the devbox's ruff), dylibs
+  and other languages rejected. No lock is held while calling into Lua; host
+  mutexes recover from poisoning and a panicking plugin thread is caught and
+  marked failed, so a plugin can't wedge the UI.
+* **Heavy work is external processes, run where the code lives** (the
+  devbox), and the socket API (`decor.*`, `plugin.*`) gives external programs
+  the same decorations as Lua. Pushes from the socket land in `ext.<ns>`;
+  requests through the devbox relay can't reload plugins and run only
+  `remote = true` commands.
+* **Stale results are dropped, not raced.** Decorations carry the content
+  hash (`blake3`, 24 hex) of the text they were made for; jobs carry the
+  plugin's load generation, so results from before a reload are dropped. The
+  viewer re-`stat`s its file every 3 s while visible and sends `file_changed`.
+  Reload replays `file_opened` for the files the viewers hold. The watcher
+  reloads once `plugin.toml` and `**/*.lua` (symlinks followed) have been
+  stable for 300 ms, and after a load error waits for the next change.
+* **File identity is `{host, worktree, path}`**: tabs have their own
+  worktrees, so `(workspace, path)` is ambiguous. Columns are characters of
+  the raw line (before tab expansion) so external tools can produce them.
+* **Long-lived processes**: writes go through a writer thread (a child that
+  stops reading can't block Lua), dropping the handle kills the child, and a
+  local child leads its own process group, killed whole: a reload once
+  killed only `uvx` and left an 11 GB ty running.
+* **Providers can't wedge `gd`.** The host fails a plugin's pending requests
+  when it unloads, and the viewer gives up after 20 s. The viewer doesn't race
+  a text search against the provider: on agi the grep took 18–36 s, never
+  won, and its late results jumped somewhere the user had left.
+* **Language servers are kept on a leash**: on agi (35k Python files) ty grew
+  to 27 GB answering one `gr`, so `kitchen.lsp` cancels superseded and 20 s
+  old requests, restarts a server above `max_rss_mb` and keeps 3 per host.
+  Servers learn of changes the viewer didn't make from a `git status` poll,
+  since nothing else tells them. ty treats agi as one project from any
+  directory, so nearest-marker roots started one whole-repo ty per
+  sub-project; marker tiers follow ty's own rule.
+* **`open`, `comment` and `views` are broadcasts**, not providers: providers
+  are filetype-keyed and first-match only, and a link or a comment isn't tied
+  to a file type. The core never stores comments (GitHub is the store for
+  PRs), and GitHub knowledge lives only in `plugins/github`.
+* **A PR is a view, not a tab**: checked out detached beside the repo and
+  shown in the current tab's viewer, with no tmux session or agent of its
+  own. The core owns the ⌘⇧S menu and the viewer cache; plugins only say what
+  the rows are. The tab's agent lists its PRs in `$KITCHEN_PRS_FILE` because
+  no branch history says reliably which branches a tab made (a reused spare
+  brings its reflog along). Each switch is numbered and the UI drops an older
+  `ShowViewer`, so a slow first checkout can't take the screen back.
+* **Markdown is rendered as GitHub renders it**: GitHub's HTML (`gh api
+  markdown`; comrak meanwhile and offline), GitHub's CSS, laid out by WebKit
+  in web views parked off screen whose snapshots become egui textures. egui
+  widgets couldn't match GitHub's spacing, list markers and bold, and live
+  web views would lag the code by a frame while scrolling, cover egui's menus
+  and take keys from vim. The cost: no text selection inside rendered
+  Markdown.
