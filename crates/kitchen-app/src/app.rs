@@ -423,22 +423,19 @@ impl KitchenApp {
         }
     }
 
-    /// What has keyboard focus, and the open file's filetype for plugin chords.
-    fn key_focus(&self) -> (KeyFocus, Option<String>) {
+    /// What has keyboard focus.
+    fn key_focus(&self) -> KeyFocus {
         if self.dialog.is_some() {
-            return (KeyFocus::Dialog, None);
+            return KeyFocus::Dialog;
         }
         if self.palette.is_some() {
-            return (KeyFocus::Palette, None);
+            return KeyFocus::Palette;
         }
         let tab = self.selected_tab_id();
         match (self.focus(), self.side(), tab) {
-            (Focus::Side, Some(SideKind::Viewer), Some(t)) => match self.viewer_key(&t).and_then(|k| self.viewers.get(&k)) {
-                Some(v) => (v.key_focus(), v.current_filetype()),
-                None => (KeyFocus::Viewer, None),
-            },
-            (Focus::Side, Some(SideKind::Plan), Some(t)) => (self.plans.get(&t).map_or(KeyFocus::Plan, |p| p.key_focus()), None),
-            _ => (KeyFocus::Terminal, None),
+            (Focus::Side, Some(SideKind::Viewer), Some(t)) => self.viewer_key(&t).and_then(|k| self.viewers.get(&k)).map_or(KeyFocus::Viewer, |v| v.key_focus()),
+            (Focus::Side, Some(SideKind::Plan), Some(t)) => self.plans.get(&t).map_or(KeyFocus::Plan, |p| p.key_focus()),
+            _ => KeyFocus::Terminal,
         }
     }
 
@@ -588,7 +585,7 @@ impl KitchenApp {
         // handlers get it with the selected tab's command ctx.
         let link = Some(picker.query.trim().to_string()).filter(|q| crate::ui::dialogs::is_link(q));
         let km = keybindings::current();
-        let choose = ctx.input(|i| keybindings::presses(i).iter().any(|p| km.lookup(KeyFocus::Palette, None, p) == Some(&Cmd::Menu(MenuCmd::Choose))));
+        let choose = ctx.input(|i| keybindings::presses(i).iter().any(|p| km.lookup(KeyFocus::Palette, p) == Some(&Cmd::Menu(MenuCmd::Choose))));
         if let Some(link) = link.filter(|_| choose) {
             self.palette = None;
             let mut ev = crate::plugins::command_context(&self.engine, &self.selected_tab_id().unwrap_or_default(), None);
@@ -1009,7 +1006,7 @@ impl KitchenApp {
             return;
         }
         let km = keybindings::current();
-        let close = |p: &keybindings::Press| km.lookup(KeyFocus::Dialog, None, p) == Some(&Cmd::Field(FieldCmd::Cancel));
+        let close = |p: &keybindings::Press| km.lookup(KeyFocus::Dialog, p) == Some(&Cmd::Field(FieldCmd::Cancel));
         if ctx.input_mut(|i| keybindings::presses(i).into_iter().find(close).is_some_and(|p| keybindings::take(i, &p, true))) {
             self.shortcuts = false;
             return;
@@ -1085,11 +1082,9 @@ impl KitchenApp {
                 if session.take_bell() {
                     // A bell in a background tab marks it unread.
                 }
-                let reg = self.engine.plugins().map(|p| p.registry());
-                let rules = reg.as_ref().map(|r| &r.links[..]).unwrap_or(&[]);
                 // Breathing room between the text and the window chrome.
                 let margin = egui::Margin { left: 12, right: 8, top: 8, bottom: 4 };
-                let (resp, link) = egui::Frame::NONE.inner_margin(margin).show(ui, |ui| TerminalView::new(session).font_size(font_size).focused(focused).links(rules).show(ui)).inner;
+                let (resp, link) = egui::Frame::NONE.inner_margin(margin).show(ui, |ui| TerminalView::new(session).font_size(font_size).focused(focused).show(ui)).inner;
                 // ⌘V with an image, and dropped files, paste paths Claude Code can read.
                 let mut sources = Vec::new();
                 if focused && self.paste {
@@ -1235,8 +1230,7 @@ impl eframe::App for KitchenApp {
             }
         } else {
             // Chords belong to what has focus; ⌘ chords bound elsewhere are swallowed.
-            let (focus, filetype) = self.key_focus();
-            for cmd in keybindings::app::collect(&ctx, &keybindings::current(), focus, filetype.as_deref()) {
+            for cmd in keybindings::app::collect(&ctx, &keybindings::current(), self.key_focus()) {
                 match cmd {
                     Cmd::App(a) => self.run_action(a),
                     Cmd::Plugin(c) => self.run_plugin_command(&c),
@@ -1483,7 +1477,7 @@ mod tests {
         assert!(!rows(&km, &reg, "Vim motions").iter().any(|(_, what)| what == "down"), "unbound: not listed");
         let mut reg = Registry::default();
         reg.commands.push(CommandEntry { plugin: "p".into(), name: "p.x".into(), desc: "do x".into(), remote: false });
-        reg.chords.push(ChordEntry { plugin: "p".into(), chord: keybindings::Binding::parse("cmd+shift+y", &[]).unwrap(), command: "p.x".into(), when: When::Any, filetype: None });
+        reg.chords.push(ChordEntry { plugin: "p".into(), chord: keybindings::Binding::parse("cmd+shift+y", &[]).unwrap(), command: "p.x".into(), when: When::Any });
         assert_eq!(rows(&d.with_plugins(&reg), &reg, "Plugins"), vec![("⌘⇧Y".to_string(), "do x".to_string())]);
     }
 

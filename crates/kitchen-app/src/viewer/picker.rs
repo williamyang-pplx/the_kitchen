@@ -307,7 +307,7 @@ impl Picker {
             let (mut up, mut down, mut enter, mut esc) = (false, false, false, false);
             ui.input_mut(|i| {
                 for p in keybindings::presses(i) {
-                    let Some(Cmd::Menu(c)) = km.lookup(focus, None, &p).cloned() else { continue };
+                    let Some(Cmd::Menu(c)) = km.lookup(focus, &p).cloned() else { continue };
                     if !keybindings::take(i, &p, true) {
                         continue;
                     }

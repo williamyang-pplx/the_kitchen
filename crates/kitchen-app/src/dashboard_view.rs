@@ -18,7 +18,7 @@ pub fn ui(ui: &mut Ui, engine: &Arc<Engine>, ws: &Workspace) {
     ui.ctx().request_repaint_after(Duration::from_secs(1));
     let Some(plugins) = engine.plugins() else { return };
     let now = wall_now();
-    let timers_list = plugins.timers_info();
+    let timers_list = plugins.timers.list();
     let sections: Vec<Section> = plugins.dashboard.get(&ws.row.id).map(|s| s.iter().flat_map(|(_, list)| list.iter().cloned()).collect()).unwrap_or_default();
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(theme::SPACE_XL as i8, 20)).show(ui, |ui| {

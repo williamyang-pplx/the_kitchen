@@ -171,84 +171,45 @@ fn default_severity() -> Severity {
     Severity::Warning
 }
 
-/// Parse diagnostics from JSON (Lua tables or socket params). Severity may
-/// be a name (`error`, `warn`, …) or an LSP number (1 error … 4 hint).
-pub fn parse_diagnostics(v: serde_json::Value) -> Result<Vec<Diagnostic>, String> {
-    let serde_json::Value::Array(items) = v else { return Err("diagnostics must be a list".into()) };
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut item)| {
-            if let Some(sev) = item.get("severity").cloned() {
-                let s = match sev {
-                    serde_json::Value::Number(n) => match n.as_u64() {
-                        Some(1) => Severity::Error,
-                        Some(2) => Severity::Warning,
-                        Some(4) => Severity::Hint,
-                        _ => Severity::Info,
-                    },
-                    serde_json::Value::String(s) => Severity::parse(&s),
-                    _ => Severity::Warning,
-                };
-                item["severity"] = serde_json::Value::String(s.label().into());
-            }
-            let d: Diagnostic = serde_json::from_value(item).map_err(|e| format!("diagnostic #{}: {e}", i + 1))?;
-            if d.line == 0 {
-                return Err(format!("diagnostic #{}: lines are 1-based", i + 1));
-            }
-            Ok(d)
-        })
-        .collect()
-}
-
-pub fn parse_highlights(v: serde_json::Value) -> Result<Vec<Highlight>, String> {
-    let serde_json::Value::Array(items) = v else { return Err("highlights must be a list".into()) };
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let h: Highlight = serde_json::from_value(item).map_err(|e| format!("highlight #{}: {e}", i + 1))?;
-            if h.line == 0 {
-                return Err(format!("highlight #{}: lines are 1-based", i + 1));
-            }
-            Ok(h)
-        })
-        .collect()
-}
-
-pub fn parse_comments(v: serde_json::Value) -> Result<Vec<Comment>, String> {
-    let serde_json::Value::Array(items) = v else { return Err("comments must be a list".into()) };
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let c: Comment = serde_json::from_value(item).map_err(|e| format!("comment #{}: {e}", i + 1))?;
-            if c.line == Some(0) {
-                return Err(format!("comment #{}: lines are 1-based", i + 1));
-            }
-            Ok(c)
-        })
-        .collect()
-}
-
-pub fn parse_render(v: serde_json::Value) -> Result<Vec<RenderRow>, String> {
+/// Parse a list of items (`what` names one in errors) from JSON (Lua tables
+/// or socket params; an empty Lua table arrives as `{}`). `line` must be 1-based.
+pub fn parse_list<T: serde::de::DeserializeOwned>(v: serde_json::Value, what: &str, line: impl Fn(&T) -> Option<usize>) -> Result<Vec<T>, String> {
     let items = match v {
         serde_json::Value::Array(items) => items,
-        // An empty Lua table arrives as `{}`.
         serde_json::Value::Object(m) if m.is_empty() => Vec::new(),
-        _ => return Err("render rows must be a list".into()),
+        _ => return Err(format!("{what}s must be a list")),
     };
     items
         .into_iter()
         .enumerate()
         .map(|(i, item)| {
-            let r: RenderRow = serde_json::from_value(item).map_err(|e| format!("render row #{}: {e}", i + 1))?;
-            if r.line == 0 {
-                return Err(format!("render row #{}: lines are 1-based", i + 1));
+            let x: T = serde_json::from_value(item).map_err(|e| format!("{what} #{}: {e}", i + 1))?;
+            if line(&x) == Some(0) {
+                return Err(format!("{what} #{}: lines are 1-based", i + 1));
             }
-            Ok(r)
+            Ok(x)
         })
         .collect()
+}
+
+/// Severity may be a name (`error`, `warn`, …) or an LSP number (1 error … 4 hint).
+fn parse_diagnostics(mut v: serde_json::Value) -> Result<Vec<Diagnostic>, String> {
+    for item in v.as_array_mut().into_iter().flatten() {
+        if let Some(sev) = item.get("severity").cloned() {
+            let s = match sev {
+                serde_json::Value::Number(n) => match n.as_u64() {
+                    Some(1) => Severity::Error,
+                    Some(2) => Severity::Warning,
+                    Some(4) => Severity::Hint,
+                    _ => Severity::Info,
+                },
+                serde_json::Value::String(s) => Severity::parse(&s),
+                _ => Severity::Warning,
+            };
+            item["severity"] = serde_json::Value::String(s.label().into());
+        }
+    }
+    parse_list(v, "diagnostic", |d: &Diagnostic| Some(d.line))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,7 +309,7 @@ pub struct DecorStore {
 
 impl DecorStore {
     fn files(&self) -> std::sync::MutexGuard<'_, HashMap<FileKey, Arc<FileDecor>>> {
-        self.files.lock().unwrap_or_else(|e| e.into_inner())
+        super::lock(&self.files)
     }
 
     pub fn generation(&self) -> u64 {
@@ -390,6 +351,17 @@ impl DecorStore {
             s.render = Arc::new(rows);
             s.render_version = version;
         });
+    }
+
+    /// Parse `items` as `kind` and set them (comments take no `version`).
+    pub fn set_kind(&self, kind: Kind, key: &FileKey, ns: &str, items: serde_json::Value, version: Option<String>) -> Result<(), String> {
+        match kind {
+            Kind::Diagnostics => self.set_diagnostics(key, ns, parse_diagnostics(items)?, version),
+            Kind::Highlights => self.set_highlights(key, ns, parse_list(items, "highlight", |h: &Highlight| Some(h.line))?, version),
+            Kind::Comments => self.set_comments(key, ns, parse_list(items, "comment", |c: &Comment| c.line)?),
+            Kind::Render => self.set_render(key, ns, parse_list(items, "render row", |r: &RenderRow| Some(r.line))?, version),
+        }
+        Ok(())
     }
 
     fn update(&self, key: &FileKey, ns: &str, f: impl FnOnce(&mut Set)) {
@@ -467,6 +439,14 @@ mod tests {
         FileKey { host: "local".into(), worktree: "/r".into(), path: "a.py".into() }
     }
 
+    fn comments(v: serde_json::Value) -> Result<Vec<Comment>, String> {
+        parse_list(v, "comment", |c: &Comment| c.line)
+    }
+
+    fn render(v: serde_json::Value) -> Result<Vec<RenderRow>, String> {
+        parse_list(v, "render row", |r: &RenderRow| Some(r.line))
+    }
+
     fn diag(line: usize) -> Diagnostic {
         Diagnostic { line, col: 1, end_line: None, end_col: None, severity: Severity::Error, message: "x".into(), code: None }
     }
@@ -488,11 +468,11 @@ mod tests {
         assert_eq!(s.get(&key()).unwrap().sets.len(), 1);
         s.clear(None, "ext.tool", None);
         assert!(s.get(&key()).is_none());
-        let c = parse_comments(serde_json::json!([{ "id": "7", "line": 3, "side": "old", "title": "@a", "body": "hi" }, { "body": "file-level" }])).unwrap();
+        let c = comments(serde_json::json!([{ "id": "7", "line": 3, "side": "old", "title": "@a", "body": "hi" }, { "body": "file-level" }])).unwrap();
         assert_eq!((c[0].side, c[1].line, c[1].side), (Side::Old, None, Side::New));
         assert!(c[0].replies.is_empty() && c[0].repo.is_none());
         // Replies from Lua: a list, or `{}` when there are none.
-        let t = parse_comments(serde_json::json!([{ "body": "a", "repo": "o/r", "replies": [{ "title": "@bo", "body": "b" }] }, { "body": "c", "replies": {} }])).unwrap();
+        let t = comments(serde_json::json!([{ "body": "a", "repo": "o/r", "replies": [{ "title": "@bo", "body": "b" }] }, { "body": "c", "replies": {} }])).unwrap();
         assert_eq!((t[0].repo.as_deref(), t[0].replies[0].title.as_str(), t[1].replies.len()), (Some("o/r"), "@bo", 0));
         s.set_comments(&key(), "github", c);
         s.set_diagnostics(&key(), "github", vec![diag(1)], None);
@@ -500,10 +480,10 @@ mod tests {
         assert_eq!(s.get(&key()).unwrap().comments().count(), 2, "clearing diagnostics keeps comments");
         s.clear(Some(&key()), "github", Some(Kind::Comments));
         assert!(s.get(&key()).is_none());
-        let rows = parse_render(serde_json::json!([{ "line": 1, "end_line": 2, "markdown": "# Title" }])).unwrap();
+        let rows = render(serde_json::json!([{ "line": 1, "end_line": 2, "markdown": "# Title" }])).unwrap();
         assert_eq!((rows[0].last_line(), rows[0].markdown.as_str()), (2, "# Title"));
-        assert!(parse_render(serde_json::json!({})).unwrap().is_empty(), "an empty Lua table");
-        assert!(parse_render(serde_json::json!([{ "line": 0 }])).is_err());
+        assert!(render(serde_json::json!({})).unwrap().is_empty(), "an empty Lua table");
+        assert!(render(serde_json::json!([{ "line": 0 }])).is_err());
         s.set_render(&key(), "markdown", rows, Some("v1".into()));
         let d = s.get(&key()).unwrap();
         assert_eq!(d.render("v1").map(|r| r.len()), Some(1));

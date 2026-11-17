@@ -29,7 +29,7 @@ use crate::engine::Engine;
 use dashboard::DashboardStore;
 use decor::{DecorStore, FileKey};
 use crate::keybindings::Binding;
-use timers::{Fire, TimerInfo, TimerSpec, TimerState, Timers};
+use timers::{Fire, TimerSpec, TimerState, Timers};
 
 /// The plugin API level this build implements.
 pub const API_LEVEL: u32 = 16;
@@ -59,8 +59,6 @@ pub struct Manifest {
     pub description: String,
     #[serde(default = "api_one")]
     pub api: u32,
-    #[serde(default = "default_entry")]
-    pub entry: String,
     /// File events only for these extensions (empty = every file).
     #[serde(default)]
     pub filetypes: Vec<String>,
@@ -70,9 +68,6 @@ pub struct Manifest {
 
 fn api_one() -> u32 {
     1
-}
-fn default_entry() -> String {
-    "init.lua".into()
 }
 
 impl Manifest {
@@ -89,23 +84,18 @@ fn user_overrides() -> toml::Table {
 
 // ------------------------------------------------------------------ registry
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum When {
     Any,
-    Terminal,
     Viewer,
-    Plan,
 }
 
 impl When {
     pub fn parse(s: &str) -> Result<When> {
         Ok(match s {
             "any" | "" => When::Any,
-            "terminal" => When::Terminal,
             "viewer" => When::Viewer,
-            "plan" => When::Plan,
-            _ => bail!("unknown `when` {s:?} (any, terminal, viewer, plan)"),
+            _ => bail!("unknown `when` {s:?} (any, viewer)"),
         })
     }
 }
@@ -127,16 +117,6 @@ pub struct ChordEntry {
     pub chord: Binding,
     pub command: String,
     pub when: When,
-    pub filetype: Option<String>,
-}
-
-/// A plugin's terminal link rule: ⌘-click on a `regex` match runs `command`.
-#[derive(Debug, Clone)]
-pub struct LinkEntry {
-    pub plugin: String,
-    pub regex: regex::Regex,
-    /// `<plugin>.<name>`.
-    pub command: String,
 }
 
 #[derive(Debug, Clone)]
@@ -169,8 +149,6 @@ pub struct Registry {
     pub providers: Vec<ProviderEntry>,
     /// (event, plugin) for each [`EMITTED`] event a plugin listens to.
     pub listeners: Vec<(String, String)>,
-    /// `kitchen.link` rules, in registration order.
-    pub links: Vec<LinkEntry>,
 }
 
 /// A place a provider points at. `path` is worktree-relative, or absolute
@@ -299,23 +277,7 @@ pub struct PluginHost {
 impl PluginHost {
     /// Discover and load every plugin, and start the reload watcher.
     pub fn start(engine: &Arc<Engine>, dirs: Vec<PathBuf>) -> Arc<PluginHost> {
-        let host = Arc::new(PluginHost {
-            engine: Arc::downgrade(engine),
-            dirs,
-            slots: Mutex::new(Vec::new()),
-            next_generation: AtomicU64::new(1),
-            decor: DecorStore::default(),
-            timers: Timers::default(),
-            dashboard: DashboardStore::default(),
-            scheduler: AtomicBool::new(false),
-            registry: Mutex::new(Arc::new(Registry::default())),
-            registry_gen: AtomicU64::new(0),
-            open_files: Mutex::new(HashMap::new()),
-            open_seq: AtomicU64::new(0),
-            toasted: Mutex::new(HashSet::new()),
-            requests: Mutex::new(HashMap::new()),
-            next_request: AtomicU64::new(1),
-        });
+        let host = Self::new(engine, dirs);
         crate::viewer::highlight::set_extra_syntax_dirs(host.discover().iter().map(|(_, d)| d.join("syntaxes")).filter(|d| d.is_dir()).collect());
         host.rescan();
         let weak = Arc::downgrade(&host);
@@ -329,9 +291,13 @@ impl PluginHost {
     /// For tests: no discovery, no watcher.
     #[cfg(test)]
     pub fn empty(engine: &Arc<Engine>) -> Arc<PluginHost> {
+        Self::new(engine, Vec::new())
+    }
+
+    fn new(engine: &Arc<Engine>, dirs: Vec<PathBuf>) -> Arc<PluginHost> {
         Arc::new(PluginHost {
             engine: Arc::downgrade(engine),
-            dirs: Vec::new(),
+            dirs,
             slots: Mutex::new(Vec::new()),
             next_generation: AtomicU64::new(1),
             decor: DecorStore::default(),
@@ -426,7 +392,6 @@ impl PluginHost {
             r.viewer_maps.retain(|c| c.plugin != name);
             r.providers.retain(|c| c.plugin != name);
             r.listeners.retain(|(_, p)| p != name);
-            r.links.retain(|l| l.plugin != name);
         });
         self.decor.clear_owner(name);
         self.timers.drop_plugin(name);
@@ -463,7 +428,7 @@ impl PluginHost {
                 config.insert(k.clone(), v.clone());
             }
             let config = serde_json::to_value(&config).unwrap_or_default();
-            tx = Some(lua::spawn(self.clone(), name.to_string(), dir.to_path_buf(), m.entry.clone(), config, generation));
+            tx = Some(lua::spawn(self.clone(), name.to_string(), dir.to_path_buf(), config, generation));
         }
         if let Status::Failed(e) = &status {
             self.log(name, &format!("not loaded: {e}"));
@@ -645,9 +610,7 @@ impl PluginHost {
         if keys {
             crate::keybindings::refresh_plugins(snap, generation);
         }
-        if let Some(e) = self.engine() {
-            e.ctx.request_repaint();
-        }
+        self.repaint();
     }
 
     /// Is `generation` still the live load of `plugin`? Registrations from
@@ -666,16 +629,6 @@ impl PluginHost {
         });
     }
 
-    fn register_link(&self, plugin: &str, generation: u64, entry: LinkEntry) {
-        if !self.current(plugin, generation) {
-            return;
-        }
-        self.edit_registry(false, |r| {
-            r.links.retain(|l| !(l.plugin == entry.plugin && l.regex.as_str() == entry.regex.as_str()));
-            r.links.push(entry);
-        });
-    }
-
     fn register_chord(&self, plugin: &str, generation: u64, entry: ChordEntry) -> Result<()> {
         if !self.current(plugin, generation) {
             return Ok(());
@@ -684,7 +637,7 @@ impl PluginHost {
             bail!("{} is a built-in shortcut ({b})", entry.chord.label());
         }
         let ctrl_only = matches!(entry.chord.0[..], [crate::keybindings::Press::Key { mods, .. }] if mods.ctrl && !mods.cmd && !mods.alt);
-        if ctrl_only && matches!(entry.when, When::Any | When::Terminal) {
+        if ctrl_only && entry.when == When::Any {
             bail!("{}: ctrl chords belong to the shell in terminals; use when = \"viewer\" (or add cmd/alt)", entry.chord.label());
         }
         let reg = self.registry();
@@ -692,7 +645,7 @@ impl PluginHost {
             bail!("{} is already mapped by plugin {}", entry.chord.label(), other.plugin);
         }
         self.edit_registry(true, |r| {
-            r.chords.retain(|c| !(c.chord == entry.chord && c.when == entry.when && c.filetype == entry.filetype));
+            r.chords.retain(|c| !(c.chord == entry.chord && c.when == entry.when));
             r.chords.push(entry);
         });
         Ok(())
@@ -800,11 +753,6 @@ impl PluginHost {
         }
     }
 
-    /// Every registered timer and what its runs did.
-    pub fn timers_info(&self) -> Vec<TimerInfo> {
-        self.timers.list()
-    }
-
     /// The UI showed or hid workspace `ws`'s dashboard; tell the plugins.
     pub fn dashboard_shown(&self, ws: &str, open: bool) {
         if self.dashboard.set_showing(ws, open) {
@@ -843,7 +791,7 @@ impl PluginHost {
         self.fail_requests(plugin);
     }
 
-    pub fn log_path(plugin: &str) -> PathBuf {
+    fn log_path(plugin: &str) -> PathBuf {
         kitchen_proto::state_dir().join("logs").join("plugins").join(format!("{plugin}.log"))
     }
 
@@ -975,7 +923,7 @@ mod tests {
         let rows_of = |text: &str| -> Vec<decor::RenderRow> {
             let f: mlua::Function = m.get("rows").unwrap();
             let v: serde_json::Value = lua.from_value(f.call(text).unwrap()).unwrap();
-            decor::parse_render(v).unwrap()
+            decor::parse_list(v, "render row", |r: &decor::RenderRow| Some(r.line)).unwrap()
         };
         let rows = rows_of("---\ntitle: x\n---\n# Title\n\n- one\n");
         assert_eq!(rows.len(), 1, "one row, for one pass");
@@ -2397,7 +2345,7 @@ end)
         .unwrap();
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![root.clone()]);
-        let info = |name: &str| host.timers_info().into_iter().find(|t| t.name == name);
+        let info = |name: &str| host.timers.list().into_iter().find(|t| t.name == name);
         wait(&|| info("fast").is_some_and(|t| t.state.runs >= 3 && t.state.last_error.is_none()));
         let fast = info("fast").unwrap();
         assert_eq!((fast.desc.as_str(), fast.interval_secs), ("fast one", 0.05));
@@ -2687,11 +2635,14 @@ end)
     /// One server too many on a host stops the least recently used.
     #[test]
     fn lsp_caps_servers_per_host() {
-        let files = [("one/root.marker", ""), ("one/a.py", "x = 1\n"), ("two/root.marker", ""), ("two/b.py", "y = 2\n")];
-        let Some(f) = FakeLsp::start("max_servers = 1,", "", &files) else { return };
-        assert!(f.ask("definition", "one/a.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
-        assert!(f.ask("definition", "two/b.py", 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
-        f.wait_for(10, &|f| f.plugin_log().contains("more than 1 servers"));
+        let roots = ["one", "two", "three", "four"];
+        let files: Vec<(String, &str)> = roots.iter().flat_map(|r| [(format!("{r}/root.marker"), ""), (format!("{r}/a.py"), "x = 1\n")]).collect();
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        let Some(f) = FakeLsp::start("", "", &files) else { return };
+        for r in roots {
+            assert!(f.ask("definition", &format!("{r}/a.py"), 1).recv_timeout(Duration::from_secs(30)).unwrap().is_some());
+        }
+        f.wait_for(10, &|f| f.plugin_log().contains("more than 3 servers"));
     }
 
     impl FakeLsp {
@@ -3085,38 +3036,6 @@ end)
         host.reload(Some("demo")).unwrap();
         wait(&|| host.decor.get(&key).is_some() && host.registry().commands.len() == 2);
         assert_eq!(host.list()[0].status, Status::Running);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// `kitchen.link` rules land in the registry in order, a function target
-    /// becomes a command that sees `ctx.link`, and a bad regex is an error.
-    #[test]
-    fn link_rules() {
-        let root = std::env::temp_dir().join(format!("kt-plugins-{}", kitchen_core::util::new_id()));
-        let dir = root.join("lk");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("plugin.toml"), "name = \"lk\"\n").unwrap();
-        std::fs::write(
-            dir.join("init.lua"),
-            r#"
-kitchen.command("pr", function() end)
-kitchen.link("AI-(\\d+)", function(ctx) kitchen.notify("ticket " .. ctx.link.groups[1] .. " " .. ctx.link.text) end)
-kitchen.link("PR-\\d+", "pr")
-local ok, err = pcall(kitchen.link, "(bad", "pr")
-assert(not ok and tostring(err):find("bad regex"), tostring(err))
-"#,
-        )
-        .unwrap();
-        let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
-        let host = host_with(&engine, vec![root.clone()]);
-        wait(&|| host.registry().links.len() == 2);
-        assert_eq!(host.list()[0].status, Status::Running);
-        let reg = host.registry();
-        assert_eq!(reg.links.iter().map(|l| (l.regex.as_str(), l.command.as_str())).collect::<Vec<_>>(), vec![(r"AI-(\d+)", "lk.link1"), (r"PR-\d+", "lk.pr")]);
-        host.invoke("lk.link1", serde_json::json!({ "link": { "text": "AI-7", "groups": ["7"] } }), false).unwrap();
-        wait(&|| engine.state().toasts.iter().any(|t| t.text.contains("ticket 7 AI-7")));
-        host.reload(Some("lk")).unwrap();
-        wait(&|| host.registry().links.len() == 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -631,7 +631,7 @@ impl CodeView<'_> {
                 // Taken before the field sees it, which would add a new line
                 // (⇧Enter is let through: a new line).
                 let km = keybindings::current();
-                let bound = |p: &keybindings::Press, c: FieldCmd| km.lookup(focus.input(), None, p) == Some(&Cmd::Field(c));
+                let bound = |p: &keybindings::Press, c: FieldCmd| km.lookup(focus.input(), p) == Some(&Cmd::Field(c));
                 if ed.ask && editor_focused && ui.input_mut(|i| !i.modifiers.shift && keybindings::presses(i).into_iter().find(|p| bound(p, FieldCmd::Submit)).is_some_and(|p| keybindings::take(i, &p, true))) {
                     out.submit_editor = true;
                 }

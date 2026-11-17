@@ -19,7 +19,7 @@ use super::jobs::{self, JobSpec};
 use super::procs::{self, Proc, ProcSpec, Stream};
 use crate::keybindings::Binding;
 use super::timers::{self, TimerSpec};
-use super::{ChordEntry, CommandEntry, FileEvent, LinkEntry, Location, MAX_TEXT, PROVIDER_KINDS, PluginHost, ProviderEntry, ToPlugin, ViewerMap, When};
+use super::{ChordEntry, CommandEntry, FileEvent, Location, MAX_TEXT, PROVIDER_KINDS, PluginHost, ProviderEntry, ToPlugin, ViewerMap, When};
 use crate::engine::UiCommand;
 
 /// Lua instructions one callback may run before it is stopped.
@@ -34,13 +34,13 @@ const STOP_GRACE: Duration = Duration::from_millis(500);
 
 static NEXT_CALLBACK: AtomicU64 = AtomicU64::new(1);
 
-pub fn spawn(host: Arc<PluginHost>, name: String, dir: PathBuf, entry: String, config: serde_json::Value, generation: u64) -> Sender<ToPlugin> {
+pub fn spawn(host: Arc<PluginHost>, name: String, dir: PathBuf, config: serde_json::Value, generation: u64) -> Sender<ToPlugin> {
     let (tx, rx) = channel();
     let self_tx = tx.clone();
     let spawned = std::thread::Builder::new().name(format!("plugin-{name}")).spawn(move || {
         let h = host.clone();
         let n = name.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(h, &n, &dir, &entry, config, generation, rx, self_tx)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(h, &n, &dir, config, generation, rx, self_tx)));
         if let Err(panic) = result {
             let msg = panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into());
             host.report_error(&name, &format!("crashed: {msg}"));
@@ -64,8 +64,7 @@ struct Ctx {
     procs: RefCell<HashMap<u64, Proc>>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(host: Arc<PluginHost>, name: &str, dir: &Path, entry: &str, config: serde_json::Value, generation: u64, rx: Receiver<ToPlugin>, self_tx: Sender<ToPlugin>) {
+fn run(host: Arc<PluginHost>, name: &str, dir: &Path, config: serde_json::Value, generation: u64, rx: Receiver<ToPlugin>, self_tx: Sender<ToPlugin>) {
     let lua = Lua::new();
     let _ = lua.set_memory_limit(MEMORY_LIMIT);
     let used = Rc::new(Cell::new(0u64));
@@ -86,13 +85,13 @@ fn run(host: Arc<PluginHost>, name: &str, dir: &Path, entry: &str, config: serde
         host.mark_failed(name, generation, format!("setup: {e}"));
         return;
     }
-    let entry_path = dir.join(entry);
+    let entry_path = dir.join("init.lua");
     if entry_path.is_file() {
         used.set(0);
         let loaded = std::fs::read_to_string(&entry_path).map_err(mlua::Error::external).and_then(|src| lua.load(src).set_name(format!("@{}", entry_path.display())).exec());
         if let Err(e) = loaded {
-            host.report_error(name, &format!("{entry}: {e}"));
-            host.mark_failed(name, generation, format!("{entry}: {e}"));
+            host.report_error(name, &format!("init.lua: {e}"));
+            host.mark_failed(name, generation, format!("init.lua: {e}"));
             return;
         }
     }
@@ -167,12 +166,6 @@ fn run(host: Arc<PluginHost>, name: &str, dir: &Path, entry: &str, config: serde
                     let key = if stream == Stream::Stdout { "on_stdout" } else { "on_stderr" };
                     match cbs.and_then(|t| t.get::<Option<Function>>(key).ok().flatten()) {
                         Some(f) => f.call::<()>(lua.create_string(&data)?),
-                        None if stream == Stream::Stderr => {
-                            for line in String::from_utf8_lossy(&data).lines().filter(|l| !l.trim().is_empty()) {
-                                host.log(name, &format!("[proc {proc}] {line}"));
-                            }
-                            Ok(())
-                        }
                         None => Ok(()),
                     }
                 })();
@@ -262,9 +255,7 @@ fn event_table(lua: &Lua, ev: &Arc<FileEvent>) -> mlua::Result<Table> {
     t.set("file", file_table(lua, &ev.key)?)?;
     t.set("filetype", ev.filetype.as_str())?;
     t.set("version", ev.version.as_str())?;
-    t.set("changed", ev.changed)?;
     t.set("replay", ev.replay)?;
-    t.set("lines", ev.text.lines().count())?;
     let text = ev.clone();
     t.set("text", lua.create_function(move |_, ()| Ok((text.text.len() <= MAX_TEXT).then(|| text.text.to_string())))?)?;
     Ok(t)
@@ -293,7 +284,7 @@ fn to_json(lua: &Lua, v: Value) -> mlua::Result<serde_json::Value> {
 }
 
 fn qualify(plugin: &str, name: &str) -> String {
-    if name.starts_with(&format!("{plugin}.")) || name.contains('.') { name.to_string() } else { format!("{plugin}.{name}") }
+    if name.contains('.') { name.to_string() } else { format!("{plugin}.{name}") }
 }
 
 fn argv_of(t: &Table, what: &str) -> mlua::Result<Vec<String>> {
@@ -304,17 +295,13 @@ fn argv_of(t: &Table, what: &str) -> mlua::Result<Vec<String>> {
     })
 }
 
-/// What `kitchen.spawn` returns: `p:write(s)`, `p:close()`, `p:kill()`, `p:alive()`, `p.id`.
+/// What `kitchen.spawn` returns: `p:write(s)`, `p:close()`, `p:kill()`.
 struct ProcHandle {
     id: u64,
     cx: Rc<Ctx>,
 }
 
 impl UserData for ProcHandle {
-    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("id", |_, this| Ok(this.id));
-    }
-
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("write", |_, this, data: mlua::LuaString| {
             Ok(this.cx.procs.borrow().get(&this.id).is_some_and(|p| p.write(data.as_bytes().to_vec())))
@@ -331,7 +318,6 @@ impl UserData for ProcHandle {
             }
             Ok(())
         });
-        methods.add_method("alive", |_, this, ()| Ok(this.cx.procs.borrow().contains_key(&this.id)));
     }
 }
 
@@ -347,11 +333,10 @@ impl UserData for TimerHandle {
     }
 }
 
-fn job_spec(lua: &Lua, t: Table) -> mlua::Result<JobSpec> {
+fn job_spec(t: Table) -> mlua::Result<JobSpec> {
     let argv = argv_of(&t, "kitchen.run")?;
     let host: Option<String> = t.get("host")?;
     let timeout: Option<f64> = t.get("timeout")?;
-    let _ = lua;
     Ok(JobSpec {
         host: kitchen_core::host::Host::parse(host.as_deref().unwrap_or("local")),
         argv,
@@ -382,7 +367,6 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
 
     let k = lua.create_table()?;
     k.set("name", cx.name.as_str())?;
-    k.set("api_level", super::API_LEVEL)?;
     k.set("config", to_lua(lua, &config)?)?;
 
     let c = cx.clone();
@@ -419,30 +403,6 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
         Ok(full)
     })?;
     k.set("command", command.clone())?;
-
-    // kitchen.link(pattern, target): ⌘-clicking a match in a terminal runs
-    // target (a command name, or a function given the command context plus
-    // ctx.link = { text, groups }). The host matches; Lua runs on click only.
-    let c = cx.clone();
-    let link_command = command.clone();
-    let link_anon = Cell::new(0u32);
-    k.set(
-        "link",
-        lua.create_function(move |lua, (pattern, target): (String, Value)| {
-            let regex = regex::Regex::new(&pattern).map_err(|e| mlua::Error::runtime(format!("kitchen.link: bad regex {pattern:?}: {e}")))?;
-            let command = match target {
-                Value::String(s) => qualify(&c.name, &s.to_str()?),
-                Value::Function(f) => {
-                    link_anon.set(link_anon.get() + 1);
-                    let name = format!("{}.link{}", c.name, link_anon.get());
-                    link_command.call::<String>((name, f, lua.create_table_from([("desc", pattern.clone())])?))?
-                }
-                _ => return Err(mlua::Error::runtime("link target must be a command name or a function")),
-            };
-            c.host.register_link(&c.name, c.generation, LinkEntry { plugin: c.name.clone(), regex, command });
-            Ok(())
-        })?,
-    )?;
 
     let c = cx.clone();
     let anon = Rc::new(Cell::new(0u32));
@@ -485,10 +445,9 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                 _ => None,
             };
             let when = When::parse(&opts.as_ref().and_then(|o| o.get::<Option<String>>("when").ok().flatten()).unwrap_or_default()).map_err(|e| mlua::Error::runtime(e.to_string()))?;
-            let filetype = opts.as_ref().and_then(|o| o.get::<Option<String>>("filetype").ok().flatten());
             let command = to_command(b, &a)?;
             c.host
-                .register_chord(&c.name, c.generation, ChordEntry { plugin: c.name.clone(), chord, command, when, filetype })
+                .register_chord(&c.name, c.generation, ChordEntry { plugin: c.name.clone(), chord, command, when })
                 .map_err(|e| mlua::Error::runtime(e.to_string()))
         })?,
     )?;
@@ -503,26 +462,8 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                 let key = to_file(lua, file)?;
                 let ns = namespace(&c.name, opts.as_ref());
                 let version = opts.as_ref().and_then(|o| o.get::<Option<String>>("version").ok().flatten());
-                let items = to_json(lua, items)?;
-                match kind {
-                    decor::Kind::Diagnostics => {
-                        let items = decor::parse_diagnostics(items).map_err(mlua::Error::runtime)?;
-                        c.host.decor.set_diagnostics(&key, &ns, items, version);
-                    }
-                    decor::Kind::Highlights => {
-                        let items = decor::parse_highlights(items).map_err(mlua::Error::runtime)?;
-                        c.host.decor.set_highlights(&key, &ns, items, version);
-                    }
-                    decor::Kind::Comments => {
-                        let items = decor::parse_comments(items).map_err(mlua::Error::runtime)?;
-                        c.host.decor.set_comments(&key, &ns, items);
-                    }
-                    decor::Kind::Render => {
-                        let rows = decor::parse_render(items).map_err(mlua::Error::runtime)?;
-                        c.host.decor.set_render(&key, &ns, rows, version);
-                    }
-                }
-                repaint(&c);
+                c.host.decor.set_kind(kind, &key, &ns, to_json(lua, items)?, version).map_err(mlua::Error::runtime)?;
+                c.host.repaint();
                 Ok(())
             })?,
         )?;
@@ -535,7 +476,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
                     v => Some(to_file(lua, v)?),
                 };
                 c.host.decor.clear(key.as_ref(), &namespace(&c.name, opts.as_ref()), Some(kind));
-                repaint(&c);
+                c.host.repaint();
                 Ok(())
             })?,
         )?;
@@ -564,7 +505,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
     k.set(
         "run",
         lua.create_function(move |lua, (spec, cb): (Table, Option<Function>)| {
-            let spec = job_spec(lua, spec)?;
+            let spec = job_spec(spec)?;
             let id = NEXT_CALLBACK.fetch_add(1, Ordering::Relaxed);
             if let Some(cb) = cb {
                 let callbacks: Table = state(lua)?.get("callbacks")?;
@@ -578,7 +519,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
             Ok(id)
         })?,
     )?;
-    k.set("run_sync", lua.create_function(|lua, spec: Table| to_lua(lua, &jobs::run(&job_spec(lua, spec)?)))?)?;
+    k.set("run_sync", lua.create_function(|lua, spec: Table| to_lua(lua, &jobs::run(&job_spec(spec)?)))?)?;
 
     let c = cx.clone();
     k.set(
@@ -639,7 +580,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
         })?,
     )?;
 
-    // Dashboard sections: kitchen.dashboard.set(ws, sections) / .clear(ws?) / .showing().
+    // Dashboard sections: kitchen.dashboard.set(ws, sections) / .showing().
     let dash = lua.create_table()?;
     let c = cx.clone();
     dash.set(
@@ -648,16 +589,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
             let sections: Vec<Section> = serde_json::from_value(to_json(lua, sections)?)
                 .map_err(|e| mlua::Error::runtime(format!("kitchen.dashboard.set: expected {{ {{ title, note?, rows = {{ {{ label, value?, fraction?, mark? }} }} }} }}: {e}")))?;
             c.host.dashboard.set(&c.name, &ws, sections);
-            repaint(&c);
-            Ok(())
-        })?,
-    )?;
-    let c = cx.clone();
-    dash.set(
-        "clear",
-        lua.create_function(move |_, ws: Option<String>| {
-            c.host.dashboard.clear(&c.name, ws.as_deref());
-            repaint(&c);
+            c.host.repaint();
             Ok(())
         })?,
     )?;
@@ -739,7 +671,6 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
     })?;
     k.set("log", log.clone())?;
     lua.globals().set("print", log)?;
-    k.set("log_path", PluginHost::log_path(&cx.name).display().to_string())?;
 
     let json = lua.create_table()?;
     json.set("encode", lua.create_function(|lua, v: Value| serde_json::to_string(&lua.from_value::<serde_json::Value>(v)?).map_err(mlua::Error::external))?)?;
@@ -766,11 +697,5 @@ fn namespace(plugin: &str, opts: Option<&Table>) -> String {
     match opts.and_then(|o| o.get::<Option<String>>("ns").ok().flatten()) {
         Some(sub) if !sub.is_empty() => format!("{plugin}.{sub}"),
         _ => plugin.to_string(),
-    }
-}
-
-fn repaint(c: &Ctx) {
-    if let Some(e) = c.host.engine() {
-        e.ctx.request_repaint();
     }
 }

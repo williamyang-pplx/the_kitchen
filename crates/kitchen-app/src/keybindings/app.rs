@@ -57,7 +57,7 @@ pub enum Action {
 /// `focus` outward. Exact modifiers, so ⌘R never fires ⌘⇧R. A ⌘ chord bound
 /// to an app action somewhere else is swallowed; other chords (a vim `<C-d>`)
 /// are left for the focused widget.
-pub fn collect(ctx: &egui::Context, km: &Keymap, focus: KeyFocus, filetype: Option<&str>) -> Vec<Cmd> {
+pub fn collect(ctx: &egui::Context, km: &Keymap, focus: KeyFocus) -> Vec<Cmd> {
     let mut out = Vec::new();
     ctx.input_mut(|i| {
         let mut j = 0;
@@ -70,7 +70,7 @@ pub fn collect(ctx: &egui::Context, km: &Keymap, focus: KeyFocus, filetype: Opti
                 j += 1;
                 continue;
             };
-            let take = match km.lookup(focus, filetype, &press) {
+            let take = match km.lookup(focus, &press) {
                 Some(c @ (Cmd::App(_) | Cmd::Plugin(_))) => {
                     out.push(c.clone());
                     true
@@ -186,7 +186,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut out = (Vec::new(), Vec::new());
         let mut output = ctx.run_ui(raw, |ui| {
-            out.0 = collect(ui.ctx(), km, focus, None);
+            out.0 = collect(ui.ctx(), km, focus);
             out.1 = ui.input(|i| i.events.clone());
         });
         output.textures_delta.clear();
@@ -258,7 +258,7 @@ mod tests {
 
     fn with_chord(chord: &str, when: When) -> Keymap {
         let mut reg = Registry::default();
-        reg.chords.push(ChordEntry { plugin: "p".into(), chord: Binding::parse(chord, &[]).unwrap(), command: "p.c".into(), when, filetype: None });
+        reg.chords.push(ChordEntry { plugin: "p".into(), chord: Binding::parse(chord, &[]).unwrap(), command: "p.c".into(), when });
         Keymap::defaults().with_plugins(&reg)
     }
 
