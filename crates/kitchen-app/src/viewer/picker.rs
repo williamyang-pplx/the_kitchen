@@ -444,8 +444,6 @@ impl Picker {
     }
 }
 
-/// One result: the label, and its detail right-aligned and dimmer. `icon`:
-/// drawn in the `ICON_SLOT` before the label's character at that index.
 /// "↑ ↓ select  ⏎ open  esc close" from the live keys; `moves` names where
 /// up / down are read first.
 fn footer(moves: Place, choose: &'static str) -> Vec<(String, &'static str)> {
@@ -459,6 +457,8 @@ fn footer(moves: Place, choose: &'static str) -> Vec<(String, &'static str)> {
     vec![(select, "select"), (km.hint(Place::Picker, &Cmd::Menu(MenuCmd::Choose), 1), choose), (km.hint(Place::Picker, &Cmd::Menu(MenuCmd::Cancel), 1), "close")]
 }
 
+/// One result: the label, and its detail right-aligned and dimmer. `icon`:
+/// drawn in the `ICON_SLOT` before the label's character at that index.
 fn picker_row(ui: &mut egui::Ui, selected: bool, label: egui::text::LayoutJob, detail: &str, icon: Option<(RowIcon, usize, f32)>) -> egui::Response {
     let width = ui.available_width();
     let pad = egui::vec2(10.0, 5.0);

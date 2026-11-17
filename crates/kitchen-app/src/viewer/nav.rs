@@ -76,17 +76,9 @@ pub(super) struct PendingNav {
 }
 
 impl Viewer {
-    /// `gd`: a provider's answer, else the symbol/grep search.
-    pub(super) fn jump_to_def(&mut self, name: String) {
-        self.nav(NavKind::Definition, name);
-    }
-
-    /// `gr`: a provider's answer, else `git grep -w`.
-    pub(super) fn find_references(&mut self, name: String) {
-        self.nav(NavKind::References, name);
-    }
-
-    fn nav(&mut self, kind: NavKind, name: String) {
+    /// `gd` / `gr`: a provider's answer, else the text search (symbols and
+    /// grep for a definition, `git grep -w` for references).
+    pub(super) fn nav(&mut self, kind: NavKind, name: String) {
         if self.current.as_deref().is_some_and(|p| kitchen_symbols::is_keyword(p, &name)) {
             self.status = Some((format!("{name} is a keyword"), false));
             return;
@@ -99,11 +91,11 @@ impl Viewer {
         }
     }
 
-    fn start_nav(&mut self, kind: NavKind, name: &str, provider: bool) -> u64 {
+    fn start_nav(&mut self, kind: NavKind, name: &str, here: Option<Loc>, word_col: Option<usize>, removed: bool, provider: bool) -> u64 {
         self.nav_token += 1;
         self.status = None;
-        let (token, here) = (self.nav_token, self.here());
-        self.pending_nav = Some(PendingNav { token, kind, name: name.to_string(), started: Instant::now(), here, word_col: None, removed: false, provider, status: None });
+        let token = self.nav_token;
+        self.pending_nav = Some(PendingNav { token, kind, name: name.to_string(), started: Instant::now(), here, word_col, removed, provider, status: None });
         token
     }
 
@@ -146,10 +138,7 @@ impl Viewer {
             return false;
         }
         let ctx = crate::plugins::command_context(&self.engine, &self.tab_id, Some(self.context()));
-        let token = self.start_nav(kind, name, true);
-        if let Some(p) = self.pending_nav.as_mut() {
-            p.word_col = word_col;
-        }
+        let token = self.start_nav(kind, name, self.here(), word_col, false, true);
         let (tx, egui_ctx, host, wt) = (self.tx.clone(), self.engine.ctx.clone(), self.host.clone(), self.worktree.clone());
         let asked = plugins.provide(kind.provider(), &ft, ctx, move |answer| {
             // Off the plugin's thread: previews may need a round trip.
@@ -191,10 +180,7 @@ impl Viewer {
                 }
             }
         }
-        self.start_nav(kind, &name, false);
-        if let Some(p) = self.pending_nav.as_mut() {
-            (p.here, p.word_col, p.removed) = (here, word_col, removed);
-        }
+        self.start_nav(kind, &name, here, word_col, removed, false);
         self.nav_status(status.unwrap_or_else(|| format!("searching for {name}…")));
         self.start_grep();
     }
@@ -610,26 +596,26 @@ mod tests {
         h.settle(&mut v, &|v| v.files.contains_key("m.py") && v.current_source_line() == Some(216));
 
         // One answer in this file, after a tab: line 123, raw col 3 → display col 5.
-        let t = v.start_nav(NavKind::Definition, "_loader", true);
+        let t = v.start_nav(NavKind::Definition, "_loader", v.here(), None, false, true);
         v.finish_nav(t, Some(vec![Location { path: "m.py".into(), line: 123, col: 3, text: None }]));
         h.settle(&mut v, &|v| v.pending_goto.is_none());
         assert_eq!((v.current_source_line(), v.vim.col), (Some(123), 5));
         assert_eq!(v.back.last().map(|l| l.line), Some(216), "jump list");
 
         // Another file.
-        let t = v.start_nav(NavKind::Definition, "_loader", true);
+        let t = v.start_nav(NavKind::Definition, "_loader", v.here(), None, false, true);
         v.finish_nav(t, Some(vec![Location { path: "n.py".into(), line: 3, col: 14, text: None }]));
         h.settle(&mut v, &|v| v.current.as_deref() == Some("n.py") && v.files.contains_key("n.py") && v.pending_goto.is_none());
         assert_eq!((v.current_source_line(), v.vim.col), (Some(3), 13));
 
         // A stale answer (older token) is ignored.
-        let old = v.start_nav(NavKind::Definition, "a", true);
-        let _new = v.start_nav(NavKind::Definition, "b", true);
+        let old = v.start_nav(NavKind::Definition, "a", v.here(), None, false, true);
+        let _new = v.start_nav(NavKind::Definition, "b", v.here(), None, false, true);
         v.finish_nav(old, Some(vec![Location { path: "m.py".into(), line: 1, col: 1, text: None }]));
         assert_eq!(v.current.as_deref(), Some("n.py"));
 
         // "Can't tell" references: git grep finds both files, listed in the picker, the current file first.
-        let t = v.start_nav(NavKind::References, "_loader", true);
+        let t = v.start_nav(NavKind::References, "_loader", v.here(), None, false, true);
         v.finish_nav(t, None);
         h.settle(&mut v, &|v| v.picker.is_some());
         let (kind, picker) = v.picker.as_ref().unwrap();
@@ -656,7 +642,7 @@ mod tests {
     #[test]
     fn slow_provider_runs_no_text_search() {
         let (_h, mut v) = repo();
-        v.start_nav(NavKind::Definition, "foo", true);
+        v.start_nav(NavKind::Definition, "foo", v.here(), None, false, true);
         v.pending_nav.as_mut().unwrap().started = Instant::now() - Duration::from_secs(5);
         v.check_nav_timeout();
         assert!(v.pending_nav.as_ref().is_some_and(|p| p.provider), "still waiting for the provider");
@@ -667,7 +653,7 @@ mod tests {
     #[test]
     fn provider_none_falls_back_to_text_search() {
         let (h, mut v) = repo();
-        let t = v.start_nav(NavKind::Definition, "foo", true);
+        let t = v.start_nav(NavKind::Definition, "foo", v.here(), None, false, true);
         v.finish_nav(t, None);
         assert_eq!(status(&v), Some("the language server found nothing for foo; searching text…"));
         h.settle(&mut v, &|v| v.picker.is_some());
@@ -678,7 +664,7 @@ mod tests {
     #[test]
     fn timeout_falls_back_to_text_search() {
         let (h, mut v) = repo();
-        v.start_nav(NavKind::Definition, "foo", true);
+        v.start_nav(NavKind::Definition, "foo", v.here(), None, false, true);
         v.pending_nav.as_mut().unwrap().started = Instant::now() - NAV_TIMEOUT * 2;
         v.check_nav_timeout();
         assert_eq!(status(&v), Some("no answer from the language server for foo; searching text…"));
@@ -689,7 +675,7 @@ mod tests {
     #[test]
     fn self_answer_falls_back_to_text_search() {
         let (h, mut v) = repo();
-        let t = v.start_nav(NavKind::Definition, "foo", true);
+        let t = v.start_nav(NavKind::Definition, "foo", v.here(), None, false, true);
         v.pending_nav.as_mut().unwrap().word_col = Some(1);
         v.finish_nav(t, Some(vec![Location { path: "use.py".into(), line: 2, col: 1, text: None }]));
         assert_eq!(status(&v), Some("the language server found nothing for foo; searching text…"));
@@ -703,7 +689,7 @@ mod tests {
         let (h, mut v) = repo();
         let elsewhere = || Some(vec![Location { path: "b.py".into(), line: 1, col: 7, text: None }]);
 
-        let t = v.start_nav(NavKind::Definition, "foo", true);
+        let t = v.start_nav(NavKind::Definition, "foo", v.here(), None, false, true);
         v.nav_status(NavKind::Definition.finding("foo"));
         v.open("a.py", Some(1), false);
         assert!(v.pending_nav.is_none() && v.status.is_none(), "opening a file abandons the query");
@@ -712,14 +698,14 @@ mod tests {
 
         v.open("use.py", Some(2), false);
         h.settle(&mut v, &|v| v.current_source_line() == Some(2));
-        let t = v.start_nav(NavKind::Definition, "foo", true);
+        let t = v.start_nav(NavKind::Definition, "foo", v.here(), None, false, true);
         v.nav_status(NavKind::Definition.finding("foo"));
         v.vim.line += 1;
         assert_eq!(v.current_source_line(), Some(3));
         v.finish_nav(t, elsewhere());
         assert_eq!((v.current.as_deref(), v.status.as_ref()), (Some("use.py"), None), "moved away: dropped");
 
-        v.start_nav(NavKind::Definition, "bar", true);
+        v.start_nav(NavKind::Definition, "bar", v.here(), None, false, true);
         v.nav_status(NavKind::Definition.finding("bar"));
         h.key(&mut v, egui::Key::Escape);
         assert!(v.pending_nav.is_none() && v.status.is_none(), "Esc abandons the query");
@@ -728,7 +714,7 @@ mod tests {
     #[test]
     fn keyword_is_not_searched() {
         let (_h, mut v) = repo();
-        v.jump_to_def("return".into());
+        v.nav(NavKind::Definition, "return".into());
         assert!(v.pending_nav.is_none());
         assert_eq!(status(&v), Some("return is a keyword"));
     }
@@ -743,7 +729,7 @@ mod tests {
         h.settle(&mut v, &|v| v.current.as_deref() == Some("a.py") && v.bases.contains_key("a.py") && v.hunk_goto.is_none());
         assert!(v.on_removed_row(), "{:?}", v.doc.lines[v.vim.line].text);
         assert_eq!(v.context()["removed"], true);
-        v.jump_to_def("helper".into());
+        v.nav(NavKind::Definition, "helper".into());
         h.settle(&mut v, &|v| v.picker.is_some());
         let (_, picker) = v.picker.as_ref().unwrap();
         assert_eq!(picker.items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["a.py:2"], "the def on the next line is kept");
@@ -759,7 +745,7 @@ mod tests {
         v.vim.col = 14;
         assert_eq!(v.word_here(), Some((13, "usage".to_string())));
         assert_eq!(v.context()["col"], 13);
-        v.command(PanelCmd::ToggleOutline, &h.engine);
+        v.command(PanelCmd::ToggleOutline);
         h.settle(&mut v, &|v| v.outline && v.doc.lines.len() == 2);
         v.vim.line = 1; // "  def run(self):"
         v.vim.col = 6;
@@ -812,7 +798,7 @@ mod tests {
         let (h, mut v) = repo();
         v.open("use.py", Some(3), false);
         h.settle(&mut v, &|v| v.current_source_line() == Some(3));
-        v.jump_to_def("bar".into());
+        v.nav(NavKind::Definition, "bar".into());
         h.settle(&mut v, &|v| v.picker.is_some());
         let (_, picker) = v.picker.as_ref().unwrap();
         assert_eq!(picker.items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(), vec!["a.py:5"]);
@@ -827,7 +813,7 @@ mod tests {
         v.open("f.py", Some(3), false);
         h.settle(&mut v, &|v| v.files.contains_key("f.py") && v.current_source_line() == Some(3));
         v.vim.col = 11;
-        v.jump_to_def("y".into());
+        v.nav(NavKind::Definition, "y".into());
         h.settle(&mut v, &|v| v.pending_goto.is_none());
         assert!(v.pending_nav.is_none(), "no text search");
         assert_eq!((v.current_source_line(), v.vim.col), (Some(2), 4));
@@ -879,7 +865,7 @@ mod tests {
     #[test]
     fn single_reference_at_cursor_does_not_jump() {
         let (_h, mut v) = repo();
-        let t = v.start_nav(NavKind::References, "foo", true);
+        let t = v.start_nav(NavKind::References, "foo", v.here(), None, false, true);
         v.finish_nav(t, Some(vec![loc("use.py", 2, 1)]));
         assert_eq!(status(&v), Some("the only reference to foo is here"));
         assert!(v.picker.is_none() && v.back.is_empty());

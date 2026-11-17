@@ -228,14 +228,10 @@ impl Viewer {
     }
 
     pub(super) fn open_diagnostics_picker(&mut self) {
-        let Some(o) = self.overlay.as_ref().filter(|o| self.current.as_deref() == Some(o.path.as_str())) else {
+        let Some(o) = self.overlay.as_ref().filter(|o| self.current.as_deref() == Some(o.path.as_str()) && !o.diags.is_empty()) else {
             self.status = Some(("no diagnostics in this file".into(), false));
             return;
         };
-        if o.diags.is_empty() {
-            self.status = Some(("no diagnostics in this file".into(), false));
-            return;
-        }
         let path = o.path.clone();
         let locs: Vec<Loc> = o.diags.iter().map(|d| Loc { path: path.clone(), line: d.0, col: d.1 }).collect();
         let items = o.diags.iter().map(|d| (format!("{}:{}  {}", d.0, d.1 + 1, d.3), String::new())).collect();

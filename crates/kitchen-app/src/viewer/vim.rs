@@ -257,7 +257,7 @@ impl Vim {
                         self.search_input = Some((q, fwd));
                     }
                     Press::Key { key: egui::Key::Backspace, .. } => {
-                        if q.pop().is_some() || !q.is_empty() {
+                        if q.pop().is_some() {
                             self.search_input = Some((q, fwd));
                         }
                     }

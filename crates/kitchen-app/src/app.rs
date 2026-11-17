@@ -231,12 +231,12 @@ impl KitchenApp {
                 UiCommand::ReloadViewer { tab_id, worktree } => self.reload_viewers(&tab_id, &worktree),
                 UiCommand::Render { tab_id, on } => {
                     if let Some(v) = self.viewer_key(&tab_id).and_then(|k| self.viewers.get_mut(&k)) {
-                        v.command(PanelCmd::Render(on), &self.engine);
+                        v.command(PanelCmd::Render(on));
                     }
                 }
                 UiCommand::ReloadPlan { tab_id } => {
                     if let Some(p) = self.plans.get_mut(&tab_id) {
-                        p.command(PanelCmd::Reload, &self.engine);
+                        p.command(PanelCmd::Reload);
                     }
                 }
                 UiCommand::Screenshot { path, reply } => {
@@ -254,12 +254,12 @@ impl KitchenApp {
     fn panel_command_for(&mut self, tab_id: &str, kind: SideKind, cmd: PanelCmd) {
         let Some((ws, tab)) = self.engine.find_tab(tab_id) else { return };
         match kind {
-            SideKind::Viewer => tab_viewer(&mut self.viewers, &self.shown, &self.engine, &ws, &tab).command(cmd, &self.engine),
+            SideKind::Viewer => tab_viewer(&mut self.viewers, &self.shown, &self.engine, &ws, &tab).command(cmd),
             SideKind::Plan => self
                 .plans
                 .entry(tab_id.to_string())
                 .or_insert_with(|| crate::plan_view::PlanView::new(&self.engine, &ws, &tab))
-                .command(cmd, &self.engine),
+                .command(cmd),
         }
     }
 
@@ -528,7 +528,7 @@ impl KitchenApp {
             let (path, line, diff) = old.location();
             let mut v = Viewer::at(&self.engine, ws.host(), tab_id, key.1.0.clone(), key.1.1.clone());
             if path.is_some() {
-                v.command(PanelCmd::Open { path, line, diff: Some(diff) }, &self.engine);
+                v.command(PanelCmd::Open { path, line, diff: Some(diff) });
             }
             self.viewers.insert(key, v);
         }

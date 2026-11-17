@@ -20,14 +20,6 @@ use crate::plugins::decor::Reply;
 use crate::theme;
 use crate::web;
 
-/// Where a row's text was drawn, for clicks.
-enum Hit {
-    /// Monospace text at the view's column grid.
-    Text,
-    /// A rendered row, as a whole.
-    Block,
-}
-
 /// Scroll position; owned by the panel so it survives frames.
 #[derive(Debug, Default, Clone)]
 pub struct ViewState {
@@ -443,7 +435,7 @@ impl CodeView<'_> {
 
         // The top unit starts `offset` above the view; the painter clips it.
         let mut y = rect.top() - state.offset;
-        let mut row_hits: Vec<(Rect, usize, Hit)> = Vec::new();
+        let mut row_hits: Vec<(Rect, usize)> = Vec::new();
         let mut editor_rect: Option<Rect> = None;
 
         let draw_blocks = |after: Option<usize>, y: &mut f32, ui: &mut Ui, heights: &mut Heights| {
@@ -484,11 +476,7 @@ impl CodeView<'_> {
                 state.heights.rows.insert(idx, row_height);
             }
             let row = Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::new(rect.width(), row_height));
-            row_hits.push((
-                row,
-                idx,
-                if rendered.is_some() { Hit::Block } else { Hit::Text },
-            ));
+            row_hits.push((row, idx));
             let bg = match line.kind {
                 LineKind::Added => Some(theme::ADDED_BG),
                 LineKind::Removed => Some(theme::REMOVED_BG),
@@ -660,12 +648,10 @@ impl CodeView<'_> {
                 // A link in rendered Markdown opens; the cursor stays.
                 out.urls.push(href);
             } else if let Some(pos) = resp.interact_pointer_pos() {
-                if let Some((_, idx, hit)) = row_hits.iter().find(|(r, ..)| r.contains(pos)) {
-                    let col = match hit {
-                        Hit::Block => 0,
-                        Hit::Text => (((pos.x - text_x) / cw).max(0.0) as usize) + state.left,
-                    };
-                    vim.set_cursor(*idx, col.min(doc.lines[*idx].text.chars().count().saturating_sub(1)));
+                if let Some(&(_, idx)) = row_hits.iter().find(|(r, _)| r.contains(pos)) {
+                    // A rendered row is clicked as a whole; text at the view's column grid.
+                    let col = if doc.lines[idx].render.is_some() { 0 } else { (((pos.x - text_x) / cw).max(0.0) as usize) + state.left };
+                    vim.set_cursor(idx, col.min(doc.lines[idx].text.chars().count().saturating_sub(1)));
                 }
             }
         }
@@ -773,12 +759,12 @@ fn nearest_visible(rows: &[(usize, f32, f32)], cur: usize, height: f32) -> usize
     }
 }
 
-/// Layout for one line from its spans, starting at char column `left`.
 /// The text of a fold row.
 fn fold_label(f: &Fold) -> String {
     format!("⋯  {} unchanged lines  ·  zo shows them", f.last + 1 - f.first)
 }
 
+/// Layout for one line from its spans, starting at char column `left`.
 fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId, over: Option<&LineOverlay>) -> LayoutJob {
     let mut job = LayoutJob::default();
     let text = &line.text;
