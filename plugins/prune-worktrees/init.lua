@@ -22,13 +22,8 @@ local M = {}
 
 local SOCKET = "kitchen" -- the kitchen's tmux socket (kitchen-core tmux::SOCKET_NAME)
 
-local function q(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-end
-
-local function basename(path)
-  return path:match("[^/]+$") or path
-end
+local util = require("kitchen.util")
+local q, basename, sh = util.q, util.basename, util.sh
 
 -- True when `path` is `dir` or inside it. Both drop a leading /private
 -- first: a pane's cwd is getcwd()'s spelling (/private/tmp), git's may not be.
@@ -166,12 +161,6 @@ function M.forget_missing_sh(minutes)
     "done",
     "git worktree prune -v",
   }, "\n")
-end
-
--- run_sync with kitchenctl on the PATH.
-local function sh(spec)
-  spec.sh = "export PATH=" .. (kitchen.config.path or "") .. ':"$PATH"; ' .. spec.sh
-  return kitchen.run_sync(spec)
 end
 
 local function why(res)

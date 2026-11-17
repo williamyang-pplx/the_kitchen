@@ -32,9 +32,8 @@ local SERVICE = "Claude Code-credentials" -- Claude Code's keychain item (servic
 local REFRESH_WINDOW = 300 -- s: Claude refreshes a token only this close to expiry
 local STRIP = { refreshToken = true, clientSecret = true } -- never leave the mac
 
-local function q(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-end
+local util = require("kitchen.util")
+local q, sh, why = util.q, util.sh, util.why
 
 -- The mac's entry for each server in `names`, from the keychain JSON
 -- `store` ({ mcpOAuth = { ["<name>|<hash>"] = entry } }), matched by
@@ -79,24 +78,6 @@ function M.seconds_left(e, now)
     return nil
   end
   return e.expires_at / 1000 - now
-end
-
--- The distinct devbox hosts of `workspaces` (kitchen.workspaces()), in
--- first-seen order, and host → list of workspace ids (for per-workspace
--- dashboard stats). "local" workspaces are skipped.
-function M.hosts(workspaces)
-  local hosts, ws_of = {}, {}
-  for _, ws in ipairs(workspaces or {}) do
-    local h = ws.host
-    if h and h ~= "local" then
-      if not ws_of[h] then
-        ws_of[h] = {}
-        table.insert(hosts, h)
-      end
-      table.insert(ws_of[h], ws.id)
-    end
-  end
-  return hosts, ws_of
 end
 
 -- MERGE_PY's stdin, as a table to kitchen.json.encode: { servers = { {
@@ -210,26 +191,6 @@ if isinstance(cache, dict):
         write(cache_path, cache)
 ]==]
 
--- run_sync with kitchen.config.path on the PATH: claude lives there on the
--- mac when the kitchen was started from Finder, and in ~/.local/bin on a box.
-local function sh(spec)
-  spec.sh = "export PATH=" .. (kitchen.config.path or "") .. ':"$PATH"; ' .. spec.sh
-  return kitchen.run_sync(spec)
-end
-
--- A failed job's reason, for logs and toasts: stderr only, one line, at most
--- 200 characters. Never stdout: the keychain read prints the secret there.
-local function why(res)
-  if res.timed_out then
-    return "timed out"
-  end
-  local text = (res.stderr or ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
-  if text == "" then
-    text = "exit " .. tostring(res.code)
-  end
-  return text:sub(1, 200)
-end
-
 -- The keychain item, decoded. Errors (no item, locked keychain, bad JSON)
 -- raise with why(res) or a fixed text, never the item's contents.
 local function read_keychain()
@@ -308,17 +269,9 @@ local function push(host, stdin, names)
   end
 end
 
-local manual = false -- the next pass was asked for with mcp-token-sync.run
-local tried = {} -- host → true once a pass of this load has started with it
-
 -- One pass (see the header). Returns the dashboard stats and per-workspace
 -- stats { [ws_id] = { pushed = 1 } or { failed = "…" } }.
-local function pass()
-  local was_manual = manual
-  manual = false
-  for _, host in ipairs((M.hosts(kitchen.workspaces()))) do
-    tried[host] = true
-  end
+local function pass(was_manual)
   local names = type(kitchen.config.servers) == "table" and kitchen.config.servers or {}
   if #names == 0 then
     return { servers = 0 }, {}
@@ -348,7 +301,7 @@ local function pass()
   end
 
   local payload = M.payload(entries, now)
-  local hosts, ws_of = M.hosts(kitchen.workspaces())
+  local hosts, ws_of = util.hosts(kitchen.workspaces())
   local stats, per_ws = { servers = #payload.servers, hosts = #hosts, pushed = 0, failed = 0 }, {}
   local min_left
   for _, e in ipairs(entries) do
@@ -384,33 +337,11 @@ local function pass()
   return stats, per_ws
 end
 
--- The kitchen runs it on schedule and never starts one while another runs.
-local timer = kitchen.every("pass", math.max(1, tonumber(kitchen.config.interval_minutes) or 5) * 60, pass, {
+util.sync_schedule {
+  pass = pass,
   desc = "push the mac's MCP OAuth tokens (no refresh tokens) to every devbox",
+  run_desc = "push MCP OAuth tokens to the devboxes now",
   first_delay = 30,
-})
-
--- A newly opened devbox workspace gets its tokens within NEW_HOST_POLL
--- seconds, not at the next pass: a tab opened there before them would come up
--- logged out. Each host counts once per load (so a box that can't be reached
--- doesn't start a pass every tick), and a reload counts every host as new.
-local NEW_HOST_POLL = 10
-kitchen.every("new-hosts", NEW_HOST_POLL, function()
-  for _, host in ipairs((M.hosts(kitchen.workspaces()))) do
-    if not tried[host] then
-      timer:run() -- false while a pass runs; then the next tick asks again
-      return { new_host = host }
-    end
-  end
-  return {}
-end, { desc = "start a pass when a devbox workspace opens", first_delay = 45 }) -- after the first pass's 30 s
-
-kitchen.command("run", function()
-  manual = true
-  if not timer:run() then
-    manual = false
-    kitchen.notify("mcp-token-sync: a pass is already running")
-  end
-end, { desc = "push MCP OAuth tokens to the devboxes now" })
+}
 
 return M

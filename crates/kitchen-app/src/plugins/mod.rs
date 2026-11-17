@@ -1,5 +1,5 @@
 //! Plugins: neovim-style, hackable Lua (one state per plugin, each on its own
-//! thread) plus external processes for heavy work. See docs/plugins-design.md.
+//! thread) plus external processes for heavy work. See docs/plugins.md.
 //!
 //! The UI never calls into Lua: it sends [`ToPlugin`] messages and reads
 //! cached state (the [`Registry`] of commands/keymaps and the
@@ -965,6 +965,47 @@ mod tests {
         host
     }
 
+    /// `require("kitchen.util")` in a bare test Lua state, as the host preloads it.
+    fn preload_util(lua: &mlua::Lua) {
+        let load = lua.create_function(|lua, ()| lua.load(lua::UTIL_LUA).eval::<mlua::Value>()).unwrap();
+        lua.globals().get::<mlua::Table>("package").unwrap().get::<mlua::Table>("preload").unwrap().set("kitchen.util", load).unwrap();
+    }
+
+    /// kitchen.util: shell quoting, sizes, paths, job errors and devbox hosts.
+    #[test]
+    fn util_lua_helpers() {
+        use mlua::LuaSerdeExt;
+        let lua = mlua::Lua::new();
+        preload_util(&lua);
+        let m: mlua::Table = lua.load(r#"return require("kitchen.util")"#).eval().unwrap();
+        let f = |name: &str| m.get::<mlua::Function>(name).unwrap();
+        let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
+        assert_eq!(f("q").call::<String>("it's").unwrap(), r#"'it'\''s'"#);
+        assert_eq!(f("q").call::<String>(12).unwrap(), "'12'");
+        assert_eq!(f("shell_path").call::<String>("~/a b").unwrap(), r#""$HOME/a b""#);
+        assert_eq!(f("shell_path").call::<String>("/x/$y\"").unwrap(), r#""/x/\$y\"""#);
+        assert_eq!(f("human").call::<String>(2_000_000).unwrap(), "1.9G");
+        assert_eq!(f("human").call::<String>(512 * 1024).unwrap(), "512M");
+        assert_eq!(f("human").call::<String>(40).unwrap(), "40K");
+        assert_eq!(f("basename").call::<String>("/a/b c").unwrap(), "b c");
+        assert_eq!(f("basename").call::<String>("/a/").unwrap(), "/a/");
+        let why = |j: serde_json::Value| -> String { f("why").call(lua.to_value(&j).unwrap()).unwrap() };
+        assert_eq!(why(serde_json::json!({ "timed_out": true })), "timed out");
+        assert_eq!(why(serde_json::json!({ "code": 2, "stderr": " no\n  such\tfile \n", "stdout": "secret" })), "no such file");
+        assert_eq!(why(serde_json::json!({ "code": 3, "stdout": "secret" })), "exit 3", "never stdout");
+        let workspaces = lua
+            .to_value(&serde_json::json!([
+                { "id": "w1", "host": "local" },
+                { "id": "w2", "host": "box-a" },
+                { "id": "w3", "host": "box-b" },
+                { "id": "w4", "host": "box-a" },
+            ]))
+            .unwrap();
+        let (hosts, ws_of): (mlua::Value, mlua::Value) = f("hosts").call(workspaces).unwrap();
+        assert_eq!(to_json(hosts), serde_json::json!(["box-a", "box-b"]));
+        assert_eq!(to_json(ws_of), serde_json::json!({ "box-a": ["w2", "w4"], "box-b": ["w3"] }));
+    }
+
     /// markdown: the document is one Markdown row, front matter as a yaml block.
     #[test]
     fn markdown_plugin_rows() {
@@ -991,6 +1032,7 @@ mod tests {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
         lua.load("kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {} }").exec().unwrap();
+        preload_util(&lua);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let parse: mlua::Function = m.get("parse").unwrap();
@@ -1065,6 +1107,7 @@ mod tests {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
         lua.load("kitchen = { on = function() end, command = function() end, keymap = function() end, config = {}, json = {} }").exec().unwrap();
+        preload_util(&lua);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
@@ -1131,6 +1174,7 @@ mod tests {
         )
         .exec()
         .unwrap();
+        preload_util(&lua);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let q: String = m.get::<mlua::Function>("query").unwrap().call(("o/r", lua.to_value(&serde_json::json!([12])).unwrap())).unwrap();
@@ -1197,6 +1241,7 @@ mod tests {
         )
         .exec()
         .unwrap();
+        preload_util(&lua);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/github/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let description: mlua::Function = m.get("description").unwrap();
@@ -1214,6 +1259,7 @@ mod tests {
 
     fn prune_module(lua: &mlua::Lua) -> mlua::Table {
         lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
+        preload_util(lua);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/prune-worktrees/init.lua");
         lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap()
     }
@@ -1397,6 +1443,7 @@ mod tests {
         use mlua::LuaSerdeExt;
         let lua = mlua::Lua::new();
         lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {}, dashboard = {} }").exec().unwrap();
+        preload_util(&lua);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/dashboard/init.lua");
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let to_json = |v: mlua::Value| -> serde_json::Value { lua.from_value(v).unwrap() };
@@ -1438,6 +1485,7 @@ mod tests {
 
     fn bazel_cache_module(lua: &mlua::Lua) -> mlua::Table {
         lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
+        preload_util(lua);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/bazel-cache/init.lua");
         lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap()
     }
@@ -1547,9 +1595,6 @@ mod tests {
         let p = run(serde_json::json!({ "df": df(100, 10), "disk_kib": 0, "bases": [], "entries": [entry("download", "/d1", 6, 9000), entry("download", "/d2", 6, 8000)], "pins": {} }));
         assert_eq!((p["over"].as_str(), paths(&p)), (Some("disk"), vec!["/d1".to_string()]));
 
-        let sp: mlua::Function = m.get("shell_path").unwrap();
-        assert_eq!(sp.call::<String>("~/a b").unwrap(), r#""$HOME/a b""#);
-        assert_eq!(sp.call::<String>("/x/$y\"").unwrap(), r#""/x/\$y\"""#);
     }
 
     /// bazel-cache: scan_sh and evict_sh on a fake cache tree, with fake
@@ -1654,6 +1699,7 @@ mod tests {
 
     fn mcp_token_sync_module(lua: &mlua::Lua) -> mlua::Table {
         lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
+        preload_util(lua);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/mcp-token-sync/init.lua");
         lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap()
     }
@@ -1705,16 +1751,6 @@ mod tests {
         assert_eq!(left(serde_json::json!({ "expires_at": (1_000_000 + 301) * 1000 })), Some(301.0));
         assert_eq!(left(serde_json::json!({ "name": "a" })), None, "no expiry");
         assert_eq!(left(serde_json::json!({ "missing": true, "expires_at": 5 })), None);
-
-        let workspaces = val(serde_json::json!([
-            { "id": "w1", "host": "local" },
-            { "id": "w2", "host": "box-a" },
-            { "id": "w3", "host": "box-b" },
-            { "id": "w4", "host": "box-a" },
-        ]));
-        let (hosts, ws_of): (mlua::Value, mlua::Value) = f("hosts").call(workspaces).unwrap();
-        assert_eq!(to_json(hosts), serde_json::json!(["box-a", "box-b"]));
-        assert_eq!(to_json(ws_of), serde_json::json!({ "box-a": ["w2", "w4"], "box-b": ["w3"] }));
 
         let entries = val(serde_json::json!([
             { "name": "live", "key": "live|1", "entry": { "accessToken": "t1" }, "expires_at": 2_000_000_000i64 },
@@ -1839,6 +1875,7 @@ mod tests {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/cli-token-sync");
         lua.load("kitchen = { on = function() end, command = function() end, every = function() return {} end, config = {}, json = {} }").exec().unwrap();
         lua.load(format!("package.path = {:?} .. ';' .. package.path", format!("{}/lua/?.lua", dir.display()))).exec().unwrap();
+        preload_util(lua);
         lua.load(std::fs::read_to_string(dir.join("init.lua")).unwrap()).eval().unwrap()
     }
 
@@ -2464,7 +2501,7 @@ end)
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 12 && host.registry().viewer_maps.len() == 3 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
+        wait(&|| host.list().len() == 11 && host.registry().viewer_maps.len() == 2 && host.registry().providers.len() == 2 && host.listeners("open") == ["github"]);
         assert!(host.has_provider("definition", "py") && !host.has_provider("definition", "rs"));
         for p in host.list() {
             assert_eq!(p.status, Status::Running, "{}", p.name);
@@ -2504,7 +2541,7 @@ end)
         let repo_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
         let engine = Engine::new(egui::Context::default(), kitchen_core::db::Db::open_in_memory().unwrap()).unwrap();
         let host = host_with(&engine, vec![repo_plugins]);
-        wait(&|| host.list().len() == 4 && host.registry().viewer_maps.len() == 3);
+        wait(&|| host.list().len() == 11 && host.registry().viewer_maps.len() == 2);
         let text = "import os\n\nprint(nope)\n";
         let key = FileKey { host: h, worktree: wt, path: "aster/kitchen_probe.py".into() };
         let start = Instant::now();

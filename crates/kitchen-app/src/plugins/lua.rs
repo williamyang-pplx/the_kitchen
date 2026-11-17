@@ -29,6 +29,7 @@ const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 
 const LINT_LUA: &str = include_str!("lint.lua");
 const LSP_LUA: &str = include_str!("lsp.lua");
+pub(super) const UTIL_LUA: &str = include_str!("util.lua");
 /// How long unloading waits for a plugin's processes to exit after `stop`.
 const STOP_GRACE: Duration = Duration::from_millis(500);
 
@@ -379,6 +380,7 @@ fn install_api(lua: &Lua, cx: &Rc<Ctx>, dir: &Path, config: serde_json::Value) -
     let preload: Table = package.get("preload")?;
     preload.set("kitchen.lint", lua.create_function(|lua, ()| lua.load(LINT_LUA).set_name("@kitchen/lint.lua").eval::<Value>())?)?;
     preload.set("kitchen.lsp", lua.create_function(|lua, ()| lua.load(LSP_LUA).set_name("@kitchen/lsp.lua").eval::<Value>())?)?;
+    preload.set("kitchen.util", lua.create_function(|lua, ()| lua.load(UTIL_LUA).set_name("@kitchen/util.lua").eval::<Value>())?)?;
 
     let k = lua.create_table()?;
     k.set("name", cx.name.as_str())?;

@@ -3,7 +3,7 @@
 `kitchenctl` controls the kitchen from a shell. It is the public interface
 for agents: anything William does with the keyboard, an agent can do here.
 Every command has `--help` with examples; `kitchenctl guide` prints the agent
-guide (also shipped as [`skill/kitchen/SKILL.md`](../skill/kitchen/SKILL.md)).
+guide.
 
 ## Transport
 

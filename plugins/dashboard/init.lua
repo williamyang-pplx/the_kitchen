@@ -9,26 +9,11 @@
 
 local M = {}
 
-local function q(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
-end
+local util = require("kitchen.util")
+local q, basename, human = util.q, util.basename, util.human
 
 local function dirname(path)
   return path:match("^(.*)/[^/]+$") or "/"
-end
-
-local function basename(path)
-  return path:match("[^/]+$") or path
-end
-
--- KiB → "1.9G", "512M", "40K".
-function M.human(k)
-  if k >= 1024 * 1024 then
-    return string.format("%.1fG", k / 1024 / 1024)
-  elseif k >= 1024 then
-    return string.format("%.0fM", k / 1024)
-  end
-  return string.format("%.0fK", k)
 end
 
 -- Worktree counts from `kitchenctl --json worktree list`.
@@ -124,7 +109,7 @@ function M.sections(counts, mem, disk, paths, top, measured_at)
   if disk and disk.df then
     table.insert(disk_rows, {
       label = disk.df.mount,
-      value = M.human(disk.df.used) .. " / " .. M.human(disk.df.size),
+      value = human(disk.df.used) .. " / " .. human(disk.df.size),
       fraction = disk.df.size > 0 and disk.df.used / disk.df.size or nil,
     })
     for i, d in ipairs(disk.dirs) do
@@ -137,7 +122,7 @@ function M.sections(counts, mem, disk, paths, top, measured_at)
           mine = true
         end
       end
-      table.insert(disk_rows, { label = basename(d.path), value = M.human(d.k), fraction = disk.df.size > 0 and d.k / disk.df.size or nil, mark = mine })
+      table.insert(disk_rows, { label = basename(d.path), value = human(d.k), fraction = disk.df.size > 0 and d.k / disk.df.size or nil, mark = mine })
     end
   end
   table.insert(out, {
@@ -146,12 +131,12 @@ function M.sections(counts, mem, disk, paths, top, measured_at)
     rows = disk_rows,
   })
   if mem and mem.mem then
-    local rows = { { label = "used", value = M.human(mem.mem.used) .. " / " .. M.human(mem.mem.total), fraction = mem.mem.total > 0 and mem.mem.used / mem.mem.total or nil } }
+    local rows = { { label = "used", value = human(mem.mem.used) .. " / " .. human(mem.mem.total), fraction = mem.mem.total > 0 and mem.mem.used / mem.mem.total or nil } }
     for i, p in ipairs(mem.procs) do
       if i > top then
         break
       end
-      table.insert(rows, { label = p.name, value = M.human(p.k), fraction = mem.mem.total > 0 and p.k / mem.mem.total or nil })
+      table.insert(rows, { label = p.name, value = human(p.k), fraction = mem.mem.total > 0 and p.k / mem.mem.total or nil })
     end
     table.insert(out, { title = "RAM", rows = rows })
   end
@@ -187,11 +172,7 @@ end
 -- Worktrees and RAM, now.
 local function refresh(ws)
   local c = entry(ws.id)
-  local res = kitchen.run_sync({
-    host = "local",
-    timeout = 60,
-    sh = "export PATH=" .. (cfg.path or "") .. ':"$PATH"; kitchenctl --json worktree list -w ' .. q(ws.id),
-  })
+  local res = util.sh({ host = "local", timeout = 60, sh = "kitchenctl --json worktree list -w " .. q(ws.id) })
   local ok, list = pcall(kitchen.json.decode, res.stdout)
   if res.code == 0 and ok and type(list) == "table" then
     c.counts = M.worktree_counts(list)

@@ -14,7 +14,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-/tmp/kitchen-shots}
 TMP=$(mktemp -d /tmp/kitchen-shots-XXXX)
 
-unset KITCHEN_WORKSPACE_ID KITCHEN_TAB_ID KITCHEN_PLAN_FILE KITCHEN_DIFF_BASE
+unset KITCHEN_WORKSPACE_ID KITCHEN_TAB_ID KITCHEN_PLAN_FILE KITCHEN_PRS_FILE KITCHEN_DIFF_BASE
 export KITCHEN_HIDDEN=1
 export KITCHEN_STATE_DIR=$TMP/state
 export KITCHEN_SOCKET_PATH=$TMP/state/kitchen.sock

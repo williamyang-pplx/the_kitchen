@@ -6,9 +6,7 @@
 local lint = require("kitchen.lint")
 local cfg = kitchen.config
 
-local function q(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
+local q = require("kitchen.util").q
 
 -- Last diagnostics per file path, for `\e` (explain the rule under the cursor).
 local last = {}
