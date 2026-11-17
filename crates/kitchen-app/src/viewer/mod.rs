@@ -1567,10 +1567,10 @@ impl Viewer {
         let rows = changes_tree::rows(&paths);
         let mut clicked: Option<usize> = None;
         let mut all = false;
-        let reviewers = self.shown_reviewers();
+        let (reviewers, gates) = self.shown_review();
         egui::ScrollArea::vertical().id_salt(("changes", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(theme::SPACE_S);
-            reviewers_section(ui, &reviewers);
+            review_section(ui, &reviewers, &gates);
             ui.horizontal(|ui| {
                 ui.add_space(theme::SPACE_M);
                 changed_header(ui, &self.changed);
@@ -1631,10 +1631,10 @@ impl Viewer {
         let scroll = std::mem::take(&mut self.list_scroll);
         let mut clicked: Option<usize> = None;
         let mut browse: Option<String> = None;
-        let reviewers = self.shown_reviewers();
+        let (reviewers, gates) = self.shown_review();
         egui::ScrollArea::vertical().id_salt(("files", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(theme::SPACE_S);
-            reviewers_section(ui, &reviewers);
+            review_section(ui, &reviewers, &gates);
             if !self.changed.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(theme::SPACE_M);
@@ -1705,46 +1705,68 @@ impl Viewer {
     }
 }
 
-/// "REVIEWERS", then each reviewer of the PR on screen: its state's icon,
-/// name and status, and under a team how many members it has, the names on
-/// hover. Nothing without any.
-fn reviewers_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer]) {
-    if reviewers.is_empty() {
-        return;
-    }
+/// The PR on screen's "REVIEWERS": each one's state icon, name (a team's in
+/// its own color) and status, and under a team how many members it has, the
+/// names on hover. Then its "CHECKS": those blocking its merge, each one's
+/// description on hover, or one row saying they all passed. Nothing for a
+/// view that isn't an open PR.
+fn review_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer], gates: &[crate::engine::Check]) {
     let pad = theme::SPACE_M;
-    ui.horizontal(|ui| {
-        ui.add_space(pad);
-        ui.label(widgets::section_label("Reviewers", theme::SUBTLE));
-    });
-    ui.add_space(2.0);
     let icon = 12.0;
-    for r in reviewers {
-        let row = ui.horizontal(|ui| {
+    let header = |ui: &mut Ui, title: &str| {
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.label(widgets::section_label(title, theme::SUBTLE));
+        });
+        ui.add_space(2.0);
+    };
+    // An icon and `job` on one line.
+    let line = |ui: &mut Ui, state, job: egui::text::LayoutJob| {
+        ui.horizontal(|ui| {
             ui.add_space(pad);
             let (square, _) = ui.allocate_exact_size(egui::vec2(icon, icon), egui::Sense::hover());
-            widgets::check_icon(ui.painter(), square, r.state);
-            let mut job = egui::text::LayoutJob::default();
-            let f = |font, color| egui::TextFormat { font_id: font, color, ..Default::default() };
-            job.append(&r.name, 0.0, f(theme::ui_font(theme::TEXT_BODY), theme::TEXT));
-            if !r.status.is_empty() {
-                job.append(&r.status, 6.0, f(theme::ui_font(theme::TEXT_SMALL), widgets::check_color(r.state)));
-            }
+            widgets::check_icon(ui.painter(), square, state);
             ui.label(job)
-        });
-        if !r.members.is_empty() {
-            let n = r.members.len();
-            let count = ui.horizontal(|ui| {
-                ui.add_space(pad + icon + ui.spacing().item_spacing.x);
-                ui.label(RichText::new(format!("{n} member{}", if n == 1 { "" } else { "s" })).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE))
-            });
-            let names = r.members.join("\n");
-            row.inner.on_hover_text(&names);
-            count.inner.on_hover_text(&names);
+        })
+        .inner
+    };
+    let f = |size, color| egui::TextFormat { font_id: theme::ui_font(size), color, ..Default::default() };
+    if !reviewers.is_empty() {
+        header(ui, "Reviewers");
+        for r in reviewers {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(&r.name, 0.0, f(theme::TEXT_BODY, if r.team { theme::team_color(&r.name) } else { theme::TEXT }));
+            if !r.status.is_empty() {
+                job.append(&r.status, 6.0, f(theme::TEXT_SMALL, widgets::check_color(r.state)));
+            }
+            let row = line(ui, r.state, job);
+            if !r.members.is_empty() {
+                let n = r.members.len();
+                let count = ui.horizontal(|ui| {
+                    ui.add_space(pad + icon + ui.spacing().item_spacing.x);
+                    ui.label(RichText::new(format!("{n} member{}", if n == 1 { "" } else { "s" })).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE))
+                });
+                let names = r.members.join("\n");
+                row.on_hover_text(&names);
+                count.inner.on_hover_text(&names);
+            }
+            ui.add_space(2.0);
         }
-        ui.add_space(2.0);
+        ui.add_space(theme::SPACE_S);
     }
-    ui.add_space(theme::SPACE_S);
+    if !gates.is_empty() {
+        header(ui, "Checks");
+        for g in gates {
+            let mut job = egui::text::LayoutJob::default();
+            let color = if g.state == crate::engine::CheckState::Done { widgets::check_color(g.state) } else { theme::TEXT };
+            job.append(&g.label, 0.0, f(theme::TEXT_SMALL, color));
+            let row = line(ui, g.state, job);
+            if !g.note.is_empty() {
+                row.on_hover_text(&g.note);
+            }
+        }
+        ui.add_space(theme::SPACE_S);
+    }
 }
 
 /// "CHANGED FILES  n" and the lines the changes add and remove in all.

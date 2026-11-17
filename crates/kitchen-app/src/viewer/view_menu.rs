@@ -167,9 +167,10 @@ impl Viewer {
         self.shown_entry().map(|(menu, i)| menu[i].0.checks.clone()).unwrap_or_default()
     }
 
-    /// The reviewers of the row on screen, for the file list.
-    pub(super) fn shown_reviewers(&self) -> Vec<Reviewer> {
-        self.shown_entry().map(|(menu, i)| menu[i].0.reviewers.clone()).unwrap_or_default()
+    /// The reviewers of the row on screen and the checks blocking it, for
+    /// the file list.
+    pub(super) fn shown_review(&self) -> (Vec<Reviewer>, Vec<Check>) {
+        self.shown_entry().map(|(menu, i)| (menu[i].0.reviewers.clone(), menu[i].0.gates.clone())).unwrap_or_default()
     }
 }
 
@@ -311,8 +312,9 @@ mod tests {
                 { "section": "main ← a", "label": "#7 a", "view": { "rev": "refs/kitchen/pr/7", "name": "kitchen-pr-7", "base": "origin/main" } },
                 { "section": "main ← a", "label": "#8 b", "view": { "base": "origin/a" },
                   "checks": [{ "state": "waiting", "label": "in review", "note": "Waiting for team review: team-x" }, { "state": "needed", "label": "atlantis apply needed" }],
-                  "reviewers": [{ "state": "waiting", "name": "team-x", "status": "requested", "members": ["Al", "@bo"] }, { "state": "done", "name": "@cy", "status": "approved", "members": {} }] },
-                { "section": "main ← c", "label": "#9 c", "view": { "base": "origin/c" }, "checks": {}, "reviewers": {} },
+                  "reviewers": [{ "state": "waiting", "name": "team-x", "team": true, "status": "requested", "members": ["Al", "@bo"] }, { "state": "done", "name": "@cy", "status": "approved", "members": {} }],
+                  "gates": [{ "state": "needed", "label": "lint", "note": "2 errors" }] },
+                { "section": "main ← c", "label": "#9 c", "view": { "base": "origin/c" }, "checks": {}, "reviewers": {}, "gates": {} },
             ]),
         );
         let at = |base: &str| Viewer::at(&h.engine, Host::Local, "t", h.repo.path(), base.into());
@@ -329,15 +331,18 @@ mod tests {
         assert!(at("origin/c").shown_checks().is_empty(), "an empty Lua table is no checks");
         assert!(at("origin/main").shown_checks().is_empty());
 
-        // So are the file list's reviewers.
-        let reviewers: Vec<(CheckState, String, String, Vec<String>)> = at("origin/a").shown_reviewers().into_iter().map(|r| (r.state, r.name, r.status, r.members)).collect();
+        // So are the file list's reviewers and checks.
+        let (reviewers, gates) = at("origin/a").shown_review();
+        let reviewers: Vec<(CheckState, String, bool, String, Vec<String>)> = reviewers.into_iter().map(|r| (r.state, r.name, r.team, r.status, r.members)).collect();
         assert_eq!(
             reviewers,
             vec![
-                (CheckState::Waiting, "team-x".into(), "requested".into(), vec!["Al".into(), "@bo".into()]),
-                (CheckState::Done, "@cy".into(), "approved".into(), vec![]),
+                (CheckState::Waiting, "team-x".into(), true, "requested".into(), vec!["Al".into(), "@bo".into()]),
+                (CheckState::Done, "@cy".into(), false, "approved".into(), vec![]),
             ]
         );
-        assert!(at("origin/c").shown_reviewers().is_empty(), "an empty Lua table is no reviewers");
+        assert_eq!(gates.into_iter().map(|g| (g.state, g.label, g.note)).collect::<Vec<_>>(), vec![(CheckState::Needed, "lint".into(), "2 errors".into())]);
+        let (reviewers, gates) = at("origin/c").shown_review();
+        assert!(reviewers.is_empty() && gates.is_empty(), "an empty Lua table is none");
     }
 }

@@ -309,8 +309,9 @@ kitchen.on("views", function(ev)   -- ⌘⇧S: the tab's command ctx, plus ev.pr
         view = { rev = "refs/kitchen/pr/12", name = "kitchen-pr-12", fetch = { … }, base = "origin/main" } },
       { section = "main ← william/a", label = "#13 use them", detail = "2/2 · live", state = "open", approved = true,
         checks = { { state = "needed", label = "atlantis apply needed", note = "…still need a confirmed successful apply." } },
-        reviewers = { { state = "waiting", name = "pplx_aster", status = "requested", members = { "Paul Fryzel", "@max" } },
+        reviewers = { { state = "waiting", name = "pplx_aster", team = true, status = "requested", members = { "Paul Fryzel", "@max" } },
                       { state = "done", name = "@al", status = "approved" } },
+        gates = { { state = "needed", label = "atlantis/apply-gate", note = "…still need a confirmed successful apply." } },
         view = { base = "origin/william/a" } },   -- no rev: the tab's own worktree
     },
   }
@@ -328,8 +329,10 @@ are what the PR waits on, drawn in the viewer's header while its row is on
 screen: each a `state` (`"done"`, `"waiting"` on others, `"needed"` from the
 author), a `label`, and a `note` shown on hover. `reviewers` are listed atop
 the viewer's file list while its row is on screen: each a `state` (as a
-check's), a `name`, a `status` beside it, and `members` (a team's: their count beside it, the
-names on hover). A viewer on screen sends
+check's), a `name` (`team = true` draws it in that team's own color), a
+`status` beside it, and `members` (a team's: their count below it, the names
+on hover). `gates` follow under "Checks", shaped like `checks`: what blocks
+the PR's merge, or one done row saying nothing does. A viewer on screen sends
 `views` itself too (when it opens, when it shows a view the menu lacks, and
 every 2 minutes), so the header's checks keep up without ⌘⇧S. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.

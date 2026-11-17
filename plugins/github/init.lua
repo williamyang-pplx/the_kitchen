@@ -9,8 +9,8 @@
 -- row has a check once its code owners approved it, and the viewer's header
 -- shows what the PR on screen waits on: approval, naming the teams and people
 -- asked to review, and an Atlantis apply. Atop the viewer's file list, the
--- PR's reviewers and their state, a team's members (whom to ping) on
--- hover. ⌘⇧D
+-- PR's reviewers and their state (a team's members, whom to ping, on
+-- hover), then the required checks that block its merge. ⌘⇧D
 -- shows the shown PR's description, rendered as on GitHub, and goes back.
 -- ⌘⇧O opens the shown PR (in the ⌘⇧S menu, the row under the cursor) in
 -- Chrome.
@@ -198,6 +198,12 @@ local function gql_string(s)
   return '"' .. (s:gsub('[\\"]', "\\%0")) .. '"'
 end
 
+-- Every check on the last commit, and whether branch protection requires it
+-- for PR %d (M.gates).
+local ROLLUP = "statusCheckRollup { contexts(first: 100) { nodes {"
+  .. " ... on CheckRun { name status conclusion isRequired(pullRequestNumber: %d) }"
+  .. " ... on StatusContext { context state description isRequired(pullRequestNumber: %d) } } } }"
+
 -- One GraphQL query for PRs `ns` of `slug`, each aliased p<N>.
 function M.query(slug, ns)
   local owner, name = slug:match("^([^/]+)/(.+)$")
@@ -207,13 +213,11 @@ function M.query(slug, ns)
       table.insert(contexts, ("%s: context(name: %s) { state description }"):format(alias, gql_string(STATUSES[alias])))
     end
   end
-  local fields = FIELDS
-  if #contexts > 0 then
-    fields = fields .. " commits(last: 1) { nodes { commit { status { " .. table.concat(contexts, " ") .. " } } } }"
-  end
+  local status = #contexts > 0 and "status { " .. table.concat(contexts, " ") .. " } " or ""
   local parts = {}
   for _, n in ipairs(ns) do
-    table.insert(parts, ("p%d: pullRequest(number: %d) { %s }"):format(n, n, fields))
+    local commit = status .. ROLLUP:format(n, n)
+    table.insert(parts, ("p%d: pullRequest(number: %d) { %s commits(last: 1) { nodes { commit { %s } } } }"):format(n, n, FIELDS, commit))
   end
   return ('query { repository(owner: "%s", name: "%s") { %s } }'):format(owner, name, table.concat(parts, " "))
 end
@@ -223,6 +227,52 @@ end
 local function check(status, labels)
   local state = status.state == "SUCCESS" and "done" or status.state == "PENDING" and "waiting" or "needed"
   return { state = state, label = labels[state], note = status.description or "" }
+end
+
+-- A check run's or commit status's state as a check's: passed (or skipped)
+-- done, running waiting, failed needed.
+local function gate_state(c)
+  if c.status then -- a check run
+    if c.status ~= "COMPLETED" then
+      return "waiting"
+    end
+    return ({ SUCCESS = true, NEUTRAL = true, SKIPPED = true })[c.conclusion or ""] and "done" or "needed"
+  end
+  return c.state == "SUCCESS" and "done" or (c.state == "PENDING" or c.state == "EXPECTED") and "waiting" or "needed"
+end
+
+-- The checks that keep open PR `p` (a GraphQL node) from merging, for the
+-- viewer's file list: the required ones that failed, then those still
+-- running, each { state, label = its name, note = its description }. Once
+-- they all passed, one done row says so. A repo that requires no check
+-- counts every check as required.
+function M.gates(p)
+  local last = p.commits and p.commits.nodes and p.commits.nodes[1]
+  local rollup = last and last.commit and last.commit.statusCheckRollup
+  local all = rollup and rollup.contexts and rollup.contexts.nodes or {}
+  local required = {}
+  for _, c in ipairs(all) do
+    if c.isRequired then
+      table.insert(required, c)
+    end
+  end
+  local kind = "required "
+  if #required == 0 then
+    required, kind = all, ""
+  end
+  local out = {}
+  for _, state in ipairs({ "needed", "waiting" }) do
+    for _, c in ipairs(required) do
+      if gate_state(c) == state then
+        table.insert(out, { state = state, label = c.name or c.context or "?", note = c.description or "" })
+      end
+    end
+  end
+  if #out == 0 and #required > 0 then
+    local n = #required
+    out[1] = { state = "done", label = (n == 1 and "the " .. kind .. "check" or "all " .. n .. " " .. kind .. "checks") .. " passed", note = "" }
+  end
+  return out
 end
 
 -- How a reviewer is shown: "Paul Fryzel" (their GitHub name), else "@paulfryzel".
@@ -248,7 +298,7 @@ function M.reviewers(p)
           table.insert(members, person(u))
         end
       end
-      table.insert(out, { state = "waiting", name = rv.slug, status = status, members = members })
+      table.insert(out, { state = "waiting", name = rv.slug, team = true, status = status, members = members })
     elseif rv.login then
       table.insert(out, { state = "waiting", name = "@" .. rv.login, status = status, members = {} })
     end
@@ -348,6 +398,7 @@ local function row(tab, p, section, place, branch, dflt)
     approved = approved,
     checks = checks,
     reviewers = p.state == "OPEN" and M.reviewers(p) or {},
+    gates = p.state == "OPEN" and M.gates(p) or {},
     view = view,
   }
 end

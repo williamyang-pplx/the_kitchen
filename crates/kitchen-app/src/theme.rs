@@ -41,6 +41,23 @@ pub const TAB_EDIT: Color32 = Color32::from_rgb(0xc8, 0x5c, 0xff);
 pub const TAB_READ: Color32 = Color32::from_rgb(0xff, 0xe6, 0x3d);
 /// Bright violet marking the focused pane.
 pub const FOCUS: Color32 = Color32::from_rgb(0xb2, 0x6b, 0xff);
+/// Team names in a PR's reviewers, each team always the same one: Tokyo
+/// Night's accents but green, yellow and red (which say a check's state).
+const TEAMS: [Color32; 6] = [
+    ACCENT,
+    CYAN,
+    PURPLE,
+    Color32::from_rgb(0xff, 0x9e, 0x64), // orange
+    Color32::from_rgb(0x73, 0xda, 0xca), // teal
+    Color32::from_rgb(0xf5, 0xa9, 0xd8), // pink
+];
+
+/// Team `name`'s color: an FNV-1a hash of it picks one of `TEAMS`.
+pub fn team_color(name: &str) -> Color32 {
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    TEAMS[hash as usize % TEAMS.len()]
+}
+
 pub const ADDED_BG: Color32 = Color32::from_rgb(0x1f, 0x33, 0x2a);
 pub const REMOVED_BG: Color32 = Color32::from_rgb(0x3b, 0x22, 0x2a);
 pub const SELECTION: Color32 = Color32::from_rgb(0x33, 0x46, 0x7c);

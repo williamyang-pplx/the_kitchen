@@ -220,6 +220,10 @@ pub struct ViewEntry {
     /// Its reviewers, listed atop the viewer's file list while it is on screen.
     #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
     pub reviewers: Vec<Reviewer>,
+    /// The checks blocking its merge (or one saying they all passed), listed
+    /// under its reviewers.
+    #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
+    pub gates: Vec<Check>,
     pub view: ViewAt,
 }
 
@@ -231,6 +235,9 @@ pub struct Reviewer {
     pub state: CheckState,
     /// e.g. "pplx_aster", "@al"
     pub name: String,
+    /// A team: its name is drawn in a color of its own.
+    #[serde(default)]
+    pub team: bool,
     /// e.g. "requested · code owner", "approved"
     #[serde(default)]
     pub status: String,

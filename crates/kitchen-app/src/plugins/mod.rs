@@ -1127,9 +1127,10 @@ mod tests {
         let m: mlua::Table = lua.load(std::fs::read_to_string(path).unwrap()).eval().unwrap();
         let q: String = m.get::<mlua::Function>("query").unwrap().call(("o/r", lua.to_value(&serde_json::json!([12])).unwrap())).unwrap();
         assert!(
-            q.contains(r#"commits(last: 1) { nodes { commit { status { owners: context(name: "[Blocking] Ownership Requirements") { state description } plan: context(name: "atlantis/plan") { state description } } } } }"#),
+            q.contains(r#"commits(last: 1) { nodes { commit { status { owners: context(name: "[Blocking] Ownership Requirements") { state description } plan: context(name: "atlantis/plan") { state description } } statusCheckRollup {"#),
             "the configured statuses, \"\" left out: {q}"
         );
+        assert!(q.contains("isRequired(pullRequestNumber: 12)"), "required for this PR: {q}");
 
         // M.checks(pr) for a PR with these statuses (and review decision).
         let checks = |state: &str, decision: Option<&str>, statuses: serde_json::Value| -> (bool, Vec<(String, String, String)>) {
@@ -1189,7 +1190,9 @@ mod tests {
             let list: serde_json::Value = lua.from_value(m.get::<mlua::Function>("reviewers").unwrap().call(pr).unwrap()).unwrap();
             let list = list.as_array().cloned().unwrap_or_default();
             let s = |v: &serde_json::Value| v.as_str().unwrap().to_string();
-            list.iter().map(|r| (s(&r["state"]), s(&r["name"]), s(&r["status"]), r["members"].as_array().map(|a| a.iter().map(s).collect()).unwrap_or_default())).collect()
+            // A team's name is marked with a "+".
+            let name = |r: &serde_json::Value| if r["team"] == true { format!("+{}", s(&r["name"])) } else { s(&r["name"]) };
+            list.iter().map(|r| (s(&r["state"]), name(r), s(&r["status"]), r["members"].as_array().map(|a| a.iter().map(s).collect()).unwrap_or_default())).collect()
         };
         let approval = |pr: mlua::Value| -> (String, String) {
             let (_, list): (bool, mlua::Value) = m.get::<mlua::Function>("checks").unwrap().call(pr).unwrap();
@@ -1208,9 +1211,9 @@ mod tests {
         assert_eq!(
             reviewers(pr_with("REVIEW_REQUIRED", requested.clone())),
             vec![
-                r("waiting", "pplx_aster", "requested · code owner", &["Paul F", "@max"]),
+                r("waiting", "+pplx_aster", "requested · code owner", &["Paul F", "@max"]),
                 r("waiting", "@dan", "requested", &[]),
-                r("waiting", "solo", "requested", &[]),
+                r("waiting", "+solo", "requested", &[]),
             ],
             "a bot (no login, no slug) is left out"
         );
@@ -1225,6 +1228,41 @@ mod tests {
         assert_eq!(approval(pr_with("CHANGES_REQUESTED", reviewed.clone())).0, "changes requested · @max");
         assert_eq!(approval(pr_with("APPROVED", reviewed)).0, "approved · @paul");
         assert_eq!(approval(pr_with("APPROVED", serde_json::json!({}))), ("approved".into(), "GitHub review: approved".into()), "no reviewers: as before");
+
+        // M.gates: the required checks keeping the PR from merging, failed
+        // first, or one row once they all passed.
+        let gates = |contexts: serde_json::Value| -> Vec<(String, String, String)> {
+            let pr = pr_with("APPROVED", serde_json::json!({ "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "contexts": { "nodes": contexts } } } }] } }));
+            let list: serde_json::Value = lua.from_value(m.get::<mlua::Function>("gates").unwrap().call(pr).unwrap()).unwrap();
+            let list = list.as_array().cloned().unwrap_or_default();
+            list.iter().map(|g| (g["state"].as_str().unwrap().into(), g["label"].as_str().unwrap().into(), g["note"].as_str().unwrap().into())).collect()
+        };
+        let run = |name: &str, status: &str, conclusion: Option<&str>, required: bool| serde_json::json!({ "name": name, "status": status, "conclusion": conclusion, "isRequired": required });
+        let st = |context: &str, state: &str, description: &str, required: bool| serde_json::json!({ "context": context, "state": state, "description": description, "isRequired": required });
+        assert_eq!(
+            gates(serde_json::json!([
+                st("[Blocking] Ownership Requirements", "PENDING", "Waiting for team review: team-x", true),
+                run("lint", "IN_PROGRESS", None, true),
+                st("atlantis/apply-gate", "FAILURE", "still need an apply", true),
+                run("build", "COMPLETED", Some("TIMED_OUT"), true),
+                run("eval", "COMPLETED", Some("FAILURE"), false),
+                st("[Blocking] Tests", "SUCCESS", "passed", true),
+            ])),
+            vec![
+                c("needed", "atlantis/apply-gate", "still need an apply"),
+                c("needed", "build", ""),
+                c("waiting", "[Blocking] Ownership Requirements", "Waiting for team review: team-x"),
+                c("waiting", "lint", ""),
+            ],
+            "a check no rule requires blocks nothing"
+        );
+        assert_eq!(
+            gates(serde_json::json!([st("[Blocking] Tests", "SUCCESS", "passed", true), run("skip", "COMPLETED", Some("SKIPPED"), true), run("eval", "COMPLETED", Some("FAILURE"), false)])),
+            vec![c("done", "all 2 required checks passed", "")]
+        );
+        assert_eq!(gates(serde_json::json!([run("ci", "COMPLETED", Some("FAILURE"), false)])), vec![c("needed", "ci", "")], "nothing required: every check counts");
+        assert_eq!(gates(serde_json::json!([run("ci", "COMPLETED", Some("SUCCESS"), false)])), vec![c("done", "the check passed", "")]);
+        assert_eq!(gates(serde_json::json!([])), vec![], "no checks at all");
     }
 
     /// github ⌘⇧D: a PR's description as the page the viewer renders, its
