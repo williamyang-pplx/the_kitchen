@@ -4,8 +4,8 @@
 //! reload, when the old Lua state may still be finishing that run.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -77,10 +77,17 @@ struct Running {
     generation: u64,
 }
 
+/// How long a timer's run count and times may go unsaved. Its stats and
+/// error are saved whenever they change, and a timer at least this slow
+/// is saved after every run.
+const SAVE_EVERY_SECS: f64 = 300.0;
+
 #[derive(Debug, Default)]
 struct Entry {
     state: TimerState,
     running: Option<Running>,
+    /// When `state` was last handed out to be saved (unix s).
+    saved_at: Option<f64>,
 }
 
 #[derive(Default)]
@@ -90,6 +97,10 @@ pub struct Timers {
     /// flight stays marked until it ends.
     entries: Mutex<HashMap<(String, String), Entry>>,
     next_run: AtomicU64,
+    /// Counts the changes that can move the next due time earlier (a timer
+    /// added, removed or finished); `wake` is notified on each.
+    changes: Mutex<u64>,
+    wake: Condvar,
 }
 
 fn next_due(spec: &TimerSpec, state: &TimerState) -> f64 {
@@ -104,26 +115,55 @@ impl Timers {
     /// first time this process sees the timer (it was persisted earlier).
     pub fn register(&self, spec: TimerSpec, saved: Option<TimerState>) {
         let key = (spec.plugin.clone(), spec.name.clone());
-        lock(&self.entries).entry(key).or_insert_with(|| Entry { state: saved.unwrap_or_default(), running: None });
+        lock(&self.entries).entry(key).or_insert_with(|| Entry { state: saved.unwrap_or_default(), running: None, saved_at: None });
         let mut specs = lock(&self.specs);
         specs.retain(|s| !(s.plugin == spec.plugin && s.name == spec.name));
         specs.push(spec);
+        drop(specs);
+        self.changed();
     }
 
     /// The plugin unloaded: its timers stop being scheduled.
     pub fn drop_plugin(&self, plugin: &str) {
         lock(&self.specs).retain(|s| s.plugin != plugin);
+        self.changed();
+    }
+
+    fn changed(&self) {
+        *lock(&self.changes) += 1;
+        self.wake.notify_all();
+    }
+
+    /// The change count, read before [`Self::due`] and passed to [`Self::sleep`].
+    pub fn epoch(&self) -> u64 {
+        *lock(&self.changes)
+    }
+
+    /// Sleep until the next timer that is not running comes due, at most
+    /// `max`; wake early when the schedule changed since `epoch`.
+    pub fn sleep(&self, epoch: u64, max: Duration) {
+        let next = {
+            let specs = lock(&self.specs);
+            let entries = lock(&self.entries);
+            specs
+                .iter()
+                .filter_map(|s| entries.get(&(s.plugin.clone(), s.name.clone())).filter(|e| e.running.is_none()).map(|e| next_due(s, &e.state)))
+                .min_by(f64::total_cmp)
+        };
+        let wait = next.map_or(max, |t| Duration::try_from_secs_f64(t - wall_now()).unwrap_or_default().min(max));
+        let changes = lock(&self.changes);
+        let _ = self.wake.wait_timeout_while(changes, wait, |c| *c == epoch);
     }
 
     /// Start every timer that is due and not running.
     pub fn due(&self, wall: f64) -> Vec<Fire> {
-        let specs = lock(&self.specs).clone();
+        let specs = lock(&self.specs);
         let mut entries = lock(&self.entries);
         let mut out = Vec::new();
-        for spec in specs {
+        for spec in specs.iter() {
             let Some(e) = entries.get_mut(&(spec.plugin.clone(), spec.name.clone())) else { continue };
-            if e.running.is_none() && next_due(&spec, &e.state) <= wall {
-                out.push(self.start(&spec, e, wall));
+            if e.running.is_none() && next_due(spec, &e.state) <= wall {
+                out.push(self.start(spec, e, wall));
             }
         }
         out
@@ -149,13 +189,25 @@ impl Timers {
     }
 
     /// Run `run` ended with the fn's (stats, per_workspace) or an error.
-    /// Returns the state to persist; None when `run` is not the one in flight.
+    /// Returns the state to persist: when its stats or error changed, or it
+    /// went unsaved for [`SAVE_EVERY_SECS`]. None when there is nothing to
+    /// save yet, or `run` is not the one in flight.
     pub fn finish(&self, plugin: &str, name: &str, run: u64, out: Result<(Value, Value), String>, wall: f64) -> Option<TimerState> {
+        let saved = self.finish_run(plugin, name, run, out, wall);
+        self.changed();
+        saved
+    }
+
+    fn finish_run(&self, plugin: &str, name: &str, run: u64, out: Result<(Value, Value), String>, wall: f64) -> Option<TimerState> {
         let mut entries = lock(&self.entries);
         let e = entries.get_mut(&(plugin.to_string(), name.to_string()))?;
         if e.running.as_ref().map(|r| r.run) != Some(run) {
             return None;
         }
+        let changed = match &out {
+            Ok((stats, workspaces)) => e.state.stats != *stats || e.state.workspaces != *workspaces || e.state.last_error.is_some(),
+            Err(err) => e.state.last_error.as_ref() != Some(err),
+        };
         e.running = None;
         e.state.last_finished = Some(wall);
         e.state.last_duration_secs = e.state.last_fired.map(|f| (wall - f).max(0.0));
@@ -167,6 +219,10 @@ impl Timers {
             }
             Err(err) => e.state.last_error = Some(err),
         }
+        if !changed && e.saved_at.is_some_and(|t| wall - t < SAVE_EVERY_SECS) {
+            return None;
+        }
+        e.saved_at = Some(wall);
         Some(e.state.clone())
     }
 
@@ -180,9 +236,12 @@ impl Timers {
                 e.running = None;
                 e.state.last_finished = Some(wall);
                 e.state.last_error = Some("the plugin stopped before the run finished".into());
+                e.saved_at = Some(wall);
                 out.push((name.clone(), e.state.clone()));
             }
         }
+        drop(entries);
+        self.changed();
         out
     }
 
@@ -240,6 +299,55 @@ mod tests {
         assert_eq!((state.runs, state.last_duration_secs, state.stats["removed"].as_i64()), (1, Some(3.0), Some(1)));
         assert!(t.due(111.9).is_empty());
         assert_eq!(t.due(112.0).len(), 1, "interval after the last fire");
+    }
+
+    /// A run is saved when its stats or error changed; a quiet run only
+    /// once `SAVE_EVERY_SECS` passed since the last save.
+    #[test]
+    fn quiet_runs_are_saved_in_batches() {
+        let t = Timers::default();
+        t.register(spec(1, 10.0, 0.0, 0.0), None);
+        let run = |at: f64, out: Result<(Value, Value), String>| {
+            let fire = t.due(at).remove(0);
+            t.finish("p", "t", fire.run, out, at + 1.0)
+        };
+        let ok = |n: i64| Ok((json!({ "n": n }), json!({})));
+        assert_eq!(run(0.0, ok(1)).map(|s| s.runs), Some(1), "the first run is saved");
+        assert!(run(10.0, ok(1)).is_none(), "same stats");
+        assert_eq!(run(20.0, ok(2)).map(|s| s.runs), Some(3), "new stats");
+        assert_eq!(run(30.0, Err("boom".into())).and_then(|s| s.last_error), Some("boom".into()));
+        assert!(run(40.0, Err("boom".into())).is_none(), "the same error");
+        assert!(run(50.0, ok(2)).is_some_and(|s| s.last_error.is_none()), "the error cleared");
+        assert!(run(60.0, ok(2)).is_none());
+        let at = 51.0 + SAVE_EVERY_SECS;
+        assert_eq!(run(at, ok(2)).map(|s| s.runs), Some(8), "unsaved for SAVE_EVERY_SECS");
+    }
+
+    /// The scheduler sleeps until the next due time, and a timer added
+    /// meanwhile wakes it.
+    #[test]
+    fn sleep_until_due_or_changed() {
+        let t = std::sync::Arc::new(Timers::default());
+        let now = wall_now();
+        t.register(spec(1, 3600.0, 0.15, now), None);
+        let start = std::time::Instant::now();
+        t.sleep(t.epoch(), Duration::from_secs(5));
+        let slept = start.elapsed();
+        assert!(slept >= Duration::from_millis(100) && slept < Duration::from_secs(2), "{slept:?}");
+        assert_eq!(t.due(wall_now()).len(), 1);
+        // Everything is running or far off: a registration ends the sleep.
+        let epoch = t.epoch();
+        let t2 = t.clone();
+        let adder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut s = spec(1, 1.0, 0.0, wall_now());
+            s.name = "other".into();
+            t2.register(s, None);
+        });
+        let start = std::time::Instant::now();
+        t.sleep(epoch, Duration::from_secs(10));
+        assert!(start.elapsed() < Duration::from_secs(5), "woken by the registration");
+        adder.join().unwrap();
     }
 
     #[test]

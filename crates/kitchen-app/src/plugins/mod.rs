@@ -259,7 +259,7 @@ pub struct PluginHost {
     slots: Mutex<Vec<Slot>>,
     next_generation: AtomicU64,
     pub decor: DecorStore,
-    pub timers: Timers,
+    pub timers: Arc<Timers>,
     pub dashboard: DashboardStore,
     scheduler: AtomicBool,
     registry: Mutex<Arc<Registry>>,
@@ -301,7 +301,7 @@ impl PluginHost {
             slots: Mutex::new(Vec::new()),
             next_generation: AtomicU64::new(1),
             decor: DecorStore::default(),
-            timers: Timers::default(),
+            timers: Arc::default(),
             dashboard: DashboardStore::default(),
             scheduler: AtomicBool::new(false),
             registry: Mutex::new(Arc::new(Registry::default())),
@@ -704,8 +704,8 @@ impl PluginHost {
             .and_then(|s| serde_json::from_str::<TimerState>(&s).ok());
         self.timers.register(spec, saved);
         if !self.scheduler.swap(true, Ordering::AcqRel) {
-            let weak = Arc::downgrade(self);
-            std::thread::Builder::new().name("plugin-timers".into()).spawn(move || schedule(weak)).ok();
+            let (weak, timers) = (Arc::downgrade(self), self.timers.clone());
+            std::thread::Builder::new().name("plugin-timers".into()).spawn(move || schedule(weak, timers)).ok();
         }
         self.repaint();
     }
@@ -731,12 +731,16 @@ impl PluginHost {
         }
     }
 
-    /// A timer run ended: record and persist it.
+    /// A timer run ended: record it, and persist it when that is due (see
+    /// [`Timers::finish`]). Only the dashboard shows timer runs; what a run
+    /// changes elsewhere on screen (decorations, sections) repaints itself.
     fn timer_done(&self, plugin: &str, name: &str, run: u64, out: Result<(serde_json::Value, serde_json::Value), String>) {
         if let Some(state) = self.timers.finish(plugin, name, run, out, timers::wall_now()) {
             self.save_timer(plugin, name, &state);
         }
-        self.repaint();
+        if !self.dashboard.showing().is_empty() {
+            self.repaint();
+        }
     }
 
     /// The thread of load `generation` ended; runs it held end with an error.
@@ -858,14 +862,22 @@ fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     }
 }
 
-/// Start timers as they come due (never one whose last run is still going).
-fn schedule(host: Weak<PluginHost>) {
+/// Longest the scheduler sleeps: the bound on how late a timer fires after
+/// the mac wakes from sleep (the wait's clock stops while it sleeps).
+const SCHEDULE_MAX_SLEEP: Duration = Duration::from_secs(30);
+
+/// Start timers as they come due (never one whose last run is still going),
+/// sleeping until the next one is due.
+fn schedule(host: Weak<PluginHost>, timers: Arc<Timers>) {
     loop {
-        std::thread::sleep(Duration::from_millis(100));
-        let Some(h) = host.upgrade() else { return };
-        for fire in h.timers.due(timers::wall_now()) {
-            h.send_fire(fire);
+        let epoch = timers.epoch();
+        {
+            let Some(h) = host.upgrade() else { return };
+            for fire in timers.due(timers::wall_now()) {
+                h.send_fire(fire);
+            }
         }
+        timers.sleep(epoch, SCHEDULE_MAX_SLEEP);
     }
 }
 
