@@ -185,6 +185,10 @@ pub struct Viewer {
     lister: Sender<ListJob>,
 
     changed: Vec<ChangedFile>,
+    /// Bumped whenever `changed` is replaced.
+    changed_rev: u64,
+    /// `changed` as tree rows, at `changed_rev`.
+    tree_rows: Option<(u64, Arc<Vec<changes_tree::Row>>)>,
     /// Every file (tracked, minus deleted, plus changed), sorted.
     all: Arc<Vec<String>>,
     /// State of `all` (the changes arrive first and are enough for a diff).
@@ -233,6 +237,8 @@ pub struct Viewer {
     /// The folds opened in each file's diff, kept while the viewer lives.
     unfolded: HashMap<String, Unfolded>,
     doc_key: Option<(String, bool, bool, bool)>,
+    /// Bumped whenever `doc` is rebuilt.
+    doc_rev: u64,
     /// The file `doc` shows and whether folded, also after `doc_key` is
     /// reset: a rebuild of the same file keeps the cursor on its line.
     doc_shown: Option<(String, bool)>,
@@ -256,6 +262,7 @@ pub struct Viewer {
     changes_at: std::time::Instant,
     changes_pending: bool,
     overlay: Option<plugin_glue::OverlayCache>,
+    comments: plugin_glue::CommentsCache,
     /// The `gd`/`gr` query in flight (answers for older ones are dropped).
     pending_nav: Option<nav::PendingNav>,
     nav_token: u64,
@@ -315,6 +322,8 @@ impl Viewer {
             rx,
             lister,
             changed: Vec::new(),
+            changed_rev: 0,
+            tree_rows: None,
             all: Arc::default(),
             files_state: None,
             merge_base: None,
@@ -343,6 +352,7 @@ impl Viewer {
             doc: Doc::default(),
             unfolded: HashMap::new(),
             doc_key: None,
+            doc_rev: 0,
             doc_shown: None,
             outline_lines: Vec::new(),
             vim: Vim::default(),
@@ -361,6 +371,7 @@ impl Viewer {
             changes_pending: false,
             stat_pending: false,
             overlay: None,
+            comments: Default::default(),
             pending_nav: None,
             nav_token: 0,
             goto_raw: false,
@@ -468,12 +479,14 @@ impl Viewer {
                         }
                     }
                     self.changed = listing.changed;
+                    self.changed_rev += 1;
                     // A deleted file may be back.
                     self.files.retain(|_, f| f.meta != DELETED);
                 }
                 Msg::Files { listing, .. } => {
                     self.changes_pending = false;
                     self.changed = listing.changed;
+                    self.changed_rev += 1;
                     self.merge_base = Some(listing.base);
                     self.index = Some(listing.index);
                     self.doc_key = None;
@@ -829,6 +842,7 @@ impl Viewer {
                 self.doc_shown = None;
                 self.entries = dir_entries(&self.all, &self.dir);
                 self.doc = folder_doc(&self.entries, &self.changed);
+                self.doc_rev += 1;
                 let sel = self.select_entry.take();
                 let idx = sel.and_then(|s| self.entries.iter().position(|e| e.path == s)).unwrap_or(if self.dir.is_empty() { 0 } else { 1.min(self.entries.len().saturating_sub(1)) });
                 self.vim.set_cursor(idx, 0);
@@ -839,6 +853,7 @@ impl Viewer {
         }
         let Some(path) = self.current.clone() else {
             self.doc = Doc::default();
+            self.doc_rev += 1;
             self.doc_shown = None;
             return;
         };
@@ -873,6 +888,7 @@ impl Viewer {
         });
         self.doc_key = Some(key);
         self.doc_shown = Some((path.clone(), folding));
+        self.doc_rev += 1;
         let Some(file) = self.files.get(&path) else {
             self.doc = Doc::default();
             self.pending_goto = keep;
@@ -1342,8 +1358,13 @@ impl Viewer {
         } else {
             let focused = cx.focused && self.picker.is_none() && !self.list_focus;
             self.offer_follow_up(focused);
-            let comments = self.comment_blocks();
-            let blocks: Vec<code_view::Block> = comments.into_iter().map(|(b, _)| b).chain(self.ask_blocks()).collect();
+            self.refresh_comments();
+            let asks = self.ask_blocks();
+            let blocks: std::borrow::Cow<[code_view::Block]> = if asks.is_empty() {
+                std::borrow::Cow::Borrowed(&self.comments.blocks)
+            } else {
+                std::borrow::Cow::Owned(self.comments.blocks.iter().cloned().chain(asks).collect())
+            };
             let overlay = self.overlay.as_ref().filter(|o| !self.browsing && !self.outline && self.current.as_deref() == Some(o.path.as_str())).map(|o| &o.overlay);
             // GitHub renders the workspace's Markdown in its repo's context.
             let repo = self.engine.find_tab(&self.tab_id).and_then(|(w, _)| w.row.github_slug);
@@ -1579,6 +1600,19 @@ impl Viewer {
         }
     }
 
+    /// `changed` as tree rows, rebuilt only when it changed.
+    fn tree_rows(&mut self) -> Arc<Vec<changes_tree::Row>> {
+        match &self.tree_rows {
+            Some((rev, rows)) if *rev == self.changed_rev => rows.clone(),
+            _ => {
+                let paths: Vec<&str> = self.changed.iter().map(|c| c.path.as_str()).collect();
+                let rows = Arc::new(changes_tree::rows(&paths));
+                self.tree_rows = Some((self.changed_rev, rows.clone()));
+                rows
+            }
+        }
+    }
+
     /// The changed files as a tree (see [`changes_tree`]); the open file is the cursor.
     fn changes_list(&mut self, ui: &mut Ui, keys: bool) {
         if keys {
@@ -1586,8 +1620,7 @@ impl Viewer {
         }
         let cur = self.current_changed();
         let scroll = std::mem::take(&mut self.list_scroll);
-        let paths: Vec<&str> = self.changed.iter().map(|c| c.path.as_str()).collect();
-        let rows = changes_tree::rows(&paths);
+        let rows = self.tree_rows();
         let mut clicked: Option<usize> = None;
         let mut all = false;
         let (reviewers, gates) = self.shown_review();
@@ -1603,7 +1636,7 @@ impl Viewer {
                 });
             });
             ui.add_space(2.0);
-            for r in &rows {
+            for r in rows.iter() {
                 let indent = r.depth as f32 * 12.0;
                 let Some(i) = r.file else {
                     let mut job = egui::text::LayoutJob::default();
@@ -2440,6 +2473,8 @@ end)"#,
         v.command(PanelCmd::Submit);
         h.frame(&mut v);
         h.settle(&mut v, &|v| v.comment_blocks().first().is_some_and(|(b, _)| b.body.ends_with("|c1")));
+        h.frame(&mut v);
+        assert!(v.comments.blocks[0].body.ends_with("|c1"), "the drawn cards follow the plugin's update");
         let _ = std::fs::remove_dir_all(&plugins);
     }
 
@@ -2545,5 +2580,31 @@ end)"#,
         for e in v.entries.iter().take(8) {
             eprintln!("  {}", e.label);
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_bench {
+    use super::*;
+    use crate::test_util::{Harness, TestRepo};
+
+    /// `cargo test --release -p kitchen-app bench_viewer_frame -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_viewer_frame() {
+        let h = Harness::new(TestRepo::new("mkdir -p a/b && seq 1 20000 | awk '{ print \"    let value = compute(\" $1 }' > a/b/big.rs"));
+        h.repo.sh("seq 1 20000 | awk '{ print \"    let \" ($1 % 50 == 0 ? \"other\" : \"value\") \" = compute(\" $1 }' > a/b/big.rs && for i in $(seq 1 300); do mkdir -p d$((i % 30))/e$((i % 7)) && echo $i > d$((i % 30))/e$((i % 7))/f$i.rs; done && git add .");
+        let mut v = h.viewer();
+        v.command(PanelCmd::Open { path: Some("a/b/big.rs".into()), line: Some(10), diff: Some(false) });
+        h.settle(&mut v, &|v| v.current.as_deref() == Some("a/b/big.rs") && v.files.contains_key("a/b/big.rs") && !v.changes_pending && !v.changed.is_empty());
+        for _ in 0..5 {
+            h.frame(&mut v);
+        }
+        let n = 300;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            h.frame(&mut v);
+        }
+        println!("viewer frame ({} doc rows, {} changed files): {:.3} ms", v.doc.lines.len(), v.changed.len(), t.elapsed().as_secs_f64() * 1000.0 / n as f64);
     }
 }

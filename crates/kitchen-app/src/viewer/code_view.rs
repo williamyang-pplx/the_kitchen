@@ -191,6 +191,8 @@ const CARD_COLS: f32 = 100.0;
 struct Geometry<'a> {
     doc: &'a Doc,
     blocks: &'a [Block],
+    /// `card_key` of each of `blocks` at `block_width`.
+    card_keys: &'a [u64],
     /// Doc row the comment field sits under, and the field's height.
     editor: Option<(usize, f32)>,
     font: FontId,
@@ -246,7 +248,12 @@ impl Geometry<'_> {
     /// Height of the blocks drawn after `after`, with their gaps.
     fn blocks_height(&self, ui: &mut Ui, after: Option<usize>, heights: &mut Heights) -> f32 {
         let painter = ui.painter();
-        self.blocks.iter().filter(|b| b.after == after).map(|b| card_height(painter, b, self.block_width, self.font_size, heights) + BLOCK_GAP).sum()
+        self.blocks
+            .iter()
+            .zip(self.card_keys)
+            .filter(|(b, _)| b.after == after)
+            .map(|(b, &key)| card_height(painter, b, key, self.block_width, self.font_size, heights) + BLOCK_GAP)
+            .sum()
     }
 
     /// Row `idx`'s extent. A Markdown row's height comes from `heights`
@@ -293,7 +300,7 @@ impl CodeView<'_> {
 
         let editor_id = id.with("editor");
         let editor_focused = ui.memory(|m| m.has_focus(editor_id));
-        let lines = doc.texts();
+        let lines = &doc.lines[..];
 
         let max_no = doc.lines.iter().filter_map(|l| l.new_no.max(l.old_no)).max().unwrap_or(1);
         let digits = max_no.to_string().len().max(3) as f32;
@@ -304,7 +311,9 @@ impl CodeView<'_> {
         let text_x = rect.left() + gutter + 6.0;
         let visible_cols = (((rect.right() - text_x) / cw).floor() as usize).max(8);
         let block_width = (rect.width() - gutter - 24.0).min(CARD_COLS * cw + CARD_PAD_X * 2.0);
-        let shown: HashSet<u64> = blocks.iter().map(|b| card_key(b, block_width)).collect();
+        // Hashed once a frame: a key covers a card's whole text.
+        let card_keys: Vec<u64> = blocks.iter().map(|b| card_key(b, block_width)).collect();
+        let shown: HashSet<u64> = card_keys.iter().copied().collect();
         state.heights.cards.retain(|k, _| shown.contains(k));
         if editor.is_none() {
             state.editor_h = None;
@@ -313,6 +322,7 @@ impl CodeView<'_> {
         let geo = Geometry {
             doc,
             blocks,
+            card_keys: &card_keys,
             editor: editor.as_deref().map(|ed| (ed.end, editor_h)),
             font: font.clone(),
             font_size,
@@ -362,10 +372,10 @@ impl CodeView<'_> {
                     (state.top, state.offset) = scroll_px(state.top, state.offset, d, height, n, &mut |i| geo.extent(ui, i, &mut state.heights));
                     true
                 };
-                let acts = vim.feed(press, &km, focus, now, &lines, view, &mut intercept);
+                let acts = vim.feed(press, &km, focus, now, lines, view, &mut intercept);
                 apply(acts, vim.line.min(n - 1), (n, height), state, &geo, ui, &mut out);
             }
-            let acts = vim.tick(&km, now, &lines, Viewport { top: state.top, rows: state.rows });
+            let acts = vim.tick(&km, now, lines, Viewport { top: state.top, rows: state.rows });
             apply(acts, vim.line.min(n - 1), (n, height), state, &geo, ui, &mut out);
             if vim.is_pending() {
                 ui.ctx().request_repaint_after(km.timeout);
@@ -439,17 +449,17 @@ impl CodeView<'_> {
         let mut editor_rect: Option<Rect> = None;
 
         let draw_blocks = |after: Option<usize>, y: &mut f32, ui: &mut Ui, heights: &mut Heights| {
-            for b in blocks.iter().filter(|b| b.after == after) {
+            for (b, &key) in blocks.iter().zip(&card_keys).filter(|(b, _)| b.after == after) {
                 if *y > rect.bottom() {
                     break;
                 }
-                let h = card_height(&painter, b, block_width, font_size, heights);
+                let h = card_height(&painter, b, key, block_width, font_size, heights);
                 let at = Pos2::new(rect.left() + gutter + 10.0, *y + BLOCK_TOP);
                 let painted = draw_card(&painter, true, b, at, block_width, font_size, h, &mut geo.links.borrow_mut());
                 // Painting refreshes the height: the card's rendered image
                 // replaces its stand-in text when WebKit has made it.
                 if (painted - h).abs() > 0.5 {
-                    heights.cards.insert(card_key(b, block_width), painted);
+                    heights.cards.insert(key, painted);
                     ui.ctx().request_repaint();
                 }
                 *y += h + BLOCK_GAP;
@@ -794,9 +804,9 @@ fn line_job(line: &super::doc::DocLine, left: usize, font: &FontId, over: Option
     job
 }
 
-/// Card `b`'s height at `width`: measured invisibly once, then from `heights`.
-fn card_height(painter: &egui::Painter, b: &Block, width: f32, font_size: f32, heights: &mut Heights) -> f32 {
-    let key = card_key(b, width);
+/// Card `b`'s height at `width` (`key`: its `card_key`): measured
+/// invisibly once, then from `heights`.
+fn card_height(painter: &egui::Painter, b: &Block, key: u64, width: f32, font_size: f32, heights: &mut Heights) -> f32 {
     if let Some(h) = heights.cards.get(&key) {
         return *h;
     }

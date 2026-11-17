@@ -127,10 +127,6 @@ pub fn expand_tabs(s: &str) -> String {
 }
 
 impl Doc {
-    pub fn texts(&self) -> Vec<String> {
-        self.lines.iter().map(|l| l.text.clone()).collect()
-    }
-
     pub fn plain(text: &str, spans: Option<&[Vec<(Range<usize>, Color32)>]>) -> Doc {
         let lines = text
             .lines()

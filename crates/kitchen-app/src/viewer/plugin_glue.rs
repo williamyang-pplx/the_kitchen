@@ -26,6 +26,16 @@ pub(super) struct OverlayCache {
     diags: Vec<(usize, usize, Severity, String)>,
 }
 
+/// The open file's comment cards and their ids (see `comment_blocks`),
+/// rebuilt only when the decorations, the file or its doc changed.
+#[derive(Default)]
+pub(super) struct CommentsCache {
+    /// (decorations generation, file, `doc_rev`) they were built at.
+    key: Option<(Option<u64>, Option<String>, u64)>,
+    pub blocks: Vec<Block>,
+    pub ids: Vec<Option<String>>,
+}
+
 /// File contents plus a size/mtime stamp, in one round trip.
 pub(super) fn read_with_meta(host: &Host, path: &str) -> anyhow::Result<(String, String)> {
     match host {
@@ -281,6 +291,17 @@ impl Viewer {
             .collect()
     }
 
+    /// Bring `self.comments` up to date.
+    pub(super) fn refresh_comments(&mut self) {
+        let generation = self.engine.plugins().map(|p| p.decor.generation());
+        let key = Some((generation, self.current.clone(), self.doc_rev));
+        if self.comments.key == key {
+            return;
+        }
+        let (blocks, ids) = self.comment_blocks().into_iter().unzip();
+        self.comments = CommentsCache { key, blocks, ids };
+    }
+
     /// The doc row showing line `n` of `side` (a fold row if it is folded: a
     /// comment or answer on a hidden line goes under its fold).
     pub(super) fn row_at(&self, side: Side, n: usize) -> Option<usize> {
@@ -329,7 +350,8 @@ impl Viewer {
             return;
         }
         let (start, end) = self.vim.visual_lines().unwrap_or((self.vim.line, self.vim.line));
-        let thread = self.comment_blocks().into_iter().find(|(b, id)| b.after == Some(end) && id.is_some());
+        self.refresh_comments();
+        let thread = self.comments.blocks.iter().zip(&self.comments.ids).find(|(b, id)| b.after == Some(end) && id.is_some()).map(|(b, id)| (b.clone(), id.clone()));
         let (first, last) = (self.row_line(start, false).1.unwrap_or(start + 1), self.row_line(end, true).1.unwrap_or(end + 1));
         let what = match &thread {
             Some((b, _)) => format!("Reply to {}", b.title),

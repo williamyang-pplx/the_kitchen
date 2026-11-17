@@ -8,6 +8,7 @@
 
 use std::time::Instant;
 
+use super::doc::DocLine;
 use crate::keybindings::{Cmd, FieldCmd, KeyFocus, Keymap, Matcher, Press, Step};
 
 /// What a `[vim]` binding names; the file's action names are these in snake_case.
@@ -219,27 +220,27 @@ impl Vim {
         c
     }
 
-    fn clamp(&mut self, lines: &[String]) {
+    fn clamp(&mut self, lines: &[DocLine]) {
         if lines.is_empty() {
             self.line = 0;
             self.col = 0;
             return;
         }
         self.line = self.line.min(lines.len() - 1);
-        let len = lines[self.line].chars().count();
+        let len = lines[self.line].text.chars().count();
         self.col = self.col.min(len.saturating_sub(1));
     }
 
     /// Identifier under (or right after) the cursor.
-    pub fn word_under_cursor(&self, lines: &[String]) -> Option<String> {
-        word_at(lines.get(self.line)?, self.col).map(|(_, w)| w)
+    pub fn word_under_cursor(&self, lines: &[DocLine]) -> Option<String> {
+        word_at(&lines.get(self.line)?.text, self.col).map(|(_, w)| w)
     }
 
     /// Feed one press: prompt input, f/t's char, a count digit, or a key
     /// sequence; runs what it completes. `intercept` sees each command (with
     /// the cursor line at that moment) first and returns true when the owner
     /// handled it (the tall-row scroll).
-    pub fn feed(&mut self, press: Press, km: &Keymap, focus: KeyFocus, now: Instant, lines: &[String], view: Viewport, intercept: &mut dyn FnMut(VimCmd, Option<usize>, usize) -> bool) -> Vec<VimAction> {
+    pub fn feed(&mut self, press: Press, km: &Keymap, focus: KeyFocus, now: Instant, lines: &[DocLine], view: Viewport, intercept: &mut dyn FnMut(VimCmd, Option<usize>, usize) -> bool) -> Vec<VimAction> {
         self.message = None;
         if let Some((mut q, fwd)) = self.search_input.take() {
             match km.lookup(focus.input(), &press) {
@@ -290,7 +291,7 @@ impl Vim {
     }
 
     /// The timeout passed with a sequence pending (call every frame while `is_pending`).
-    pub fn tick(&mut self, km: &Keymap, now: Instant, lines: &[String], view: Viewport) -> Vec<VimAction> {
+    pub fn tick(&mut self, km: &Keymap, now: Instant, lines: &[DocLine], view: Viewport) -> Vec<VimAction> {
         let Some(step) = self.keys.tick(now, km.timeout) else { return Vec::new() };
         let out = self.settle(step, km, true, lines, view, &mut |_, _, _| false);
         self.clamp(lines);
@@ -298,7 +299,7 @@ impl Vim {
     }
 
     /// What one matcher step does. `timed_out`: a dropped prefix says nothing.
-    fn settle(&mut self, step: Step, km: &Keymap, timed_out: bool, lines: &[String], view: Viewport, intercept: &mut dyn FnMut(VimCmd, Option<usize>, usize) -> bool) -> Vec<VimAction> {
+    fn settle(&mut self, step: Step, km: &Keymap, timed_out: bool, lines: &[DocLine], view: Viewport, intercept: &mut dyn FnMut(VimCmd, Option<usize>, usize) -> bool) -> Vec<VimAction> {
         match step {
             Step::Pending => Vec::new(),
             Step::Fire(Cmd::Vim(c)) => {
@@ -324,7 +325,7 @@ impl Vim {
     }
 
     /// One command, with the count typed before it.
-    fn run(&mut self, cmd: VimCmd, count: Option<usize>, lines: &[String], view: Viewport) -> Vec<VimAction> {
+    fn run(&mut self, cmd: VimCmd, count: Option<usize>, lines: &[DocLine], view: Viewport) -> Vec<VimAction> {
         let n_lines = lines.len();
         if n_lines == 0 {
             return Vec::new();
@@ -343,20 +344,20 @@ impl Vim {
                 self.want_col = self.col;
             }
             VimCmd::Right => {
-                let len = lines[self.line].chars().count();
+                let len = lines[self.line].text.chars().count();
                 self.col = (self.col + n).min(len.saturating_sub(1));
                 self.want_col = self.col;
             }
             VimCmd::LineStart => self.set_col(0),
             VimCmd::FirstNonBlank => {
-                let c = lines[self.line].chars().take_while(|c| c.is_whitespace()).count();
+                let c = lines[self.line].text.chars().take_while(|c| c.is_whitespace()).count();
                 self.set_col(c);
             }
             VimCmd::LineEnd => {
                 if n > 1 {
                     self.line = (self.line + n - 1).min(n_lines - 1);
                 }
-                let len = lines[self.line].chars().count();
+                let len = lines[self.line].text.chars().count();
                 self.col = len.saturating_sub(1);
                 self.want_col = usize::MAX;
             }
@@ -468,25 +469,25 @@ impl Vim {
         }
     }
 
-    fn vertical(&mut self, delta: isize, lines: &[String]) {
+    fn vertical(&mut self, delta: isize, lines: &[DocLine]) {
         let target = (self.line as isize + delta).clamp(0, lines.len() as isize - 1) as usize;
         self.line = target;
-        let len = lines[target].chars().count();
+        let len = lines[target].text.chars().count();
         self.col = self.want_col.min(len.saturating_sub(1));
     }
 
-    fn goto_line(&mut self, line: usize, lines: &[String]) {
+    fn goto_line(&mut self, line: usize, lines: &[DocLine]) {
         self.line = line.min(lines.len() - 1);
-        let first = lines[self.line].chars().take_while(|c| c.is_whitespace()).count();
+        let first = lines[self.line].text.chars().take_while(|c| c.is_whitespace()).count();
         self.set_col(first);
     }
 
     /// Next position (line, col) after the cursor, crossing lines; empty
     /// lines count as a single position.
-    fn step(&self, lines: &[String], pos: (usize, usize), fwd: bool) -> Option<(usize, usize)> {
+    fn step(&self, lines: &[DocLine], pos: (usize, usize), fwd: bool) -> Option<(usize, usize)> {
         let (l, c) = pos;
         if fwd {
-            let len = lines[l].chars().count();
+            let len = lines[l].text.chars().count();
             if c + 1 < len {
                 Some((l, c + 1))
             } else if l + 1 < lines.len() {
@@ -497,18 +498,18 @@ impl Vim {
         } else if c > 0 {
             Some((l, c - 1))
         } else if l > 0 {
-            Some((l - 1, lines[l - 1].chars().count().saturating_sub(1)))
+            Some((l - 1, lines[l - 1].text.chars().count().saturating_sub(1)))
         } else {
             None
         }
     }
 
-    fn char_at(lines: &[String], (l, c): (usize, usize)) -> char {
+    fn char_at(lines: &[DocLine], (l, c): (usize, usize)) -> char {
         // Empty lines (and line ends) behave like whitespace boundaries.
-        lines[l].chars().nth(c).unwrap_or('\n')
+        lines[l].text.chars().nth(c).unwrap_or('\n')
     }
 
-    fn word_forward(&mut self, lines: &[String], big: bool) {
+    fn word_forward(&mut self, lines: &[DocLine], big: bool) {
         let mut pos = (self.line, self.col);
         let start_class = class(Self::char_at(lines, pos), big);
         let start_line = pos.0;
@@ -523,7 +524,7 @@ impl Vim {
         // Skip whitespace (an empty line is a stop).
         loop {
             let ch = Self::char_at(lines, pos);
-            if lines[pos.0].is_empty() && pos.0 != start_line {
+            if lines[pos.0].text.is_empty() && pos.0 != start_line {
                 break;
             }
             if class(ch, big) != Class::Space {
@@ -538,12 +539,12 @@ impl Vim {
         self.set_col(pos.1);
     }
 
-    fn word_back(&mut self, lines: &[String], big: bool) {
+    fn word_back(&mut self, lines: &[DocLine], big: bool) {
         let mut pos = (self.line, self.col);
         // Step back once, then over whitespace.
         let Some(p) = self.step(lines, pos, false) else { return };
         pos = p;
-        while class(Self::char_at(lines, pos), big) == Class::Space && !lines[pos.0].is_empty() {
+        while class(Self::char_at(lines, pos), big) == Class::Space && !lines[pos.0].text.is_empty() {
             match self.step(lines, pos, false) {
                 Some(p) => pos = p,
                 None => break,
@@ -561,7 +562,7 @@ impl Vim {
         self.set_col(pos.1);
     }
 
-    fn word_end(&mut self, lines: &[String], big: bool) {
+    fn word_end(&mut self, lines: &[DocLine], big: bool) {
         let mut pos = (self.line, self.col);
         let Some(p) = self.step(lines, pos, true) else { return };
         pos = p;
@@ -572,7 +573,7 @@ impl Vim {
             }
         }
         let cls = class(Self::char_at(lines, pos), big);
-        let len = lines[pos.0].chars().count();
+        let len = lines[pos.0].text.chars().count();
         while pos.1 + 1 < len && class(Self::char_at(lines, (pos.0, pos.1 + 1)), big) == cls {
             pos.1 += 1;
         }
@@ -580,8 +581,8 @@ impl Vim {
         self.set_col(pos.1);
     }
 
-    fn paragraph(&mut self, lines: &[String], fwd: bool) {
-        let blank = |i: usize| lines[i].trim().is_empty();
+    fn paragraph(&mut self, lines: &[DocLine], fwd: bool) {
+        let blank = |i: usize| lines[i].text.trim().is_empty();
         let mut i = self.line;
         if fwd {
             while i + 1 < lines.len() && blank(i) {
@@ -602,9 +603,9 @@ impl Vim {
         self.set_col(0);
     }
 
-    fn match_bracket(&mut self, lines: &[String]) -> bool {
+    fn match_bracket(&mut self, lines: &[DocLine]) -> bool {
         let pairs = [('(', ')'), ('[', ']'), ('{', '}')];
-        let cs = chars(&lines[self.line]);
+        let cs = chars(&lines[self.line].text);
         // Like vim: use the first bracket at or after the cursor on this line.
         let Some(start) = (self.col..cs.len()).find(|&i| pairs.iter().any(|(o, c)| cs[i] == *o || cs[i] == *c)) else {
             return false;
@@ -635,8 +636,8 @@ impl Vim {
         }
     }
 
-    fn find(&mut self, lines: &[String], kind: FindKind, ch: char, repeat: bool) {
-        let cs = chars(&lines[self.line]);
+    fn find(&mut self, lines: &[DocLine], kind: FindKind, ch: char, repeat: bool) {
+        let cs = chars(&lines[self.line].text);
         let col = self.col;
         let target = match kind {
             FindKind::F => (col + 1..cs.len()).find(|&i| cs[i] == ch),
@@ -655,7 +656,7 @@ impl Vim {
         }
     }
 
-    fn repeat_find(&mut self, lines: &[String], reverse: bool, n: usize) {
+    fn repeat_find(&mut self, lines: &[DocLine], reverse: bool, n: usize) {
         let Some((kind, ch)) = self.last_find else { return };
         let kind = if !reverse {
             kind
@@ -673,7 +674,7 @@ impl Vim {
     }
 
     /// Jump to the next match of the last search (`reverse` flips direction).
-    fn search_next(&mut self, lines: &[String], reverse: bool) -> Vec<VimAction> {
+    fn search_next(&mut self, lines: &[DocLine], reverse: bool) -> Vec<VimAction> {
         let Some((pat, fwd)) = self.search.clone() else { return Vec::new() };
         let fwd = fwd != reverse;
         let smart_case = !pat.chars().any(|c| c.is_uppercase());
@@ -688,7 +689,7 @@ impl Vim {
         let col_of = |line: &str, byte: usize| line[..byte].chars().count();
         for step in 0..=n {
             let idx = if fwd { (self.line + step) % n } else { (self.line + n - step % n) % n };
-            let line = &lines[idx];
+            let line = &lines[idx].text;
             let matches: Vec<usize> = re.find_iter(line).map(|m| col_of(line, m.start())).collect();
             let hit = if fwd {
                 matches.into_iter().find(|&c| step > 0 || c > self.col)
@@ -744,19 +745,19 @@ mod tests {
         assert_eq!(word_at("x = ", 2), None);
     }
 
-    fn buf(s: &str) -> Vec<String> {
-        s.lines().map(String::from).collect()
+    fn buf(s: &str) -> Vec<DocLine> {
+        s.lines().enumerate().map(|(i, l)| DocLine::plain(l.to_string(), i + 1)).collect()
     }
 
-    fn feed_with(v: &mut Vim, km: &Keymap, lines: &[String], p: Press, view: Viewport) -> Vec<VimAction> {
+    fn feed_with(v: &mut Vim, km: &Keymap, lines: &[DocLine], p: Press, view: Viewport) -> Vec<VimAction> {
         v.feed(p, km, KeyFocus::Viewer, Instant::now(), lines, view, &mut |_, _, _| false)
     }
 
-    fn feed(v: &mut Vim, lines: &[String], p: Press, view: Viewport) -> Vec<VimAction> {
+    fn feed(v: &mut Vim, lines: &[DocLine], p: Press, view: Viewport) -> Vec<VimAction> {
         feed_with(v, &Keymap::defaults(), lines, p, view)
     }
 
-    fn keys(v: &mut Vim, lines: &[String], ks: &str) -> Vec<VimAction> {
+    fn keys(v: &mut Vim, lines: &[DocLine], ks: &str) -> Vec<VimAction> {
         let view = Viewport { top: 0, rows: 10 };
         ks.chars().flat_map(|c| feed(v, lines, Press::Char(c), view)).collect()
     }
