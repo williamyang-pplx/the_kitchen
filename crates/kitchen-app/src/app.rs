@@ -88,6 +88,9 @@ pub struct KitchenApp {
     dashboard: HashSet<String>,
     /// The workspace plugins were last told has its dashboard on screen.
     dashboard_shown: Option<String>,
+    /// The tab whose terminal this frame painted; the others' output does
+    /// not repaint (see `hide_unpainted_terminals`).
+    painted_terminal: Option<String>,
 }
 
 #[derive(Clone)]
@@ -127,6 +130,7 @@ impl KitchenApp {
             palette: None,
             dashboard: HashSet::new(),
             dashboard_shown: None,
+            painted_terminal: None,
         }
     }
 
@@ -1051,6 +1055,7 @@ impl KitchenApp {
         let focused = self.focus() == Focus::Terminal && self.dialog.is_none() && self.palette.is_none();
         match self.slots.get_mut(&tab.row.id) {
             Some(TermSlot::Live(session)) => {
+                self.painted_terminal = Some(tab.row.id.clone());
                 // Breathing room between the text and the window chrome.
                 let margin = egui::Margin { left: 12, right: 8, top: 8, bottom: 4 };
                 let (resp, link) = egui::Frame::NONE.inner_margin(margin).show(ui, |ui| TerminalView::new(session).font_size(font_size).focused(focused).show(ui)).inner;
@@ -1149,6 +1154,17 @@ impl KitchenApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             } else {
                 ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
+    }
+
+    /// Mark every terminal but the one painted this frame as hidden, so a
+    /// busy agent in another tab no longer repaints the window.
+    fn hide_unpainted_terminals(&mut self) {
+        let painted = self.painted_terminal.take();
+        for (id, slot) in &self.slots {
+            if let TermSlot::Live(s) = slot {
+                s.set_visible(painted.as_deref() == Some(id.as_str()));
             }
         }
     }
@@ -1257,6 +1273,7 @@ impl eframe::App for KitchenApp {
             }
             (None, _) => widgets::empty_state(ui, "the kitchen", Some("A workspace is a repo on this mac or on a devbox."), &[(keybindings::hint(Place::Global, Action::NewWorkspace), "New workspace")]),
         });
+        self.hide_unpainted_terminals();
         self.palette_ui(&ctx);
         self.shortcuts_ui(&ctx);
         self.save_screenshots(&ctx);

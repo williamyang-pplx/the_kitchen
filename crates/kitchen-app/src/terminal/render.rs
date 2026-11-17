@@ -43,6 +43,7 @@ impl<'a> TerminalView<'a> {
     /// The widget's response, and the link ⌘-clicked this frame.
     pub fn show(self, ui: &mut Ui) -> (Response, Option<Link>) {
         let TerminalView { session, font_size, has_focus } = self;
+        session.set_visible(true);
         let rect = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let font = FontId::monospace(font_size);

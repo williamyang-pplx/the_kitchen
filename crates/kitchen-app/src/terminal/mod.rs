@@ -44,6 +44,9 @@ impl Dimensions for GridSize {
 struct Shared {
     clipboard: Mutex<Option<String>>,
     exited: AtomicBool,
+    /// The session is on screen. Output to a hidden one does not repaint:
+    /// the frame that shows it again draws its current grid.
+    visible: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -55,6 +58,7 @@ pub struct Listener {
 
 impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
+        let mut repaint = self.shared.visible.load(Ordering::Relaxed);
         match event {
             TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange | TermEvent::Bell => {}
             TermEvent::Title(_) | TermEvent::ResetTitle => {}
@@ -64,10 +68,15 @@ impl EventListener for Listener {
                     let _ = s.send(Msg::Input(Cow::Owned(text.into_bytes())));
                 }
             }
-            TermEvent::ChildExit(_) | TermEvent::Exit => self.shared.exited.store(true, Ordering::Relaxed),
+            TermEvent::ChildExit(_) | TermEvent::Exit => {
+                self.shared.exited.store(true, Ordering::Relaxed);
+                repaint = true;
+            }
             TermEvent::ClipboardLoad(..) | TermEvent::ColorRequest(..) | TermEvent::TextAreaSizeRequest(..) => {}
         }
-        self.ctx.request_repaint();
+        if repaint {
+            self.ctx.request_repaint();
+        }
     }
 }
 
@@ -154,6 +163,11 @@ impl TermSession {
         let _ = self.sender.send(Msg::Resize(window_size(size, cell)));
     }
 
+    /// Whether the session is on screen: only then does its output repaint.
+    pub fn set_visible(&self, visible: bool) {
+        self.shared.visible.store(visible, Ordering::Relaxed);
+    }
+
     pub fn exited(&self) -> bool {
         self.shared.exited.load(Ordering::Relaxed)
     }
@@ -191,4 +205,30 @@ impl Drop for TermSession {
 
 fn window_size(size: GridSize, cell: (u16, u16)) -> WindowSize {
     WindowSize { num_lines: size.rows as u16, num_cols: size.cols as u16, cell_width: cell.0, cell_height: cell.1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Output repaints the window only while the session is on screen.
+    #[test]
+    fn hidden_session_output_does_not_repaint() {
+        let ctx = egui::Context::default();
+        let script = "while :; do echo spinner; sleep 0.02; done";
+        let session = TermSession::spawn(&ctx, &["sh".into(), "-c".into(), script.into()], None, HashMap::new()).unwrap();
+        let settle = || {
+            for _ in 0..3 {
+                ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+            }
+        };
+        settle();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!ctx.has_requested_repaint(), "a hidden session's output repainted");
+        session.set_visible(true);
+        settle();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(ctx.has_requested_repaint(), "a visible session's output did not repaint");
+    }
 }
