@@ -102,9 +102,19 @@ impl Viewer {
         FileKey { host: self.host.label().to_string(), worktree: self.worktree.clone(), path: path.to_string() }
     }
 
+    /// Whether the app window is in front. The viewer polls the file and
+    /// git only then: focusing the window repaints, and that frame polls. A
+    /// hidden test kitchen is never focused, and polls as if it were.
+    fn window_focused(&self) -> bool {
+        crate::hidden::active() || self.engine.ctx.input(|i| i.focused)
+    }
+
     /// Re-stat the current file every few seconds; a change re-reads it.
     pub(super) fn check_fresh(&mut self) {
         let Some(path) = self.current.clone().filter(|p| self.files.contains_key(p)) else { return };
+        if !self.window_focused() {
+            return;
+        }
         if self.stat_pending || self.stat_at.elapsed() < STAT_EVERY || self.loading.contains(&path) {
             if !self.stat_pending {
                 self.engine.ctx.request_repaint_after(STAT_EVERY);
@@ -127,6 +137,9 @@ impl Viewer {
     /// Every few seconds re-list the changes quietly (one small round trip;
     /// the file list is only re-sent when they or HEAD moved).
     pub(super) fn check_changes(&mut self) {
+        if !self.window_focused() {
+            return;
+        }
         if self.changes_pending || self.changes_at.elapsed() < STAT_EVERY {
             if !self.changes_pending {
                 self.engine.ctx.request_repaint_after(STAT_EVERY);

@@ -4,6 +4,8 @@
 //! Worktree layout follows the existing convention on both machines:
 //! siblings of the main checkout named `<repo>-<slug>`.
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, bail};
 
 use crate::host::Host;
@@ -27,6 +29,10 @@ const NICE: &str = "nice -n 10 $(command -v ionice >/dev/null && echo ionice -c2
 /// ~1,200 a day, 55k over seven weeks), and every object lookup searches each
 /// pack the index doesn't cover.
 const UNINDEXED_PACKS: usize = 50;
+
+/// How often [`Repo::listing`] scans for untracked files while neither HEAD
+/// nor the index moves.
+pub const UNTRACKED_EVERY: Duration = Duration::from_secs(30);
 
 pub struct Repo<'a> {
     pub host: &'a Host,
@@ -396,23 +402,55 @@ true"#,
     }
 
     /// Everything the file viewer needs but the tracked-file list, in one
-    /// round trip: HEAD, a checksum of the index's file list (~60 ms on agi),
-    /// the merge base of HEAD and `base_ref`, and the files
-    /// changed since it, untracked files included (as added).
-    pub fn listing(&self, dir: &str, base_ref: &str) -> Result<Listing> {
+    /// round trip: HEAD, a checksum of the index's file list, the merge base
+    /// of HEAD and `base_ref`, and the files changed since it, untracked
+    /// files included (as added). `memo` is the previous listing of `dir`:
+    /// the checksum (`ls-files | cksum`, ~60 ms on agi) is reused while the
+    /// index file is unchanged, and untracked files (~0.5 s on agi) are
+    /// scanned only when HEAD or the index moved, or every
+    /// [`UNTRACKED_EVERY`].
+    pub fn listing(&self, dir: &str, base_ref: &str, memo: &mut ListingMemo) -> Result<Listing> {
         let (d, b) = (shell_quote(dir), shell_quote(base_ref));
+        let scan = memo.scanned_at.is_none_or(|t| t.elapsed() >= UNTRACKED_EVERY);
+        let started = Instant::now();
+        let (prev_head, prev_stamp, prev_index) = (shell_quote(&memo.head), shell_quote(&memo.stamp), shell_quote(&memo.index));
+        // The index is stat'ed before it is read: a write in between changes
+        // the stamp, and the next listing reads it again.
         let script = format!(
             "cd {d} || exit 3\n\
-             git rev-parse HEAD | tr -d '\\n'; printf '\\036'\n\
-             git ls-files --cached -z | cksum | tr -d '\\n'; printf '\\036'\n\
+             head=$(git rev-parse HEAD); printf '%s\\036' \"$head\"\n\
+             idx=$(git rev-parse --git-path index)\n\
+             stamp=$({{ stat -c '%s %y %i' -- \"$idx\" || stat -f '%z %Fm %i' -- \"$idx\"; }} 2>/dev/null | tr -d '\\n')\n\
+             printf '%s\\036' \"$stamp\"\n\
+             if [ -n \"$stamp\" ] && [ \"$stamp\" = {prev_stamp} ]; then printf '%s' {prev_index}; \
+             else git ls-files --cached -z | cksum | tr -d '\\n'; fi; printf '\\036'\n\
              base=$(git merge-base HEAD {b} 2>/dev/null) || base={b}\n\
-             printf '%s' \"$base\"; printf '\\036'\n\
-             git diff -M --name-status -z \"$base\"; printf '\\036'\n\
-             git diff -M --numstat -z \"$base\"; printf '\\036'\n\
-             git ls-files --others --exclude-standard -z\n"
+             printf '%s\\036' \"$base\"\n\
+             git diff -M --raw --numstat -z \"$base\"; printf '\\036'\n\
+             if [ {scan} = 1 ] || [ \"$head\" != {prev_head} ] || [ \"$stamp\" != {prev_stamp} ]; then \
+             printf y; git ls-files --others --exclude-standard -z; fi\n",
+            scan = scan as u8,
         );
         let out = self.host.sh_ok(&script, None).with_context(|| format!("list files in {dir}"))?;
-        parse_listing(&out)
+        let parts: Vec<&str> = out.split('\x1e').collect();
+        let [head, stamp, index, base, diff, others] = parts[..] else {
+            bail!("unexpected listing output ({} sections)", parts.len());
+        };
+        if let Some(others) = others.strip_prefix('y') {
+            memo.untracked = others.split('\0').filter(|p| !p.is_empty()).map(String::from).collect();
+            memo.scanned_at = Some(started);
+        }
+        let mut changed = parse_diff_z(diff);
+        for p in &memo.untracked {
+            if !changed.iter().any(|f| f.path == *p) {
+                changed.push(ChangedFile { path: p.clone(), old_path: None, status: 'A', added: 0, removed: 0 });
+            }
+        }
+        changed.sort_by(|a, b| (b.added + b.removed).cmp(&(a.added + a.removed)).then(a.path.cmp(&b.path)));
+        memo.head = head.trim().to_string();
+        memo.stamp = stamp.trim().to_string();
+        memo.index = index.trim().to_string();
+        Ok(Listing { head: memo.head.clone(), index: memo.index.clone(), base: base.trim().to_string(), changed })
     }
 
     /// Every file in the worktree's index, sorted (agi: 136k paths, 10 MB,
@@ -591,63 +629,60 @@ pub struct Listing {
     pub changed: Vec<ChangedFile>,
 }
 
-fn parse_listing(out: &str) -> Result<Listing> {
-    let parts: Vec<&str> = out.split('\x1e').collect();
-    let [head, index, base, status, numstat, others] = parts[..] else {
-        bail!("unexpected listing output ({} sections)", parts.len());
-    };
-    let mut changed = parse_name_status_z(status);
-    let stats = parse_numstat_z(numstat);
-    for f in &mut changed {
-        if let Some((a, r)) = stats.get(&f.path) {
-            f.added = *a;
-            f.removed = *r;
-        }
-    }
-    for p in others.split('\0').filter(|p| !p.is_empty()) {
-        if !changed.iter().any(|f| f.path == p) {
-            changed.push(ChangedFile { path: p.to_string(), old_path: None, status: 'A', added: 0, removed: 0 });
-        }
-    }
-    changed.sort_by(|a, b| (b.added + b.removed).cmp(&(a.added + a.removed)).then(a.path.cmp(&b.path)));
-    Ok(Listing { head: head.trim().to_string(), index: index.trim().to_string(), base: base.trim().to_string(), changed })
+/// What [`Repo::listing`] reuses from the previous listing of a worktree.
+#[derive(Debug, Default)]
+pub struct ListingMemo {
+    head: String,
+    /// The index file's size, mtime and inode ("" when it could not be stat'ed).
+    stamp: String,
+    /// The index's file-list checksum when the index had `stamp`.
+    index: String,
+    untracked: Vec<String>,
+    /// When `untracked` was scanned (None: scan on the next listing).
+    scanned_at: Option<Instant>,
 }
 
-fn parse_name_status_z(s: &str) -> Vec<ChangedFile> {
+impl ListingMemo {
+    /// Scan for untracked files on the next listing, whatever moved.
+    pub fn rescan(&mut self) {
+        self.scanned_at = None;
+    }
+}
+
+/// `git diff --raw --numstat -z` output: the raw records
+/// (`:<modes> <shas> <status>\0<path>\0`, a rename `…R<score>\0<old>\0<new>\0`),
+/// then the numstat ones (`<a>\t<r>\t<path>\0`, a rename `<a>\t<r>\t\0<old>\0<new>\0`;
+/// `-` for a binary file's counts).
+fn parse_diff_z(s: &str) -> Vec<ChangedFile> {
     let mut out = Vec::new();
+    let mut stats = std::collections::HashMap::new();
     let mut it = s.split('\0').filter(|p| !p.is_empty());
-    while let Some(code) = it.next() {
-        let status = code.chars().next().unwrap_or('M');
-        if status == 'R' || status == 'C' {
-            let old = it.next().unwrap_or_default().to_string();
-            let new = it.next().unwrap_or_default().to_string();
-            out.push(ChangedFile { path: new, old_path: Some(old), status: 'R', added: 0, removed: 0 });
-        } else if let Some(p) = it.next() {
-            out.push(ChangedFile { path: p.to_string(), old_path: None, status, added: 0, removed: 0 });
-        }
-    }
-    out
-}
-
-fn parse_numstat_z(s: &str) -> std::collections::HashMap<String, (u32, u32)> {
-    // Format: "<a>\t<r>\t<path>\0" or for renames "<a>\t<r>\t\0<old>\0<new>\0".
-    let mut out = std::collections::HashMap::new();
-    let mut it = s.split('\0');
     while let Some(rec) = it.next() {
-        if rec.is_empty() {
+        if let Some(header) = rec.strip_prefix(':') {
+            let status = header.rsplit(' ').next().and_then(|code| code.chars().next()).unwrap_or('M');
+            if status == 'R' || status == 'C' {
+                let old = it.next().unwrap_or_default().to_string();
+                let new = it.next().unwrap_or_default().to_string();
+                out.push(ChangedFile { path: new, old_path: Some(old), status: 'R', added: 0, removed: 0 });
+            } else if let Some(p) = it.next() {
+                out.push(ChangedFile { path: p.to_string(), old_path: None, status, added: 0, removed: 0 });
+            }
             continue;
         }
         let mut f = rec.splitn(3, '\t');
         let a = f.next().and_then(|x| x.parse().ok()).unwrap_or(0);
         let r = f.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-        let path = f.next().unwrap_or_default();
-        if path.is_empty() {
-            let _old = it.next();
-            if let Some(new) = it.next() {
-                out.insert(new.to_string(), (a, r));
-            }
-        } else {
-            out.insert(path.to_string(), (a, r));
+        let path = match f.next().unwrap_or_default() {
+            "" => it.nth(1), // the new path, after the old one
+            p => Some(p),
+        };
+        if let Some(p) = path {
+            stats.insert(p, (a, r));
+        }
+    }
+    for f in &mut out {
+        if let Some(&(a, r)) = stats.get(f.path.as_str()) {
+            (f.added, f.removed) = (a, r);
         }
     }
     out
@@ -675,15 +710,19 @@ mod tests {
     }
 
     #[test]
-    fn name_status() {
-        let s = "M\0a.rs\0R100\0old.rs\0new.rs\0A\0b.rs\0";
-        let f = parse_name_status_z(s);
-        assert_eq!(f.len(), 3);
-        assert_eq!(f[1].path, "new.rs");
-        assert_eq!(f[1].old_path.as_deref(), Some("old.rs"));
-        let n = parse_numstat_z("1\t2\ta.rs\0003\t4\t\0old.rs\0new.rs\0");
-        assert_eq!(n["a.rs"], (1, 2));
-        assert_eq!(n["new.rs"], (3, 4));
+    fn raw_and_numstat() {
+        let z = "0000000 0000000";
+        let s = format!(
+            ":100644 100644 {z} M\0a.rs\0:100644 100644 {z} R085\0old.rs\0new.rs\0:000000 100644 {z} A\0:b.rs\0\
+             :100644 100644 {z} M\0bin.dat\0\
+             1\t2\ta.rs\0003\t4\t\0old.rs\0new.rs\0005\t0\t:b.rs\0-\t-\tbin.dat\0"
+        );
+        let f = parse_diff_z(&s);
+        let got: Vec<(&str, Option<&str>, char, u32, u32)> = f.iter().map(|c| (c.path.as_str(), c.old_path.as_deref(), c.status, c.added, c.removed)).collect();
+        assert_eq!(
+            got,
+            vec![("a.rs", None, 'M', 1, 2), ("new.rs", Some("old.rs"), 'R', 3, 4), (":b.rs", None, 'A', 5, 0), ("bin.dat", None, 'M', 0, 0)]
+        );
     }
 
     #[test]
@@ -699,16 +738,16 @@ mod tests {
         );
         let dir = root.join("repo").display().to_string();
         let repo = Repo::new(&Host::Local, &dir);
-        let l = repo.listing(&dir, "origin/main").unwrap();
+        let l = repo.listing(&dir, "origin/main", &mut ListingMemo::default()).unwrap();
         assert_eq!(l.head.len(), 40, "{:?}", l.head);
         assert_eq!(l.base, l.head, "nothing committed: the merge base is HEAD");
         assert!(!l.index.is_empty());
         sh(root.join("repo").as_path(), "git add 'aster/sp ace.rs'");
-        let staged = repo.listing(&dir, "origin/main").unwrap();
+        let staged = repo.listing(&dir, "origin/main", &mut ListingMemo::default()).unwrap();
         assert_ne!(staged.index, l.index, "staging a file changes the index checksum");
         assert_eq!(staged.head, l.head);
         sh(root.join("repo").as_path(), "git rm -q --cached 'aster/sp ace.rs'");
-        assert_eq!(repo.listing(&dir, "origin/main").unwrap().index, l.index);
+        assert_eq!(repo.listing(&dir, "origin/main", &mut ListingMemo::default()).unwrap().index, l.index);
         let changed: Vec<&str> = l.changed.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(changed, vec!["aster/src/a.rs", "aster/sp ace.rs"]);
         assert_eq!(l.changed[0].added, 1);
@@ -722,6 +761,37 @@ mod tests {
         ] {
             assert_eq!(repo.find_by_suffix(&dir, suffix).unwrap(), want, "suffix={suffix:?}");
         }
+    }
+
+    /// A re-list with the last one's memo reuses the index checksum while
+    /// the index is unchanged, and finds new untracked files when HEAD or
+    /// the index moved, or when the scan is due.
+    #[test]
+    fn relisting_reuses_the_memo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        sh(root, "git init -q -b main repo && cd repo && git config user.email t@t && git config user.name t && echo one > a.rs && git add . && git commit -qm init");
+        let dir = root.join("repo").display().to_string();
+        let repo = Repo::new(&Host::Local, &dir);
+        let mut memo = ListingMemo::default();
+        let first = repo.listing(&dir, "main", &mut memo).unwrap();
+        assert!(!memo.stamp.is_empty(), "the index was stat'ed");
+        // A checksum the index could not have: reused while the stamp holds.
+        memo.index = "memo".into();
+        assert_eq!(repo.listing(&dir, "main", &mut memo).unwrap().index, "memo");
+        // A new untracked file waits for the next scan...
+        sh(&root.join("repo"), "echo new > b.rs");
+        assert!(repo.listing(&dir, "main", &mut memo).unwrap().changed.is_empty());
+        memo.rescan();
+        let changed: Vec<String> = repo.listing(&dir, "main", &mut memo).unwrap().changed.into_iter().map(|c| c.path).collect();
+        assert_eq!(changed, vec!["b.rs"]);
+        // ...and staging one rewrites the index: a new checksum and a scan.
+        sh(&root.join("repo"), "git add b.rs && echo newer > c.rs");
+        let staged = repo.listing(&dir, "main", &mut memo).unwrap();
+        assert_ne!(staged.index, "memo");
+        assert_ne!(staged.index, first.index, "the file list changed");
+        let changed: Vec<&str> = staged.changed.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(changed, vec!["b.rs", "c.rs"]);
     }
 
     #[test]
@@ -879,7 +949,7 @@ mod tests {
             assert_eq!(wt.branch.as_deref(), Some("william/first"));
             assert_eq!(wt.head, "", "no commit yet");
             std::fs::write(format!("{}/new.txt", wt.path), "x\n").unwrap();
-            let l = repo.listing(&wt.path, &format!("origin/{base}")).unwrap();
+            let l = repo.listing(&wt.path, &format!("origin/{base}"), &mut ListingMemo::default()).unwrap();
             let changed: Vec<&str> = l.changed.iter().map(|c| c.path.as_str()).collect();
             assert_eq!(changed, vec!["new.txt"], "{name}: untracked files show as added");
         }

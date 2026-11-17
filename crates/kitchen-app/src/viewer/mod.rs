@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use egui::{RichText, Ui};
-use kitchen_core::git::{ChangedFile, Listing, Repo};
+use kitchen_core::git::{ChangedFile, Listing, ListingMemo, Repo};
 use kitchen_core::host::Host;
 use kitchen_core::summaries;
 use kitchen_symbols::Symbol;
@@ -90,6 +90,51 @@ struct Entry {
     is_dir: bool,
 }
 
+/// A listing for the viewer's list worker.
+struct ListJob {
+    /// A background refresh (keep the view as is).
+    quiet: bool,
+    /// The index checksum `all` was listed at and the changes: a listing
+    /// that finds both the same lists no files.
+    known: Option<(Option<String>, Vec<ChangedFile>)>,
+}
+
+/// The viewer's listing thread, one per viewer instead of one per poll. It
+/// keeps the last listing's memo, so a quiet re-list stats the index
+/// instead of reading it. It ends when the viewer is dropped.
+fn spawn_lister(host: Host, wt: String, base_ref: String, tx: Sender<Msg>, ctx: egui::Context) -> Sender<ListJob> {
+    let (jobs, rx) = channel::<ListJob>();
+    std::thread::spawn(move || {
+        let repo = Repo::new(&host, &wt);
+        let mut memo = ListingMemo::default();
+        for ListJob { quiet, known } in rx {
+            if !quiet {
+                memo.rescan();
+            }
+            let mut listing = match repo.listing(&wt, &base_ref, &mut memo) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(Msg::FilesFailed(format!("{e:#}")));
+                    ctx.request_repaint();
+                    continue;
+                }
+            };
+            changes_tree::sort(&mut listing.changed);
+            let same = known.is_some_and(|(index, changed)| index.as_deref() == Some(listing.index.as_str()) && changed == listing.changed);
+            let (index, changed) = (listing.index.clone(), listing.changed.clone());
+            let _ = tx.send(Msg::Files { listing, quiet });
+            ctx.request_repaint();
+            if same {
+                continue;
+            }
+            let result = tracked_files(&host, &wt, &index).map(|t| merge_all(&t, &changed)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::Tree { index, result });
+            ctx.request_repaint();
+        }
+    });
+    jobs
+}
+
 enum Msg {
     /// HEAD and the changes; `quiet` = a background refresh (keep the view as is).
     Files { listing: Listing, quiet: bool },
@@ -136,6 +181,8 @@ pub struct Viewer {
     base_ref: String,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
+    /// The listing worker (see `spawn_lister`).
+    lister: Sender<ListJob>,
 
     changed: Vec<ChangedFile>,
     /// Every file (tracked, minus deleted, plus changed), sorted.
@@ -257,6 +304,7 @@ impl Viewer {
     /// A viewer for tab `tab_id` on any worktree of its host (a PR's, `kitchen.view`).
     pub fn at(engine: &Arc<Engine>, host: Host, tab_id: &str, worktree: String, base_ref: String) -> Self {
         let (tx, rx) = channel();
+        let lister = spawn_lister(host.clone(), worktree.clone(), base_ref.clone(), tx.clone(), engine.ctx.clone());
         let mut v = Self {
             engine: engine.clone(),
             tab_id: tab_id.to_string(),
@@ -265,6 +313,7 @@ impl Viewer {
             base_ref,
             tx,
             rx,
+            lister,
             changed: Vec::new(),
             all: Arc::default(),
             files_state: None,
@@ -345,29 +394,7 @@ impl Viewer {
         // A quiet re-list that finds the same index and changes sends no file
         // list, unless the last one failed (then it is what recovers).
         let known = (quiet && matches!(self.files_state, Some(Ok(())))).then(|| (self.all_index.clone(), self.changed.clone()));
-        let (host, wt, base_ref, tx, ctx) =
-            (self.host.clone(), self.worktree.clone(), self.base_ref.clone(), self.tx.clone(), self.engine.ctx.clone());
-        std::thread::spawn(move || {
-            let mut listing = match Repo::new(&host, &wt).listing(&wt, &base_ref) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = tx.send(Msg::FilesFailed(format!("{e:#}")));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
-            changes_tree::sort(&mut listing.changed);
-            let same = known.is_some_and(|(index, changed)| index.as_deref() == Some(listing.index.as_str()) && changed == listing.changed);
-            let (index, changed) = (listing.index.clone(), listing.changed.clone());
-            let _ = tx.send(Msg::Files { listing, quiet });
-            ctx.request_repaint();
-            if same {
-                return;
-            }
-            let result = tracked_files(&host, &wt, &index).map(|t| merge_all(&t, &changed)).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Msg::Tree { index, result });
-            ctx.request_repaint();
-        });
+        let _ = self.lister.send(ListJob { quiet, known });
     }
 
     /// `path` on the host: worktree-relative, or already absolute (outside the worktree).
@@ -2050,8 +2077,10 @@ mod tests {
         assert!(v.changes_pending, "a quiet re-list started");
         settle(&mut v);
         assert!(Arc::ptr_eq(&first, &v.all), "unchanged worktree: no new file list");
-        // An agent adds a file: it shows up as changed and in the folder.
-        h.repo.sh("echo b > aster/b.rs");
+        // An agent adds a file and stages it: it shows up as changed and in
+        // the folder. (Unstaged, it waits for the untracked scan, which runs
+        // every `UNTRACKED_EVERY` while the index and HEAD stay put.)
+        h.repo.sh("echo b > aster/b.rs && git add aster/b.rs");
         v.changes_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
         h.frame(&mut v);
         settle(&mut v);
