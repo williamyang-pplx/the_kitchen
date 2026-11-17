@@ -1,6 +1,6 @@
 //! Painting the terminal grid and routing input to the pty.
 
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
@@ -248,10 +248,8 @@ fn handle_keyboard(ui: &mut Ui, session: &mut TermSession) {
         }
     }
     if wrote {
-        // Typing snaps back to the live screen and clears a stale selection.
-        let mut term = session.term.lock();
-        term.scroll_display(Scroll::Bottom);
-        term.selection = None;
+        // Typing clears a stale selection.
+        session.term.lock().selection = None;
     }
 }
 
@@ -281,7 +279,7 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
         });
         session.wheel.feed(if unit_is_line { lines } else { lines / geom.ch }, now);
     }
-    // Wheel steps the program draws are paced; our own scrollback is not.
+    // Wheel steps go to the program, paced (there is no local scrollback).
     let alt_scroll = mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL);
     let whole = session.wheel.take(now, report || alt_scroll);
     if whole != 0 {
@@ -302,8 +300,6 @@ fn handle_mouse(ui: &mut Ui, resp: &Response, session: &mut TermSession, geom: &
                 (false, false) => b"\x1b[B",
             };
             session.write(seq.repeat(n));
-        } else {
-            session.term.lock().scroll_display(Scroll::Delta(whole));
         }
     }
     if let Some(wait) = session.wheel.due_in(now) {
@@ -502,12 +498,6 @@ fn paint(ui: &mut Ui, rect: Rect, session: &mut TermSession, geom: &Geom, font: 
                 painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, theme::TEXT), egui::StrokeKind::Inside);
             }
         }
-    }
-
-    if offset > 0 {
-        let label = format!("↑ {offset} / {}", term.grid().history_size());
-        let pos = Pos2::new(rect.right() - 8.0, rect.top() + 6.0);
-        painter.text(pos, egui::Align2::RIGHT_TOP, label, FontId::proportional(11.0), Color32::from_gray(160));
     }
 }
 

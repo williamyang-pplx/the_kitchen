@@ -114,7 +114,10 @@ impl TermSession {
         let shared = Arc::new(Shared::default());
         let sender_cell = Arc::new(OnceLock::new());
         let listener = Listener { ctx: ctx.clone(), shared: shared.clone(), sender: sender_cell.clone() };
-        let config = TermConfig { scrolling_history: 10_000, ..Default::default() };
+        // No scrollback of our own: tmux runs on the alternate screen with
+        // `mouse on`, so the wheel scrolls tmux's history and nothing ever
+        // scrolled off into ours.
+        let config = TermConfig { scrolling_history: 0, ..Default::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let sender = event_loop.channel();
