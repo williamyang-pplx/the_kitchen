@@ -99,6 +99,33 @@ const UI_FONT: &str = "/System/Library/Fonts/SFNS.ttf";
 /// below 20pt; pin it here since every label is smaller than that.
 const UI_OPSZ: f32 = 17.0;
 
+/// The font file at `path`, mapped read-only for the life of the app.
+/// Read into memory instead, epaint copies owned font data once more, so
+/// the fonts above (about 70 MB) took twice that in heap. Reads the file
+/// when it cannot be mapped; None when it cannot be read.
+fn font_file(path: &str) -> Option<FontData> {
+    match map_file(path) {
+        Some(bytes) => Some(FontData::from_static(bytes)),
+        None => std::fs::read(path).ok().map(FontData::from_owned),
+    }
+}
+
+/// Map `path` read-only and never unmap it. Only for files that do not
+/// change while mapped: these are on the sealed system volume.
+fn map_file(path: &str) -> Option<&'static [u8]> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).ok()?;
+    let len = usize::try_from(file.metadata().ok()?.len()).ok().filter(|&n| n > 0)?;
+    // SAFETY: a fresh read-only private mapping of `len` bytes of an open
+    // file; the mapping outlives the descriptor and is never unmapped.
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
+    if ptr == libc::MAP_FAILED {
+        return None;
+    }
+    // SAFETY: the mapping is `len` readable bytes and lives until exit.
+    Some(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) })
+}
+
 /// Font for tab and workspace labels: SF Pro, falling back to the
 /// default proportional font when it isn't installed.
 pub fn ui_font(size: f32) -> FontId {
@@ -112,32 +139,33 @@ pub fn ui_font_semibold(size: f32) -> FontId {
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Menlo.ttc") {
-        fonts.font_data.insert("menlo".into(), FontData::from_owned(bytes).into());
+    if let Some(data) = font_file("/System/Library/Fonts/Menlo.ttc") {
+        fonts.font_data.insert("menlo".into(), data.into());
         fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "menlo".into());
     }
     for (name, path) in FALLBACKS {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert((*name).into(), FontData::from_owned(bytes).into());
+        if let Some(data) = font_file(path) {
+            fonts.font_data.insert((*name).into(), data.into());
             for fam in [FontFamily::Monospace, FontFamily::Proportional] {
                 fonts.families.entry(fam).or_default().push((*name).into());
             }
         }
     }
     let proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    let bytes = std::fs::read(UI_FONT).ok();
+    // One file for the three weights (cloning mapped data copies nothing).
+    let ui = font_file(UI_FONT);
     for (family, weight) in [("ui", 400.0), ("ui-semibold", 600.0), ("ui-bold", 700.0)] {
         let mut list = proportional.clone();
-        if let Some(bytes) = &bytes {
+        if let Some(data) = &ui {
             let tweak = FontTweak { coords: VariationCoords::new([(b"opsz", UI_OPSZ), (b"wght", weight)]), ..Default::default() };
-            fonts.font_data.insert(family.into(), FontData::from_owned(bytes.clone()).tweak(tweak).into());
+            fonts.font_data.insert(family.into(), data.clone().tweak(tweak).into());
             list.insert(0, family.into());
         }
         fonts.families.insert(FontFamily::Name(family.into()), list);
     }
     // Proportional text is SF Pro too, so labels sized with `RichText::size`
     // match the ones drawn with `ui_font`.
-    if bytes.is_some() {
+    if ui.is_some() {
         fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "ui".into());
     }
     ctx.set_fonts(fonts);
@@ -199,4 +227,14 @@ fn visuals() -> Visuals {
     fill(&mut w.active, Color32::from_rgb(0x41, 0x48, 0x68), ACCENT, TEXT);
     fill(&mut w.open, SELECTED, BORDER, TEXT);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_mapped_file_holds_its_bytes() {
+        let path = env!("CARGO_MANIFEST_DIR").to_string() + "/Cargo.toml";
+        assert_eq!(super::map_file(&path), Some(&std::fs::read(&path).unwrap()[..]));
+        assert_eq!(super::map_file("/nonexistent/font.ttf"), None);
+    }
 }
