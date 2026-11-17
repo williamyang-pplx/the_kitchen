@@ -1197,18 +1197,18 @@ mod tests {
             (list[0]["label"].as_str().unwrap().into(), list[0]["note"].as_str().unwrap().into())
         };
         let r = |state: &str, name: &str, status: &str, members: &[&str]| (state.to_string(), name.to_string(), status.to_string(), members.iter().map(|m| m.to_string()).collect::<Vec<_>>());
-        let team = serde_json::json!({ "slug": "pplx_aster", "members": { "totalCount": 53,
+        let team = serde_json::json!({ "slug": "pplx_aster", "members": {
             "nodes": [{ "login": "me", "name": "Me" }, { "login": "paul", "name": "Paul F" }, { "login": "max", "name": null }] } });
         let requested = serde_json::json!({ "reviewRequests": { "nodes": [
             { "asCodeOwner": true, "requestedReviewer": team },
             { "asCodeOwner": false, "requestedReviewer": { "login": "dan", "name": "Dan" } },
             { "asCodeOwner": false, "requestedReviewer": {} },
-            { "asCodeOwner": false, "requestedReviewer": { "slug": "solo", "members": { "totalCount": 1, "nodes": [{ "login": "me" }] } } },
+            { "asCodeOwner": false, "requestedReviewer": { "slug": "solo", "members": { "nodes": [{ "login": "me" }] } } },
         ] } });
         assert_eq!(
             reviewers(pr_with("REVIEW_REQUIRED", requested.clone())),
             vec![
-                r("waiting", "pplx_aster", "requested · code owner", &["Paul F", "@max", "+50 more"]),
+                r("waiting", "pplx_aster", "requested · code owner", &["Paul F", "@max"]),
                 r("waiting", "@dan", "requested", &[]),
                 r("waiting", "solo", "requested", &[]),
             ],

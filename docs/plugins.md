@@ -328,7 +328,8 @@ are what the PR waits on, drawn in the viewer's header while its row is on
 screen: each a `state` (`"done"`, `"waiting"` on others, `"needed"` from the
 author), a `label`, and a `note` shown on hover. `reviewers` are listed atop
 the viewer's file list while its row is on screen: each a `state` (as a
-check's), a `name`, a `status` beside it, and `members` (a team's) below. A viewer on screen sends
+check's), a `name`, a `status` beside it, and `members` (a team's: their count beside it, the
+names on hover). A viewer on screen sends
 `views` itself too (when it opens, when it shows a view the menu lacks, and
 every 2 minutes), so the header's checks keep up without ⌘⇧S. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.

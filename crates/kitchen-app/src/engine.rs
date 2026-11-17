@@ -224,7 +224,7 @@ pub struct ViewEntry {
 }
 
 /// One reviewer of a PR, as the file list shows it: the state's icon, the
-/// name, the status, and a team's members (whom to ping) below.
+/// name, the status, and a team's members (whom to ping) on hover.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Reviewer {
     /// Waiting: asked to review; done: approved; needed: asked for changes.
@@ -234,7 +234,7 @@ pub struct Reviewer {
     /// e.g. "requested · code owner", "approved"
     #[serde(default)]
     pub status: String,
-    /// A team's members, e.g. "Paul Fryzel", "@max", "+3 more".
+    /// A team's members, e.g. "Paul Fryzel", "@max".
     #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
     pub members: Vec<String>,
 }

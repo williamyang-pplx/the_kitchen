@@ -9,8 +9,8 @@
 -- row has a check once its code owners approved it, and the viewer's header
 -- shows what the PR on screen waits on: approval, naming the teams and people
 -- asked to review, and an Atlantis apply. Atop the viewer's file list, the
--- PR's reviewers and their state, each team with its members (whom to
--- ping). ⌘⇧D
+-- PR's reviewers and their state, a team's members (whom to ping) on
+-- hover. ⌘⇧D
 -- shows the shown PR's description, rendered as on GitHub, and goes back.
 -- ⌘⇧O opens the shown PR (in the ⌘⇧S menu, the row under the cursor) in
 -- Chrome.
@@ -181,7 +181,7 @@ end
 local FIELDS = "number title url state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions reviewDecision"
   .. " author { login }"
   .. " reviewRequests(first: 20) { nodes { asCodeOwner requestedReviewer {"
-  .. " ... on User { login name } ... on Team { slug members(first: 50) { totalCount nodes { login name } } } } } }"
+  .. " ... on User { login name } ... on Team { slug members(first: 100) { nodes { login name } } } } } }"
   .. " latestOpinionatedReviews(first: 20) { nodes { state author { login } } }"
 
 local function named(s)
@@ -242,16 +242,11 @@ function M.reviewers(p)
     local rv = r.requestedReviewer or {}
     local status = "requested" .. (r.asCodeOwner and " · code owner" or "")
     if rv.slug then
-      local all = rv.members or {}
       local members = {}
-      for _, u in ipairs(all.nodes or {}) do
+      for _, u in ipairs(rv.members and rv.members.nodes or {}) do
         if u.login ~= author then
           table.insert(members, person(u))
         end
-      end
-      local more = (all.totalCount or 0) - #(all.nodes or {})
-      if more > 0 then
-        table.insert(members, "+" .. more .. " more")
       end
       table.insert(out, { state = "waiting", name = rv.slug, status = status, members = members })
     elseif rv.login then

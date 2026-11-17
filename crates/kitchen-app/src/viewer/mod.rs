@@ -1706,7 +1706,8 @@ impl Viewer {
 }
 
 /// "REVIEWERS", then each reviewer of the PR on screen: its state's icon,
-/// name and status, and a team's members wrapped below. Nothing without any.
+/// name and status, and under a team how many members it has, the names on
+/// hover. Nothing without any.
 fn reviewers_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer]) {
     if reviewers.is_empty() {
         return;
@@ -1718,9 +1719,8 @@ fn reviewers_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer]) {
     });
     ui.add_space(2.0);
     let icon = 12.0;
-    let indent = pad + icon + theme::SPACE_XS;
     for r in reviewers {
-        ui.horizontal(|ui| {
+        let row = ui.horizontal(|ui| {
             ui.add_space(pad);
             let (square, _) = ui.allocate_exact_size(egui::vec2(icon, icon), egui::Sense::hover());
             widgets::check_icon(ui.painter(), square, r.state);
@@ -1730,13 +1730,17 @@ fn reviewers_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer]) {
             if !r.status.is_empty() {
                 job.append(&r.status, 6.0, f(theme::ui_font(theme::TEXT_SMALL), widgets::check_color(r.state)));
             }
-            ui.label(job);
+            ui.label(job)
         });
         if !r.members.is_empty() {
-            ui.horizontal(|ui| {
-                ui.add_space(indent);
-                ui.add(egui::Label::new(RichText::new(r.members.join(", ")).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE)).wrap());
+            let n = r.members.len();
+            let count = ui.horizontal(|ui| {
+                ui.add_space(pad + icon + ui.spacing().item_spacing.x);
+                ui.label(RichText::new(format!("{n} member{}", if n == 1 { "" } else { "s" })).font(theme::ui_font(theme::TEXT_SMALL)).color(theme::SUBTLE))
             });
+            let names = r.members.join("\n");
+            row.inner.on_hover_text(&names);
+            count.inner.on_hover_text(&names);
         }
         ui.add_space(2.0);
     }
