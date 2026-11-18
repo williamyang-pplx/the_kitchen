@@ -1,0 +1,16 @@
+#!/bin/sh
+# A stand-in `ssh` for the PR-switch bench: the "devbox" is this mac. It waits
+# FAKE_RTT seconds (a devbox's round trip), then runs the command here with
+# HOME=FAKE_HOME, so the test kitchen's devbox setup (dotfiles, skills,
+# kitchenctl) lands in a temp dir, never in the real home.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|-p|-l|-i|-F|-S|-O) shift 2 ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) shift; [ "${1:-}" = "--" ] && shift; break ;;  # the host alias
+  esac
+done
+sleep "${FAKE_RTT:-0.08}"
+cd "$FAKE_HOME" || exit 255
+HOME=$FAKE_HOME exec /bin/sh -c "$*"
