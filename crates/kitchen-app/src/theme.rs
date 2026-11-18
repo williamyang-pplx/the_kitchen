@@ -39,9 +39,10 @@ pub const CYAN: Color32 = Color32::from_rgb(0x7d, 0xcf, 0xff);
 /// checkout, ⌘I).
 pub const TAB_EDIT: Color32 = Color32::from_rgb(0xc8, 0x5c, 0xff);
 pub const TAB_READ: Color32 = Color32::from_rgb(0xff, 0xe6, 0x3d);
-/// A workspace's pill in the sidebar: on this mac or on a devbox.
-pub const WS_LOCAL: Color32 = Color32::from_rgb(0x73, 0xda, 0xca);
-pub const WS_DEVBOX: Color32 = Color32::from_rgb(0xff, 0x9e, 0x64);
+/// Neon workspace colors in the sidebar (outline and text): on this mac or
+/// on a devbox.
+pub const WS_LOCAL: Color32 = Color32::from_rgb(0xff, 0x8a, 0x1f);
+pub const WS_DEVBOX: Color32 = Color32::from_rgb(0x2e, 0xa8, 0xff);
 /// Bright violet marking the focused pane.
 pub const FOCUS: Color32 = Color32::from_rgb(0xb2, 0x6b, 0xff);
 /// Team names in a PR's reviewers, each team always the same one: Tokyo

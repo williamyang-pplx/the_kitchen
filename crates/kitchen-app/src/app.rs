@@ -673,8 +673,8 @@ impl KitchenApp {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click_and_drag());
                 rects.push(rect);
                 drag = drag_of(&resp, i).or(drag);
-                // A rounded outline around the whole row, in the color of where
-                // the workspace lives; the selected one filled and outlined brighter.
+                // A rounded outline around the whole row, and its text, in the
+                // color of where the workspace lives; the selected one filled and brighter.
                 let card = rect.shrink2(egui::vec2(8.0, 3.0));
                 let round = CornerRadius::same(theme::RADIUS_L);
                 let host_color = if ws.host().is_local() { theme::WS_LOCAL } else { theme::WS_DEVBOX };
@@ -690,7 +690,7 @@ impl KitchenApp {
                 let x = card.left() + 18.0;
                 // Text stays inside the outline.
                 let p = ui.painter().with_clip_rect(card.shrink2(egui::vec2(8.0, 0.0)).intersect(ui.clip_rect()));
-                let name_color = if is_sel { theme::TEXT } else { theme::MUTED };
+                let name_color = if is_sel { host_color } else { host_color.gamma_multiply(0.8) };
                 p.text(egui::pos2(x, rect.top() + 10.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_semibold(13.0), name_color);
                 if ws.tabs.iter().any(|t| t.unread) {
                     p.circle_filled(egui::pos2(card.right() - 20.0, rect.top() + 18.0), 3.5, theme::YELLOW);
@@ -701,7 +701,7 @@ impl KitchenApp {
                     n => format!("{n} tabs"),
                 };
                 let sub = format!("{} · {} · {tabs}", ws.row.host, ws.repo_name());
-                p.text(egui::pos2(x, rect.top() + 28.0), egui::Align2::LEFT_TOP, sub, theme::ui_font(theme::TEXT_SMALL), theme::SUBTLE);
+                p.text(egui::pos2(x, rect.top() + 28.0), egui::Align2::LEFT_TOP, sub, theme::ui_font(theme::TEXT_SMALL), host_color.gamma_multiply(if is_sel { 0.75 } else { 0.6 }));
                 if !status.is_empty() {
                     let status: String = status.chars().take(36).collect();
                     p.text(egui::pos2(x, rect.top() + 44.0), egui::Align2::LEFT_TOP, status, theme::ui_font(theme::TEXT_SMALL), status_color);
