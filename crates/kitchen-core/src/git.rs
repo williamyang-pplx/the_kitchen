@@ -24,11 +24,15 @@ const REFRESH_LOCK: &str = "kitchen-refresh";
 /// Prefix for background git work: below the agents' CPU and I/O priority.
 const NICE: &str = "nice -n 10 $(command -v ionice >/dev/null && echo ionice -c2 -n7)";
 
-/// Packs not in the multi-pack index that make [`Repo::index_packs`] write it
-/// again. A partial clone gets a pack per on-demand download (a devbox's agi:
-/// ~1,200 a day, 55k over seven weeks), and every object lookup searches each
-/// pack the index doesn't cover.
-const UNINDEXED_PACKS: usize = 50;
+/// Small packs (under [`SMALL_PACK_KIB`]) that make [`Repo::compact_packs`]
+/// roll them into one. A partial clone keeps a pack per fetch and on-demand
+/// download (a devbox's agi had 178k, ~660 more an hour), and every git
+/// command pays for each one: 0.35 s each with them indexed, 2.6 s without.
+const SMALL_PACKS: usize = 50;
+
+/// Packs at least this big are kept as they are when the small ones are
+/// rolled up, so a compaction rewrites at most about this much.
+const SMALL_PACK_KIB: u64 = 64 * 1024;
 
 /// How often [`Repo::listing`] scans for untracked files while neither HEAD
 /// nor the index moves.
@@ -165,6 +169,24 @@ impl<'a> Repo<'a> {
     /// PR's ref and base branch at the commits GitHub reports). A fetch from
     /// GitHub is seconds; most switches back to a PR find nothing new.
     pub fn checkout_worktree_unless(&self, path: &str, to: Checkout, fetch: &[String], have: &[(String, String)]) -> Result<(Worktree, bool)> {
+        let out = self.host.sh_ok(&self.checkout_script(path, to, fetch, have), None)?;
+        Ok((parse_report(&out)?, out.lines().any(|l| l == "KT_MOVED=1")))
+    }
+
+    /// [`Self::checkout_worktree_unless`], then [`Self::listing`] of the
+    /// worktree against `base_ref` in the same round trip, so a viewer of it
+    /// starts with its changes. The listing's memo comes back for the
+    /// viewer's next listings.
+    pub fn checkout_and_list(&self, path: &str, to: Checkout, fetch: &[String], have: &[(String, String)], base_ref: &str, mut memo: ListingMemo) -> Result<(Worktree, bool, Listing, ListingMemo)> {
+        let started = Instant::now();
+        let script = format!("{}\nprintf '\\035'\n{}", self.checkout_script(path, to, fetch, have), listing_script(path, base_ref, &memo));
+        let out = self.host.sh_ok(&script, None)?;
+        let (checkout, listing) = out.split_once('\x1d').with_context(|| format!("checkout of {path} printed no listing"))?;
+        let listing = read_listing(listing, &mut memo, started).with_context(|| format!("list files in {path}"))?;
+        Ok((parse_report(checkout)?, checkout.lines().any(|l| l == "KT_MOVED=1"), listing, memo))
+    }
+
+    fn checkout_script(&self, path: &str, to: Checkout, fetch: &[String], have: &[(String, String)]) -> String {
         let r = shell_quote(self.path);
         let fetch = match (fetch.is_empty(), have.is_empty()) {
             (true, _) => String::new(),
@@ -221,7 +243,7 @@ fi"#,
                 rv = shell_quote(&format!("{rev}^{{commit}}")),
             ),
         };
-        let script = format!(
+        format!(
             r#"{fetch}P={p}
 {take_spare}
 {checkout}
@@ -232,9 +254,7 @@ fi"#,
             take_spare = take_spare_snippet(&r, &self.spare_paths()),
             exclude = exclude_snippet("\"$P\""),
             report = report_snippet("\"$P\""),
-        );
-        let out = self.host.sh_ok(&script, None)?;
-        Ok((parse_report(&out)?, out.lines().any(|l| l == "KT_MOVED=1")))
+        )
     }
 
     /// New branch `<prefix><slug>` (first free slug: `slug`, `slug-2`, …)
@@ -361,31 +381,36 @@ exit ${{err:-0}}"#,
 
     /// Once per workspace setup: turn on git's untracked-file cache unless the
     /// repo configures it (big repos: `git status` stops walking every
-    /// directory), run the cheap maintenance tasks, and index the packs (see
-    /// [`Self::index_packs`]), niced. No repacking: partial clones keep their
-    /// promisor packs as they are. Returns what it changed, for the log.
+    /// directory) and run the cheap maintenance tasks, niced. Returns what it
+    /// changed, for the log. (The spare warmer compacts the packs, see
+    /// [`Self::compact_packs`].)
     pub fn tune(&self) -> Result<Vec<String>> {
         let script = format!(
             r#"git config --get core.untrackedCache >/dev/null || {{ git config core.untrackedCache true && echo "set core.untrackedCache=true"; }}
 {NICE} git maintenance run --task=loose-objects --task=commit-graph >/dev/null 2>&1 && echo "maintenance: loose-objects, commit-graph"
-{}
-true"#,
-            index_packs_snippet()
+true"#
         );
         let out = self.host.sh_ok(&script, Some(self.path))?;
         Ok(out.lines().map(String::from).filter(|l| !l.is_empty()).collect())
     }
 
-    /// Write the repo's multi-pack index when at least [`UNINDEXED_PACKS`]
-    /// packs are newer than it (or there is none), so an object lookup
-    /// searches one index, not every pack (a devbox's agi with 55k packs: a
-    /// lookup 395 ms → 89 ms, the viewer's diff listing 896 ms → 155 ms). It
-    /// only indexes the packs, never repacks them; deleting
-    /// `objects/pack/multi-pack-index` undoes it. Niced; seconds on a big
-    /// repo. Whether it was written.
-    pub fn index_packs(&self) -> Result<bool> {
-        let out = self.host.sh_ok(index_packs_snippet(), Some(self.path))?;
-        Ok(out.lines().any(|l| l.starts_with("multi-pack-index written")))
+    /// With [`SMALL_PACKS`] or more packs under [`SMALL_PACK_KIB`], roll them
+    /// up (`git repack -A -d`: one promisor pack, and one for objects of our
+    /// own; the big packs kept as they are) and
+    /// index every pack in a multi-pack index. Devboxes turn git's own
+    /// maintenance off, so without this a partial clone's packs pile up and
+    /// every git command slows down (a devbox's agi at 178k packs: 0.35 s for
+    /// a lookup). Promisor packs stay promisor packs, and a fetch's pack
+    /// still being written has a `.keep` and is left alone. One compaction
+    /// per repo at a time (workspaces share repos); niced. What it did, for
+    /// the log (None: nothing to do).
+    pub fn compact_packs(&self) -> Result<Option<String>> {
+        self.compact_packs_under(SMALL_PACK_KIB)
+    }
+
+    fn compact_packs_under(&self, small_kib: u64) -> Result<Option<String>> {
+        let out = self.host.sh_ok(&compact_packs_snippet(small_kib), Some(self.path))?;
+        Ok(out.lines().find(|l| l.starts_with("packs compacted")).map(String::from))
     }
 
     pub fn remove_worktree(&self, path: &str, force: bool) -> Result<()> {
@@ -404,53 +429,16 @@ true"#,
     /// Everything the file viewer needs but the tracked-file list, in one
     /// round trip: HEAD, a checksum of the index's file list, the merge base
     /// of HEAD and `base_ref`, and the files changed since it, untracked
-    /// files included (as added). `memo` is the previous listing of `dir`:
+    /// files included as added (unless `memo` is
+    /// [`ListingMemo::tracked_only`]). `memo` is the previous listing of `dir`:
     /// the checksum (`ls-files | cksum`, ~60 ms on agi) is reused while the
     /// index file is unchanged, and untracked files (~0.5 s on agi) are
     /// scanned only when HEAD or the index moved, or every
     /// [`UNTRACKED_EVERY`].
     pub fn listing(&self, dir: &str, base_ref: &str, memo: &mut ListingMemo) -> Result<Listing> {
-        let (d, b) = (shell_quote(dir), shell_quote(base_ref));
-        let scan = memo.scanned_at.is_none_or(|t| t.elapsed() >= UNTRACKED_EVERY);
         let started = Instant::now();
-        let (prev_head, prev_stamp, prev_index) = (shell_quote(&memo.head), shell_quote(&memo.stamp), shell_quote(&memo.index));
-        // The index is stat'ed before it is read: a write in between changes
-        // the stamp, and the next listing reads it again.
-        let script = format!(
-            "cd {d} || exit 3\n\
-             head=$(git rev-parse HEAD); printf '%s\\036' \"$head\"\n\
-             idx=$(git rev-parse --git-path index)\n\
-             stamp=$({{ stat -c '%s %y %i' -- \"$idx\" || stat -f '%z %Fm %i' -- \"$idx\"; }} 2>/dev/null | tr -d '\\n')\n\
-             printf '%s\\036' \"$stamp\"\n\
-             if [ -n \"$stamp\" ] && [ \"$stamp\" = {prev_stamp} ]; then printf '%s' {prev_index}; \
-             else git ls-files --cached -z | cksum | tr -d '\\n'; fi; printf '\\036'\n\
-             base=$(git merge-base HEAD {b} 2>/dev/null) || base={b}\n\
-             printf '%s\\036' \"$base\"\n\
-             git diff -M --raw --numstat -z \"$base\"; printf '\\036'\n\
-             if [ {scan} = 1 ] || [ \"$head\" != {prev_head} ] || [ \"$stamp\" != {prev_stamp} ]; then \
-             printf y; git ls-files --others --exclude-standard -z; fi\n",
-            scan = scan as u8,
-        );
-        let out = self.host.sh_ok(&script, None).with_context(|| format!("list files in {dir}"))?;
-        let parts: Vec<&str> = out.split('\x1e').collect();
-        let [head, stamp, index, base, diff, others] = parts[..] else {
-            bail!("unexpected listing output ({} sections)", parts.len());
-        };
-        if let Some(others) = others.strip_prefix('y') {
-            memo.untracked = others.split('\0').filter(|p| !p.is_empty()).map(String::from).collect();
-            memo.scanned_at = Some(started);
-        }
-        let mut changed = parse_diff_z(diff);
-        for p in &memo.untracked {
-            if !changed.iter().any(|f| f.path == *p) {
-                changed.push(ChangedFile { path: p.clone(), old_path: None, status: 'A', added: 0, removed: 0 });
-            }
-        }
-        changed.sort_by(|a, b| (b.added + b.removed).cmp(&(a.added + a.removed)).then(a.path.cmp(&b.path)));
-        memo.head = head.trim().to_string();
-        memo.stamp = stamp.trim().to_string();
-        memo.index = index.trim().to_string();
-        Ok(Listing { head: memo.head.clone(), index: memo.index.clone(), base: base.trim().to_string(), changed })
+        let out = self.host.sh_ok(&listing_script(dir, base_ref, memo), None).with_context(|| format!("list files in {dir}"))?;
+        read_listing(&out, memo, started)
     }
 
     /// Every file in the worktree's index, sorted (agi: 136k paths, 10 MB,
@@ -493,6 +481,54 @@ true"#,
         let out = self.host.run(&["git", "-C", dir, "show", &spec], None)?;
         Ok(if out.ok() { Some(out.stdout) } else { None })
     }
+}
+
+/// The script of [`Repo::listing`]: sections split by `\x1e`.
+fn listing_script(dir: &str, base_ref: &str, memo: &ListingMemo) -> String {
+    let (d, b) = (shell_quote(dir), shell_quote(base_ref));
+    let scan = !memo.tracked_only && memo.scanned_at.is_none_or(|t| t.elapsed() >= UNTRACKED_EVERY);
+    let moved = if memo.tracked_only { "false".to_string() } else { format!("[ \"$head\" != {} ] || [ \"$stamp\" != {} ]", shell_quote(&memo.head), shell_quote(&memo.stamp)) };
+    let (prev_stamp, prev_index) = (shell_quote(&memo.stamp), shell_quote(&memo.index));
+    // The index is stat'ed before it is read: a write in between changes
+    // the stamp, and the next listing reads it again.
+    format!(
+        "cd {d} || exit 3\n\
+         head=$(git rev-parse HEAD); printf '%s\\036' \"$head\"\n\
+         idx=$(git rev-parse --git-path index)\n\
+         stamp=$({{ stat -c '%s %y %i' -- \"$idx\" || stat -f '%z %Fm %i' -- \"$idx\"; }} 2>/dev/null | tr -d '\\n')\n\
+         printf '%s\\036' \"$stamp\"\n\
+         if [ -n \"$stamp\" ] && [ \"$stamp\" = {prev_stamp} ]; then printf '%s' {prev_index}; \
+         else git ls-files --cached -z | cksum | tr -d '\\n'; fi; printf '\\036'\n\
+         base=$(git merge-base HEAD {b} 2>/dev/null) || base={b}\n\
+         printf '%s\\036' \"$base\"\n\
+         git diff -M --raw --numstat -z \"$base\"; printf '\\036'\n\
+         if [ {scan} = 1 ] || {moved}; then \
+         printf y; git ls-files --others --exclude-standard -z; fi\n",
+        scan = scan as u8,
+    )
+}
+
+/// [`Repo::listing`] from its script's output, updating `memo`.
+fn read_listing(out: &str, memo: &mut ListingMemo, started: Instant) -> Result<Listing> {
+    let parts: Vec<&str> = out.split('\x1e').collect();
+    let [head, stamp, index, base, diff, others] = parts[..] else {
+        bail!("unexpected listing output ({} sections)", parts.len());
+    };
+    if let Some(others) = others.strip_prefix('y') {
+        memo.untracked = others.split('\0').filter(|p| !p.is_empty()).map(String::from).collect();
+        memo.scanned_at = Some(started);
+    }
+    let mut changed = parse_diff_z(diff);
+    for p in &memo.untracked {
+        if !changed.iter().any(|f| f.path == *p) {
+            changed.push(ChangedFile { path: p.clone(), old_path: None, status: 'A', added: 0, removed: 0 });
+        }
+    }
+    changed.sort_by(|a, b| (b.added + b.removed).cmp(&(a.added + a.removed)).then(a.path.cmp(&b.path)));
+    memo.head = head.trim().to_string();
+    memo.stamp = stamp.trim().to_string();
+    memo.index = index.trim().to_string();
+    Ok(Listing { head: memo.head.clone(), index: memo.index.clone(), base: base.trim().to_string(), changed })
 }
 
 /// `+refs/heads/<b>:refs/remotes/origin/<b>`.
@@ -543,17 +579,27 @@ fn gunzip_if_gzipped(bytes: Vec<u8>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Shell (run in the repo) for [`Repo::index_packs`]; prints
-/// "multi-pack-index written (N packs)" when it wrote it.
-fn index_packs_snippet() -> &'static str {
-    static SNIPPET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SNIPPET.get_or_init(|| {
-        format!(
-            r#"d=$(git rev-parse --git-path objects/pack) && m="$d/multi-pack-index"
-if [ -f "$m" ]; then n=$(find "$d" -maxdepth 1 -name '*.pack' -newer "$m" | wc -l); else n=$(find "$d" -maxdepth 1 -name '*.pack' | wc -l); fi
-if [ "$n" -ge {UNINDEXED_PACKS} ]; then {NICE} git multi-pack-index write >/dev/null 2>&1 && echo "multi-pack-index written ($(find "$d" -maxdepth 1 -name '*.pack' | wc -l | tr -d ' ') packs)"; fi"#
-        )
-    })
+/// Shell (run in the repo) for [`Repo::compact_packs`]; prints "packs
+/// compacted: …" when it compacted.
+fn compact_packs_snippet(small_kib: u64) -> String {
+    format!(
+            r#"d=$(git rev-parse --path-format=absolute --git-path objects/pack) || exit 3
+n=$(find "$d" -maxdepth 1 -name '*.pack' -size -{small_kib}k | wc -l | tr -d ' ')
+[ "$n" -ge {SMALL_PACKS} ] || exit 0
+# A lock a killed compaction left is stale after a day.
+l="$d/kitchen-compact.lock"
+find "$l" -maxdepth 0 -mmin +1440 -exec rmdir {{}} \; 2>/dev/null
+mkdir "$l" 2>/dev/null || exit 0
+keep=$(find "$d" -maxdepth 1 -name '*.pack' ! -size -{small_kib}k | sed 's|.*/|--keep-pack=|')
+# git keeps a descriptor per pack it reads, up to the limit: with a high
+# one, a repack of 100k+ packs holds that many (on a mac, a few such gits
+# filled the system's file table). Below 10240, git closes packs as it goes.
+f=$(ulimit -n); {{ [ "$f" = unlimited ] || [ "$f" -gt 10240 ]; }} && ulimit -n 10240
+{NICE} git repack -A -d -q --write-midx --threads=2 $keep >/dev/null 2>&1; rc=$?
+rmdir "$l"
+[ $rc = 0 ] || exit $rc
+echo "packs compacted: $n small packs rolled up, $(find "$d" -maxdepth 1 -name '*.pack' | wc -l | tr -d ' ') packs now""#
+    )
 }
 
 /// Shell lines printing `KT_PATH=`/`KT_HEAD=`/`KT_BRANCH=` for [`parse_report`].
@@ -630,7 +676,7 @@ pub struct Listing {
 }
 
 /// What [`Repo::listing`] reuses from the previous listing of a worktree.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ListingMemo {
     head: String,
     /// The index file's size, mtime and inode ("" when it could not be stat'ed).
@@ -640,9 +686,18 @@ pub struct ListingMemo {
     untracked: Vec<String>,
     /// When `untracked` was scanned (None: scan on the next listing).
     scanned_at: Option<Instant>,
+    /// Never scan for untracked files (see [`ListingMemo::tracked_only`]).
+    tracked_only: bool,
 }
 
 impl ListingMemo {
+    /// Listings that never scan for untracked files: a PR's checkout has
+    /// none worth showing, and on agi the scan is most of a listing (~0.8 s
+    /// on a devbox).
+    pub fn tracked_only() -> Self {
+        Self { tracked_only: true, ..Self::default() }
+    }
+
     /// Scan for untracked files on the next listing, whatever moved.
     pub fn rescan(&mut self) {
         self.scanned_at = None;
@@ -1000,32 +1055,74 @@ mod tests {
         let e = repo.checkout_worktree_unless(&det, Checkout::Detached("refs/kitchen/pr/7"), &broken, &stale).unwrap_err();
         assert!(e.to_string().contains("exit 11"), "{e:#}");
         assert_eq!(rev("refs/kitchen/pr/7"), origin("refs/pull/7/head"));
+
+        // Checked out and listed in one trip, as a separate listing lists it;
+        // a tracked-only listing leaves an untracked file out.
+        std::fs::write(format!("{det}/stray.txt"), "x").unwrap();
+        let (_, moved, listing, mut memo) = repo.checkout_and_list(&det, Checkout::Detached("refs/kitchen/pr/7"), &broken, &have, "origin/main", ListingMemo::tracked_only()).unwrap();
+        assert!(!moved);
+        let paths: Vec<&str> = listing.changed.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["p.txt"]);
+        assert_eq!(listing, repo.listing(&det, "origin/main", &mut memo).unwrap(), "its memo lists the same");
+        let all = repo.listing(&det, "origin/main", &mut ListingMemo::default()).unwrap();
+        assert!(all.changed.iter().any(|c| c.path == "stray.txt"), "a default memo lists untracked files");
         let _ = std::fs::remove_dir_all(&det);
     }
 
-    /// Packs get a multi-pack index once enough of them aren't in one.
+    /// A partial clone's small packs are rolled up once there are enough.
     #[test]
-    fn index_packs_writes_the_multi_pack_index() {
+    fn compact_packs_rolls_up_a_partial_clones_downloads() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        sh(root, "git init -q -b main r && cd r && git config user.email t@t && git config user.name t");
+        let n = SMALL_PACKS + 2;
+        // Git's own maintenance off, as on a devbox.
+        sh(
+            root,
+            &format!(
+                "git init -q -b main origin && cd origin && git config uploadpack.allowFilter true \
+                  && for i in $(seq {n}); do head -c 3000 /dev/urandom | base64 > f$i; done && git add . && git -c user.email=t@t -c user.name=t commit -qm init \
+                 && cd .. && git clone -q --filter=blob:none --no-checkout \"file://$PWD/origin\" r \
+                 && git -C r config gc.auto 0 && git -C r config maintenance.auto false"
+            ),
+        );
         let r = root.join("r");
         let host = Host::Local;
         let path = r.display().to_string();
         let repo = Repo::new(&host, &path);
-        let midx = r.join(".git/objects/pack/multi-pack-index");
-        // A pack per commit, like a partial clone's downloads.
-        let packs = |n: usize, from: usize| {
-            for i in from..from + n {
-                sh(&r, &format!("echo {i} > f && git add f && git commit -qm {i} && git repack -q"));
-            }
-        };
-        packs(UNINDEXED_PACKS - 1, 0);
-        assert!(!repo.index_packs().unwrap() && !midx.exists(), "few packs: no index");
-        packs(1, UNINDEXED_PACKS);
-        assert!(repo.index_packs().unwrap() && midx.exists());
-        assert!(!repo.index_packs().unwrap(), "every pack is indexed");
-        assert!(repo.tune().unwrap().iter().all(|l| !l.starts_with("multi-pack-index")), "tune indexes only when needed");
+        let pack_dir = r.join(".git/objects/pack");
+        let count = |ext: &str| std::fs::read_dir(&pack_dir).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == ext)).count();
+        // One download, one pack: too few to compact.
+        sh(&r, "git show HEAD:f1 >/dev/null");
+        assert_eq!(repo.compact_packs().unwrap(), None, "few packs: left as they are");
+        sh(&r, &format!("for i in $(seq 2 {n}); do git show HEAD:f$i >/dev/null; done"));
+        // A commit of our own: a loose object, in no promisor pack.
+        sh(&r, "git -c user.email=t@t -c user.name=t commit -q --allow-empty -m mine");
+        assert!(count("pack") > SMALL_PACKS, "{} packs", count("pack"));
+        let done = repo.compact_packs().unwrap().expect("compacted");
+        assert!(done.starts_with("packs compacted"), "{done}");
+        // The downloads in one promisor pack, our commit in a pack of its own.
+        assert_eq!((count("pack"), count("promisor")), (2, 1), "{done}");
+        assert!(pack_dir.join("multi-pack-index").exists());
+        assert!(!pack_dir.join("kitchen-compact.lock").exists());
+        assert_eq!(repo.compact_packs().unwrap(), None);
+        sh(&r, &format!("git cat-file -e HEAD~1:f{n} && git log -1 --format=%s | grep -qx mine && git fsck --connectivity-only 2>/dev/null"));
+        // Still a partial clone: a new file on origin is downloaded on demand.
+        sh(root, "cd origin && echo new > g && git add g && git -c user.email=t@t -c user.name=t commit -qm g");
+        sh(&r, "git fetch -q origin && git show origin/main:g | grep -qx new");
+        // Another compaction holds the repo: this one waits for its turn.
+        sh(root, &format!("cd origin && for i in $(seq {n}); do echo $i > h$i; done && git add . && git -c user.email=t@t -c user.name=t commit -qm h"));
+        sh(&r, &format!("git fetch -q origin && for i in $(seq {n}); do git cat-file -p origin/main:h$i >/dev/null; done"));
+        std::fs::create_dir(pack_dir.join("kitchen-compact.lock")).unwrap();
+        assert_eq!(repo.compact_packs().unwrap(), None, "locked: no second compaction");
+        std::fs::remove_dir(pack_dir.join("kitchen-compact.lock")).unwrap();
+        // Big packs are kept as they are: here, with 8 KiB as "big", the
+        // packs compacted so far (the f files), while the new downloads (the
+        // h files, a line each) roll up.
+        let big: Vec<_> = std::fs::read_dir(&pack_dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "pack") && p.metadata().unwrap().len() >= 8 * 1024).collect();
+        assert!(!big.is_empty());
+        assert!(repo.compact_packs_under(8).unwrap().is_some());
+        assert!(big.iter().all(|p| p.exists()), "kept: {big:?}");
+        sh(&r, &format!("git cat-file -p origin/main:h{n} | grep -qx {n} && git cat-file -e HEAD~1:f1 && git fsck --connectivity-only 2>/dev/null"));
     }
 
     #[test]

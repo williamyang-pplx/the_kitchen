@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use kitchen_core::db::{Db, PlanComment, TabRow, WorkspaceRow};
-use kitchen_core::git::{Checkout, Repo, branch_refspec};
+use kitchen_core::git::{Checkout, Listing, ListingMemo, Repo, branch_refspec};
 use kitchen_core::host::Host;
 use kitchen_core::tmux::{self, Tmux};
 use kitchen_core::util::{new_id, shell_quote, slugify};
@@ -107,9 +107,15 @@ pub enum UiCommand {
     /// The tab's viewer shows plugin renderings (`kitchen.render.show`; `None` toggles).
     Render { tab_id: String, on: Option<bool> },
     ReloadPlan { tab_id: String },
-    /// Show `view` in the tab's viewer (a cached viewer of it, or a new one),
-    /// unless the UI has since shown a view with a later `seq`.
-    ShowViewer { tab_id: String, view: Shown, seq: u64 },
+    /// Show `view` in the tab's viewer (a cached viewer of it, or a new one,
+    /// starting from `listing` when the checkout listed it), unless the UI
+    /// has since shown a view with a later `seq`.
+    ShowViewer { tab_id: String, view: Shown, seq: u64, listing: Option<Box<(Listing, ListingMemo)>> },
+    /// `view` is checked out (and listed): load a viewer of it off screen, so
+    /// picking it in the PR menu shows it at once.
+    WarmViewer { tab_id: String, view: Shown, listing: Option<Box<(Listing, ListingMemo)>> },
+    /// Warming `view` failed (already logged).
+    WarmFailed { tab_id: String, view: Shown },
     /// `worktree` moved under the tab's viewers of it (shown or cached):
     /// rebuild them at the same file and line.
     ReloadViewer { tab_id: String, worktree: String },
@@ -681,13 +687,13 @@ impl Engine {
                 let _guard = OpeningGuard { engine: &me, key };
                 while let Some(ws) = me.workspace(&ws_id) {
                     me.refill_spare(&ws_id, true);
-                    // A partial clone gains a pack per on-demand download;
-                    // keep them indexed, or every object lookup slows down.
+                    // A partial clone gains a pack per fetch and on-demand
+                    // download; roll them up, or every git command slows down.
                     let host = ws.host();
-                    match Repo::new(&host, &ws.row.repo_path).index_packs() {
-                        Ok(true) => log::info!("{}: multi-pack-index written", ws.row.name),
-                        Ok(false) => {}
-                        Err(e) => log::warn!("{}: multi-pack-index: {e:#}", ws.row.name),
+                    match Repo::new(&host, &ws.row.repo_path).compact_packs() {
+                        Ok(Some(done)) => log::info!("{}: {done}", ws.row.name),
+                        Ok(None) => {}
+                        Err(e) => log::warn!("{}: compacting packs: {e:#}", ws.row.name),
                     }
                     std::thread::sleep(SPARE_REFRESH);
                 }
@@ -1060,13 +1066,31 @@ impl Engine {
         let (ws, _) = self.find_tab(&v.tab).context("no such tab")?;
         let Some(rev) = v.at.rev.clone() else {
             let shown = self.shown_by(&v).context("no such tab")?;
-            self.push_ui(UiCommand::ShowViewer { tab_id: v.tab, view: shown, seq });
+            self.push_ui(UiCommand::ShowViewer { tab_id: v.tab, view: shown, seq, listing: None });
             return Ok(());
         };
         let shown = self.shown_by(&v).context("kitchen.view needs a name with a rev")?;
-        self.checkout_view(&ws, &shown.0, &rev, &v.at)?;
-        self.push_ui(UiCommand::ShowViewer { tab_id: v.tab, view: shown, seq });
+        let (_, listing) = self.checkout_view(&ws, &shown, &rev, &v.at)?;
+        self.push_ui(UiCommand::ShowViewer { tab_id: v.tab, view: shown, seq, listing: Some(Box::new(listing)) });
         Ok(())
+    }
+
+    /// Check out the PR menu row `v` and list it, then have the UI load its
+    /// viewer off screen (see [`UiCommand::WarmViewer`]). Blocking.
+    pub fn warm_view(self: &Arc<Self>, v: View) {
+        let Some(shown) = self.shown_by(&v) else { return };
+        let listed = match (v.at.rev.clone(), self.find_tab(&v.tab)) {
+            (Some(rev), Some((ws, _))) => self.checkout_view(&ws, &shown, &rev, &v.at).map(|(_, l)| Some(Box::new(l))),
+            (None, _) => Ok(None),
+            (_, None) => return,
+        };
+        match listed {
+            Ok(listing) => self.push_ui(UiCommand::WarmViewer { tab_id: v.tab, view: shown, listing }),
+            Err(e) => {
+                log::warn!("warming {}: {e:#}", shown.0);
+                self.push_ui(UiCommand::WarmFailed { tab_id: v.tab, view: shown });
+            }
+        }
     }
 
     /// A view the UI already shows from its cache: fetch and check out its rev
@@ -1074,16 +1098,19 @@ impl Engine {
     /// (A failure is toasted by `spawn`; the cached view stays up.)
     pub fn refresh_view(self: &Arc<Self>, v: View) -> Result<()> {
         let (Some(rev), Some((ws, _))) = (v.at.rev.clone(), self.find_tab(&v.tab)) else { return Ok(()) };
-        let Some((worktree, _)) = self.shown_by(&v) else { return Ok(()) };
-        if self.checkout_view(&ws, &worktree, &rev, &v.at)? {
-            self.push_ui(UiCommand::ReloadViewer { tab_id: v.tab, worktree });
+        let Some(shown) = self.shown_by(&v) else { return Ok(()) };
+        if self.checkout_view(&ws, &shown, &rev, &v.at)?.0 {
+            self.push_ui(UiCommand::ReloadViewer { tab_id: v.tab, worktree: shown.0 });
         }
         Ok(())
     }
 
-    /// Check `rev` out detached at `path` beside `ws`'s repo, after any other
-    /// checkout of that path finished. Whether HEAD moved.
-    fn checkout_view(self: &Arc<Self>, ws: &Workspace, path: &str, rev: &str, at: &ViewAt) -> Result<bool> {
+    /// Check `rev` out detached at `shown`'s worktree beside `ws`'s repo,
+    /// after any other checkout of that path finished, and list it against
+    /// `shown`'s base in the same round trip. Whether HEAD moved, and the
+    /// listing.
+    fn checkout_view(self: &Arc<Self>, ws: &Workspace, shown: &Shown, rev: &str, at: &ViewAt) -> Result<(bool, (Listing, ListingMemo))> {
+        let (path, base) = (shown.0.as_str(), shown.1.as_str());
         let key = format!("open:{}:{path}", ws.row.id);
         // A refresh, or the same row picked twice: wait for it, then this
         // checkout is quick and its caller still shows its own view.
@@ -1095,10 +1122,11 @@ impl Engine {
         let _guard = OpeningGuard { engine: self, key };
         let host = ws.host();
         let have: Vec<(String, String)> = at.have.iter().map(|h| (h.rev.clone(), h.commit.clone())).collect();
-        let checked = Repo::new(&host, &ws.row.repo_path).checkout_worktree_unless(path, Checkout::Detached(rev), &at.fetch, &have);
+        let checked = Repo::new(&host, &ws.row.repo_path).checkout_and_list(path, Checkout::Detached(rev), &at.fetch, &have, base, ListingMemo::tracked_only());
         // The checkout may have taken over a spare (even if it failed after).
         self.refill_spare(&ws.row.id, false);
-        Ok(checked?.1)
+        let (_, moved, listing, memo) = checked?;
+        Ok((moved, (listing, memo)))
     }
 
     /// ⌘⇧S: on a background thread, read the tab's PR list and checked-out
@@ -1617,11 +1645,18 @@ mod tests {
             e.take_ui_commands()
                 .into_iter()
                 .filter_map(|c| match c {
-                    UiCommand::ShowViewer { tab_id, view, seq } if tab_id == "t" => Some((view, seq)),
+                    UiCommand::ShowViewer { tab_id, view, seq, .. } if tab_id == "t" => Some((view, seq)),
                     _ => None,
                 })
                 .collect()
         };
+        engine.view(view(Some("pr")), None).unwrap();
+        let cmds = engine.take_ui_commands();
+        let listed = cmds.iter().find_map(|c| match c {
+            UiCommand::ShowViewer { listing: Some(l), .. } => Some(l.0.changed.iter().map(|c| c.path.clone()).collect::<Vec<_>>()),
+            _ => None,
+        });
+        assert_eq!(listed, Some(vec!["a".to_string()]), "listed by the checkout: {cmds:?}");
         engine.view(view(Some("pr")), None).unwrap();
         let got = shown(&engine);
         let ((wt, base), first) = got[0].clone();

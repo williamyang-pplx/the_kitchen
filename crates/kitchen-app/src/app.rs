@@ -69,6 +69,19 @@ pub struct KitchenApp {
     /// A PR menu pick being checked out, by tab: (its name, the switch's
     /// number). Its viewer shows the frying pan until the view arrives.
     switching: HashMap<String, (String, u64)>,
+    /// PR menu picks not on screen yet, by tab: (the PR's name, when it was
+    /// picked, how it was served). Logged once ready (`kitchen::switch`).
+    timed_switches: HashMap<String, (String, Instant, &'static str)>,
+    /// The selected tab's PR menu rows being checked out and loaded off
+    /// screen (see `warm_views`): None while it runs, else when it failed.
+    warming: HashMap<(String, Shown), Option<Instant>>,
+    /// Viewers being rebuilt off screen after their worktree moved, and
+    /// since when: each replaces its cached viewer once loaded.
+    replacing: HashMap<(String, Shown), (Viewer, Instant)>,
+    /// The commits GitHub reported (a menu row's `have`) when each cached
+    /// PR viewer's worktree was last checked out: when they change (a push
+    /// to the PR or to its base), it is checked out again, once.
+    checked_at: HashMap<(String, Shown), Vec<crate::engine::Have>>,
     plans: HashMap<String, crate::plan_view::PlanView>,
     dialog: Option<Dialog>,
     screenshots: Vec<(String, Sender<Result<(), String>>)>,
@@ -119,6 +132,10 @@ impl KitchenApp {
             shown: HashMap::new(),
             view_seqs: HashMap::new(),
             switching: HashMap::new(),
+            timed_switches: HashMap::new(),
+            warming: HashMap::new(),
+            replacing: HashMap::new(),
+            checked_at: HashMap::new(),
             plans: HashMap::new(),
             dialog: None,
             shortcuts: false,
@@ -217,7 +234,7 @@ impl KitchenApp {
                     self.open_side_for(&tab_id, SideKind::Plan);
                     self.panel_command_for(&tab_id, SideKind::Plan, PanelCmd::Reload);
                 }
-                UiCommand::ShowViewer { tab_id, view, seq } => {
+                UiCommand::ShowViewer { tab_id, view, seq, listing } => {
                     if self.view_seqs.get(&tab_id).is_some_and(|&last| seq < last) {
                         continue; // a later switch won
                     }
@@ -225,7 +242,18 @@ impl KitchenApp {
                     if self.switching.get(&tab_id).is_some_and(|(_, s)| seq >= *s) {
                         self.switching.remove(&tab_id);
                     }
-                    self.show_viewer(&tab_id, view);
+                    self.show_viewer(&tab_id, view, listing.map(|l| *l));
+                }
+                UiCommand::WarmViewer { tab_id, view, listing } => {
+                    let key = (tab_id, view);
+                    self.warming.remove(&key);
+                    if let (Some((ws, _)), false) = (self.engine.find_tab(&key.0), self.viewers.contains_key(&key)) {
+                        let v = Viewer::listed(&self.engine, ws.host(), &key.0, key.1.0.clone(), key.1.1.clone(), listing.map(|l| *l));
+                        self.viewers.insert(key, v);
+                    }
+                }
+                UiCommand::WarmFailed { tab_id, view } => {
+                    self.warming.insert((tab_id, view), Some(Instant::now()));
                 }
                 UiCommand::ViewFailed { tab_id, seq } => {
                     if self.switching.get(&tab_id).is_some_and(|(_, s)| *s == seq) {
@@ -486,12 +514,12 @@ impl KitchenApp {
 
     /// Point `tab_id`'s viewer at `view` (a cached viewer of it, or a new
     /// one) and open the tab's viewer side.
-    fn show_viewer(&mut self, tab_id: &str, view: Shown) {
+    fn show_viewer(&mut self, tab_id: &str, view: Shown, listing: Option<(kitchen_core::git::Listing, kitchen_core::git::ListingMemo)>) {
         let Some((ws, _)) = self.engine.find_tab(tab_id) else { return };
         let engine = &self.engine;
         self.viewers
             .entry((tab_id.to_string(), view.clone()))
-            .or_insert_with(|| Viewer::at(engine, ws.host(), tab_id, view.0.clone(), view.1.clone()));
+            .or_insert_with(|| Viewer::listed(engine, ws.host(), tab_id, view.0.clone(), view.1.clone(), listing));
         self.shown.insert(tab_id.to_string(), view);
         self.open_side_for(tab_id, SideKind::Viewer);
     }
@@ -504,14 +532,24 @@ impl KitchenApp {
         let Some(shown) = self.engine.shown_by(&v) else { return };
         let seq = self.engine.next_view_seq();
         self.view_seqs.insert(v.tab.clone(), seq);
-        if self.viewers.contains_key(&(v.tab.clone(), shown.clone())) {
+        let cached = self.viewers.contains_key(&(v.tab.clone(), shown.clone()));
+        let name = self.engine.views_of(&v.tab).and_then(|m| m.iter().find(|(_, s)| *s == shown).map(|(e, _)| e.label.split_whitespace().next().unwrap_or(&e.label).to_string()));
+        let name = name.unwrap_or_else(|| "the view".into());
+        self.timed_switches.insert(v.tab.clone(), (name.clone(), Instant::now(), if cached { "cached" } else { "cold" }));
+        if cached {
             self.switching.remove(&v.tab);
-            self.show_viewer(&v.tab.clone(), shown);
-            self.engine.spawn("refresh view", move |e| e.refresh_view(v));
+            // Its checkout is refreshed behind it, unless it was checked out
+            // at the commits GitHub reports now.
+            let key = (v.tab.clone(), shown.clone());
+            let fresh = !v.at.have.is_empty() && self.checked_at.get(&key) == Some(&v.at.have);
+            self.show_viewer(&v.tab.clone(), shown, None);
+            if !fresh {
+                self.checked_at.insert(key, v.at.have.clone());
+                self.engine.spawn("refresh view", move |e| e.refresh_view(v));
+            }
         } else {
-            // The PR's name for the frying pan's caption, from its menu row.
-            let name = self.engine.views_of(&v.tab).and_then(|m| m.iter().find(|(_, s)| *s == shown).map(|(e, _)| e.label.split_whitespace().next().unwrap_or(&e.label).to_string()));
-            self.switching.insert(v.tab.clone(), (name.unwrap_or_else(|| "the view".into()), seq));
+            self.switching.insert(v.tab.clone(), (name, seq));
+            self.checked_at.insert((v.tab.clone(), shown.clone()), v.at.have.clone());
             let tab = v.tab.clone();
             self.engine.spawn("view", move |e| {
                 e.view(v, Some(seq)).inspect_err(|_| e.push_ui(UiCommand::ViewFailed { tab_id: tab, seq }))
@@ -519,19 +557,110 @@ impl KitchenApp {
         }
     }
 
+    /// Log how long `tab_id`'s last PR menu pick took to be on screen, once
+    /// its viewer is ready and no frying pan covers it.
+    fn log_ready_switch(&mut self, tab_id: &str) {
+        let Some((name, at, how)) = self.timed_switches.get(tab_id) else { return };
+        let viewer = self.viewer_key(tab_id).and_then(|k| self.viewers.get(&k)).filter(|v| v.ready());
+        if let (false, Some(v)) = (self.switching.contains_key(tab_id), viewer) {
+            let head = v.head().map(|h| &h[..h.len().min(12)]).unwrap_or("?");
+            log::info!(target: "kitchen::switch", "{name} at {head}: on screen in {} ms ({how})", at.elapsed().as_millis());
+            self.timed_switches.remove(tab_id);
+        }
+    }
+
     /// `worktree` moved: rebuild `tab_id`'s viewers of it (shown or cached),
-    /// each with its base, reopened at its file and line.
+    /// each with its base, reopened at its file and line. Each is rebuilt
+    /// off screen and replaces the old one once it has loaded (see
+    /// `swap_replacements`), so the one on screen never goes blank.
     fn reload_viewers(&mut self, tab_id: &str, worktree: &str) {
         let Some((ws, _)) = self.engine.find_tab(tab_id) else { return };
         let keys: Vec<(String, Shown)> = self.viewers.keys().filter(|(t, (w, _))| t == tab_id && w == worktree).cloned().collect();
         for key in keys {
-            let Some(old) = self.viewers.remove(&key) else { continue };
+            let Some(old) = self.viewers.get(&key) else { continue };
             let (path, line, diff) = old.location();
             let mut v = Viewer::at(&self.engine, ws.host(), tab_id, key.1.0.clone(), key.1.1.clone());
             if path.is_some() {
                 v.command(PanelCmd::Open { path, line, diff: Some(diff) });
             }
-            self.viewers.insert(key, v);
+            self.replacing.insert(key, (v, Instant::now()));
+        }
+    }
+
+    /// Load the rebuilt viewers off screen, and put each in place of its old
+    /// one once it is ready (or after `SWAP_AFTER`, so one that never loads
+    /// still replaces a stale view).
+    fn swap_replacements(&mut self) {
+        let mut done = Vec::new();
+        for (key, (v, since)) in self.replacing.iter_mut() {
+            v.tick_hidden();
+            if v.ready() || since.elapsed() >= SWAP_AFTER {
+                done.push(key.clone());
+            }
+        }
+        for key in done {
+            let Some((v, since)) = self.replacing.remove(&key) else { continue };
+            if self.viewer_key(&key.0).as_ref() == Some(&key) {
+                let at = v.head().map(|h| &h[..h.len().min(12)]).unwrap_or("?");
+                log::info!(target: "kitchen::switch", "{} at {at}: on screen in {} ms (moved)", key.1.0.rsplit('/').next().unwrap_or(&key.1.0), since.elapsed().as_millis());
+            }
+            if self.viewers.contains_key(&key) {
+                self.viewers.insert(key, v);
+            }
+        }
+    }
+
+    /// Keep every open PR in the selected tab's menu ready to show: check
+    /// out and load the rows no viewer has yet, one at a time, nearest the
+    /// one on screen first, off screen; and when GitHub reports new commits
+    /// for a cached one (its head or its base moved), check it out again (a
+    /// moved head rebuilds its viewer behind the old one). Then a pick in
+    /// the menu is a cache hit. Merged and closed PRs load only when picked
+    /// (prune-worktrees removes their checkouts). The other cached viewers
+    /// of the tab take in their loads meanwhile.
+    fn warm_views(&mut self) {
+        let Some(tab) = self.selected_tab_id() else { return };
+        let shown = self.viewer_key(&tab);
+        for (key, v) in self.viewers.iter_mut() {
+            if key.0 == tab && Some(key) != shown.as_ref() {
+                v.tick_hidden();
+            }
+        }
+        let Some(menu) = self.engine.views_of(&tab) else { return };
+        let menu: Vec<&crate::engine::MenuRow> = menu.iter().filter(|(e, _)| !matches!(e.state, Some(crate::engine::PrState::Merged | crate::engine::PrState::Closed))).collect();
+        for (e, at) in menu.iter().copied() {
+            let key = (tab.clone(), at.clone());
+            if e.view.rev.is_none() || e.view.have.is_empty() || !self.viewers.contains_key(&key) || self.checked_at.get(&key) == Some(&e.view.have) {
+                continue;
+            }
+            self.checked_at.insert(key, e.view.have.clone());
+            let v = View { tab: tab.clone(), at: e.view.clone() };
+            self.engine.spawn("refresh view", move |e| e.refresh_view(v));
+        }
+        if self.warming.iter().any(|((t, _), failed)| *t == tab && failed.is_none()) {
+            return;
+        }
+        // Nearest the row on screen first: the next and previous PRs of its
+        // stack are the likely picks.
+        let here = shown.as_ref().and_then(|k| menu.iter().position(|(_, at)| *at == k.1)).unwrap_or(0);
+        let next = menu
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, (_, at))| {
+                let key = (tab.clone(), at.clone());
+                !self.viewers.contains_key(&key) && self.warming.get(&key).is_none_or(|f| f.is_some_and(|at| at.elapsed() >= WARM_RETRY))
+            })
+            .min_by_key(|(i, _)| i.abs_diff(here))
+            .map(|(_, row)| row);
+        if let Some((e, at)) = next {
+            self.warming.insert((tab.clone(), at.clone()), None);
+            self.checked_at.insert((tab.clone(), at.clone()), e.view.have.clone());
+            let v = View { tab, at: e.view.clone() };
+            self.engine.spawn("warm view", move |e| {
+                e.warm_view(v);
+                Ok(())
+            });
         }
     }
 
@@ -1126,6 +1255,9 @@ impl KitchenApp {
             crate::ui::cooking::cooking(&mut cover, &format!("cooking {name}…"));
         }
         let (clicked, picked) = (cx.clicked, cx.view.take());
+        if let Some(tab) = tab {
+            self.log_ready_switch(&tab.row.id);
+        }
         if clicked {
             self.set_focus(Focus::Side);
         }
@@ -1181,6 +1313,10 @@ impl KitchenApp {
         self.shown.retain(|id, _| live.contains(id));
         self.view_seqs.retain(|id, _| live.contains(id));
         self.switching.retain(|id, _| live.contains(id));
+        self.timed_switches.retain(|id, _| live.contains(id));
+        self.warming.retain(|(id, _), _| live.contains(id));
+        self.replacing.retain(|(id, _), _| live.contains(id));
+        self.checked_at.retain(|(id, _), _| live.contains(id));
         self.plans.retain(|id, _| live.contains(id));
         self.sides.retain(|id, _| live.contains(id));
         self.side_shown.retain(|id| live.contains(id));
@@ -1207,6 +1343,8 @@ impl eframe::App for KitchenApp {
         self.paste = attach::take_paste();
         self.handle_ui_commands(&ctx);
         self.drop_stale_state();
+        self.swap_replacements();
+        self.warm_views();
 
         if let Some(dialog) = &mut self.dialog {
             match dialog.show(&ctx, &self.engine) {
@@ -1427,6 +1565,11 @@ fn write_png(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// How long a rebuilt viewer may load before it replaces the old one anyway.
+const SWAP_AFTER: Duration = Duration::from_secs(15);
+/// How long after a failed warm-up a PR menu row is tried again.
+const WARM_RETRY: Duration = Duration::from_secs(120);
+
 /// The viewer `tab` shows, created on its worktree and diff base if none. A
 /// free function over just the fields it needs, so a caller can keep
 /// `&self.engine` borrowed for a `PanelCtx`.
@@ -1632,10 +1775,10 @@ mod tests {
 
         // Numbers come from the engine, as the UI's and the engine's switches do.
         let (s1, s2) = (engine.next_view_seq(), engine.next_view_seq());
-        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: a.clone(), seq: s1 });
+        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: a.clone(), seq: s1, listing: None });
         app.handle_ui_commands(&ctx);
         app.panel_command_for("t", SideKind::Viewer, PanelCmd::Open { path: Some("a".into()), line: Some(1), diff: Some(false) });
-        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: b.clone(), seq: s2 });
+        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: b.clone(), seq: s2, listing: None });
         app.handle_ui_commands(&ctx);
         assert_eq!(app.shown.get("t"), Some(&b));
 
@@ -1644,7 +1787,7 @@ mod tests {
         assert_eq!(app.shown.get("t"), Some(&a));
         assert_eq!(opened(&app, &a).as_deref(), Some("a"));
         // b's switch was overtaken.
-        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: b.clone(), seq: s2 });
+        engine.push_ui(UiCommand::ShowViewer { tab_id: "t".into(), view: b.clone(), seq: s2, listing: None });
         app.handle_ui_commands(&ctx);
         assert_eq!(app.shown.get("t"), Some(&a), "a late ShowViewer is dropped");
 
@@ -1690,5 +1833,59 @@ mod tests {
         app.run_action(Action::ViewMenu);
         assert_eq!(app.focus(), Focus::Side);
         assert!(app.viewer_key("t").and_then(|k| app.viewers.get(&k)).is_some_and(|v| v.menu_open()));
+    }
+
+    /// The selected tab's PR menu rows are checked out and loaded off
+    /// screen, so picking one is a cache hit; when GitHub reports a new head
+    /// for one, it is rebuilt behind the old view, which stays until the new
+    /// one has loaded.
+    #[test]
+    fn pr_menu_rows_load_off_screen_and_rebuild_behind() {
+        let repo = TestRepo::new("echo 1 > a");
+        repo.sh("git checkout -qb pr && echo 2 > a && git commit -qam pr && git checkout -q main");
+        let (ctx, engine) = test_util::engine("local", &repo.path(), &["t"]);
+        engine.select_tab("t");
+        let head = || String::from_utf8(std::process::Command::new("git").args(["-C", &repo.path(), "rev-parse", "pr"]).output().unwrap().stdout).unwrap().trim().to_string();
+        let row = |commit: &str| serde_json::json!({ "rev": "pr", "name": "kitchen-pr-7", "base": "main", "have": [{ "rev": "pr", "commit": commit }] });
+        let menu = |commit: &str| {
+            let set = serde_json::json!({ "tab": "t", "entries": [{ "label": "#7 pr", "view": row(commit) }] });
+            engine.set_views(serde_json::from_value(set).unwrap()).unwrap();
+        };
+        let mut app = KitchenApp::new(engine.clone());
+        let first = head();
+        menu(&first);
+        let view = || View { tab: "t".into(), at: serde_json::from_value(row(&first)).unwrap() };
+        let key = ("t".to_string(), engine.shown_by(&view()).unwrap());
+        let frames_until = |app: &mut KitchenApp, done: &dyn Fn(&KitchenApp) -> bool| {
+            for _ in 0..500 {
+                app.handle_ui_commands(&ctx);
+                app.swap_replacements();
+                app.warm_views();
+                if done(app) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        assert!(frames_until(&mut app, &|a| a.viewers.get(&key).is_some_and(|v| v.ready())), "loaded off screen");
+        assert_ne!(app.viewer_key("t"), Some(key.clone()), "…while the tab's own view is on screen");
+        assert_eq!(app.viewers[&key].head(), Some(first.as_str()));
+
+        // The pick: on screen at once, no frying pan.
+        app.choose_view(view());
+        assert_eq!(app.viewer_key("t"), Some(key.clone()));
+        assert!(!app.switching.contains_key("t"));
+
+        // A push: GitHub's menu names a new head. The PR is checked out
+        // again and rebuilt off screen; the old view stays meanwhile.
+        repo.sh("git checkout -q pr && echo 3 > a && git commit -qam pr2 && git checkout -q main");
+        let second = head();
+        menu(&second);
+        assert!(frames_until(&mut app, &|a| a.replacing.contains_key(&key)), "rebuilt behind");
+        assert_eq!(app.viewers[&key].head(), Some(first.as_str()), "the old view stays up");
+        assert!(frames_until(&mut app, &|a| a.viewers[&key].head() == Some(second.as_str())), "then replaces it");
+        assert!(app.replacing.is_empty());
+        test_util::remove_siblings(&engine, &repo);
     }
 }

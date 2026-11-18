@@ -334,9 +334,12 @@ saying nothing does. A viewer on screen sends `views` itself too (when it
 opens, when it shows a view the menu lacks, and every 2 minutes), so these
 keep up without ⌘⇧S. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.
-Picking a row shows it. A view the tab showed before comes back at once
-from the viewer cache, and its checkout is then refreshed (the viewer is
-rebuilt if HEAD moved).
+Picking a row shows it. While its tab is selected, every row is checked out
+and loaded off screen, one at a time, so a pick comes from the viewer cache
+at once. With `have`, a row whose head commit differs from what its viewer
+shows is checked out again and its viewer rebuilt off screen, replacing the
+one on screen once loaded; without it, a pick refreshes the row's checkout
+behind it.
 
 ### Comments
 

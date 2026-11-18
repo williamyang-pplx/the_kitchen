@@ -100,36 +100,41 @@ struct ListJob {
 }
 
 /// The viewer's listing thread, one per viewer instead of one per poll. It
-/// keeps the last listing's memo, so a quiet re-list stats the index
-/// instead of reading it. It ends when the viewer is dropped.
-fn spawn_lister(host: Host, wt: String, base_ref: String, tx: Sender<Msg>, ctx: egui::Context) -> Sender<ListJob> {
+/// keeps the last listing's memo (starting from `memo`), so a quiet re-list
+/// stats the index instead of reading it. `first`: a listing made with
+/// `memo` already (by the checkout), delivered before any job. It ends when
+/// the viewer is dropped.
+fn spawn_lister(host: Host, wt: String, base_ref: String, tx: Sender<Msg>, ctx: egui::Context, mut memo: ListingMemo, first: Option<Listing>) -> Sender<ListJob> {
     let (jobs, rx) = channel::<ListJob>();
     std::thread::spawn(move || {
         let repo = Repo::new(&host, &wt);
-        let mut memo = ListingMemo::default();
-        for ListJob { quiet, known } in rx {
-            if !quiet {
-                memo.rescan();
-            }
-            let mut listing = match repo.listing(&wt, &base_ref, &mut memo) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = tx.send(Msg::FilesFailed(format!("{e:#}")));
-                    ctx.request_repaint();
-                    continue;
-                }
-            };
+        let deliver = |mut listing: Listing, quiet: bool, known: Option<(Option<String>, Vec<ChangedFile>)>| {
             changes_tree::sort(&mut listing.changed);
             let same = known.is_some_and(|(index, changed)| index.as_deref() == Some(listing.index.as_str()) && changed == listing.changed);
             let (index, changed) = (listing.index.clone(), listing.changed.clone());
             let _ = tx.send(Msg::Files { listing, quiet });
             ctx.request_repaint();
             if same {
-                continue;
+                return;
             }
             let result = tracked_files(&host, &wt, &index).map(|t| merge_all(&t, &changed)).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Tree { index, result });
             ctx.request_repaint();
+        };
+        if let Some(listing) = first {
+            deliver(listing, false, None);
+        }
+        for ListJob { quiet, known } in rx {
+            if !quiet {
+                memo.rescan();
+            }
+            match repo.listing(&wt, &base_ref, &mut memo) {
+                Ok(listing) => deliver(listing, quiet, known),
+                Err(e) => {
+                    let _ = tx.send(Msg::FilesFailed(format!("{e:#}")));
+                    ctx.request_repaint();
+                }
+            }
         }
     });
     jobs
@@ -288,6 +293,12 @@ pub struct Viewer {
     menu_asked: Option<(std::time::Instant, Shown)>,
     /// Since when the code area has been waiting for files.
     loading_since: Option<std::time::Instant>,
+    /// HEAD as of the last listing.
+    head: Option<String>,
+    /// Loaded off screen (`tick_hidden`) since it was last on screen.
+    hidden: bool,
+    /// Files loaded while hidden, announced to plugins once shown.
+    unannounced: Vec<String>,
 }
 
 impl Viewer {
@@ -310,8 +321,23 @@ impl Viewer {
 
     /// A viewer for tab `tab_id` on any worktree of its host (a PR's, `kitchen.view`).
     pub fn at(engine: &Arc<Engine>, host: Host, tab_id: &str, worktree: String, base_ref: String) -> Self {
+        Self::listed(engine, host, tab_id, worktree, base_ref, None)
+    }
+
+    /// [`Self::at`], starting from `listed`: the worktree's listing against
+    /// `base_ref` and its memo, when its checkout made one (one round trip
+    /// fewer before the diff shows). Only the tab's own worktree lists
+    /// untracked files.
+    pub fn listed(engine: &Arc<Engine>, host: Host, tab_id: &str, worktree: String, base_ref: String, listed: Option<(Listing, ListingMemo)>) -> Self {
         let (tx, rx) = channel();
-        let lister = spawn_lister(host.clone(), worktree.clone(), base_ref.clone(), tx.clone(), engine.ctx.clone());
+        let own = engine.find_tab(tab_id).is_none_or(|(_, t)| t.row.worktree == worktree);
+        let (memo, first) = match listed {
+            Some((listing, memo)) => (memo, Some(listing)),
+            None if own => (ListingMemo::default(), None),
+            None => (ListingMemo::tracked_only(), None),
+        };
+        let seeded = first.is_some();
+        let lister = spawn_lister(host.clone(), worktree.clone(), base_ref.clone(), tx.clone(), engine.ctx.clone(), memo, first);
         let mut v = Self {
             engine: engine.clone(),
             tab_id: tab_id.to_string(),
@@ -386,9 +412,62 @@ impl Viewer {
             asked: None,
             menu_asked: None,
             loading_since: None,
+            head: None,
+            hidden: false,
+            unannounced: Vec::new(),
         };
-        v.load_file_list(false);
+        if seeded {
+            v.changes_pending = true;
+        } else {
+            v.load_file_list(false);
+        }
         v
+    }
+
+    /// HEAD of the worktree as last listed.
+    pub fn head(&self) -> Option<&str> {
+        self.head.as_deref()
+    }
+
+    /// A frame while another view is on screen: take in what the loads sent
+    /// (the changes, the first file and its base), without telling plugins
+    /// about files until the viewer is shown.
+    pub fn tick_hidden(&mut self) {
+        self.hidden = true;
+        self.poll();
+        if let (true, Some(p)) = (self.diff, self.current.clone()) {
+            self.ensure_base(&p);
+        }
+    }
+
+    /// Everything a switch to this viewer waits for has landed: the changes
+    /// and, on a file, its text (and its base, in a diff); in a folder, the
+    /// file list.
+    pub fn ready(&self) -> bool {
+        if self.merge_base.is_none() && self.files_state.is_none() {
+            return false;
+        }
+        match self.current.as_deref().filter(|_| !self.browsing) {
+            Some(p) => {
+                let has = |m: bool| m || self.load_errors.contains_key(p);
+                has(self.files.contains_key(p)) && (!self.diff || p.starts_with('/') || self.merge_base.is_none() || has(self.bases.contains_key(p)))
+            }
+            None => self.files_state.is_some(),
+        }
+    }
+
+    /// On screen again: tell plugins about the files loaded while hidden.
+    fn announce(&mut self) {
+        self.hidden = false;
+        let Some(p) = self.engine.plugins() else {
+            self.unannounced.clear();
+            return;
+        };
+        for path in std::mem::take(&mut self.unannounced) {
+            if let Some(f) = self.files.get(&path) {
+                p.file_loaded(self.file_key(&path), std::sync::Arc::from(f.text.as_str()), false);
+            }
+        }
     }
 
     // ------------------------------------------------------------ loading
@@ -466,6 +545,7 @@ impl Viewer {
             match msg {
                 Msg::Files { listing, quiet: true } => {
                     self.changes_pending = false;
+                    self.head = Some(listing.head.clone());
                     self.index = Some(listing.index);
                     let base_moved = self.merge_base.as_deref() != Some(listing.base.as_str());
                     if !base_moved && listing.changed == self.changed {
@@ -485,6 +565,7 @@ impl Viewer {
                 }
                 Msg::Files { listing, .. } => {
                     self.changes_pending = false;
+                    self.head = Some(listing.head.clone());
                     self.changed = listing.changed;
                     self.changed_rev += 1;
                     self.merge_base = Some(listing.base);
@@ -530,7 +611,9 @@ impl Viewer {
                         Ok(data) => {
                             let changed = self.reloading.remove(&path);
                             let same = self.files.get(&path).is_some_and(|old| old.version == data.version);
-                            if !(changed && same) {
+                            if self.hidden && !changed {
+                                self.unannounced.push(path.clone());
+                            } else if !(changed && same) {
                                 if let Some(p) = self.engine.plugins() {
                                     p.file_loaded(self.file_key(&path), std::sync::Arc::from(data.text.as_str()), changed);
                                 }
@@ -1204,6 +1287,7 @@ impl Viewer {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, cx: &mut PanelCtx) {
+        self.announce();
         self.poll();
         self.check_nav_timeout();
         self.check_fresh();
