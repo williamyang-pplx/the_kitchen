@@ -817,7 +817,7 @@ impl KitchenApp {
                 let stroke = if is_sel { egui::Stroke::new(1.5, host_color) } else { egui::Stroke::new(1.0, host_color.gamma_multiply(0.55)) };
                 ui.painter().rect(card, round, fill, stroke, egui::StrokeKind::Inside);
                 if is_sel {
-                    shimmer::paint(ui, card, theme::RADIUS_L as f32, host_color);
+                    shimmer::paint(ui, "workspace", &ws.row.id, card, theme::RADIUS_L as f32, host_color);
                 }
                 let x = card.left() + 18.0;
                 // Text stays inside the outline.
@@ -1040,7 +1040,7 @@ impl KitchenApp {
             let is_sel = sel.as_deref() == Some(&tab.row.id);
             let title: String = tab.row.title.chars().take(32).collect();
             let kind = if tab.in_main_checkout(ws) { theme::TAB_READ } else { theme::TAB_EDIT };
-            let resp = tab_button(ui, strip, Some(i + 1), &title, Some(kind), is_sel, tab.unread).on_hover_text(format!(
+            let resp = tab_button(ui, strip, &tab.row.id, Some(i + 1), &title, Some(kind), is_sel, tab.unread).on_hover_text(format!(
                 "{}\n{}",
                 tab.row.worktree,
                 tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
@@ -1058,7 +1058,7 @@ impl KitchenApp {
         }
         for p in &ws.pending {
             let title: String = p.title.chars().take(32).collect();
-            let resp = tab_button(ui, strip, None, &format!("⋯ {title}"), None, p.focus, false).on_hover_text("fetching origin and preparing the worktree…");
+            let resp = tab_button(ui, strip, &p.id, None, &format!("⋯ {title}"), None, p.focus, false).on_hover_text("fetching origin and preparing the worktree…");
             reveal(&resp, &p.id);
         }
         // Drag-to-reorder, scrolling while the pointer nears either end.
@@ -1445,9 +1445,10 @@ fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
 
 /// A tab in the strip: a rounded box outlined in the tab's color, the selected
 /// one filled with the content's color and outlined brighter.
-/// `number`: None for a pending tab (drawn in italics). `kind`: the tab's
-/// color (edit or read tab); None for a pending tab.
-fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str, kind: Option<Color32>, selected: bool, unread: bool) -> egui::Response {
+/// `id`: the tab's (or pending tab's) id. `number`: None for a pending tab
+/// (drawn in italics). `kind`: the tab's color (edit or read tab); None for
+/// a pending tab.
+fn tab_button(ui: &mut Ui, strip: egui::Rect, id: &str, number: Option<usize>, title: &str, kind: Option<Color32>, selected: bool, unread: bool) -> egui::Response {
     let mut job = egui::text::LayoutJob::default();
     let fmt = |font: egui::FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: Align::Center, italics: number.is_none(), ..Default::default() };
     if let Some(n) = number {
@@ -1477,7 +1478,7 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str
     let stroke = if selected { egui::Stroke::new(1.5, color) } else { egui::Stroke::new(1.0, color.gamma_multiply(if resp.hovered() { 0.8 } else { 0.45 })) };
     ui.painter().rect(pill, round, fill, stroke, egui::StrokeKind::Inside);
     if selected {
-        shimmer::paint(ui, pill, theme::RADIUS as f32, color);
+        shimmer::paint(ui, "tab", id, pill, theme::RADIUS as f32, color);
     }
     let text_color = if resp.hovered() && !selected { kind.unwrap_or(theme::MUTED) } else { title_color };
     let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);

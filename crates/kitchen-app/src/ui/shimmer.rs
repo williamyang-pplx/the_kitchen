@@ -1,7 +1,8 @@
-//! The animated glow around the selected tab and workspace: an OpenGL
-//! fragment shader, run as an egui paint callback. Around the outline it
-//! draws a soft glow that breathes, a bright spot that runs round the
-//! outline, and a slanted sheen that sweeps across it now and then.
+//! The glow around the selected tab and workspace: an OpenGL fragment
+//! shader, run as an egui paint callback. It lays a soft glow around the
+//! outline. When the selection changes, a bright spot runs once round the
+//! outline and a slanted sheen sweeps across it, for `BURST`; then it holds
+//! still, so it costs nothing until the next switch.
 //!
 //! When the shader can't be built (no GLSL 1.40), nothing is drawn and the
 //! plain egui outline stays.
@@ -16,25 +17,34 @@ use egui::{Color32, Rect, Ui};
 /// How far the glow reaches past the outline, in points.
 const REACH: f32 = 12.0;
 
-/// Frame interval while the window has focus: 30 fps. Every frame redraws
-/// the whole window (about 10% of a core at 30 fps, twice that at 60), and
-/// the motion is slow enough for 30. Without focus the animation stops.
-const FRAME: Duration = Duration::from_millis(33);
+/// How long the shimmer plays after the selection changes, in seconds.
+/// Every frame of it redraws the whole window, so it is kept short.
+const BURST: f64 = 1.5;
 
-/// The shader's clock wraps here: a multiple of every period in it (3 s,
-/// 2.5 s), so the wrap doesn't show, and small enough for f32.
-const CLOCK_WRAP: f64 = 600.0;
+/// Frame interval during the shimmer.
+const FRAME: Duration = Duration::from_millis(16);
 
-/// Paint the glow around `outline` (corner radius `radius`) in `color`.
-/// Call it after the outline is painted and before the text inside it.
-pub fn paint(ui: &Ui, outline: Rect, radius: f32, color: Color32) {
-    let time = (ui.input(|i| i.time) % CLOCK_WRAP) as f32;
-    let params = Params { center: outline.center(), half: outline.size() / 2.0, radius, color: color.to_normalized_gamma_f32(), time };
-    let callback = egui_glow::CallbackFn::new(move |info, painter| draw(painter, &info, &params));
-    ui.painter().add(egui::PaintCallback { rect: outline.expand(REACH), callback: Arc::new(callback) });
-    if ui.input(|i| i.viewport().focused.unwrap_or(true)) {
+/// Paint the glow around `outline` (corner radius `radius`) in `color`,
+/// for `selection` (the selected item's id) in `slot` (one per place that
+/// has a selection). Call it after the outline is painted and before the
+/// text inside it.
+pub fn paint(ui: &Ui, slot: &str, selection: &str, outline: Rect, radius: f32, color: Color32) {
+    let now = ui.input(|i| i.time);
+    let key = egui::Id::new(("shimmer", slot));
+    let started = ui.data_mut(|d| match d.get_temp::<(String, f64)>(key) {
+        Some((id, at)) if id == selection => at,
+        _ => {
+            d.insert_temp(key, (selection.to_string(), now));
+            now
+        }
+    });
+    let progress = ((now - started) / BURST).clamp(0.0, 1.0) as f32;
+    if progress < 1.0 {
         ui.ctx().request_repaint_after(FRAME);
     }
+    let params = Params { center: outline.center(), half: outline.size() / 2.0, radius, color: color.to_normalized_gamma_f32(), progress };
+    let callback = egui_glow::CallbackFn::new(move |info, painter| draw(painter, &info, &params));
+    ui.painter().add(egui::PaintCallback { rect: outline.expand(REACH), callback: Arc::new(callback) });
 }
 
 #[derive(Clone, Copy)]
@@ -43,7 +53,8 @@ struct Params {
     half: egui::Vec2,
     radius: f32,
     color: [f32; 4],
-    time: f32,
+    /// Through the shimmer, 0 to 1; 1 once it is over.
+    progress: f32,
 }
 
 /// The compiled shader, built on first use; `None` inside when it failed
@@ -59,7 +70,7 @@ struct Program {
     radius: Option<glow::UniformLocation>,
     reach: Option<glow::UniformLocation>,
     color: Option<glow::UniformLocation>,
-    time: Option<glow::UniformLocation>,
+    progress: Option<glow::UniformLocation>,
 }
 
 fn draw(painter: &egui_glow::Painter, info: &egui::PaintCallbackInfo, p: &Params) {
@@ -81,7 +92,7 @@ fn draw(painter: &egui_glow::Painter, info: &egui::PaintCallbackInfo, p: &Params
         gl.uniform_1_f32(prog.radius.as_ref(), p.radius);
         gl.uniform_1_f32(prog.reach.as_ref(), REACH);
         gl.uniform_3_f32(prog.color.as_ref(), p.color[0], p.color[1], p.color[2]);
-        gl.uniform_1_f32(prog.time.as_ref(), p.time);
+        gl.uniform_1_f32(prog.progress.as_ref(), p.progress);
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         gl.bind_vertex_array(None);
     }
@@ -136,7 +147,7 @@ fn build(gl: &glow::Context) -> Result<Program, String> {
             radius: at("u_radius"),
             reach: at("u_reach"),
             color: at("u_color"),
-            time: at("u_time"),
+            progress: at("u_progress"),
         })
     }
 }
@@ -159,7 +170,7 @@ uniform vec2 u_half;    // half the outline's size
 uniform float u_radius; // the outline's corner radius
 uniform float u_reach;  // how far the glow reaches past the outline
 uniform vec3 u_color;
-uniform float u_time;   // seconds
+uniform float u_progress; // through the shimmer, 0 to 1
 
 const float TAU = 6.2831853;
 
@@ -175,24 +186,25 @@ void main() {
     float d = rounded_rect(p, u_half, u_radius);
     float px = 1.0 / u_scale;
 
-    // Breathing: the whole glow swells and fades every 3 s.
-    float breathe = 0.75 + 0.25 * sin(u_time * TAU / 3.0);
-    // A bright spot running round the outline every 2.5 s.
+    // The shimmer fades out over its last 30%.
+    float motion = 1.0 - smoothstep(0.7, 1.0, u_progress);
+    // A bright spot running once round the outline, from the left.
     float angle = atan(p.y / u_half.y, p.x / u_half.x);
-    float spot = pow(0.5 + 0.5 * cos(angle - u_time * TAU / 2.5), 10.0);
-    // A slanted sheen crossing left to right, then a pause, every 3 s.
-    float travel = 2.0 * u_half.x + 2.0 * u_reach;
-    float head = -u_half.x - u_reach + fract(u_time / 3.0) * travel * 1.6;
-    float sheen = exp(-pow((p.x + 0.7 * p.y - head) / 12.0, 2.0));
+    float spot = motion * pow(0.5 + 0.5 * cos(angle - 3.1415927 - u_progress * TAU), 10.0);
+    // A slanted sheen crossing once, left to right.
+    float slant = 0.7 * u_half.y;
+    float travel = 2.0 * (u_half.x + u_reach + slant);
+    float head = -u_half.x - u_reach - slant + u_progress * travel;
+    float sheen = motion * exp(-pow((p.x + 0.7 * p.y - head) / 12.0, 2.0));
 
     float outside = max(d, 0.0);
     float glow = step(0.0, d) * exp(-outside / 4.0) * (1.0 - smoothstep(0.5 * u_reach, u_reach, outside));
     float ring = 1.0 - smoothstep(0.6, 0.6 + 1.5 * px, abs(d + 0.9));
     float inside = 1.0 - smoothstep(-px, 0.0, d);
 
-    vec3 light = u_color * (glow * (0.32 * breathe + 0.55 * spot)
+    vec3 light = u_color * (glow * (0.3 + 0.2 * motion + 0.55 * spot)
                             + ring * (0.35 + 1.1 * spot)
-                            + inside * 0.05 * breathe)
+                            + inside * 0.04)
                + vec3(1.0) * (ring * (0.8 * sheen + 0.35 * spot) + inside * 0.07 * sheen);
     f_color = vec4(light, 0.0);
 }
