@@ -41,7 +41,7 @@ pub const TAB_EDIT: Color32 = Color32::from_rgb(0xc8, 0x5c, 0xff);
 pub const TAB_READ: Color32 = Color32::from_rgb(0xff, 0xe6, 0x3d);
 /// Neon workspace colors in the sidebar (outline and text): on this mac or
 /// on a devbox.
-pub const WS_LOCAL: Color32 = Color32::from_rgb(0xff, 0x8a, 0x1f);
+pub const WS_LOCAL: Color32 = Color32::from_rgb(0x6b, 0xff, 0x8a);
 pub const WS_DEVBOX: Color32 = Color32::from_rgb(0x2e, 0xa8, 0xff);
 /// Bright violet marking the focused pane.
 pub const FOCUS: Color32 = Color32::from_rgb(0xb2, 0x6b, 0xff);
