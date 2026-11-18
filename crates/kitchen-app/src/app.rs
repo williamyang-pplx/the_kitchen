@@ -17,7 +17,7 @@ use crate::panels::{PanelCmd, PanelCtx};
 use crate::terminal::{TermSession, TerminalView};
 use crate::theme;
 use crate::ui::dialogs::{Dialog, DialogOutcome};
-use crate::ui::widgets;
+use crate::ui::{shimmer, widgets};
 
 /// Height of the macOS title bar the window draws under.
 const TITLEBAR_HEIGHT: f32 = 28.0;
@@ -816,6 +816,9 @@ impl KitchenApp {
                 };
                 let stroke = if is_sel { egui::Stroke::new(1.5, host_color) } else { egui::Stroke::new(1.0, host_color.gamma_multiply(0.55)) };
                 ui.painter().rect(card, round, fill, stroke, egui::StrokeKind::Inside);
+                if is_sel {
+                    shimmer::paint(ui, card, theme::RADIUS_L as f32, host_color);
+                }
                 let x = card.left() + 18.0;
                 // Text stays inside the outline.
                 let p = ui.painter().with_clip_rect(card.shrink2(egui::vec2(8.0, 0.0)).intersect(ui.clip_rect()));
@@ -1473,6 +1476,9 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str
     };
     let stroke = if selected { egui::Stroke::new(1.5, color) } else { egui::Stroke::new(1.0, color.gamma_multiply(if resp.hovered() { 0.8 } else { 0.45 })) };
     ui.painter().rect(pill, round, fill, stroke, egui::StrokeKind::Inside);
+    if selected {
+        shimmer::paint(ui, pill, theme::RADIUS as f32, color);
+    }
     let text_color = if resp.hovered() && !selected { kind.unwrap_or(theme::MUTED) } else { title_color };
     let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
     let width = galley.size().x;
