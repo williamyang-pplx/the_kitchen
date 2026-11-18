@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use egui::{Align, Color32, Layout, RichText, Sense, Ui};
+use egui::{Align, Color32, CornerRadius, Layout, RichText, Sense, Ui};
 
 use crate::attach;
 use crate::engine::{Engine, Shown, Tab, UiCommand, View, Workspace};
@@ -678,13 +678,17 @@ impl KitchenApp {
                     ui.painter().rect_filled(card, theme::RADIUS as f32, theme::HOVER);
                 } else if is_sel {
                     ui.painter().rect_filled(card, theme::RADIUS as f32, theme::SELECTED);
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(card.min + egui::vec2(0.0, 10.0), egui::vec2(3.0, card.height() - 20.0)),
-                        2.0,
-                        theme::ACCENT,
-                    );
                 }
-                let x = card.left() + 12.0;
+                // A pill at the left edge, colored by where the workspace
+                // lives; filled in for the selected one.
+                let host_color = if ws.host().is_local() { theme::WS_LOCAL } else { theme::WS_DEVBOX };
+                let pill = egui::Rect::from_min_size(card.min + egui::vec2(6.0, 9.0), egui::vec2(7.0, card.height() - 18.0));
+                if is_sel {
+                    ui.painter().rect_filled(pill, CornerRadius::same(4), host_color);
+                } else {
+                    ui.painter().rect_stroke(pill, CornerRadius::same(4), egui::Stroke::new(1.5, host_color.gamma_multiply(0.85)), egui::StrokeKind::Inside);
+                }
+                let x = card.left() + 22.0;
                 let p = ui.painter();
                 let name_color = if is_sel { theme::TEXT } else { theme::MUTED };
                 p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_semibold(13.0), name_color);
@@ -863,7 +867,7 @@ impl KitchenApp {
                 }
                 ui.add_space(theme::SPACE_M);
                 // The rest of the strip, left to right: the tabs, then "+".
-                // Top-aligned: the tabs fill the strip's height and hang from its top.
+                // Top-aligned: the tabs fill the strip's height.
                 ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
                     ui.add_space(theme::SPACE_S);
                     ui.spacing_mut().item_spacing.x = 2.0;
@@ -1246,7 +1250,7 @@ impl eframe::App for KitchenApp {
         if let Some(ws) = &ws {
             egui::Panel::top("tabs")
                 .exact_size(38.0)
-                .frame(egui::Frame::NONE.fill(theme::SIDEBAR).inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 0 }))
+                .frame(egui::Frame::NONE.fill(theme::SIDEBAR))
                 .show(ui, |ui| self.tab_strip(ui, ws));
         }
         let creating = ws.as_ref().and_then(|w| w.pending.iter().rev().find(|p| p.focus).cloned());
@@ -1298,8 +1302,8 @@ fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
     });
 }
 
-/// A tab in the strip, as tall as the strip: the selected one takes the
-/// content's color, so it reads as the top of what is shown below.
+/// A tab in the strip: a pill outlined in the tab's color, the selected
+/// one filled with the content's color and outlined brighter.
 /// `number`: None for a pending tab (drawn in italics). `kind`: the tab's
 /// color (edit or read tab); None for a pending tab.
 fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str, kind: Option<Color32>, selected: bool, unread: bool) -> egui::Response {
@@ -1319,16 +1323,18 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, number: Option<usize>, title: &str
     let galley = ui.painter().layout_job(job);
     let dot = if unread { 12.0 } else { 0.0 };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 28.0 + dot, strip.height()), Sense::click_and_drag());
-    let top = egui::CornerRadius { nw: theme::RADIUS, ne: theme::RADIUS, sw: 0, se: 0 };
-    if selected {
-        ui.painter().rect_filled(rect, top, theme::BG);
-        // A bright outline on the top and sides; the bottom stays open
-        // into the content below (clipped off).
-        let outline = egui::Rect::from_min_max(rect.min + egui::vec2(0.75, 0.75), rect.max + egui::vec2(-0.75, 8.0));
-        ui.painter().with_clip_rect(rect).rect_stroke(outline, top, egui::Stroke::new(1.5, kind.unwrap_or(theme::ACCENT)), egui::StrokeKind::Middle);
+    let pill = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 2.0, 26.0));
+    let round = CornerRadius::same(13);
+    let color = kind.unwrap_or(theme::DIM);
+    let fill = if selected {
+        theme::BG
     } else if resp.hovered() {
-        ui.painter().rect_filled(rect, top, theme::HOVER);
-    }
+        theme::HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke = if selected { egui::Stroke::new(1.5, color) } else { egui::Stroke::new(1.0, color.gamma_multiply(if resp.hovered() { 0.8 } else { 0.45 })) };
+    ui.painter().rect(pill, round, fill, stroke, egui::StrokeKind::Inside);
     let text_color = if resp.hovered() && !selected { kind.unwrap_or(theme::MUTED) } else { title_color };
     let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
     let width = galley.size().x;
