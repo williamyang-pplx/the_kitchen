@@ -800,17 +800,23 @@ kitchen.keymap("cmd+shift+d", "github.description", { when = "viewer" })
 
 -- Opening a PR on GitHub (⌘⇧O) ---------------------------------------------
 
--- Waits (up to 2s) for the app with pid argv[1] to lose the front, then brings
--- it back.
+-- Keeps the app with pid argv[1] in front for the next few seconds: Chrome
+-- takes the front when it gets the URL and can take it again as the tab
+-- opens, so after the first hand-back it keeps watching for another second.
 local REFOCUS = [[
 on run argv
   set pid to (item 1 of argv) as integer
   tell application "System Events"
-    repeat 40 times
-      if not (frontmost of first process whose unix id is pid) then exit repeat
+    set p to first process whose unix id is pid
+    set lost to 0
+    repeat with i from 1 to 60
+      if not (frontmost of p) then
+        set frontmost of p to true
+        if lost is 0 then set lost to i
+      end if
+      if lost > 0 and i - lost >= 20 then exit repeat
       delay 0.05
     end repeat
-    set frontmost of first process whose unix id is pid to true
   end tell
 end run]]
 
