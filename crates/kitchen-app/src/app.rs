@@ -669,31 +669,31 @@ impl KitchenApp {
                     (None, Some(s)) => (format!("⋯ {s}"), theme::YELLOW),
                     _ => (String::new(), theme::DIM),
                 };
-                let height = if status.is_empty() { 46.0 } else { 62.0 };
+                let height = if status.is_empty() { 50.0 } else { 66.0 };
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click_and_drag());
                 rects.push(rect);
                 drag = drag_of(&resp, i).or(drag);
-                let card = rect.shrink2(egui::vec2(8.0, 1.0));
-                if drag.is_some_and(|(d, _)| d == i) || (resp.hovered() && !is_sel) {
-                    ui.painter().rect_filled(card, theme::RADIUS as f32, theme::HOVER);
-                } else if is_sel {
-                    ui.painter().rect_filled(card, theme::RADIUS as f32, theme::SELECTED);
-                }
-                // A pill at the left edge, colored by where the workspace
-                // lives; filled in for the selected one.
+                // A pill around the whole row, outlined in the color of where
+                // the workspace lives; the selected one filled and outlined brighter.
+                let card = rect.shrink2(egui::vec2(8.0, 3.0));
+                let round = card.height() / 2.0;
                 let host_color = if ws.host().is_local() { theme::WS_LOCAL } else { theme::WS_DEVBOX };
-                let pill = egui::Rect::from_min_size(card.min + egui::vec2(6.0, 9.0), egui::vec2(7.0, card.height() - 18.0));
-                if is_sel {
-                    ui.painter().rect_filled(pill, CornerRadius::same(4), host_color);
+                let fill = if drag.is_some_and(|(d, _)| d == i) || (resp.hovered() && !is_sel) {
+                    theme::HOVER
+                } else if is_sel {
+                    theme::SELECTED
                 } else {
-                    ui.painter().rect_stroke(pill, CornerRadius::same(4), egui::Stroke::new(1.5, host_color.gamma_multiply(0.85)), egui::StrokeKind::Inside);
-                }
-                let x = card.left() + 22.0;
-                let p = ui.painter();
+                    Color32::TRANSPARENT
+                };
+                let stroke = if is_sel { egui::Stroke::new(1.5, host_color) } else { egui::Stroke::new(1.0, host_color.gamma_multiply(0.55)) };
+                ui.painter().rect(card, round, fill, stroke, egui::StrokeKind::Inside);
+                let x = card.left() + 18.0;
+                // Text stays inside the pill's ends.
+                let p = ui.painter().with_clip_rect(card.shrink2(egui::vec2(12.0, 0.0)).intersect(ui.clip_rect()));
                 let name_color = if is_sel { theme::TEXT } else { theme::MUTED };
-                p.text(egui::pos2(x, rect.top() + 8.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_semibold(13.0), name_color);
+                p.text(egui::pos2(x, rect.top() + 10.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_semibold(13.0), name_color);
                 if ws.tabs.iter().any(|t| t.unread) {
-                    p.circle_filled(egui::pos2(card.right() - 12.0, rect.top() + 16.0), 3.5, theme::YELLOW);
+                    p.circle_filled(egui::pos2(card.right() - 20.0, rect.top() + 18.0), 3.5, theme::YELLOW);
                 }
                 let tabs = match ws.tabs.len() {
                     0 => "no tabs".to_string(),
@@ -701,10 +701,10 @@ impl KitchenApp {
                     n => format!("{n} tabs"),
                 };
                 let sub = format!("{} · {} · {tabs}", ws.row.host, ws.repo_name());
-                p.text(egui::pos2(x, rect.top() + 26.0), egui::Align2::LEFT_TOP, sub, theme::ui_font(theme::TEXT_SMALL), theme::SUBTLE);
+                p.text(egui::pos2(x, rect.top() + 28.0), egui::Align2::LEFT_TOP, sub, theme::ui_font(theme::TEXT_SMALL), theme::SUBTLE);
                 if !status.is_empty() {
                     let status: String = status.chars().take(36).collect();
-                    p.text(egui::pos2(x, rect.top() + 42.0), egui::Align2::LEFT_TOP, status, theme::ui_font(theme::TEXT_SMALL), status_color);
+                    p.text(egui::pos2(x, rect.top() + 44.0), egui::Align2::LEFT_TOP, status, theme::ui_font(theme::TEXT_SMALL), status_color);
                 }
                 let resp = resp.on_hover_text(format!("{}:{}\nworkspace:{}", ws.row.host, ws.row.repo_path, i + 1));
                 if resp.clicked_by(egui::PointerButton::Primary) {
