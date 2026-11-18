@@ -34,7 +34,7 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSError", "NSObject", "NSSet", "NSBundle", "NSData", "NSValue", "NSGeometry"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSError", "NSObject", "NSSet", "NSBundle", "NSData", "NSValue", "NSGeometry", "NSProcessInfo"] }
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "WKWebView", "WKSnapshotConfiguration", "block2", "objc2-app-kit"] }
 wry = { version = "0.53", features = ["transparent"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSEvent", "NSPasteboard", "NSImageRep", "NSBitmapImageRep", "NSImage", "NSView", "NSResponder", "NSWindow"] }
