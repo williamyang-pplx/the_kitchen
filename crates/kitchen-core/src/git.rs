@@ -394,16 +394,15 @@ true"#
         Ok(out.lines().map(String::from).filter(|l| !l.is_empty()).collect())
     }
 
-    /// With [`SMALL_PACKS`] or more packs under [`SMALL_PACK_KIB`], roll them
-    /// up (`git repack -A -d`: one promisor pack, and one for objects of our
-    /// own; the big packs kept as they are) and
-    /// index every pack in a multi-pack index. Devboxes turn git's own
-    /// maintenance off, so without this a partial clone's packs pile up and
-    /// every git command slows down (a devbox's agi at 178k packs: 0.35 s for
-    /// a lookup). Promisor packs stay promisor packs, and a fetch's pack
-    /// still being written has a `.keep` and is left alone. One compaction
-    /// per repo at a time (workspaces share repos); niced. What it did, for
-    /// the log (None: nothing to do).
+    /// With [`SMALL_PACKS`] or more promisor packs under [`SMALL_PACK_KIB`]
+    /// (a partial clone's fetches and on-demand downloads), roll them into
+    /// one promisor pack, delete them, and index every pack in a multi-pack
+    /// index. Other packs and loose objects are left as they are, and so is a
+    /// pack a fetch is still writing (it has a `.keep`). Devboxes turn git's
+    /// own maintenance off, so without this the packs pile up and every git
+    /// command slows down (a devbox's agi at 178k packs: 0.35 s for a
+    /// lookup). One compaction per repo at a time (workspaces share repos);
+    /// niced. What it did, for the log (None: nothing to do).
     pub fn compact_packs(&self) -> Result<Option<String>> {
         self.compact_packs_under(SMALL_PACK_KIB)
     }
@@ -582,23 +581,40 @@ fn gunzip_if_gzipped(bytes: Vec<u8>) -> Result<Vec<u8>> {
 /// Shell (run in the repo) for [`Repo::compact_packs`]; prints "packs
 /// compacted: …" when it compacted.
 fn compact_packs_snippet(small_kib: u64) -> String {
+    // Not `git repack -A -d --keep-pack`: in a partial clone it copies every
+    // promisor object, the kept packs' too, into its new pack (27 GB a run
+    // on a devbox's agi, kept packs and all). `pack-objects --stdin-packs`
+    // packs exactly the listed packs' objects and downloads nothing.
     format!(
-            r#"d=$(git rev-parse --path-format=absolute --git-path objects/pack) || exit 3
-n=$(find "$d" -maxdepth 1 -name '*.pack' -size -{small_kib}k | wc -l | tr -d ' ')
+        r#"d=$(git rev-parse --path-format=absolute --git-path objects/pack) || exit 3
+n=$(find "$d" -maxdepth 1 -name 'pack-*.pack' -size -{small_kib}k | wc -l | tr -d ' ')
 [ "$n" -ge {SMALL_PACKS} ] || exit 0
 # A lock a killed compaction left is stale after a day.
 l="$d/kitchen-compact.lock"
-find "$l" -maxdepth 0 -mmin +1440 -exec rmdir {{}} \; 2>/dev/null
+find "$l" -maxdepth 0 -mmin +1440 -exec rm -rf {{}} + 2>/dev/null
 mkdir "$l" 2>/dev/null || exit 0
-keep=$(find "$d" -maxdepth 1 -name '*.pack' ! -size -{small_kib}k | sed 's|.*/|--keep-pack=|')
+trap 'rm -rf "${{l:?}}"' EXIT
 # git keeps a descriptor per pack it reads, up to the limit: with a high
-# one, a repack of 100k+ packs holds that many (on a mac, a few such gits
-# filled the system's file table). Below 10240, git closes packs as it goes.
+# one, packing 100k+ packs holds that many (on a mac, a few such gits filled
+# the system's file table). Below 10240, git closes packs as it goes.
 f=$(ulimit -n); {{ [ "$f" = unlimited ] || [ "$f" -gt 10240 ]; }} && ulimit -n 10240
-{NICE} git repack -A -d -q --write-midx --threads=2 $keep >/dev/null 2>&1; rc=$?
-rmdir "$l"
-[ $rc = 0 ] || exit $rc
-echo "packs compacted: $n small packs rolled up, $(find "$d" -maxdepth 1 -name '*.pack' | wc -l | tr -d ' ') packs now""#
+cd "$d" || exit 3
+# The small promisor packs, but none a fetch is still writing (.keep).
+for p in $(find . -maxdepth 1 -name 'pack-*.pack' -size -{small_kib}k | sed 's|^\./||'); do
+  b=${{p%.pack}}; [ -e "$b.promisor" ] && [ ! -e "$b.keep" ] && echo "$p"
+done > "$l/packs"
+n=$(wc -l < "$l/packs" | tr -d ' ')
+[ "$n" -ge {SMALL_PACKS} ] || exit 0
+new=$({NICE} git pack-objects --stdin-packs -q --threads=2 "$d/pack" < "$l/packs") || exit 4
+[ -n "$new" ] && [ -e "pack-$new.pack" ] && [ -e "pack-$new.idx" ] || exit 4
+# A promisor pack too, with the refs the old ones recorded.
+sed 's/\.pack$/.promisor/' "$l/packs" | xargs cat > "pack-$new.promisor" 2>/dev/null || : > "pack-$new.promisor"
+rm -f multi-pack-index
+while read -r p; do
+  b=${{p%.pack}}; [ "$b" = "pack-$new" ] || rm -f "./$b.pack" "./$b.idx" "./$b.rev" "./$b.bitmap" "./$b.promisor"
+done < "$l/packs"
+git multi-pack-index write >/dev/null 2>&1
+echo "packs compacted: $n small packs rolled up, $(find . -maxdepth 1 -name 'pack-*.pack' | wc -l | tr -d ' ') packs now""#
     )
 }
 
@@ -1100,8 +1116,9 @@ mod tests {
         assert!(count("pack") > SMALL_PACKS, "{} packs", count("pack"));
         let done = repo.compact_packs().unwrap().expect("compacted");
         assert!(done.starts_with("packs compacted"), "{done}");
-        // The downloads in one promisor pack, our commit in a pack of its own.
-        assert_eq!((count("pack"), count("promisor")), (2, 1), "{done}");
+        // The downloads (and the clone's pack) in one promisor pack; our
+        // commit stays a loose object.
+        assert_eq!((count("pack"), count("promisor")), (1, 1), "{done}");
         assert!(pack_dir.join("multi-pack-index").exists());
         assert!(!pack_dir.join("kitchen-compact.lock").exists());
         assert_eq!(repo.compact_packs().unwrap(), None);
@@ -1120,8 +1137,20 @@ mod tests {
         // h files, a line each) roll up.
         let big: Vec<_> = std::fs::read_dir(&pack_dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "pack") && p.metadata().unwrap().len() >= 8 * 1024).collect();
         assert!(!big.is_empty());
+        let objects = |p: &std::path::Path| -> std::collections::HashSet<String> {
+            let idx = std::fs::File::open(p.with_extension("idx")).unwrap();
+            let out = std::process::Command::new("git").arg("show-index").stdin(idx).output().unwrap().stdout;
+            String::from_utf8(out).unwrap().lines().filter_map(|l| l.split_whitespace().nth(1).map(String::from)).collect()
+        };
+        let packs = || -> Vec<std::path::PathBuf> { std::fs::read_dir(&pack_dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "pack") && !big.contains(p)).collect() };
+        let small: std::collections::HashSet<String> = packs().iter().flat_map(|p| objects(p)).collect();
         assert!(repo.compact_packs_under(8).unwrap().is_some());
         assert!(big.iter().all(|p| p.exists()), "kept: {big:?}");
+        // …and only the small packs' objects are packed (`repack -A -d
+        // --keep-pack` copies the kept packs' too).
+        let rest = packs();
+        assert_eq!(rest.len(), 1, "one new pack: {rest:?}");
+        assert_eq!(objects(&rest[0]), small);
         sh(&r, &format!("git cat-file -p origin/main:h{n} | grep -qx {n} && git cat-file -e HEAD~1:f1 && git fsck --connectivity-only 2>/dev/null"));
     }
 
