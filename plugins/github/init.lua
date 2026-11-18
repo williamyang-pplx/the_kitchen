@@ -800,10 +800,28 @@ kitchen.keymap("cmd+shift+d", "github.description", { when = "viewer" })
 
 -- Opening a PR on GitHub (⌘⇧O) ---------------------------------------------
 
+-- Waits (up to 2s) for the app with pid argv[1] to lose the front, then brings
+-- it back.
+local REFOCUS = [[
+on run argv
+  set pid to (item 1 of argv) as integer
+  tell application "System Events"
+    repeat 40 times
+      if not (frontmost of first process whose unix id is pid) then exit repeat
+      delay 0.05
+    end repeat
+    set frontmost of first process whose unix id is pid to true
+  end tell
+end run]]
+
 -- Open `url` in Chrome on this mac (devbox tabs too), else the default browser,
--- in the background (`open -g`): the kitchen keeps the focus.
+-- and keep the kitchen in front. Chrome comes to the front on every tab it
+-- opens, `open -g` or not, so the app that was in front is put back.
 local function browse(url)
-  local sh = "open -g -a 'Google Chrome' " .. q(url) .. " 2>/dev/null || open -g " .. q(url)
+  local sh = "front=$(osascript -e 'tell application \"System Events\" to unix id of first process whose frontmost is true' 2>/dev/null)\n"
+    .. "open -g -a 'Google Chrome' " .. q(url) .. " 2>/dev/null || open -g " .. q(url) .. " || exit 1\n"
+    .. "[ -z \"$front\" ] || osascript -e " .. q(REFOCUS) .. " \"$front\" >/dev/null 2>&1\n"
+    .. "exit 0"
   kitchen.run({ sh = sh, host = "local", timeout = 15 }, function(res)
     if res.code ~= 0 then
       kitchen.notify("couldn't open " .. url .. ": " .. why(res), "error")
