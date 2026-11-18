@@ -11,7 +11,7 @@
 -- hover), then the required checks that block its merge. ⌘⇧D
 -- shows the shown PR's description, rendered as on GitHub, and goes back.
 -- ⌘⇧O opens the shown PR (in the ⌘⇧S menu, the row under the cursor) in
--- Chrome.
+-- Chrome, in the background.
 
 local M = {}
 
@@ -800,9 +800,10 @@ kitchen.keymap("cmd+shift+d", "github.description", { when = "viewer" })
 
 -- Opening a PR on GitHub (⌘⇧O) ---------------------------------------------
 
--- Open `url` in Chrome on this mac (devbox tabs too), else the default browser.
+-- Open `url` in Chrome on this mac (devbox tabs too), else the default browser,
+-- in the background (`open -g`): the kitchen keeps the focus.
 local function browse(url)
-  local sh = "open -a 'Google Chrome' " .. q(url) .. " 2>/dev/null || open " .. q(url)
+  local sh = "open -g -a 'Google Chrome' " .. q(url) .. " 2>/dev/null || open -g " .. q(url)
   kitchen.run({ sh = sh, host = "local", timeout = 15 }, function(res)
     if res.code ~= 0 then
       kitchen.notify("couldn't open " .. url .. ": " .. why(res), "error")
