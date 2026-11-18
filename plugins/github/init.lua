@@ -11,7 +11,7 @@
 -- hover), then the required checks that block its merge. ⌘⇧D
 -- shows the shown PR's description, rendered as on GitHub, and goes back.
 -- ⌘⇧O opens the shown PR (in the ⌘⇧S menu, the row under the cursor) in
--- Chrome, in the background.
+-- Chrome, behind the kitchen.
 
 local M = {}
 
@@ -800,34 +800,21 @@ kitchen.keymap("cmd+shift+d", "github.description", { when = "viewer" })
 
 -- Opening a PR on GitHub (⌘⇧O) ---------------------------------------------
 
--- Keeps the app with pid argv[1] in front for the next few seconds: Chrome
--- takes the front when it gets the URL and can take it again as the tab
--- opens, so after the first hand-back it keeps watching for another second.
-local REFOCUS = [[
+-- Opens argv[1] in a new tab of Chrome's front window. Unlike `open`, which
+-- hands Chrome the URL and lets it come to the front, scripting Chrome leaves
+-- it in the background.
+local NEW_TAB = [[
 on run argv
-  set pid to (item 1 of argv) as integer
-  tell application "System Events"
-    set p to first process whose unix id is pid
-    set lost to 0
-    repeat with i from 1 to 60
-      if not (frontmost of p) then
-        set frontmost of p to true
-        if lost is 0 then set lost to i
-      end if
-      if lost > 0 and i - lost >= 20 then exit repeat
-      delay 0.05
-    end repeat
+  tell application "Google Chrome"
+    if (count of windows) = 0 then make new window
+    make new tab at end of tabs of window 1 with properties {URL:item 1 of argv}
   end tell
 end run]]
 
--- Open `url` in Chrome on this mac (devbox tabs too), else the default browser,
--- and keep the kitchen in front. Chrome comes to the front on every tab it
--- opens, `open -g` or not, so the app that was in front is put back.
+-- Open `url` in Chrome on this mac (devbox tabs too), behind the kitchen; else
+-- in the default browser.
 local function browse(url)
-  local sh = "front=$(osascript -e 'tell application \"System Events\" to unix id of first process whose frontmost is true' 2>/dev/null)\n"
-    .. "open -g -a 'Google Chrome' " .. q(url) .. " 2>/dev/null || open -g " .. q(url) .. " || exit 1\n"
-    .. "[ -z \"$front\" ] || osascript -e " .. q(REFOCUS) .. " \"$front\" >/dev/null 2>&1\n"
-    .. "exit 0"
+  local sh = "osascript -e " .. q(NEW_TAB) .. " " .. q(url) .. " >/dev/null 2>&1 || open " .. q(url)
   kitchen.run({ sh = sh, host = "local", timeout = 15 }, function(res)
     if res.code ~= 0 then
       kitchen.notify("couldn't open " .. url .. ": " .. why(res), "error")
