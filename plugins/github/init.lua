@@ -738,9 +738,10 @@ local function show_description(ctx, slug, ref)
       if w.code ~= 0 then
         return kitchen.notify("couldn't write the description: " .. why(w), "error")
       end
-      before[ctx.tab] = { path = ctx.viewer.path, line = ctx.viewer.line, dir = ctx.viewer.dir, diff = ctx.viewer.diff }
-      -- Plain, not diffed: the file is in no commit, so a diff shows it all as added.
-      kitchen.open(abs, nil, { diff = false })
+      before[ctx.tab] = { path = ctx.viewer.path, line = ctx.viewer.line, dir = ctx.viewer.dir }
+      -- The viewer's mode stays: a git-ignored file shows plain in diff
+      -- mode too, and the files opened after it keep their diffs.
+      kitchen.open(abs)
       kitchen.render.show(ctx.tab, true)
     end)
   end)
@@ -783,11 +784,10 @@ kitchen.command("description", function(ctx)
     local b = before[ctx.tab] or {}
     before[ctx.tab] = nil
     kitchen.render.show(ctx.tab, false)
-    local opts = { diff = b.diff }
     if b.path then
-      kitchen.open(v.worktree .. "/" .. b.path, b.line, opts)
+      kitchen.open(v.worktree .. "/" .. b.path, b.line)
     else
-      kitchen.open(v.worktree .. "/" .. ((b.dir or "") ~= "" and b.dir .. "/" or ""), nil, opts)
+      kitchen.open(v.worktree .. "/" .. ((b.dir or "") ~= "" and b.dir .. "/" or ""))
     end
     return
   end

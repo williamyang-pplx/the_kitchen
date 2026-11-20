@@ -523,6 +523,15 @@ impl Viewer {
         });
     }
 
+    /// Whether diff mode shows `path` as a diff. Not a file outside the
+    /// worktree (an installed package), nor one git knows neither at the
+    /// base nor among the changes: a git-ignored file, such as ⌘⇧D's PR
+    /// description, would show all added. Those show plain, and the viewer
+    /// stays in diff mode for the next file.
+    fn diffable(&self, path: &str) -> bool {
+        !path.starts_with('/') && (self.changed.iter().any(|c| c.path == path) || self.bases.get(path).is_none_or(|b| b.text.is_some()))
+    }
+
     fn ensure_base(&mut self, path: &str) {
         let key = format!("base:{path}");
         let Some(base) = self.merge_base.clone().filter(|_| !path.starts_with('/')) else { return };
@@ -944,7 +953,7 @@ impl Viewer {
         if !opt_ptr_eq(&rows, &self.render_shown) {
             self.doc_key = None;
         }
-        let has_base = self.bases.contains_key(&path);
+        let has_base = self.bases.contains_key(&path) && self.diffable(&path);
         let key = (path.clone(), self.diff && has_base, self.outline, self.files.contains_key(&path));
         if self.doc_key.as_ref() == Some(&key) {
             if self.files.contains_key(&path) {
@@ -1317,8 +1326,7 @@ impl Viewer {
         };
         header_ui.label(widgets::path_job(&path, 12.5));
         header_ui.add_space(theme::SPACE_XS);
-        // Files outside the worktree (an installed package) never have a base.
-        let has_base = self.current.as_ref().is_some_and(|p| !p.starts_with('/'));
+        let has_base = self.current.as_ref().is_some_and(|p| self.diffable(p));
         let (mode, color) = mode_pill(self.browsing, self.outline, self.render_shown.is_some(), self.diff, has_base);
         widgets::pill(&mut header_ui, mode, color);
         if mode == "DIFF" {
@@ -1452,6 +1460,7 @@ impl Viewer {
             let overlay = self.overlay.as_ref().filter(|o| !self.browsing && !self.outline && self.current.as_deref() == Some(o.path.as_str())).map(|o| &o.overlay);
             // GitHub renders the workspace's Markdown in its repo's context.
             let repo = self.engine.find_tab(&self.tab_id).and_then(|(w, _)| w.row.github_slug);
+            let two_gutters = self.diff && !self.outline && !self.browsing && self.current.as_ref().is_some_and(|p| self.diffable(p));
             let mut out = CodeView {
                 doc: &self.doc,
                 vim: &mut self.vim,
@@ -1460,7 +1469,7 @@ impl Viewer {
                 editor: self.editor.as_mut(),
                 focused,
                 font_size,
-                two_gutters: self.diff && !self.outline && !self.browsing && self.current.as_ref().is_some_and(|p| !p.starts_with('/')),
+                two_gutters,
                 relative: cx.engine.settings().relative_line_numbers,
                 overlay,
                 repo: repo.as_deref(),
@@ -2467,6 +2476,32 @@ mod tests {
         v.command(PanelCmd::ToggleDiff);
         settle(&mut v);
         assert!(v.diff && folds(&v).is_empty());
+    }
+
+    /// A git-ignored file (⌘⇧D's PR description) shows plain in diff mode,
+    /// and the viewer stays in diff mode: the changed file opened next is a
+    /// diff again.
+    #[test]
+    fn ignored_files_show_plain_and_keep_diff_mode() {
+        let h = Harness::new(TestRepo::new("echo 1 > a.rs"));
+        h.repo.sh("echo 2 > a.rs && git commit -qam change && echo .kitchen/ >> .git/info/exclude && mkdir .kitchen && printf '# PR\\n\\nbody\\n' > .kitchen/pr-7.md");
+        let mut v = h.viewer();
+        let settle = |v: &mut Viewer, p: &'static str| {
+            h.settle(v, &|v| v.current.as_deref() == Some(p) && v.files.contains_key(p) && v.bases.contains_key(p));
+            h.frame(v);
+        };
+        let added = |v: &Viewer| v.doc.lines.iter().filter(|l| l.kind == LineKind::Added).count();
+        settle(&mut v, "a.rs");
+        assert!(v.diff && added(&v) == 1, "the change opens as a diff");
+
+        v.command(PanelCmd::Open { path: Some(".kitchen/pr-7.md".into()), line: None, diff: None });
+        settle(&mut v, ".kitchen/pr-7.md");
+        assert_eq!((v.doc.lines.len(), added(&v)), (3, 0), "plain, not all added");
+        assert!(v.diff, "still in diff mode");
+
+        v.command(PanelCmd::Open { path: Some("a.rs".into()), line: None, diff: None });
+        settle(&mut v, "a.rs");
+        assert_eq!(added(&v), 1, "the next changed file is a diff");
     }
 
     /// ⌘M … ⌘Enter hands the comment to the `comment` listener with its
