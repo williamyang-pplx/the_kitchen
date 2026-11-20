@@ -24,11 +24,9 @@ pub enum Mark {
 }
 
 /// Paint `mark` centred on `at` with `p` (the caller's clipped painter): an
-/// orange `!` (NeedsYou), the yellow dot of radius `r` (Unread), or a
-/// three-quarter ring in `working_color` that steps a quarter turn every
-/// 250 ms (Working). The ring asks for the next step's frame only while it
-/// is on screen, so a working tab costs 4 repaints a second, and only when
-/// it can be seen.
+/// orange `!` (NeedsYou), the yellow dot of radius `r` (Unread), or an open
+/// ring in `working_color` (Working). The ring holds still: an animated one
+/// would redraw the whole window several times a second while any agent works.
 pub fn paint_mark(p: &egui::Painter, at: egui::Pos2, r: f32, mark: Mark, working_color: Color32) {
     match mark {
         Mark::NeedsYou => {
@@ -38,21 +36,13 @@ pub fn paint_mark(p: &egui::Painter, at: egui::Pos2, r: f32, mark: Mark, working
             p.circle_filled(at, r, theme::YELLOW);
         }
         Mark::Working => {
+            // Three quarters of a circle, open at the top right.
             let radius = r + 1.0;
-            let bounds = egui::Rect::from_center_size(at, egui::vec2(2.0 * radius + 2.0, 2.0 * radius + 2.0));
-            if !p.clip_rect().intersects(bounds) {
-                return; // scrolled out of the strip: no frames for it
-            }
-            let time = p.ctx().input(|i| i.time);
-            let step = (time * 4.0).floor();
-            let start = (step % 4.0) as f32 * std::f32::consts::FRAC_PI_2;
             let points: Vec<_> = (0..=18)
-                .map(|i| start + i as f32 / 18.0 * 1.5 * std::f32::consts::PI)
-                .map(|a| at + radius * egui::vec2(a.cos(), a.sin()))
+                .map(|i| -std::f32::consts::FRAC_PI_2 + i as f32 / 18.0 * 1.5 * std::f32::consts::PI)
+                .map(|a| at + radius * egui::vec2(-a.cos(), a.sin()))
                 .collect();
             p.add(egui::Shape::line(points, egui::Stroke::new(1.5, working_color)));
-            let next = ((step + 1.0) / 4.0 - time).max(0.001);
-            p.ctx().request_repaint_after(std::time::Duration::from_secs_f64(next));
         }
     }
 }
