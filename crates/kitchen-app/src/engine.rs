@@ -15,7 +15,7 @@ use kitchen_core::host::Host;
 use kitchen_core::tmux::{self, Tmux};
 use kitchen_core::util::{new_id, shell_quote, slugify};
 use kitchen_core::plan;
-use kitchen_proto::{Caller, TabInfo, WorkspaceInfo};
+use kitchen_proto::{AgentState, Caller, TabInfo, WorkspaceInfo};
 
 use crate::links::Link;
 use crate::settings::Settings;
@@ -23,6 +23,13 @@ use crate::settings::Settings;
 /// How often each workspace's warmer fetches `origin/<default>` and
 /// fast-forwards its spares (opening the ⌘T dialog also does it once).
 const SPARE_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often the agent watcher ([`Engine::watch_agents`]) wakes.
+const AGENT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+/// A working agent's pane redraws its spinner every fraction of a second;
+/// one this long without output is no longer working (an Esc interrupt or
+/// `/exit` fires no Stop). Seconds, to compare with tmux's.
+const AGENT_QUIET_SECS: u64 = 20;
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -66,6 +73,10 @@ impl Workspace {
 pub struct Tab {
     pub row: TabRow,
     pub unread: bool,
+    /// The agent's last state and when it arrived (this mac's clock); None
+    /// until it reports. In memory only: after a restart it is None until
+    /// the next hook.
+    pub agent_state: Option<(AgentState, std::time::Instant)>,
 }
 
 impl Tab {
@@ -333,7 +344,7 @@ impl Engine {
             .unwrap_or_default();
         let mut state = State::default();
         for row in db.workspaces()? {
-            let tabs = db.tabs(&row.id)?.into_iter().map(|row| Tab { row, unread: false }).collect();
+            let tabs = db.tabs(&row.id)?.into_iter().map(|row| Tab { row, unread: false, agent_state: None }).collect();
             let selected_tab = db.setting(&format!("selected_tab:{}", row.id))?;
             state.workspaces.push(Workspace { row, tabs, selected_tab, status: None, error: None, pending: Vec::new() });
         }
@@ -956,7 +967,7 @@ impl Engine {
         {
             let mut st = self.state();
             if let Some(w) = st.workspaces.iter_mut().find(|w| w.row.id == ws_id) {
-                w.tabs.push(Tab { row: row.clone(), unread: false });
+                w.tabs.push(Tab { row: row.clone(), unread: false, agent_state: None });
             }
         }
         if focus {
@@ -1347,7 +1358,7 @@ impl Engine {
         let mut closed = self.closed.lock().unwrap();
         loop {
             let i = closed.iter().rposition(|t| t.workspace_id == ws.row.id)?;
-            let tab = Tab { row: closed.remove(i), unread: false };
+            let tab = Tab { row: closed.remove(i), unread: false, agent_state: None };
             if tab.in_main_checkout(ws) || !ws.tabs.iter().any(|t| t.row.worktree == tab.row.worktree) {
                 return Some(tab.row);
             }
@@ -1360,7 +1371,7 @@ impl Engine {
         let mut st = self.state();
         if let Some(w) = st.workspaces.iter_mut().find(|w| w.row.id == row.workspace_id) {
             let at = w.tabs.iter().position(|t| t.row.position > row.position).unwrap_or(w.tabs.len());
-            w.tabs.insert(at, Tab { row: row.clone(), unread: false });
+            w.tabs.insert(at, Tab { row: row.clone(), unread: false, agent_state: None });
         }
         drop(st);
         self.select_tab(&row.id);
@@ -1436,6 +1447,116 @@ impl Engine {
         Ok(id)
     }
 
+    // ================================================================ agent state
+
+    /// The tab's agent reports `state` (`tab.agent_state`, from its hooks).
+    /// Idle raises "agent finished" through [`Engine::notify`] (banner, plus
+    /// the unread dot when the tab is not on screen), every time: Stop fires
+    /// once per turn, and the watcher may have idled the tab silently before
+    /// it. NeedsYou raises "agent needs you" unless the tab already needs you
+    /// (PreToolUse and Notification can both fire for one prompt). Working
+    /// raises nothing.
+    pub fn report_agent_state(&self, tab_id: &str, state: AgentState) -> Result<()> {
+        let (prev, ws_id, body) = {
+            let mut st = self.state();
+            let (ws, tab) = st
+                .workspaces
+                .iter_mut()
+                .find_map(|w| {
+                    let id = w.row.id.clone();
+                    w.tabs.iter_mut().find(|t| t.row.id == tab_id).map(|t| (id, t))
+                })
+                .context("no such tab")?;
+            let prev = tab.agent_state.map(|(s, _)| s);
+            tab.agent_state = Some((state, std::time::Instant::now()));
+            // What the hooks sent as `basename "$PWD"`.
+            let body = tab.row.worktree.trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string();
+            (prev, ws, body)
+        };
+        match state {
+            AgentState::Idle => self.notify(Some(&ws_id), Some(tab_id), "agent finished", &body).map(|_| ()),
+            AgentState::NeedsYou if prev != Some(AgentState::NeedsYou) => {
+                self.notify(Some(&ws_id), Some(tab_id), "agent needs you", &body).map(|_| ())
+            }
+            _ => {
+                if prev != Some(state) {
+                    self.repaint();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The watcher saw `tab_id`'s pane quiet: Working -> Idle, silently (no
+    /// banner, no dot: William interrupted it, or it exited). Skipped when a
+    /// report arrived after `reported_at` (the one the watcher looked at).
+    /// A tab that needs you is left alone: its prompt waits without output.
+    fn idle_if_quiet(&self, tab_id: &str, reported_at: std::time::Instant) {
+        let mut st = self.state();
+        let Some(tab) = st.workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()).find(|t| t.row.id == tab_id) else { return };
+        if tab.agent_state != Some((AgentState::Working, reported_at)) {
+            return;
+        }
+        tab.agent_state = Some((AgentState::Idle, std::time::Instant::now()));
+        drop(st);
+        self.repaint();
+    }
+
+    /// Start the agent watcher, one thread for the app's life. Every
+    /// [`AGENT_POLL`] it takes the tabs that have been Working for at least
+    /// [`AGENT_QUIET_SECS`] and checks their hosts one after another, one
+    /// [`Tmux::window_activity`] round trip each; a pane that printed nothing
+    /// for that long goes idle. Nothing working: no ssh, no tmux. A dead
+    /// devbox delays the next host by up to ssh's ConnectTimeout.
+    pub fn watch_agents(self: &Arc<Self>) {
+        let me = self.clone();
+        std::thread::Builder::new()
+            .name("agent watch".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(AGENT_POLL);
+                    for (host, tabs) in me.long_working_tabs() {
+                        let (now, seen) = match Tmux::new(&host).window_activity() {
+                            Ok(found) => found,
+                            // An unreachable host doesn't mean its agents stopped.
+                            Err(e) => {
+                                log::debug!("agent watch on {}: {e:#}", host.label());
+                                continue;
+                            }
+                        };
+                        for (tab_id, session, reported_at) in tabs {
+                            if seen.get(&session).is_none_or(|at| now.saturating_sub(*at) >= AGENT_QUIET_SECS) {
+                                me.idle_if_quiet(&tab_id, reported_at);
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn thread");
+    }
+
+    /// Tabs reported Working at least [`AGENT_QUIET_SECS`] ago, by host:
+    /// (tab id, tmux session, when the report came).
+    fn long_working_tabs(&self) -> Vec<(Host, Vec<(String, String, std::time::Instant)>)> {
+        let quiet = std::time::Duration::from_secs(AGENT_QUIET_SECS);
+        let mut by_host: Vec<(Host, Vec<_>)> = Vec::new();
+        for ws in &self.state().workspaces {
+            let host = ws.host();
+            for t in &ws.tabs {
+                let Some((AgentState::Working, at)) = t.agent_state else { continue };
+                if at.elapsed() < quiet {
+                    continue;
+                }
+                let tab = (t.row.id.clone(), t.row.tmux_session.clone(), at);
+                match by_host.iter_mut().find(|(h, _)| *h == host) {
+                    Some((_, tabs)) => tabs.push(tab),
+                    None => by_host.push((host.clone(), vec![tab])),
+                }
+            }
+        }
+        by_host
+    }
+
     // ================================================================ plans
 
     pub fn plan_comments(&self, tab_id: &str) -> Result<Vec<PlanComment>> {
@@ -1492,7 +1613,7 @@ impl Engine {
 /// as the tmux session). The file is the tab's own: read tabs share the main
 /// checkout's `.kitchen/`.
 fn agent_command(worktree: &str, tab_id: &str, settings: &Settings, first_message: Option<&str>) -> (String, Option<String>) {
-    let base = format!("{} --settings {}", settings.edit_agent_command, shell_quote(&agent_settings_json(tab_id)));
+    let base = format!("{} --settings {}", settings.edit_agent_command, shell_quote(&agent_settings_json(worktree, tab_id)));
     let Some(message) = first_message else {
         return (base, None);
     };
@@ -1555,12 +1676,17 @@ fn closest(matches: &[String]) -> Option<&String> {
 }
 
 /// `--settings` for agents the kitchen starts: plan files land in the
-/// tab's own directory, where the plan reviewer looks, and Stop/Notification hooks badge the
-/// tab through `kitchenctl notify` so a finished or blocked agent is visible
-/// from any workspace. Stop stays quiet while background subagents run, and
-/// reports the agent's session (`__agent-session`) for a revived tab to resume.
-fn agent_settings_json(tab_id: &str) -> String {
+/// tab's own directory, where the plan reviewer looks, and hooks report the
+/// agent's state with `kitchenctl agent state`, which shows on the tab and
+/// raises "agent finished" / "agent needs you" from any workspace. Stop
+/// stays quiet while background subagents run, and reports the agent's
+/// session (`__agent-session`) for a revived tab to resume.
+///
+/// This is Claude Code's wiring; another harness reports the same three
+/// states from its own hooks.
+fn agent_settings_json(worktree: &str, tab_id: &str) -> String {
     let hook = |matcher: &str, commands: &[String]| {
+        // One entry per command: commands that read the hook's stdin can't share it.
         let hooks: Vec<_> = commands
             .iter()
             .map(|c| serde_json::json!({ "type": "command",
@@ -1569,24 +1695,42 @@ fn agent_settings_json(tab_id: &str) -> String {
         serde_json::json!([{ "matcher": matcher, "hooks": hooks }])
     };
     let args = |title: &str| format!("--title '{title}' --body \"$(basename \"$PWD\")\"");
+    // Set while the tab isn't shown working (after a stop or an ask): the next
+    // tool call reports Working. Every other tool call costs one sh and a stat.
+    let dir = format!("{}/{}", worktree.trim_end_matches('/'), plan::tab_dir(tab_id));
+    let marker = shell_quote(&format!("{dir}/report-working"));
+    let mark = format!("mkdir -p {} && touch {marker}", shell_quote(&dir));
+    let prompt = hook("", &[format!("rm -f {marker}; kitchenctl agent state working")]);
+    // An older kitchenctl exits 2 and an older app 1; plain notify then.
+    let ask = |matcher: &str| hook(matcher, &[format!("{mark}; kitchenctl agent state needs-you || kitchenctl notify {}", args("agent needs you"))]);
+    // Only prompts that block the agent; idle_prompt repeats Stop a minute later.
+    let blocked = ask("permission_prompt|elicitation_dialog|elicitation_url_dialog");
+    let asks = ask("AskUserQuestion|ExitPlanMode");
+    // The marker goes only once the report went through.
+    let tool = hook("", &[format!("[ -e {marker} ] && kitchenctl agent state working && rm -f {marker}")]);
     let stop = hook(
         "",
         &[
-            // A kitchenctl older than __agent-stopped exits 2; plain notify then.
-            format!("kitchenctl __agent-stopped {a} || kitchenctl notify {a}", a = args("agent finished")),
+            // Marked even with subagents pending: the next tool call re-reports Working.
+            format!("{mark}; kitchenctl __agent-stopped {a} || kitchenctl notify {a}", a = args("agent finished")),
             "kitchenctl __agent-session".to_string(),
         ],
     );
-    // Only prompts that block the agent; idle_prompt repeats Stop a minute later.
-    let blocked = hook(
-        "permission_prompt|elicitation_dialog|elicitation_url_dialog",
-        &[format!("kitchenctl notify {}", args("agent needs you"))],
-    );
+    // A quiet Working tab is idled by the watcher; this only drops the marker.
+    let end = hook("", &[format!("rm -f {marker}")]);
     // Its stdout joins the agent's context: the kitchen guide, every session.
     let guide = serde_json::json!([{ "matcher": "", "hooks": [{ "type": "command",
         "command": "command -v kitchenctl >/dev/null && kitchenctl guide 2>/dev/null; true" }] }]);
     serde_json::json!({
-        "hooks": { "SessionStart": guide, "Stop": stop, "Notification": blocked },
+        "hooks": {
+            "SessionStart": guide,
+            "UserPromptSubmit": prompt,
+            "PreToolUse": asks,
+            "PostToolUse": tool,
+            "Notification": blocked,
+            "Stop": stop,
+            "SessionEnd": end,
+        },
         "plansDirectory": plan::plans_dir(tab_id),
     })
     .to_string()
@@ -1607,6 +1751,7 @@ fn tab_infos(w: &Workspace) -> Vec<TabInfo> {
             selected: sel.as_deref() == Some(&t.row.id),
             plan_file: t.row.plan_file(),
             unread: t.unread,
+            agent_state: t.agent_state.map(|(s, _)| s),
         })
         .collect()
 }
@@ -1864,7 +2009,26 @@ mod tests {
     /// first message from a per-tab file that the command removes.
     #[test]
     fn agent_command_and_settings() {
-        let settings: serde_json::Value = serde_json::from_str(&agent_settings_json("a")).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&agent_settings_json("/r-a", "a")).unwrap();
+        let hooks = &settings["hooks"];
+        for event in ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd"] {
+            assert!(hooks[event][0]["hooks"][0]["command"].is_string(), "{event} hook");
+        }
+        let command = |event: &str, i: usize| hooks[event][0]["hooks"][i]["command"].as_str().unwrap().to_string();
+        assert!(
+            command("PostToolUse", 0).contains("[ -e /r-a/.kitchen/tabs/a/report-working ] && kitchenctl agent state working && rm -f /r-a/.kitchen/tabs/a/report-working"),
+            "{}",
+            command("PostToolUse", 0)
+        );
+        assert_eq!(hooks["PreToolUse"][0]["matcher"], "AskUserQuestion|ExitPlanMode");
+        assert!(command("PreToolUse", 0).contains("touch /r-a/.kitchen/tabs/a/report-working; kitchenctl agent state needs-you || kitchenctl notify"));
+        // Both read the hook's stdin: an entry each.
+        assert_eq!(hooks["Stop"][0]["hooks"].as_array().unwrap().len(), 2);
+        assert!(command("Stop", 0).contains("kitchenctl __agent-stopped --title 'agent finished'") && command("Stop", 0).contains("|| kitchenctl notify"));
+        assert!(command("Stop", 1).contains("kitchenctl __agent-session"));
+        let quoted: serde_json::Value = serde_json::from_str(&agent_settings_json("/r/it's here", "a")).unwrap();
+        let post = quoted["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+        assert!(post.contains(r"[ -e '/r/it'\''s here/.kitchen/tabs/a/report-working' ]"), "{post}");
         let start = &settings["hooks"]["SessionStart"][0];
         assert_eq!(start["matcher"], "", "every session: startup, resume, clear, compact");
         assert_eq!(start["hooks"][0]["command"], "command -v kitchenctl >/dev/null && kitchenctl guide 2>/dev/null; true");
@@ -1916,6 +2080,7 @@ mod tests {
                 agent_session: None,
             },
             unread: false,
+            agent_state: None,
         };
         // (the repo is /r)
         assert!(tab("/r").in_main_checkout(&ws) && tab("/private/r/").in_main_checkout(&ws));
@@ -1944,6 +2109,63 @@ mod tests {
         e.mark_read(None).unwrap();
         assert_eq!(unread(&e, "v"), 0);
         assert!(e.db().notifications(true, 50).unwrap().is_empty());
+    }
+
+    /// A reported Idle always notifies (Stop fires once per turn); a repeated
+    /// NeedsYou doesn't; Working never does. Unread follows the banner.
+    #[test]
+    fn agent_state_notifies_on_idle_and_needs_you() {
+        let e = engine_with(&["w"]);
+        for id in ["a", "b"] {
+            // (restoring selects the tab: b ends up selected, a not)
+            e.restore_tab(TabRow { id: id.into(), workspace_id: "w".into(), title: id.into(), worktree: format!("/r-{id}"), branch: None, tmux_session: format!("kt-test-state-{id}"), position: 0, agent: true, agent_session: None }).unwrap();
+        }
+        let banners = |e: &Engine| e.db().notifications(false, 50).unwrap().len();
+        let state = |e: &Engine| e.workspace("w").unwrap().tab("a").unwrap().agent_state.map(|(s, _)| s);
+
+        e.report_agent_state("a", AgentState::Working).unwrap();
+        assert_eq!((banners(&e), state(&e)), (0, Some(AgentState::Working)));
+        e.report_agent_state("a", AgentState::Idle).unwrap();
+        assert_eq!(banners(&e), 1);
+        assert!(e.workspace("w").unwrap().tab("a").unwrap().unread);
+        let n = e.db().notifications(false, 50).unwrap().remove(0);
+        assert_eq!((n.title.as_str(), n.body.as_str()), ("agent finished", "r-a"));
+        e.report_agent_state("a", AgentState::Idle).unwrap();
+        assert_eq!(banners(&e), 2, "every Stop notifies");
+        e.report_agent_state("a", AgentState::NeedsYou).unwrap();
+        e.report_agent_state("a", AgentState::NeedsYou).unwrap();
+        assert_eq!(banners(&e), 3, "one banner per prompt");
+        let infos = tab_infos(&e.workspace("w").unwrap());
+        assert_eq!(infos.iter().map(|t| t.agent_state).collect::<Vec<_>>(), [Some(AgentState::NeedsYou), None]);
+        assert!(e.report_agent_state("nope", AgentState::Idle).is_err());
+    }
+
+    /// The watcher idles a quiet Working tab without a banner, never one with
+    /// a newer report or one that needs you.
+    #[test]
+    fn quiet_agent_goes_idle_silently() {
+        let e = engine_with(&["w"]);
+        for id in ["a", "b"] {
+            e.restore_tab(TabRow { id: id.into(), workspace_id: "w".into(), title: id.into(), worktree: format!("/r-{id}"), branch: None, tmux_session: format!("kt-test-quiet-{id}"), position: 0, agent: true, agent_session: None }).unwrap();
+        }
+        let agent = |e: &Engine| e.workspace("w").unwrap().tab("a").unwrap().agent_state.unwrap();
+        let banners = |e: &Engine| e.db().notifications(false, 50).unwrap().len();
+
+        e.report_agent_state("a", AgentState::Working).unwrap();
+        let (_, first) = agent(&e);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        e.report_agent_state("a", AgentState::Working).unwrap();
+        e.idle_if_quiet("a", first);
+        assert_eq!(agent(&e).0, AgentState::Working, "a newer report wins");
+        e.idle_if_quiet("a", agent(&e).1);
+        assert_eq!((agent(&e).0, banners(&e)), (AgentState::Idle, 0));
+        assert!(!e.workspace("w").unwrap().tab("a").unwrap().unread);
+        e.report_agent_state("a", AgentState::Idle).unwrap();
+        assert_eq!(banners(&e), 1, "Stop after a silent idle still notifies");
+
+        e.report_agent_state("a", AgentState::NeedsYou).unwrap();
+        e.idle_if_quiet("a", agent(&e).1);
+        assert_eq!(agent(&e).0, AgentState::NeedsYou, "a prompt waits without output");
     }
 
     fn engine_with(ids: &[&str]) -> Arc<Engine> {

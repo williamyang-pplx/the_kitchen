@@ -95,6 +95,7 @@ fn startup(engine: &Arc<engine::Engine>) {
         }
         Ok(())
     });
+    engine.watch_agents();
     for ws in engine.workspaces() {
         // (local workspaces are not bootstrapped at start)
         engine.keep_spares_warm(&ws.row.id);

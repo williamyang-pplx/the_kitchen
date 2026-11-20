@@ -18,6 +18,8 @@ use crate::terminal::{TermSession, TerminalView};
 use crate::theme;
 use crate::ui::dialogs::{Dialog, DialogOutcome};
 use crate::ui::{shimmer, widgets};
+use crate::ui::widgets::Mark;
+use kitchen_proto::AgentState;
 
 /// Height of the macOS title bar the window draws under.
 const TITLEBAR_HEIGHT: f32 = 28.0;
@@ -824,15 +826,15 @@ impl KitchenApp {
                 let p = ui.painter().with_clip_rect(card.shrink2(egui::vec2(8.0, 0.0)).intersect(ui.clip_rect()));
                 let name_color = if is_sel { host_color } else { host_color.gamma_multiply(0.8) };
                 p.text(egui::pos2(x, rect.top() + 10.0), egui::Align2::LEFT_TOP, &ws.row.name, theme::ui_font_semibold(13.0), name_color);
-                if ws.tabs.iter().any(|t| t.unread) {
-                    p.circle_filled(egui::pos2(card.right() - 20.0, rect.top() + 18.0), 3.5, theme::YELLOW);
+                if let Some(mark) = workspace_mark(&ws.tabs) {
+                    widgets::paint_mark(&p, egui::pos2(card.right() - 20.0, rect.top() + 18.0), 3.5, mark, host_color);
                 }
                 let tabs = match ws.tabs.len() {
                     0 => "no tabs".to_string(),
                     1 => "1 tab".to_string(),
                     n => format!("{n} tabs"),
                 };
-                let sub = format!("{} · {} · {tabs}", ws.row.host, ws.repo_name());
+                let sub = format!("{} · {} · {tabs}{}", ws.row.host, ws.repo_name(), agent_counts(&ws.tabs));
                 p.text(egui::pos2(x, rect.top() + 28.0), egui::Align2::LEFT_TOP, sub, theme::ui_font(theme::TEXT_SMALL), host_color.gamma_multiply(if is_sel { 0.75 } else { 0.6 }));
                 if !status.is_empty() {
                     let status: String = status.chars().take(36).collect();
@@ -1040,7 +1042,7 @@ impl KitchenApp {
             let is_sel = sel.as_deref() == Some(&tab.row.id);
             let title: String = tab.row.title.chars().take(32).collect();
             let kind = if tab.in_main_checkout(ws) { theme::TAB_READ } else { theme::TAB_EDIT };
-            let resp = tab_button(ui, strip, &tab.row.id, Some(i + 1), &title, Some(kind), is_sel, tab.unread).on_hover_text(format!(
+            let resp = tab_button(ui, strip, &tab.row.id, Some(i + 1), &title, Some(kind), is_sel, tab_mark(tab)).on_hover_text(format!(
                 "{}\n{}",
                 tab.row.worktree,
                 tab.row.branch.as_deref().map(|b| format!("branch {b}")).unwrap_or_else(|| "detached".into())
@@ -1058,7 +1060,7 @@ impl KitchenApp {
         }
         for p in &ws.pending {
             let title: String = p.title.chars().take(32).collect();
-            let resp = tab_button(ui, strip, &p.id, None, &format!("⋯ {title}"), None, p.focus, false).on_hover_text("fetching origin and preparing the worktree…");
+            let resp = tab_button(ui, strip, &p.id, None, &format!("⋯ {title}"), None, p.focus, None).on_hover_text("fetching origin and preparing the worktree…");
             reveal(&resp, &p.id);
         }
         // Drag-to-reorder, scrolling while the pointer nears either end.
@@ -1443,12 +1445,40 @@ fn centered_note(ui: &mut Ui, text: &str, color: Color32) {
     });
 }
 
+/// A tab's mark: needs you, else working (a working tab's old "finished" is
+/// stale), else unread.
+fn tab_mark(tab: &Tab) -> Option<Mark> {
+    match tab.agent_state {
+        Some((AgentState::NeedsYou, _)) => Some(Mark::NeedsYou),
+        Some((AgentState::Working, _)) => Some(Mark::Working),
+        _ => tab.unread.then_some(Mark::Unread),
+    }
+}
+
+/// A workspace's mark: the most urgent of its tabs' marks. Built on
+/// [`tab_mark`], so a tab and its workspace never disagree.
+fn workspace_mark(tabs: &[Tab]) -> Option<Mark> {
+    tabs.iter().filter_map(tab_mark).min()
+}
+
+/// " · 2 working · 1 needs you" for a workspace's subtitle, leaving out zero
+/// counts; "" when none.
+fn agent_counts(tabs: &[Tab]) -> String {
+    let count = |state: AgentState| tabs.iter().filter(|t| t.agent_state.is_some_and(|(s, _)| s == state)).count();
+    [(count(AgentState::Working), "working"), (count(AgentState::NeedsYou), "needs you")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!(" · {n} {what}"))
+        .collect()
+}
+
 /// A tab in the strip: a rounded box outlined in the tab's color, the selected
 /// one filled with the content's color and outlined brighter.
 /// `id`: the tab's (or pending tab's) id. `number`: None for a pending tab
 /// (drawn in italics). `kind`: the tab's color (edit or read tab); None for
-/// a pending tab.
-fn tab_button(ui: &mut Ui, strip: egui::Rect, id: &str, number: Option<usize>, title: &str, kind: Option<Color32>, selected: bool, unread: bool) -> egui::Response {
+/// a pending tab. `mark`: what its corner shows; a tab that needs you is
+/// outlined (and, selected, glows) orange.
+fn tab_button(ui: &mut Ui, strip: egui::Rect, id: &str, number: Option<usize>, title: &str, kind: Option<Color32>, selected: bool, mark: Option<Mark>) -> egui::Response {
     let mut job = egui::text::LayoutJob::default();
     let fmt = |font: egui::FontId, color: Color32| egui::TextFormat { font_id: font, color, valign: Align::Center, italics: number.is_none(), ..Default::default() };
     if let Some(n) = number {
@@ -1463,7 +1493,7 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, id: &str, number: Option<usize>, t
     let title_font = if selected { theme::ui_font_semibold(theme::TEXT_BODY) } else { theme::ui_font(theme::TEXT_BODY) };
     job.append(title, if number.is_some() { 7.0 } else { 0.0 }, fmt(title_font, title_color));
     let galley = ui.painter().layout_job(job);
-    let dot = if unread { 12.0 } else { 0.0 };
+    let dot = if mark.is_some() { 12.0 } else { 0.0 };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 28.0 + dot, strip.height()), Sense::click_and_drag());
     let pill = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 2.0, 26.0));
     let round = CornerRadius::same(theme::RADIUS);
@@ -1475,10 +1505,16 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, id: &str, number: Option<usize>, t
     } else {
         Color32::TRANSPARENT
     };
-    let stroke = if selected { egui::Stroke::new(1.5, color) } else { egui::Stroke::new(1.0, color.gamma_multiply(if resp.hovered() { 0.8 } else { 0.45 })) };
+    let needs_you = mark == Some(Mark::NeedsYou);
+    let outline = if needs_you { theme::ORANGE } else { color };
+    let stroke = if selected || needs_you {
+        egui::Stroke::new(1.5, outline)
+    } else {
+        egui::Stroke::new(1.0, color.gamma_multiply(if resp.hovered() { 0.8 } else { 0.45 }))
+    };
     ui.painter().rect(pill, round, fill, stroke, egui::StrokeKind::Inside);
     if selected {
-        shimmer::paint(ui, "tab", id, pill, theme::RADIUS as f32, color);
+        shimmer::paint(ui, "tab", id, pill, theme::RADIUS as f32, outline);
     }
     let text_color = if resp.hovered() && !selected { kind.unwrap_or(theme::MUTED) } else { title_color };
     let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
@@ -1488,8 +1524,8 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, id: &str, number: Option<usize>, t
     } else {
         ui.painter().galley(pos, galley, text_color);
     }
-    if unread {
-        ui.painter().circle_filled(egui::pos2(pos.x + width + 9.0, rect.center().y), 3.0, theme::YELLOW);
+    if let Some(mark) = mark {
+        widgets::paint_mark(ui.painter(), egui::pos2(pos.x + width + 9.0, rect.center().y), 3.0, mark, color);
     }
     resp
 }
@@ -1613,6 +1649,27 @@ mod tests {
         reg.commands.push(CommandEntry { plugin: "p".into(), name: "p.x".into(), desc: "do x".into(), remote: false });
         reg.chords.push(ChordEntry { plugin: "p".into(), chord: keybindings::Binding::parse("cmd+shift+y", &[]).unwrap(), command: "p.x".into(), when: When::Any });
         assert_eq!(rows(&d.with_plugins(&reg), &reg, "Plugins"), vec![("⌘⇧Y".to_string(), "do x".to_string())]);
+    }
+
+    /// A tab shows its own most current mark; a workspace its most urgent tab's.
+    #[test]
+    fn marks() {
+        let tab = |state: Option<AgentState>, unread: bool| Tab {
+            row: kitchen_core::db::TabRow { id: "t".into(), workspace_id: "w".into(), title: "t".into(), worktree: "/w".into(), branch: None, tmux_session: "t".into(), position: 0, agent: true, agent_session: None },
+            unread,
+            agent_state: state.map(|s| (s, Instant::now())),
+        };
+        let (needs, working, idle) = (Some(AgentState::NeedsYou), Some(AgentState::Working), Some(AgentState::Idle));
+        assert_eq!(tab_mark(&tab(needs, true)), Some(Mark::NeedsYou));
+        assert_eq!(tab_mark(&tab(working, true)), Some(Mark::Working), "working again: the old finish is stale");
+        assert_eq!(tab_mark(&tab(idle, true)), Some(Mark::Unread));
+        assert_eq!(tab_mark(&tab(idle, false)), None);
+        assert_eq!(workspace_mark(&[tab(working, false), tab(idle, true)]), Some(Mark::Unread), "something to look at beats working");
+        assert_eq!(workspace_mark(&[tab(working, false), tab(needs, false), tab(idle, true)]), Some(Mark::NeedsYou));
+        assert_eq!(workspace_mark(&[tab(working, true)]), Some(Mark::Working));
+        assert_eq!(workspace_mark(&[tab(None, false)]), None);
+        assert_eq!(agent_counts(&[tab(idle, false)]), "");
+        assert_eq!(agent_counts(&[tab(working, false), tab(needs, false), tab(working, true)]), " · 2 working · 1 needs you");
     }
 
     fn key(key: Key, modifiers: Modifiers) -> Vec<egui::Event> {

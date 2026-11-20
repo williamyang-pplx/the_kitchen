@@ -134,4 +134,20 @@ pub struct TabInfo {
     pub plan_file: String,
     #[serde(default)]
     pub unread: bool,
+    /// None until the tab's agent reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<AgentState>,
+}
+
+/// What a tab's agent is doing, as its harness last reported it
+/// (`kitchenctl agent state`) or as the kitchen's watcher settled it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentState {
+    /// Taking a turn: thinking, running tools, or waiting on its subagents.
+    Working,
+    /// Its turn is over (or it exited); it waits for the next prompt.
+    Idle,
+    /// Blocked on William: a permission prompt, a question, a plan to approve.
+    NeedsYou,
 }

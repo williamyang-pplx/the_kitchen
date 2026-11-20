@@ -1,5 +1,6 @@
 //! Small pieces of the kitchen's look shared by every view: badges, section
-//! labels, key hints, buttons, the frame of dialogs and popups, empty states.
+//! labels, key hints, buttons, the frame of dialogs and popups, empty states,
+//! the marks on tabs and workspaces.
 
 use egui::text::LayoutJob;
 use egui::{Color32, CornerRadius, Response, RichText, Sense, TextFormat, Ui};
@@ -9,6 +10,52 @@ use crate::theme;
 
 /// Height of the header row atop the viewer and the plan.
 pub const HEADER_HEIGHT: f32 = 36.0;
+
+/// The mark in a tab's or workspace's corner, most urgent first (`Ord`
+/// ranks them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Mark {
+    /// Its agent is blocked on William.
+    NeedsYou,
+    /// Its agent finished, and William hasn't looked yet.
+    Unread,
+    /// Its agent is taking a turn.
+    Working,
+}
+
+/// Paint `mark` centred on `at` with `p` (the caller's clipped painter): an
+/// orange `!` (NeedsYou), the yellow dot of radius `r` (Unread), or a
+/// three-quarter ring in `working_color` that steps a quarter turn every
+/// 250 ms (Working). The ring asks for the next step's frame only while it
+/// is on screen, so a working tab costs 4 repaints a second, and only when
+/// it can be seen.
+pub fn paint_mark(p: &egui::Painter, at: egui::Pos2, r: f32, mark: Mark, working_color: Color32) {
+    match mark {
+        Mark::NeedsYou => {
+            p.text(at, egui::Align2::CENTER_CENTER, "!", theme::ui_font_semibold(theme::TEXT_BODY), theme::ORANGE);
+        }
+        Mark::Unread => {
+            p.circle_filled(at, r, theme::YELLOW);
+        }
+        Mark::Working => {
+            let radius = r + 1.0;
+            let bounds = egui::Rect::from_center_size(at, egui::vec2(2.0 * radius + 2.0, 2.0 * radius + 2.0));
+            if !p.clip_rect().intersects(bounds) {
+                return; // scrolled out of the strip: no frames for it
+            }
+            let time = p.ctx().input(|i| i.time);
+            let step = (time * 4.0).floor();
+            let start = (step % 4.0) as f32 * std::f32::consts::FRAC_PI_2;
+            let points: Vec<_> = (0..=18)
+                .map(|i| start + i as f32 / 18.0 * 1.5 * std::f32::consts::PI)
+                .map(|a| at + radius * egui::vec2(a.cos(), a.sin()))
+                .collect();
+            p.add(egui::Shape::line(points, egui::Stroke::new(1.5, working_color)));
+            let next = ((step + 1.0) / 4.0 - time).max(0.001);
+            p.ctx().request_repaint_after(std::time::Duration::from_secs_f64(next));
+        }
+    }
+}
 
 /// A path in monospace: its folders dimmer than its name.
 pub fn path_job(path: &str, size: f32) -> LayoutJob {

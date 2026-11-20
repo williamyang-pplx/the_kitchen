@@ -51,7 +51,7 @@ app is not reachable.
 | `workspace close W` | `workspace.close` | ends tmux sessions; repo + worktrees stay |
 | `workspace read [-w W \| --all]` | `workspace.mark_read` | clears the yellow unread dots; marks the tabs' notifications read |
 | `workspace bootstrap [-w W]` | `workspace.bootstrap` | pull dotfiles, relink skills, install kitchenctl, start relay |
-| `tab list [-w W]` | `tab.list` | |
+| `tab list [-w W]` | `tab.list` | with each tab's agent state |
 | `tab new [--task T\|--task-file F\|--prompt T\|--prompt-file F] [--branch B\|--read] [--title T] [--command C] [--no-agent] [--no-focus] [-w W]` | `tab.create` | own worktree + new branch off fresh origin, or `--branch` (fetched; a tab on it is reused), or `--read` (`--main-checkout`): the main checkout; `--task` starts `/low-level-plan`, `--prompt` starts the agent on that message (from a kitchen tab, with a note naming the calling tab) |
 | `tab select T [-w W]` | `tab.select` | ⌘1…⌘9 |
 | `tab rename TITLE [-t T]` | `tab.rename` | |
@@ -66,12 +66,22 @@ app is not reachable.
 | `plan path` / `open` / `ready` | `plan.path` / `.open` / `.ready` | `ready` reloads the reviewer and notifies William |
 | `plan comments [--all]` | `plan.comments` | open (and sent) comments; `--all` includes resolved |
 | `plan resolve ID` | `plan.resolve` | |
-| `notify --title T [--body B] [-t T]` | `notify` | badge + macOS banner |
+| `agent state working\|idle\|needs-you` | `tab.agent_state` | the caller tab's agent state; idle and needs-you raise "agent finished" / "agent needs you" |
+| `notify --title T [--body B] [-t T]` | `notify` | badge + macOS banner; harness hooks report `agent state` instead |
 | `notifications [--unread] [--limit N]` | `notification.list` | |
 | `debug screenshot PATH` | `debug.screenshot` | PNG of the window (works for a hidden kitchen too, see [testing.md](testing.md)) |
 | `debug keys KEYS` | `debug.keys` | type into the focused pane: `gd`, `<cmd-p>main<cr>` |
 
 Hidden helper: `__relay` (devbox tunnel, above).
+
+## Agent state from a harness
+
+A harness reports its state from hooks that run inside the tab:
+`kitchenctl agent state working|idle|needs-you`. The kitchen draws the tab's
+mark and raises the banners, so the harness does not call `notify`. Report
+idle once per finished turn. A tab marked working that prints nothing for
+20 s becomes idle on its own, because an interrupt fires no hook. Claude
+Code's wiring is `agent_settings_json` in `crates/kitchen-app/src/engine.rs`.
 
 ## Building for devboxes
 

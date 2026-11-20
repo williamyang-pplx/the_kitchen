@@ -43,9 +43,9 @@ pub fn pending_agents(transcript: &str) -> usize {
     launched.difference(&reported).count()
 }
 
-/// Whether a Stop hook with this stdin should notify: yes unless the
-/// transcript shows background subagents still running. Unreadable input
-/// notifies (better a spare banner than a missed one).
+/// Whether a Stop hook with this stdin should report the agent idle (and so
+/// notify): yes unless the transcript shows background subagents still
+/// running. Unreadable input reports (better a spare banner than a missed one).
 pub fn should_notify_on_stop(hook_input: &str) -> bool {
     let input: Value = serde_json::from_str(hook_input).unwrap_or_default();
     let Some(path) = input["transcript_path"].as_str() else { return true };

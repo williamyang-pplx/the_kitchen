@@ -2,7 +2,9 @@
 //! attaches to it, so tabs survive app restarts, laptop sleep and dropped
 //! ssh links, and agents can drive them headlessly (`send`, `read-screen`).
 
-use anyhow::Result;
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
 
 use crate::host::Host;
 use crate::util::{shell_join, shell_quote};
@@ -139,6 +141,32 @@ impl<'a> Tmux<'a> {
         self.tmux(&args)
     }
 
+    /// The host's clock and every kitchen session's last output, in Unix
+    /// seconds, in one round trip. Err when the host can't be reached (ssh
+    /// exits 255) or the output doesn't parse; a host with no tmux server
+    /// has no sessions (an empty map). Empty output is never read as "no
+    /// sessions": that would idle every tab on a dropped link.
+    pub fn window_activity(&self) -> Result<(u64, HashMap<String, u64>)> {
+        let script = format!("date +%s; tmux -L {SOCKET_NAME} list-windows -a -F '#{{session_name}} #{{window_activity}}' 2>/dev/null; true");
+        let out = self.host.sh_ok(&script, None)?;
+        parse_window_activity(&out).context("unexpected tmux output")
+    }
+}
+
+/// `(now, session -> last activity)` from [`Tmux::window_activity`]'s output:
+/// the first line is `date +%s`, then `<session> <seconds>` per window. Lines
+/// that don't parse are skipped (a session named with spaces isn't ours).
+fn parse_window_activity(out: &str) -> Option<(u64, HashMap<String, u64>)> {
+    let mut lines = out.lines();
+    let now = lines.next()?.trim().parse().ok()?;
+    let mut seen = HashMap::new();
+    for line in lines {
+        let Some((session, secs)) = line.trim().rsplit_once(' ') else { continue };
+        let Ok(secs) = secs.parse::<u64>() else { continue };
+        let at = seen.entry(session.to_string()).or_insert(secs);
+        *at = (*at).max(secs);
+    }
+    Some((now, seen))
 }
 
 /// Shell script behind [`Tmux::new_session_with_setup`].
@@ -176,6 +204,17 @@ fn new_session_script(name: &str, cwd: &str, env: &[(String, String)], command: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_window_activity() {
+        let (now, seen) = parse_window_activity("1700000100\nkt_w_a 1700000090\nkt_w_b 1700000010\nkt_w_a 1700000095\njunk\nkt_w_c soon\n").unwrap();
+        assert_eq!(now, 1700000100);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!((seen["kt_w_a"], seen["kt_w_b"]), (1700000095, 1700000010), "a session's newest window");
+        assert_eq!(parse_window_activity("1700000100\n").unwrap().1.len(), 0, "no tmux server: no sessions");
+        assert_eq!(parse_window_activity(""), None, "a dropped link is not \"no sessions\"");
+        assert_eq!(parse_window_activity("ssh: oops\nkt_w_a 1\n"), None);
+    }
 
     #[test]
     fn session_lifecycle() {

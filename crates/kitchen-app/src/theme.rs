@@ -31,8 +31,10 @@ pub const ACCENT: Color32 = Color32::from_rgb(0x7a, 0xa2, 0xf7);
 pub const GREEN: Color32 = Color32::from_rgb(0x9e, 0xce, 0x6a);
 /// Removed / error.
 pub const RED: Color32 = Color32::from_rgb(0xf7, 0x76, 0x8e);
-/// Needs you: unread, in progress.
+/// Unread, in progress, warnings. (An agent that needs you is `ORANGE`.)
 pub const YELLOW: Color32 = Color32::from_rgb(0xe0, 0xaf, 0x68);
+/// An agent blocked on William: a permission prompt, a question, a plan to approve.
+pub const ORANGE: Color32 = Color32::from_rgb(0xff, 0x9e, 0x64);
 pub const PURPLE: Color32 = Color32::from_rgb(0xbb, 0x9a, 0xf7);
 pub const CYAN: Color32 = Color32::from_rgb(0x7d, 0xcf, 0xff);
 /// Neon tab colors: an edit tab (own worktree, ⌘T) and a read tab (the main
@@ -51,7 +53,7 @@ const TEAMS: [Color32; 6] = [
     ACCENT,
     CYAN,
     PURPLE,
-    Color32::from_rgb(0xff, 0x9e, 0x64), // orange
+    ORANGE,
     Color32::from_rgb(0x73, 0xda, 0xca), // teal
     Color32::from_rgb(0xf5, 0xa9, 0xd8), // pink
 ];

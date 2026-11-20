@@ -20,8 +20,8 @@ pub fn install(engine: &Arc<Engine>) {
 
 /// Raise a banner for notification `id`; clicking it selects `tab_id`, if given.
 pub fn post(id: i64, title: &str, body: &str, tab_id: Option<&str>) {
-    if crate::hidden::active() {
-        return; // a hidden kitchen's banners would reach the person at the mac
+    if cfg!(test) || crate::hidden::active() {
+        return; // a hidden kitchen's (or a test's) banners would reach the person at the mac
     }
     if ENGINE.get().is_some() && bundled() {
         imp::post(id, title, body, tab_id.unwrap_or(""));

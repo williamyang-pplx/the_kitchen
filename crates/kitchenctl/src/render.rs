@@ -18,8 +18,9 @@ fn tabs(out: &mut String, tabs: &Value, indent: &str) {
     for t in tabs.as_array().into_iter().flatten() {
         let mark = if t["selected"].as_bool() == Some(true) { "*" } else { " " };
         let unread = if t["unread"].as_bool() == Some(true) { " ●" } else { "" };
+        let state = t["agent_state"].as_str().map(|st| format!(" · {st}")).unwrap_or_default();
         out.push_str(&format!(
-            "{indent}{mark} tab:{} {}{unread}  (id {}{})\n{indent}    {}\n",
+            "{indent}{mark} tab:{} {}{unread}{state}  (id {}{})\n{indent}    {}\n",
             s(&t["index"]),
             s(&t["title"]),
             s(&t["id"]),
@@ -203,6 +204,9 @@ mod tests {
         let out = render("workspace.list", &v);
         assert!(out.contains("* workspace:1 air  [local] /r"));
         assert!(out.contains("* tab:1 Fix ●  (id t1, branch william/fix)"));
+        let v = json!([{"id":"a1","index":1,"name":"air","host":"local","repo_path":"/r","selected":true,
+            "tabs":[{"id":"t1","index":1,"title":"Fix","worktree":"/r-fix","selected":true,"agent_state":"working"}]}]);
+        assert!(render("workspace.list", &v).contains("* tab:1 Fix · working  (id t1)"));
     }
 
     #[test]

@@ -302,6 +302,17 @@ pub fn dispatch(engine: &Arc<Engine>, method: &str, params: Value, caller: &Call
             engine.set_agent_session(tab, &a.session_id)?;
             Ok(json!({"tab": tab}))
         }
+        "tab.agent_state" => {
+            #[derive(Deserialize)]
+            struct P {
+                state: kitchen_proto::AgentState,
+            }
+            let a: P = p(params)?;
+            // Only the tab's own agent reports, as for tab.agent_session.
+            let tab = caller.tab_id.as_deref().context("not called from a kitchen tab")?;
+            engine.report_agent_state(tab, a.state)?;
+            Ok(json!({"tab": tab}))
+        }
         "tab.select" => {
             let t: Target = p(params)?;
             let id = engine.resolve_tab(t.tab.as_deref(), t.workspace.as_deref(), caller)?;

@@ -2,7 +2,8 @@
 //!
 //! Every subcommand maps to exactly one API method (see [`Cli::to_call`]),
 //! except the few that run without the app: `guide`, `version`, and the
-//! hidden `__relay` / `__agent-stopped` / `__agent-session` helpers.
+//! hidden `__relay` / `__agent-stopped` (reports the agent idle) /
+//! `__agent-session` helpers.
 
 use std::path::PathBuf;
 
@@ -73,6 +74,10 @@ pub enum Command {
     /// Push diagnostics / highlights into the file viewer from any program.
     #[command(subcommand)]
     Decor(DecorCmd),
+    /// What this tab's agent is doing. Harness hooks call it; the kitchen
+    /// shows it on the tab and raises "agent finished" / "agent needs you".
+    #[command(subcommand)]
+    Agent(AgentCmd),
     /// Raise a notification (badges the tab, shows a macOS banner).
     #[command(after_help = "Example:\n  kitchenctl notify --title \"tests green\" --body \"ready for review\"")]
     Notify {
@@ -98,8 +103,10 @@ pub enum Command {
     /// Devbox side of the API tunnel (started by the app over ssh).
     #[command(name = "__relay", hide = true)]
     Relay,
-    /// Claude Code Stop hook (hook JSON on stdin): `notify`, unless background
-    /// subagents are still running.
+    /// Claude Code Stop hook (hook JSON on stdin): report the agent idle,
+    /// unless background subagents are still running. `--title` and `--body`
+    /// are accepted and ignored: the kitchen words the banner itself, and the
+    /// hook passes them on to its `|| kitchenctl notify` fallback.
     #[command(name = "__agent-stopped", hide = true)]
     AgentStopped {
         #[arg(long)]
@@ -375,6 +382,18 @@ pub enum ViewerCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum AgentCmd {
+    /// Report the caller tab's agent state: `working`, `idle` (its turn is
+    /// over) or `needs-you` (blocked on a prompt). Idle and needs-you raise
+    /// "agent finished" / "agent needs you".
+    #[command(after_help = "Example (a harness hook):\n  kitchenctl agent state needs-you")]
+    State {
+        #[arg(value_parser = ["working", "idle", "needs-you"])]
+        state: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum PlanCmd {
     /// Print the tab's plan file path.
     Path {
@@ -559,9 +578,10 @@ impl Cli {
                 }
             },
             Command::Notify { title, body, target } => api("notify", merge(tab(target), json!({"title": title, "body": body}))),
-            Command::AgentStopped { title, body } => {
+            Command::Agent(AgentCmd::State { state }) => api("tab.agent_state", json!({"state": state})),
+            Command::AgentStopped { .. } => {
                 if crate::hook::should_notify_on_stop(&stdin()?) {
-                    api("notify", json!({"title": title, "body": body}))
+                    api("tab.agent_state", json!({"state": "idle"}))
                 } else {
                     Call::Skip
                 }
@@ -626,6 +646,22 @@ mod tests {
         for clash in [&["--task", "t"][..], &["--task-file", "f"], &["--command", "c"], &["--no-agent"]] {
             let argv = [&["kitchenctl", "tab", "new", "--prompt", "p"][..], clash].concat();
             assert!(Cli::try_parse_from(argv).is_err(), "--prompt with {clash:?}");
+        }
+    }
+
+    /// Hooks report the caller tab's state; the strings are AgentState's wire names.
+    #[test]
+    fn agent_state() {
+        assert_eq!(api_call(&["agent", "state", "needs-you"]), ("tab.agent_state".into(), json!({"state": "needs-you"})));
+        assert!(Cli::try_parse_from(["kitchenctl", "agent", "state", "busy"]).is_err());
+        for state in ["working", "idle", "needs-you"] {
+            let parsed: kitchen_proto::AgentState = serde_json::from_value(json!(state)).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), json!(state));
+        }
+        let stopped = Cli::try_parse_from(["kitchenctl", "__agent-stopped", "--title", "agent finished", "--body", "x"]).unwrap();
+        match stopped.to_call_with(&mut || Ok(String::new())).unwrap() {
+            Call::Api { method, params } => assert_eq!((method.as_str(), params), ("tab.agent_state", json!({"state": "idle"}))),
+            other => panic!("expected api call, got {other:?}"),
         }
     }
 
