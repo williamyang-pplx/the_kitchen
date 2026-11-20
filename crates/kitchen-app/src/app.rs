@@ -818,8 +818,11 @@ impl KitchenApp {
                 };
                 let stroke = if is_sel { egui::Stroke::new(1.5, host_color) } else { egui::Stroke::new(1.0, host_color.gamma_multiply(0.55)) };
                 ui.painter().rect(card, round, fill, stroke, egui::StrokeKind::Inside);
+                let working = ws.tabs.iter().any(|t| matches!(t.agent_state, Some((AgentState::Working, _))));
                 if is_sel {
-                    shimmer::paint(ui, "workspace", &ws.row.id, card, theme::RADIUS_L as f32, host_color);
+                    shimmer::paint(ui, "workspace", &ws.row.id, card, theme::RADIUS_L as f32, host_color, working);
+                } else if working {
+                    shimmer::ripple_only(ui, card, theme::RADIUS_L as f32, host_color);
                 }
                 let x = card.left() + 18.0;
                 // Text stays inside the outline.
@@ -1513,8 +1516,11 @@ fn tab_button(ui: &mut Ui, strip: egui::Rect, id: &str, number: Option<usize>, t
         egui::Stroke::new(1.0, color.gamma_multiply(if resp.hovered() { 0.8 } else { 0.45 }))
     };
     ui.painter().rect(pill, round, fill, stroke, egui::StrokeKind::Inside);
+    let working = mark == Some(Mark::Working);
     if selected {
-        shimmer::paint(ui, "tab", id, pill, theme::RADIUS as f32, outline);
+        shimmer::paint(ui, "tab", id, pill, theme::RADIUS as f32, outline, working);
+    } else if working {
+        shimmer::ripple_only(ui, pill, theme::RADIUS as f32, outline);
     }
     let text_color = if resp.hovered() && !selected { kind.unwrap_or(theme::MUTED) } else { title_color };
     let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
