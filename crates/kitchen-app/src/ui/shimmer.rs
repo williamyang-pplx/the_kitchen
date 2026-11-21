@@ -4,13 +4,6 @@
 //! outline and a slanted sheen sweeps across it, for `BURST`; then it holds
 //! still, so it costs nothing until the next switch.
 //!
-//! A tab or workspace whose agent is working sends out a ripple every
-//! `RIPPLE_EVERY`: a thin ring that leaves the outline and fades as it
-//! spreads, for `RIPPLE`. Every ripple runs on one clock, so one burst of
-//! frames covers them all, and only while the kitchen has focus; between
-//! ripples nothing is drawn. On a selected item the ripple rises out of its
-//! glow.
-//!
 //! When the shader can't be built (no GLSL 1.40), nothing is drawn and the
 //! plain egui outline stays.
 
@@ -31,19 +24,11 @@ const BURST: f64 = 1.5;
 /// Frame interval during the shimmer.
 const FRAME: Duration = Duration::from_millis(16);
 
-/// How often working items ripple, and how long one ripple takes, in seconds.
-const RIPPLE_EVERY: f64 = 10.0;
-const RIPPLE: f64 = 0.8;
-
-/// Frame interval during a ripple: half the shimmer's rate, as a ripple
-/// recurs (24 frames each, ~2.5% of a core every 10 s).
-const RIPPLE_FRAME: Duration = Duration::from_millis(33);
-
 /// Paint the glow around `outline` (corner radius `radius`) in `color`,
 /// for `selection` (the selected item's id) in `slot` (one per place that
-/// has a selection). `working`: its agent is working, so it ripples too.
-/// Call it after the outline is painted and before the text inside it.
-pub fn paint(ui: &Ui, slot: &str, selection: &str, outline: Rect, radius: f32, color: Color32, working: bool) {
+/// has a selection). Call it after the outline is painted and before the
+/// text inside it.
+pub fn paint(ui: &Ui, slot: &str, selection: &str, outline: Rect, radius: f32, color: Color32) {
     let now = ui.input(|i| i.time);
     let key = egui::Id::new(("shimmer", slot));
     let started = ui.data_mut(|d| match d.get_temp::<(String, f64)>(key) {
@@ -57,50 +42,7 @@ pub fn paint(ui: &Ui, slot: &str, selection: &str, outline: Rect, radius: f32, c
     if progress < 1.0 {
         ui.ctx().request_repaint_after(FRAME);
     }
-    let ripple = if working { ripple(ui) } else { None };
-    add(ui, outline, radius, color, Light { glow: 1.0, progress, ripple: ripple.unwrap_or(-1.0) });
-}
-
-/// The ripple of an item that isn't selected but whose agent is working:
-/// nothing at all between ripples.
-pub fn ripple_only(ui: &Ui, outline: Rect, radius: f32, color: Color32) {
-    if let Some(ripple) = ripple(ui) {
-        add(ui, outline, radius, color, Light { glow: 0.0, progress: 1.0, ripple });
-    }
-}
-
-/// Where the shared ripple clock is: Some(0 to 1) during a ripple, None
-/// between them or while the kitchen isn't focused. Asks for the frames the
-/// ripple needs: the next one during it, else the start of the next ripple.
-fn ripple(ui: &Ui) -> Option<f32> {
-    // A hidden (test) kitchen never has focus; it shows what a focused one would.
-    let (now, focused) = ui.input(|i| (i.time, i.focused || crate::hidden::active()));
-    if !focused {
-        return None; // regaining focus repaints, and that frame asks again
-    }
-    let phase = now % RIPPLE_EVERY;
-    if phase < RIPPLE {
-        ui.ctx().request_repaint_after(RIPPLE_FRAME);
-        Some((phase / RIPPLE) as f32)
-    } else {
-        ui.ctx().request_repaint_after(Duration::from_secs_f64(RIPPLE_EVERY - phase));
-        None
-    }
-}
-
-/// How much of each effect to draw.
-#[derive(Clone, Copy)]
-struct Light {
-    /// The steady glow and the selection shimmer: 1 selected, 0 not.
-    glow: f32,
-    /// Through the selection shimmer, 0 to 1; 1 once it is over.
-    progress: f32,
-    /// Through a ripple, 0 to 1; below 0 for none.
-    ripple: f32,
-}
-
-fn add(ui: &Ui, outline: Rect, radius: f32, color: Color32, light: Light) {
-    let params = Params { center: outline.center(), half: outline.size() / 2.0, radius, color: color.to_normalized_gamma_f32(), light };
+    let params = Params { center: outline.center(), half: outline.size() / 2.0, radius, color: color.to_normalized_gamma_f32(), progress };
     let callback = egui_glow::CallbackFn::new(move |info, painter| draw(painter, &info, &params));
     ui.painter().add(egui::PaintCallback { rect: outline.expand(REACH), callback: Arc::new(callback) });
 }
@@ -111,7 +53,8 @@ struct Params {
     half: egui::Vec2,
     radius: f32,
     color: [f32; 4],
-    light: Light,
+    /// Through the shimmer, 0 to 1; 1 once it is over.
+    progress: f32,
 }
 
 /// The compiled shader, built on first use; `None` inside when it failed
@@ -128,8 +71,6 @@ struct Program {
     reach: Option<glow::UniformLocation>,
     color: Option<glow::UniformLocation>,
     progress: Option<glow::UniformLocation>,
-    glow: Option<glow::UniformLocation>,
-    ripple: Option<glow::UniformLocation>,
 }
 
 fn draw(painter: &egui_glow::Painter, info: &egui::PaintCallbackInfo, p: &Params) {
@@ -151,9 +92,7 @@ fn draw(painter: &egui_glow::Painter, info: &egui::PaintCallbackInfo, p: &Params
         gl.uniform_1_f32(prog.radius.as_ref(), p.radius);
         gl.uniform_1_f32(prog.reach.as_ref(), REACH);
         gl.uniform_3_f32(prog.color.as_ref(), p.color[0], p.color[1], p.color[2]);
-        gl.uniform_1_f32(prog.progress.as_ref(), p.light.progress);
-        gl.uniform_1_f32(prog.glow.as_ref(), p.light.glow);
-        gl.uniform_1_f32(prog.ripple.as_ref(), p.light.ripple);
+        gl.uniform_1_f32(prog.progress.as_ref(), p.progress);
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         gl.bind_vertex_array(None);
     }
@@ -209,8 +148,6 @@ fn build(gl: &glow::Context) -> Result<Program, String> {
             reach: at("u_reach"),
             color: at("u_color"),
             progress: at("u_progress"),
-            glow: at("u_glow"),
-            ripple: at("u_ripple"),
         })
     }
 }
@@ -234,8 +171,6 @@ uniform float u_radius; // the outline's corner radius
 uniform float u_reach;  // how far the glow reaches past the outline
 uniform vec3 u_color;
 uniform float u_progress; // through the shimmer, 0 to 1
-uniform float u_glow;     // the steady glow and the shimmer: 1 selected, 0 not
-uniform float u_ripple;   // through a ripple, 0 to 1; below 0 for none
 
 const float TAU = 6.2831853;
 
@@ -267,20 +202,10 @@ void main() {
     float ring = 1.0 - smoothstep(0.6, 0.6 + 1.5 * px, abs(d + 0.9));
     float inside = 1.0 - smoothstep(-px, 0.0, d);
 
-    vec3 light = u_glow * (u_color * (glow * (0.3 + 0.2 * motion + 0.55 * spot)
-                                      + ring * (0.35 + 1.1 * spot)
-                                      + inside * 0.04)
-                           + vec3(1.0) * (ring * (0.8 * sheen + 0.35 * spot) + inside * 0.07 * sheen));
-
-    // The ripple: the outline flares, then a thin ring leaves it and spreads
-    // to most of the reach, fading as it goes.
-    if (u_ripple >= 0.0) {
-        float fade = (1.0 - u_ripple) * (1.0 - u_ripple);
-        float at = u_ripple * 0.85 * u_reach;
-        float wave = step(0.0, d) * fade * exp(-pow((d - at) / 1.4, 2.0));
-        float flare = (1.0 - smoothstep(0.0, 0.35, u_ripple)) * ring;
-        light += u_color * (0.9 * wave + 0.7 * flare) + vec3(1.0) * 0.25 * wave * fade;
-    }
+    vec3 light = u_color * (glow * (0.3 + 0.2 * motion + 0.55 * spot)
+                            + ring * (0.35 + 1.1 * spot)
+                            + inside * 0.04)
+               + vec3(1.0) * (ring * (0.8 * sheen + 0.35 * spot) + inside * 0.07 * sheen);
     f_color = vec4(light, 0.0);
 }
 ";

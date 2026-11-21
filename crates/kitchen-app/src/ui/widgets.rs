@@ -2,6 +2,8 @@
 //! labels, key hints, buttons, the frame of dialogs and popups, empty states,
 //! the marks on tabs and workspaces.
 
+use std::time::Duration;
+
 use egui::text::LayoutJob;
 use egui::{Color32, CornerRadius, Response, RichText, Sense, TextFormat, Ui};
 
@@ -23,10 +25,19 @@ pub enum Mark {
     Working,
 }
 
+/// How often the working ring spins, and how long one spin takes, in seconds.
+const SPIN_EVERY: f64 = 3.0;
+const SPIN: f64 = 0.6;
+
+/// Frame interval during a spin (18 frames each; every frame redraws the
+/// whole window).
+const SPIN_FRAME: Duration = Duration::from_millis(33);
+
 /// Paint `mark` centred on `at` with `p` (the caller's clipped painter): an
 /// orange `!` (NeedsYou), the yellow dot of radius `r` (Unread), or an open
-/// ring in `working_color` (Working). The ring holds still: an animated one
-/// would redraw the whole window several times a second while any agent works.
+/// ring in `working_color` (Working). Every `SPIN_EVERY` the ring turns once
+/// and swells and brightens as it turns; between spins it holds still, so
+/// nothing is redrawn for it.
 pub fn paint_mark(p: &egui::Painter, at: egui::Pos2, r: f32, mark: Mark, working_color: Color32) {
     match mark {
         Mark::NeedsYou => {
@@ -36,14 +47,39 @@ pub fn paint_mark(p: &egui::Painter, at: egui::Pos2, r: f32, mark: Mark, working
             p.circle_filled(at, r, theme::YELLOW);
         }
         Mark::Working => {
-            // Three quarters of a circle, open at the top right.
-            let radius = r + 1.0;
+            let spin = spin(p.ctx()).unwrap_or(0.0);
+            // One clockwise turn, easing in and out; the swell peaks halfway.
+            let turn = spin * spin * (3.0 - 2.0 * spin) * std::f32::consts::TAU;
+            let swell = (spin * std::f32::consts::PI).sin();
+            let radius = r + 1.0 + 1.5 * swell;
+            let color = working_color.lerp_to_gamma(Color32::WHITE, 0.45 * swell);
+            // Three quarters of a circle, open at the top right when still.
             let points: Vec<_> = (0..=18)
-                .map(|i| -std::f32::consts::FRAC_PI_2 + i as f32 / 18.0 * 1.5 * std::f32::consts::PI)
+                .map(|i| -std::f32::consts::FRAC_PI_2 + i as f32 / 18.0 * 1.5 * std::f32::consts::PI - turn)
                 .map(|a| at + radius * egui::vec2(-a.cos(), a.sin()))
                 .collect();
-            p.add(egui::Shape::line(points, egui::Stroke::new(1.5, working_color)));
+            p.add(egui::Shape::line(points, egui::Stroke::new(1.5 + 0.5 * swell, color)));
         }
+    }
+}
+
+/// Where the shared spin clock is: Some(0 to 1) during a spin, None between
+/// spins or while the kitchen isn't focused. Every working ring runs on this
+/// one clock, so one burst of frames covers them all. Asks for the frames
+/// the spin needs: the next one during it, else the start of the next spin.
+fn spin(ctx: &egui::Context) -> Option<f32> {
+    // A hidden (test) kitchen never has focus; it shows what a focused one would.
+    let (now, focused) = ctx.input(|i| (i.time, i.focused || crate::hidden::active()));
+    if !focused {
+        return None; // regaining focus repaints, and that frame asks again
+    }
+    let phase = now % SPIN_EVERY;
+    if phase < SPIN {
+        ctx.request_repaint_after(SPIN_FRAME);
+        Some((phase / SPIN) as f32)
+    } else {
+        ctx.request_repaint_after(Duration::from_secs_f64(SPIN_EVERY - phase));
+        None
     }
 }
 
