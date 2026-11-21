@@ -6,6 +6,7 @@
 //! lock, so a slow devbox never freezes the window. Keyboard shortcuts and
 //! `kitchenctl` commands end up calling the same methods here.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -24,12 +25,51 @@ use crate::settings::Settings;
 /// fast-forwards its spares (opening the ⌘T dialog also does it once).
 const SPARE_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// How often the agent watcher ([`Engine::watch_agents`]) wakes.
-const AGENT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
-/// A working agent's pane redraws its spinner every fraction of a second;
-/// one this long without output is no longer working (an Esc interrupt or
-/// `/exit` fires no Stop). Seconds, to compare with tmux's.
+/// How often the agent watcher ([`Engine::watch_agents`]) wakes, in seconds.
+const AGENT_POLL_SECS: u64 = 5;
+/// A working agent's pane redraws its spinner every second, through long
+/// commands too; one this long without output is no longer working (an Esc
+/// interrupt or `/exit` fires no Stop). Seconds, to compare with tmux's.
 const AGENT_QUIET_SECS: u64 = 20;
+/// How long the watcher leaves a host alone after it couldn't reach it.
+const AGENT_HOST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the agent watcher does with a tab after one look at its pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    Leave,
+    /// Working, but its pane has been quiet: interrupted or exited.
+    Idle,
+    /// Idle or never reported, but its pane keeps printing: a turn that
+    /// started without a hook (a message from another session or a finished
+    /// background task fires no UserPromptSubmit), or one the watcher idled
+    /// wrongly.
+    Working,
+}
+
+/// The watcher's verdict on one tab, and whether its pane printed since the
+/// last look. `state`: the tab's agent state and how long ago it arrived
+/// (None: never reported). `gap`: seconds since the pane last printed (None:
+/// tmux doesn't list the session). `was_printing`: the last look saw it
+/// printing.
+///
+/// Printing means output within the last poll; looks are at least a poll
+/// apart, so two looks in a row see two separate bursts, never one redraw
+/// twice. An idle tab needs both, and output in the first poll after its
+/// report doesn't count (the agent draws its last lines as Stop fires). A
+/// tab that needs you is left alone: moving through its prompt prints.
+fn watch(state: Option<(AgentState, std::time::Duration)>, gap: Option<u64>, was_printing: bool) -> (Watch, bool) {
+    let Some(gap) = gap else { return (Watch::Leave, false) };
+    let printing = gap < AGENT_POLL_SECS;
+    let poll = std::time::Duration::from_secs(AGENT_POLL_SECS);
+    let verdict = match state {
+        Some((AgentState::Working, age)) if age.as_secs() >= AGENT_QUIET_SECS && gap >= AGENT_QUIET_SECS => Watch::Idle,
+        Some((AgentState::Idle, age)) if age < poll => return (Watch::Leave, false),
+        None | Some((AgentState::Idle, _)) if printing && was_printing => Watch::Working,
+        _ => Watch::Leave,
+    };
+    (verdict, printing)
+}
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -1487,46 +1527,62 @@ impl Engine {
         }
     }
 
-    /// The watcher saw `tab_id`'s pane quiet: Working -> Idle, silently (no
-    /// banner, no dot: William interrupted it, or it exited). Skipped when a
-    /// report arrived after `reported_at` (the one the watcher looked at).
-    /// A tab that needs you is left alone: its prompt waits without output.
-    fn idle_if_quiet(&self, tab_id: &str, reported_at: std::time::Instant) {
+    /// The watcher moves `tab_id` to `to` (Idle or Working), silently: no
+    /// banner, no dot (William interrupted it, or it exited; or it is working
+    /// after all). Skipped when the tab's state is no longer `seen`, the one
+    /// the watcher looked at: a hook reported since.
+    fn settle_agent(&self, tab_id: &str, seen: Option<(AgentState, std::time::Instant)>, to: AgentState) {
         let mut st = self.state();
         let Some(tab) = st.workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()).find(|t| t.row.id == tab_id) else { return };
-        if tab.agent_state != Some((AgentState::Working, reported_at)) {
+        if tab.agent_state != seen {
             return;
         }
-        tab.agent_state = Some((AgentState::Idle, std::time::Instant::now()));
+        tab.agent_state = Some((to, std::time::Instant::now()));
         drop(st);
         self.repaint();
     }
 
     /// Start the agent watcher, one thread for the app's life. Every
-    /// [`AGENT_POLL`] it takes the tabs that have been Working for at least
-    /// [`AGENT_QUIET_SECS`] and checks their hosts one after another, one
-    /// [`Tmux::window_activity`] round trip each; a pane that printed nothing
-    /// for that long goes idle. Nothing working: no ssh, no tmux. A dead
-    /// devbox delays the next host by up to ssh's ConnectTimeout.
+    /// [`AGENT_POLL_SECS`] it looks at the panes of the agent tabs that
+    /// [`watch`] could act on, one [`Tmux::window_activity`] round trip per
+    /// host, hosts one after another, and settles each tab by its verdict. A
+    /// host it can't reach is left alone for [`AGENT_HOST_RETRY`], so a dead
+    /// devbox delays the others by ssh's ConnectTimeout only that often.
     pub fn watch_agents(self: &Arc<Self>) {
         let me = self.clone();
         std::thread::Builder::new()
             .name("agent watch".into())
             .spawn(move || {
+                // Tabs whose pane printed at the last look.
+                let mut printing: HashSet<String> = HashSet::new();
+                let mut retry_at: HashMap<Host, std::time::Instant> = HashMap::new();
                 loop {
-                    std::thread::sleep(AGENT_POLL);
-                    for (host, tabs) in me.long_working_tabs() {
+                    std::thread::sleep(std::time::Duration::from_secs(AGENT_POLL_SECS));
+                    for (host, tabs) in me.watched_tabs() {
+                        if retry_at.get(&host).is_some_and(|at| std::time::Instant::now() < *at) {
+                            continue;
+                        }
                         let (now, seen) = match Tmux::new(&host).window_activity() {
                             Ok(found) => found,
                             // An unreachable host doesn't mean its agents stopped.
                             Err(e) => {
                                 log::debug!("agent watch on {}: {e:#}", host.label());
+                                retry_at.insert(host, std::time::Instant::now() + AGENT_HOST_RETRY);
                                 continue;
                             }
                         };
-                        for (tab_id, session, reported_at) in tabs {
-                            if seen.get(&session).is_none_or(|at| now.saturating_sub(*at) >= AGENT_QUIET_SECS) {
-                                me.idle_if_quiet(&tab_id, reported_at);
+                        for (tab_id, session, state) in tabs {
+                            let gap = seen.get(&session).map(|at| now.saturating_sub(*at));
+                            let (verdict, prints) = watch(state.map(|(s, at)| (s, at.elapsed())), gap, printing.contains(&tab_id));
+                            if prints {
+                                printing.insert(tab_id.clone());
+                            } else {
+                                printing.remove(&tab_id);
+                            }
+                            match verdict {
+                                Watch::Idle => me.settle_agent(&tab_id, state, AgentState::Idle),
+                                Watch::Working => me.settle_agent(&tab_id, state, AgentState::Working),
+                                Watch::Leave => {}
                             }
                         }
                     }
@@ -1535,19 +1591,18 @@ impl Engine {
             .expect("spawn thread");
     }
 
-    /// Tabs reported Working at least [`AGENT_QUIET_SECS`] ago, by host:
-    /// (tab id, tmux session, when the report came).
-    fn long_working_tabs(&self) -> Vec<(Host, Vec<(String, String, std::time::Instant)>)> {
-        let quiet = std::time::Duration::from_secs(AGENT_QUIET_SECS);
+    /// The tabs [`watch`] could act on, by host: (tab id, tmux session, its
+    /// agent state). Those whose agent works, is idle or never reported; not
+    /// those that need you, nor tabs without an agent.
+    fn watched_tabs(&self) -> Vec<(Host, Vec<(String, String, Option<(AgentState, std::time::Instant)>)>)> {
         let mut by_host: Vec<(Host, Vec<_>)> = Vec::new();
         for ws in &self.state().workspaces {
             let host = ws.host();
             for t in &ws.tabs {
-                let Some((AgentState::Working, at)) = t.agent_state else { continue };
-                if at.elapsed() < quiet {
+                if !t.row.agent || matches!(t.agent_state, Some((AgentState::NeedsYou, _))) {
                     continue;
                 }
-                let tab = (t.row.id.clone(), t.row.tmux_session.clone(), at);
+                let tab = (t.row.id.clone(), t.row.tmux_session.clone(), t.agent_state);
                 match by_host.iter_mut().find(|(h, _)| *h == host) {
                     Some((_, tabs)) => tabs.push(tab),
                     None => by_host.push((host.clone(), vec![tab])),
@@ -2140,32 +2195,59 @@ mod tests {
         assert!(e.report_agent_state("nope", AgentState::Idle).is_err());
     }
 
-    /// The watcher idles a quiet Working tab without a banner, never one with
-    /// a newer report or one that needs you.
+    /// The watcher settles a tab silently (no banner, no dot), and only from
+    /// the state it looked at: a newer report wins.
     #[test]
-    fn quiet_agent_goes_idle_silently() {
+    fn watcher_settles_silently() {
         let e = engine_with(&["w"]);
         for id in ["a", "b"] {
             e.restore_tab(TabRow { id: id.into(), workspace_id: "w".into(), title: id.into(), worktree: format!("/r-{id}"), branch: None, tmux_session: format!("kt-test-quiet-{id}"), position: 0, agent: true, agent_session: None }).unwrap();
         }
-        let agent = |e: &Engine| e.workspace("w").unwrap().tab("a").unwrap().agent_state.unwrap();
+        let agent = |e: &Engine| e.workspace("w").unwrap().tab("a").unwrap().agent_state;
         let banners = |e: &Engine| e.db().notifications(false, 50).unwrap().len();
 
-        e.report_agent_state("a", AgentState::Working).unwrap();
-        let (_, first) = agent(&e);
+        e.settle_agent("a", None, AgentState::Working);
+        assert_eq!(agent(&e).map(|(s, _)| s), Some(AgentState::Working), "never reported, printing");
+        let first = agent(&e);
         std::thread::sleep(std::time::Duration::from_millis(2));
         e.report_agent_state("a", AgentState::Working).unwrap();
-        e.idle_if_quiet("a", first);
-        assert_eq!(agent(&e).0, AgentState::Working, "a newer report wins");
-        e.idle_if_quiet("a", agent(&e).1);
-        assert_eq!((agent(&e).0, banners(&e)), (AgentState::Idle, 0));
+        e.settle_agent("a", first, AgentState::Idle);
+        assert_eq!(agent(&e).map(|(s, _)| s), Some(AgentState::Working), "a newer report wins");
+        e.settle_agent("a", agent(&e), AgentState::Idle);
+        assert_eq!((agent(&e).map(|(s, _)| s), banners(&e)), (Some(AgentState::Idle), 0));
         assert!(!e.workspace("w").unwrap().tab("a").unwrap().unread);
+        e.settle_agent("a", agent(&e), AgentState::Working);
+        assert_eq!((agent(&e).map(|(s, _)| s), banners(&e)), (Some(AgentState::Working), 0), "working after all");
         e.report_agent_state("a", AgentState::Idle).unwrap();
-        assert_eq!(banners(&e), 1, "Stop after a silent idle still notifies");
+        assert_eq!(banners(&e), 1, "Stop after a silent change still notifies");
+        // Only agent tabs that don't need you are watched.
+        e.report_agent_state("b", AgentState::NeedsYou).unwrap();
+        let watched: Vec<_> = e.watched_tabs().into_iter().flat_map(|(_, tabs)| tabs).map(|(id, _, _)| id).collect();
+        assert_eq!(watched, ["a"]);
+    }
 
-        e.report_agent_state("a", AgentState::NeedsYou).unwrap();
-        e.idle_if_quiet("a", agent(&e).1);
-        assert_eq!(agent(&e).0, AgentState::NeedsYou, "a prompt waits without output");
+    /// The watcher's verdicts. `ago(s)`: a report `s` seconds old.
+    #[test]
+    fn watch_verdicts() {
+        let ago = std::time::Duration::from_secs;
+        let (working, idle, needs) = (AgentState::Working, AgentState::Idle, AgentState::NeedsYou);
+        // Working: idle once reported and quiet for AGENT_QUIET_SECS.
+        assert_eq!(watch(Some((working, ago(60))), Some(20), false), (Watch::Idle, false));
+        assert_eq!(watch(Some((working, ago(60))), Some(19), false), (Watch::Leave, false));
+        assert_eq!(watch(Some((working, ago(10))), Some(30), false), (Watch::Leave, false), "a fresh report");
+        assert_eq!(watch(Some((working, ago(60))), Some(1), true), (Watch::Leave, true));
+        // Idle or never reported: working once it prints at two looks in a row.
+        assert_eq!(watch(Some((idle, ago(60))), Some(1), false), (Watch::Leave, true), "one burst: a redraw, or typing");
+        assert_eq!(watch(Some((idle, ago(60))), Some(4), true), (Watch::Working, true));
+        assert_eq!(watch(Some((idle, ago(60))), Some(5), true), (Watch::Leave, false), "older than a poll: the same burst");
+        assert_eq!(watch(None, Some(0), true), (Watch::Working, true), "never reported (old hooks, or since a restart)");
+        assert_eq!(watch(Some((idle, ago(3))), Some(0), true), (Watch::Leave, false), "the last lines drawn as Stop fires");
+        // Needs you: left alone, printing or not.
+        assert_eq!(watch(Some((needs, ago(60))), Some(0), true).0, Watch::Leave);
+        assert_eq!(watch(Some((needs, ago(60))), Some(600), false).0, Watch::Leave);
+        // A session tmux doesn't list (or a failed listing) is unknown, not quiet.
+        assert_eq!(watch(Some((working, ago(60))), None, true), (Watch::Leave, false));
+        assert_eq!(watch(None, None, true), (Watch::Leave, false));
     }
 
     fn engine_with(ids: &[&str]) -> Arc<Engine> {

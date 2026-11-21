@@ -79,9 +79,13 @@ Hidden helper: `__relay` (devbox tunnel, above).
 A harness reports its state from hooks that run inside the tab:
 `kitchenctl agent state working|idle|needs-you`. The kitchen draws the tab's
 mark and raises the banners, so the harness does not call `notify`. Report
-idle once per finished turn. A tab marked working that prints nothing for
-20 s becomes idle on its own, because an interrupt fires no hook. Claude
-Code's wiring is `agent_settings_json` in `crates/kitchen-app/src/engine.rs`.
+idle once per finished turn. The kitchen also watches each agent tab's
+pane, because some changes fire no hook. A tab marked working that prints
+nothing for 20 s becomes idle (an interrupt fires no Stop). An idle or
+unreported tab that keeps printing becomes working (a turn started by a
+message from another session or a finished background task fires no
+UserPromptSubmit). A tab that needs you is left alone. Claude Code's wiring
+is `agent_settings_json` in `crates/kitchen-app/src/engine.rs`.
 
 ## Building for devboxes
 
