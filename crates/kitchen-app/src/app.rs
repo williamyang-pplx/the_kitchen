@@ -195,6 +195,7 @@ impl KitchenApp {
                     match TermSession::spawn(ctx, &argv, Some(&home()), env) {
                         Ok(mut s) => {
                             self.attempts.remove(&tab_id);
+                            self.engine.watch_input(&tab_id, s.input_clock());
                             s.set_predictive_echo(!ws.host().is_local());
                             if !ws.host().is_local() {
                                 // Claude Code redraws ~6KB per wheel step; batch them per 25ms.

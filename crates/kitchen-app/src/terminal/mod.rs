@@ -8,7 +8,7 @@ mod render;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
@@ -93,6 +93,18 @@ pub struct TermSession {
     pub(crate) mouse_buttons_down: u8,
     /// Local echo prediction (enabled for devbox tabs).
     pub(crate) predictor: predict::Predictor,
+    input_at: InputClock,
+}
+
+/// When a session last sent its program input from William (keys, pastes,
+/// focus and wheel reports), in unix milliseconds, 0 for never. The agent
+/// watcher reads it: output right after input is its echo or a redraw it
+/// caused, not the agent working.
+pub type InputClock = Arc<AtomicU64>;
+
+fn mark_input(clock: &InputClock) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    clock.store(now, Ordering::Relaxed);
 }
 
 impl TermSession {
@@ -133,6 +145,7 @@ impl TermSession {
             focused: false,
             mouse_buttons_down: 0,
             predictor: Default::default(),
+            input_at: Default::default(),
         })
     }
 
@@ -148,12 +161,18 @@ impl TermSession {
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        mark_input(&self.input_at);
         let _ = self.sender.send(Msg::Input(bytes.into()));
     }
 
     /// A handle that pastes into this session from another thread.
     pub fn paster(&self) -> Paster {
-        Paster { term: self.term.clone(), sender: self.sender.clone() }
+        Paster { term: self.term.clone(), sender: self.sender.clone(), input_at: self.input_at.clone() }
+    }
+
+    /// The session's [`InputClock`].
+    pub fn input_clock(&self) -> InputClock {
+        self.input_at.clone()
     }
 
     pub fn resize(&mut self, size: GridSize, cell: (u16, u16)) {
@@ -191,11 +210,13 @@ impl TermSession {
 pub struct Paster {
     term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
+    input_at: InputClock,
 }
 
 impl Paster {
     pub fn paste(&self, text: &str) {
         let mode = *self.term.lock().mode();
+        mark_input(&self.input_at);
         let _ = self.sender.send(Msg::Input(input::paste_bytes(text, mode).into()));
     }
 }

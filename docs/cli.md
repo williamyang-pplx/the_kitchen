@@ -84,7 +84,8 @@ pane, because some changes fire no hook. A tab marked working that prints
 nothing for 20 s becomes idle (an interrupt fires no Stop). An idle or
 unreported tab that keeps printing becomes working (a turn started by a
 message from another session or a finished background task fires no
-UserPromptSubmit). A tab that needs you is left alone. Claude Code's wiring
+UserPromptSubmit). Output right after your own typing, pasting or
+scrolling in a tab doesn't count. A tab that needs you is left alone. Claude Code's wiring
 is `agent_settings_json` in `crates/kitchen-app/src/engine.rs`.
 
 ## Building for devboxes

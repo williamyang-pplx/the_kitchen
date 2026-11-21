@@ -20,6 +20,7 @@ use kitchen_proto::{AgentState, Caller, TabInfo, WorkspaceInfo};
 
 use crate::links::Link;
 use crate::settings::Settings;
+use crate::terminal::InputClock;
 
 /// How often each workspace's warmer fetches `origin/<default>` and
 /// fast-forwards its spares (opening the ⌘T dialog also does it once).
@@ -31,6 +32,11 @@ const AGENT_POLL_SECS: u64 = 5;
 /// commands too; one this long without output is no longer working (an Esc
 /// interrupt or `/exit` fires no Stop). Seconds, to compare with tmux's.
 const AGENT_QUIET_SECS: u64 = 20;
+/// Output this soon after William's own input to a tab (keys, pastes,
+/// focus, wheel) is its echo or a redraw it caused, not the agent: a poll
+/// (how old printing output can be), a second of tmux's rounding, and a
+/// second for the echo to come back over ssh.
+const AGENT_TYPED_SECS: u64 = AGENT_POLL_SECS + 2;
 /// How long the watcher leaves a host alone after it couldn't reach it.
 const AGENT_HOST_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -51,16 +57,18 @@ enum Watch {
 /// last look. `state`: the tab's agent state and how long ago it arrived
 /// (None: never reported). `gap`: seconds since the pane last printed (None:
 /// tmux doesn't list the session). `was_printing`: the last look saw it
-/// printing.
+/// printing. `typed`: William sent the tab input within [`AGENT_TYPED_SECS`],
+/// so its output proves nothing (typing into a prompt and deleting it again
+/// is not a turn).
 ///
 /// Printing means output within the last poll; looks are at least a poll
 /// apart, so two looks in a row see two separate bursts, never one redraw
 /// twice. An idle tab needs both, and output in the first poll after its
 /// report doesn't count (the agent draws its last lines as Stop fires). A
 /// tab that needs you is left alone: moving through its prompt prints.
-fn watch(state: Option<(AgentState, std::time::Duration)>, gap: Option<u64>, was_printing: bool) -> (Watch, bool) {
+fn watch(state: Option<(AgentState, std::time::Duration)>, gap: Option<u64>, was_printing: bool, typed: bool) -> (Watch, bool) {
     let Some(gap) = gap else { return (Watch::Leave, false) };
-    let printing = gap < AGENT_POLL_SECS;
+    let printing = gap < AGENT_POLL_SECS && !typed;
     let poll = std::time::Duration::from_secs(AGENT_POLL_SECS);
     let verdict = match state {
         Some((AgentState::Working, age)) if age.as_secs() >= AGENT_QUIET_SECS && gap >= AGENT_QUIET_SECS => Watch::Idle,
@@ -370,6 +378,8 @@ pub struct Engine {
     opening: Mutex<std::collections::HashSet<String>>,
     /// Tabs closed since launch, newest last: ⌘⇧T reopens them.
     closed: Mutex<Vec<TabRow>>,
+    /// Each tab's terminal [`InputClock`], for the agent watcher.
+    input_clocks: Mutex<HashMap<String, InputClock>>,
     plugins: std::sync::OnceLock<Arc<crate::plugins::PluginHost>>,
     /// Numbers each viewer switch, so the UI drops a `ShowViewer` that a later
     /// switch overtook.
@@ -401,6 +411,7 @@ impl Engine {
             fresh_sessions: Mutex::new(Default::default()),
             opening: Mutex::new(Default::default()),
             closed: Mutex::new(Vec::new()),
+            input_clocks: Default::default(),
             view_seq: Default::default(),
             plugins: std::sync::OnceLock::new(),
         }))
@@ -1573,7 +1584,8 @@ impl Engine {
                         };
                         for (tab_id, session, state) in tabs {
                             let gap = seen.get(&session).map(|at| now.saturating_sub(*at));
-                            let (verdict, prints) = watch(state.map(|(s, at)| (s, at.elapsed())), gap, printing.contains(&tab_id));
+                            let typed = me.typed_secs_ago(&tab_id).is_some_and(|ago| ago < AGENT_TYPED_SECS);
+                            let (verdict, prints) = watch(state.map(|(s, at)| (s, at.elapsed())), gap, printing.contains(&tab_id), typed);
                             if prints {
                                 printing.insert(tab_id.clone());
                             } else {
@@ -1589,6 +1601,20 @@ impl Engine {
                 }
             })
             .expect("spawn thread");
+    }
+
+    /// The terminal showing `tab_id` reports William's input to `clock`; the
+    /// agent watcher discounts the output it causes.
+    pub fn watch_input(&self, tab_id: &str, clock: InputClock) {
+        self.input_clocks.lock().unwrap().insert(tab_id.to_string(), clock);
+    }
+
+    /// Whole seconds since William last sent `tab_id`'s terminal input; None
+    /// if he hasn't since it attached.
+    fn typed_secs_ago(&self, tab_id: &str) -> Option<u64> {
+        let at = self.input_clocks.lock().unwrap().get(tab_id)?.load(std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+        (at > 0).then(|| now.saturating_sub(at) / 1000)
     }
 
     /// The tabs [`watch`] could act on, by host: (tab id, tmux session, its
@@ -2224,6 +2250,14 @@ mod tests {
         e.report_agent_state("b", AgentState::NeedsYou).unwrap();
         let watched: Vec<_> = e.watched_tabs().into_iter().flat_map(|(_, tabs)| tabs).map(|(id, _, _)| id).collect();
         assert_eq!(watched, ["a"]);
+        // William's input, as the terminal records it.
+        assert_eq!(e.typed_secs_ago("a"), None, "no terminal attached");
+        let clock = crate::terminal::InputClock::default();
+        e.watch_input("a", clock.clone());
+        assert_eq!(e.typed_secs_ago("a"), None, "attached, nothing typed");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        clock.store(now - 3_500, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(e.typed_secs_ago("a"), Some(3));
     }
 
     /// The watcher's verdicts. `ago(s)`: a report `s` seconds old.
@@ -2232,22 +2266,27 @@ mod tests {
         let ago = std::time::Duration::from_secs;
         let (working, idle, needs) = (AgentState::Working, AgentState::Idle, AgentState::NeedsYou);
         // Working: idle once reported and quiet for AGENT_QUIET_SECS.
-        assert_eq!(watch(Some((working, ago(60))), Some(20), false), (Watch::Idle, false));
-        assert_eq!(watch(Some((working, ago(60))), Some(19), false), (Watch::Leave, false));
-        assert_eq!(watch(Some((working, ago(10))), Some(30), false), (Watch::Leave, false), "a fresh report");
-        assert_eq!(watch(Some((working, ago(60))), Some(1), true), (Watch::Leave, true));
+        assert_eq!(watch(Some((working, ago(60))), Some(20), false, false), (Watch::Idle, false));
+        assert_eq!(watch(Some((working, ago(60))), Some(19), false, false), (Watch::Leave, false));
+        assert_eq!(watch(Some((working, ago(10))), Some(30), false, false), (Watch::Leave, false), "a fresh report");
+        assert_eq!(watch(Some((working, ago(60))), Some(1), true, false), (Watch::Leave, true));
         // Idle or never reported: working once it prints at two looks in a row.
-        assert_eq!(watch(Some((idle, ago(60))), Some(1), false), (Watch::Leave, true), "one burst: a redraw, or typing");
-        assert_eq!(watch(Some((idle, ago(60))), Some(4), true), (Watch::Working, true));
-        assert_eq!(watch(Some((idle, ago(60))), Some(5), true), (Watch::Leave, false), "older than a poll: the same burst");
-        assert_eq!(watch(None, Some(0), true), (Watch::Working, true), "never reported (old hooks, or since a restart)");
-        assert_eq!(watch(Some((idle, ago(3))), Some(0), true), (Watch::Leave, false), "the last lines drawn as Stop fires");
+        assert_eq!(watch(Some((idle, ago(60))), Some(1), false, false), (Watch::Leave, true), "one burst: a redraw");
+        assert_eq!(watch(Some((idle, ago(60))), Some(4), true, false), (Watch::Working, true));
+        assert_eq!(watch(Some((idle, ago(60))), Some(5), true, false), (Watch::Leave, false), "older than a poll: the same burst");
+        assert_eq!(watch(None, Some(0), true, false), (Watch::Working, true), "never reported (old hooks, or since a restart)");
+        assert_eq!(watch(Some((idle, ago(3))), Some(0), true, false), (Watch::Leave, false), "the last lines drawn as Stop fires");
         // Needs you: left alone, printing or not.
-        assert_eq!(watch(Some((needs, ago(60))), Some(0), true).0, Watch::Leave);
-        assert_eq!(watch(Some((needs, ago(60))), Some(600), false).0, Watch::Leave);
+        assert_eq!(watch(Some((needs, ago(60))), Some(0), true, false).0, Watch::Leave);
+        assert_eq!(watch(Some((needs, ago(60))), Some(600), false, false).0, Watch::Leave);
         // A session tmux doesn't list (or a failed listing) is unknown, not quiet.
-        assert_eq!(watch(Some((working, ago(60))), None, true), (Watch::Leave, false));
-        assert_eq!(watch(None, None, true), (Watch::Leave, false));
+        assert_eq!(watch(Some((working, ago(60))), None, true, false), (Watch::Leave, false));
+        assert_eq!(watch(None, None, true, false), (Watch::Leave, false));
+        // Output right after William's own input proves nothing: typing into
+        // a prompt and deleting it again is not a turn.
+        assert_eq!(watch(Some((idle, ago(60))), Some(0), true, true), (Watch::Leave, false));
+        assert_eq!(watch(None, Some(0), true, true), (Watch::Leave, false));
+        assert_eq!(watch(Some((working, ago(60))), Some(25), false, true), (Watch::Idle, false), "typing doesn't keep a quiet tab working");
     }
 
     fn engine_with(ids: &[&str]) -> Arc<Engine> {
