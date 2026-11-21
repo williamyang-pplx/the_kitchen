@@ -26,12 +26,12 @@ pub enum Mark {
 }
 
 /// How often the working ring spins, and how long one spin takes, in seconds.
-const SPIN_EVERY: f64 = 3.0;
-const SPIN: f64 = 0.6;
+const SPIN_EVERY: f64 = 1.5;
+const SPIN: f64 = 0.4;
 
-/// Frame interval during a spin (18 frames each; every frame redraws the
-/// whole window).
-const SPIN_FRAME: Duration = Duration::from_millis(33);
+/// Frame interval during a spin: 20 fps, 8 frames each. Every frame redraws
+/// the whole window, and the ring is too small for more to show.
+const SPIN_FRAME: Duration = Duration::from_millis(50);
 
 /// Paint `mark` centred on `at` with `p` (the caller's clipped painter): an
 /// orange `!` (NeedsYou), the yellow dot of radius `r` (Unread), or an open
