@@ -310,6 +310,10 @@ impl KitchenApp {
                 engine.select_tab_index(n);
                 self.hide_dashboard();
             }
+            Action::LastTab => {
+                engine.select_last_tab();
+                self.hide_dashboard();
+            }
             Action::FocusFileList => self.side_command(PanelCmd::FocusList),
             Action::FocusCode => self.side_command(PanelCmd::FocusCode),
             Action::NextFile => self.side_command(PanelCmd::NextFile),
@@ -1550,7 +1554,7 @@ fn icon_button(ui: &mut Ui, strip: egui::Rect, glyph: &str) -> egui::Response {
 }
 
 /// The ⌘/ list: per place, its bound actions (keys, what) in file order,
-/// then the plugin commands with keys. ⌘1 … ⌘9 are one row.
+/// then the plugin commands with keys. ⌘1 … ⌘8 are one row.
 fn shortcut_groups(km: &keybindings::Keymap, reg: &crate::plugins::Registry) -> Vec<(String, Vec<(String, String)>)> {
     let mut out = Vec::new();
     for place in Place::ALL {
@@ -1563,7 +1567,7 @@ fn shortcut_groups(km: &keybindings::Keymap, reg: &crate::plugins::Registry) -> 
             match def.cmd {
                 Cmd::App(Action::GoToTab(n)) if n > 1 => {}
                 Cmd::App(Action::GoToTab(1)) => {
-                    let last = km.hint(place, &Cmd::App(Action::GoToTab(9)), 1);
+                    let last = km.hint(place, &Cmd::App(Action::GoToTab(8)), 1);
                     let first = km.hint(place, &def.cmd, 1);
                     rows.push((if last.is_empty() { first } else { format!("{first} … {last}") }, "go to tab".into()));
                 }
@@ -1641,7 +1645,8 @@ mod tests {
         let d = keybindings::Keymap::defaults();
         let everywhere = rows(&d, &reg, "Everywhere");
         assert!(everywhere.contains(&("⌘Q".into(), "quit".into())));
-        assert!(everywhere.contains(&("⌘1 … ⌘9".into(), "go to tab".into())));
+        assert!(everywhere.contains(&("⌘1 … ⌘8".into(), "go to tab".into())));
+        assert!(everywhere.contains(&("⌘9".into(), "last tab".into())));
         assert!(rows(&d, &reg, "Vim motions").contains(&("j  ↓".into(), "down".into())));
         let km = keybindings::Keymap::with_user("[global]\nquit = [\"cmd+shift+q\"]\n[vim]\ndown = []\n");
         assert!(rows(&km, &reg, "Everywhere").contains(&("⌘⇧Q".into(), "quit".into())));
@@ -1761,6 +1766,10 @@ mod tests {
         step(&mut app, key(Key::Num1, Modifiers::COMMAND));
         assert_eq!(app.selected_tab_id().as_deref(), Some("t1"));
         assert_eq!(app.focus(), Focus::Side);
+        // ⌘9 goes to the rightmost tab (t2 of two), not tab 9.
+        step(&mut app, key(Key::Num9, Modifiers::COMMAND));
+        assert_eq!(app.selected_tab_id().as_deref(), Some("t2"));
+        step(&mut app, key(Key::Num1, Modifiers::COMMAND));
         // ⌘. on t1 brings its terminal back, and t1 remembers that too.
         step(&mut app, key(Key::Period, Modifiers::COMMAND));
         step(&mut app, key(Key::L, Modifiers::COMMAND));

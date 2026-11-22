@@ -277,7 +277,7 @@ static GLOBAL: [ActionDef; 26] = [
     app("go_to_tab_6", Action::GoToTab(6), "tab 6"),
     app("go_to_tab_7", Action::GoToTab(7), "tab 7"),
     app("go_to_tab_8", Action::GoToTab(8), "tab 8"),
-    app("go_to_tab_9", Action::GoToTab(9), "tab 9"),
+    app("go_to_last_tab", Action::LastTab, "last tab"),
     app("rename_tab", Action::RenameTab, "rename tab"),
     app("reopen_tab", Action::ReopenTab, "reopen closed tab"),
     app("toggle_viewer", Action::ToggleViewer, "terminal ↔ viewer"),

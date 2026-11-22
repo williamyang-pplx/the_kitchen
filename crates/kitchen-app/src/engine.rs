@@ -1314,6 +1314,14 @@ impl Engine {
         }
     }
 
+    /// ⌘9: focus the selected workspace's rightmost tab.
+    pub fn select_last_tab(&self) {
+        let id = self.selected_workspace().and_then(|w| w.tabs.last().map(|t| t.row.id.clone()));
+        if let Some(id) = id {
+            self.select_tab(&id);
+        }
+    }
+
     /// ⌘H / ⌘L: previous / next tab of the selected workspace, wrapping.
     pub fn cycle_tab(&self, delta: isize) {
         let Some(ws) = self.selected_workspace() else { return };

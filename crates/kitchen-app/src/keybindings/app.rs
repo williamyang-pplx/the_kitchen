@@ -14,6 +14,8 @@ pub enum Action {
     NextWorkspace,
     PrevWorkspace,
     GoToTab(usize),
+    /// The selected workspace's rightmost tab.
+    LastTab,
     PrevTab,
     NextTab,
     NewTab,
@@ -365,6 +367,7 @@ mod tests {
         assert_eq!(press(Key::P, cmd), app(Action::FilePicker));
         assert_eq!(press(Key::Period, cmd), app(Action::ToggleViewer));
         assert_eq!(press(Key::Num3, cmd), app(Action::GoToTab(3)));
+        assert_eq!(press(Key::Num9, cmd), app(Action::LastTab));
         assert!(press(Key::H, Modifiers::NONE).is_empty(), "plain keys belong to the terminal/viewer");
         assert!(press(Key::H, Modifiers::ALT).is_empty() && press(Key::Backtick, cmd).is_empty(), "⌥H and ⌘` are not bound");
     }
