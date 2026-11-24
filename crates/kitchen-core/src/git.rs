@@ -34,6 +34,12 @@ const SMALL_PACKS: usize = 50;
 /// rolled up, so a compaction rewrites at most about this much.
 const SMALL_PACK_KIB: u64 = 64 * 1024;
 
+/// Small packs one compaction rolls up at most; the next warmer round takes
+/// the next batch. On a devbox's agi, 2000 packs took 51 s (into one 154 MB
+/// pack), so a batch takes a few minutes. All 178k at once took over an
+/// hour and never finished: an ssh drop or a restart killed it first.
+const COMPACT_BATCH: usize = 10_000;
+
 /// How often [`Repo::listing`] scans for untracked files while neither HEAD
 /// nor the index moves.
 pub const UNTRACKED_EVERY: Duration = Duration::from_secs(30);
@@ -395,21 +401,24 @@ true"#
     }
 
     /// With [`SMALL_PACKS`] or more promisor packs under [`SMALL_PACK_KIB`]
-    /// (a partial clone's fetches and on-demand downloads), roll them into
-    /// one promisor pack, delete them, and index every pack in a multi-pack
-    /// index. Other packs and loose objects are left as they are, and so is a
-    /// pack a fetch is still writing (it has a `.keep`). Devboxes turn git's
-    /// own maintenance off, so without this the packs pile up and every git
-    /// command slows down (a devbox's agi at 178k packs: 0.35 s for a
-    /// lookup). One compaction per repo at a time (workspaces share repos);
-    /// niced. What it did, for the log (None: nothing to do).
+    /// (a partial clone's fetches and on-demand downloads), start rolling up
+    /// to [`COMPACT_BATCH`] of them into one promisor pack, deleting them and
+    /// indexing every pack in a multi-pack index. Other packs and loose
+    /// objects are left as they are, and so is a pack a fetch is still
+    /// writing (it has a `.keep`). Devboxes turn git's own maintenance off,
+    /// so without this the packs pile up and every git command slows down (a
+    /// devbox's agi at 178k packs: 0.35 s for a lookup). The batch runs
+    /// detached on the host, so an ssh drop doesn't kill it; one compaction
+    /// per repo at a time (workspaces share repos); niced. For the log: the
+    /// last batch's result, once, and the batch it started (None: nothing).
     pub fn compact_packs(&self) -> Result<Option<String>> {
-        self.compact_packs_under(SMALL_PACK_KIB)
+        self.compact_packs_under(SMALL_PACK_KIB, COMPACT_BATCH)
     }
 
-    fn compact_packs_under(&self, small_kib: u64) -> Result<Option<String>> {
-        let out = self.host.sh_ok(&compact_packs_snippet(small_kib), Some(self.path))?;
-        Ok(out.lines().find(|l| l.starts_with("packs compacted")).map(String::from))
+    fn compact_packs_under(&self, small_kib: u64, batch: usize) -> Result<Option<String>> {
+        let out = self.host.sh_ok(&compact_packs_snippet(small_kib, batch), Some(self.path))?;
+        let report: Vec<&str> = out.lines().filter(|l| l.starts_with("packs ")).collect();
+        Ok(Some(report.join("; ")).filter(|r| !r.is_empty()))
     }
 
     pub fn remove_worktree(&self, path: &str, force: bool) -> Result<()> {
@@ -578,35 +587,42 @@ fn gunzip_if_gzipped(bytes: Vec<u8>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Shell (run in the repo) for [`Repo::compact_packs`]; prints "packs
-/// compacted: …" when it compacted.
-fn compact_packs_snippet(small_kib: u64) -> String {
+/// Shell (run in the repo) for [`Repo::compact_packs`]: prints the last
+/// batch's "packs compacted: …" (or "packs compaction failed: …") once, then
+/// starts the next batch detached and prints "packs compaction started: …".
+fn compact_packs_snippet(small_kib: u64, batch: usize) -> String {
     // Not `git repack -A -d --keep-pack`: in a partial clone it copies every
     // promisor object, the kept packs' too, into its new pack (27 GB a run
     // on a devbox's agi, kept packs and all). `pack-objects --stdin-packs`
     // packs exactly the listed packs' objects and downloads nothing.
     format!(
         r#"d=$(git rev-parse --path-format=absolute --git-path objects/pack) || exit 3
-n=$(find "$d" -maxdepth 1 -name 'pack-*.pack' -size -{small_kib}k | wc -l | tr -d ' ')
-[ "$n" -ge {SMALL_PACKS} ] || exit 0
-# A lock a killed compaction left is stale after a day.
 l="$d/kitchen-compact.lock"
-find "$l" -maxdepth 0 -mmin +1440 -exec rm -rf {{}} + 2>/dev/null
+r="$d/kitchen-compact.result"
+[ -s "$r" ] && cat "$r" && rm -f "$r"
+total=$(find "$d" -maxdepth 1 -name 'pack-*.pack' -size -{small_kib}k | wc -l | tr -d ' ')
+[ "$total" -ge {SMALL_PACKS} ] || exit 0
+# A lock a killed batch left (a reboot) is stale after two hours.
+find "$l" -maxdepth 0 -mmin +120 -exec rm -rf {{}} + 2>/dev/null
 mkdir "$l" 2>/dev/null || exit 0
+cd "$d" || {{ rm -rf "$l"; exit 3; }}
+# The small promisor packs, but none a fetch is still writing (.keep), a batch at most.
+for p in $(find . -maxdepth 1 -name 'pack-*.pack' -size -{small_kib}k | sed 's|^\./||'); do
+  b=${{p%.pack}}; [ -e "$b.promisor" ] && [ ! -e "$b.keep" ] && echo "$p"
+done | head -n {batch} > "$l/packs"
+n=$(wc -l < "$l/packs" | tr -d ' ')
+[ "$n" -ge {SMALL_PACKS} ] || {{ rm -rf "$l"; exit 0; }}
+cat > "$l/run.sh" <<'KITCHEN_EOF'
+d=$1 l=$2 r=$3
 trap 'rm -rf "${{l:?}}"' EXIT
 # git keeps a descriptor per pack it reads, up to the limit: with a high
 # one, packing 100k+ packs holds that many (on a mac, a few such gits filled
 # the system's file table). Below 10240, git closes packs as it goes.
 f=$(ulimit -n); {{ [ "$f" = unlimited ] || [ "$f" -gt 10240 ]; }} && ulimit -n 10240
 cd "$d" || exit 3
-# The small promisor packs, but none a fetch is still writing (.keep).
-for p in $(find . -maxdepth 1 -name 'pack-*.pack' -size -{small_kib}k | sed 's|^\./||'); do
-  b=${{p%.pack}}; [ -e "$b.promisor" ] && [ ! -e "$b.keep" ] && echo "$p"
-done > "$l/packs"
 n=$(wc -l < "$l/packs" | tr -d ' ')
-[ "$n" -ge {SMALL_PACKS} ] || exit 0
-new=$({NICE} git pack-objects --stdin-packs -q --threads=2 "$d/pack" < "$l/packs") || exit 4
-[ -n "$new" ] && [ -e "pack-$new.pack" ] && [ -e "pack-$new.idx" ] || exit 4
+new=$({NICE} git pack-objects --stdin-packs -q --threads=2 "$d/pack" < "$l/packs")
+[ -n "$new" ] && [ -e "pack-$new.pack" ] && [ -e "pack-$new.idx" ] || {{ echo "packs compaction failed: git pack-objects on $n small packs" > "$r"; exit 4; }}
 # A promisor pack too, with the refs the old ones recorded.
 sed 's/\.pack$/.promisor/' "$l/packs" | xargs cat > "pack-$new.promisor" 2>/dev/null || : > "pack-$new.promisor"
 rm -f multi-pack-index
@@ -614,7 +630,13 @@ while read -r p; do
   b=${{p%.pack}}; [ "$b" = "pack-$new" ] || rm -f "./$b.pack" "./$b.idx" "./$b.rev" "./$b.bitmap" "./$b.promisor"
 done < "$l/packs"
 git multi-pack-index write >/dev/null 2>&1
-echo "packs compacted: $n small packs rolled up, $(find . -maxdepth 1 -name 'pack-*.pack' | wc -l | tr -d ' ') packs now""#
+echo "packs compacted: $n small packs rolled up, $(find . -maxdepth 1 -name 'pack-*.pack' | wc -l | tr -d ' ') packs now" > "$r"
+KITCHEN_EOF
+# In its own session, off this shell's pipes: an ssh drop (a mac asleep)
+# or a kitchen restart doesn't kill a batch halfway.
+s=; command -v setsid >/dev/null && s=setsid
+$s nohup sh "$l/run.sh" "$d" "$l" "$r" >/dev/null 2>&1 </dev/null &
+echo "packs compaction started: $n of $total small packs""#
     )
 }
 
@@ -1085,6 +1107,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&det);
     }
 
+    /// Starts a compaction and waits for its detached batch: that batch's
+    /// result, and the next batch if one started.
+    fn compact_and_wait(repo: &Repo, small_kib: u64, batch: usize, pack_dir: &std::path::Path) -> Option<String> {
+        let started = repo.compact_packs_under(small_kib, batch).unwrap()?;
+        assert!(started.starts_with("packs compaction started"), "{started}");
+        let lock = pack_dir.join("kitchen-compact.lock");
+        let t = std::time::Instant::now();
+        while lock.exists() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "batch still running");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        repo.compact_packs_under(small_kib, batch).unwrap()
+    }
+
     /// A partial clone's small packs are rolled up once there are enough.
     #[test]
     fn compact_packs_rolls_up_a_partial_clones_downloads() {
@@ -1114,7 +1150,7 @@ mod tests {
         // A commit of our own: a loose object, in no promisor pack.
         sh(&r, "git -c user.email=t@t -c user.name=t commit -q --allow-empty -m mine");
         assert!(count("pack") > SMALL_PACKS, "{} packs", count("pack"));
-        let done = repo.compact_packs().unwrap().expect("compacted");
+        let done = compact_and_wait(&repo, SMALL_PACK_KIB, COMPACT_BATCH, &pack_dir).expect("compacted");
         assert!(done.starts_with("packs compacted"), "{done}");
         // The downloads (and the clone's pack) in one promisor pack; our
         // commit stays a loose object.
@@ -1144,7 +1180,8 @@ mod tests {
         };
         let packs = || -> Vec<std::path::PathBuf> { std::fs::read_dir(&pack_dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "pack") && !big.contains(p)).collect() };
         let small: std::collections::HashSet<String> = packs().iter().flat_map(|p| objects(p)).collect();
-        assert!(repo.compact_packs_under(8).unwrap().is_some());
+        let done = compact_and_wait(&repo, 8, COMPACT_BATCH, &pack_dir).expect("compacted");
+        assert!(done.starts_with("packs compacted"), "{done}");
         assert!(big.iter().all(|p| p.exists()), "kept: {big:?}");
         // …and only the small packs' objects are packed (`repack -A -d
         // --keep-pack` copies the kept packs' too).
@@ -1152,6 +1189,14 @@ mod tests {
         assert_eq!(rest.len(), 1, "one new pack: {rest:?}");
         assert_eq!(objects(&rest[0]), small);
         sh(&r, &format!("git cat-file -p origin/main:h{n} | grep -qx {n} && git cat-file -e HEAD~1:f1 && git fsck --connectivity-only 2>/dev/null"));
+        // A batch rolls up at most `batch` packs; the rest wait for the next.
+        sh(root, &format!("cd origin && for i in $(seq {n}); do echo i$i > i$i; done && git add . && git -c user.email=t@t -c user.name=t commit -qm i"));
+        sh(&r, &format!("git fetch -q origin && for i in $(seq {n}); do git cat-file -p origin/main:i$i >/dev/null; done"));
+        let before = packs().len();
+        let done = compact_and_wait(&repo, 8, SMALL_PACKS, &pack_dir).expect("compacted");
+        assert!(done.starts_with(&format!("packs compacted: {SMALL_PACKS} small packs")), "{done}");
+        assert_eq!(packs().len(), before - SMALL_PACKS + 1);
+        sh(&r, &format!("git cat-file -p origin/main:i{n} | grep -qx i{n} && git fsck --connectivity-only 2>/dev/null"));
     }
 
     #[test]
