@@ -167,6 +167,11 @@ impl Viewer {
     pub(super) fn shown_review(&self) -> (Vec<Reviewer>, Vec<Check>) {
         self.shown_entry().map(|(menu, i)| (menu[i].0.reviewers.clone(), menu[i].0.gates.clone())).unwrap_or_default()
     }
+
+    /// The row on screen, when it has a description: the menu, its index.
+    pub(super) fn described_entry(&self) -> Option<(Arc<Vec<MenuRow>>, usize)> {
+        self.shown_entry().filter(|(menu, i)| menu[*i].0.description.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +335,69 @@ mod tests {
         let (reviewers, gates) = at("origin/c").shown_review();
         assert!(reviewers.is_empty() && gates.is_empty(), "an empty Lua table is none");
         assert_eq!(at("origin/main").shown_review(), (vec![], vec![]), "not a row of the menu");
+    }
+
+    /// A PR's description is the file list's row above its changed files:
+    /// ⌘⇧K from the first file shows it rendered, ⌘⇧J from the last wraps
+    /// to it, and the tree's and the folder list's keys reach it too.
+    #[test]
+    fn the_description_comes_before_the_changed_files() {
+        let h = Harness::new(TestRepo::new("echo 1 > a && echo 1 > b"));
+        h.repo.sh("echo 2 > a && echo 2 > b && git commit -qam change");
+        let entry = |description: Option<&str>| serde_json::json!([{ "section": "main ← a", "label": "#8 b", "view": { "base": "origin/main" }, "description": description }]);
+        set(&h, entry(Some("# b\n\nwhy")));
+        let mut v = h.viewer();
+        let settle = |v: &mut Viewer| {
+            h.settle(v, &|v| v.describing || v.current.as_ref().is_some_and(|p| v.files.contains_key(p) && v.bases.contains_key(p) && v.hunk_goto.is_none()));
+            h.frame(v);
+        };
+        let shown = |v: &Viewer| if v.describing { "description".to_string() } else { v.current.clone().unwrap_or_default() };
+        settle(&mut v);
+        assert_eq!(shown(&v), "a", "a PR still opens on its first changed file");
+
+        v.command(PanelCmd::PrevFile);
+        settle(&mut v);
+        assert_eq!(shown(&v), "description");
+        assert!(v.current.is_none(), "no file is open");
+        let rows: Vec<Option<String>> = v.doc.lines.iter().map(|l| l.render.as_ref().map(|r| r.markdown.clone())).collect();
+        assert_eq!(rows, vec![Some("# b\n\nwhy".to_string())], "one row, rendered");
+        v.command(PanelCmd::NextFile);
+        settle(&mut v);
+        assert_eq!(shown(&v), "a");
+        v.command(PanelCmd::NextFile);
+        settle(&mut v);
+        assert_eq!(shown(&v), "b");
+        v.command(PanelCmd::NextFile);
+        settle(&mut v);
+        assert_eq!(shown(&v), "description", "⌘⇧J from the last file wraps to it");
+
+        // The tree: j/k move between it and the files.
+        v.command(PanelCmd::FocusList);
+        h.text(&mut v, "j");
+        assert_eq!(shown(&v), "a");
+        h.text(&mut v, "k");
+        assert_eq!(shown(&v), "description");
+        // The folder list: its first row.
+        h.text(&mut v, "a");
+        assert!(!v.tree_mode());
+        assert_eq!(v.list_cursor, 0, "the cursor starts on the description");
+        h.text(&mut v, "j");
+        h.text(&mut v, "l");
+        settle(&mut v);
+        assert_eq!(shown(&v), "a");
+        v.command(PanelCmd::FocusList);
+        h.text(&mut v, "k");
+        h.text(&mut v, "l");
+        settle(&mut v);
+        assert_eq!(shown(&v), "description");
+
+        // Without a description there is no row: ⌘⇧K from the first file wraps to the last.
+        set(&h, entry(None));
+        v.command(PanelCmd::Open { path: Some("a".into()), line: None, diff: None });
+        settle(&mut v);
+        v.command(PanelCmd::PrevFile);
+        settle(&mut v);
+        assert_eq!(shown(&v), "b");
     }
 
     /// Hovering a reviewer team in the file list shows its members.

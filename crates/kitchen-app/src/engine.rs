@@ -285,6 +285,10 @@ pub struct ViewEntry {
     /// under its reviewers.
     #[serde(default, deserialize_with = "crate::plugins::decor::list_or_empty_table")]
     pub gates: Vec<Check>,
+    /// Its description (Markdown): a row above the file list's changed
+    /// files shows it rendered, as GitHub does.
+    #[serde(default)]
+    pub description: Option<String>,
     pub view: ViewAt,
 }
 

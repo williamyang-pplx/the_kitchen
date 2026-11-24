@@ -8,8 +8,8 @@
 -- section per stack, then the PRs opened in the tab with ⌘⇧P; an open PR's
 -- row has a check once its code owners approved it. Atop the viewer's file
 -- list, the PR's reviewers and their state (a team's members, whom to ping, on
--- hover), then the required checks that block its merge. ⌘⇧D
--- shows the shown PR's description, rendered as on GitHub, and goes back.
+-- hover), the required checks that block its merge, and a row that shows
+-- the PR's description, rendered as on GitHub (⌘⇧K from the first file).
 -- ⌘⇧O opens the shown PR (in the ⌘⇧S menu, the row under the cursor) in
 -- Chrome, keeping the kitchen in front.
 
@@ -176,7 +176,7 @@ function M.list(lines, slug)
   return out
 end
 
-local FIELDS = "number title url state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions reviewDecision"
+local FIELDS = "number title body url state isDraft headRefName headRefOid baseRefName baseRefOid additions deletions reviewDecision"
   .. " author { login }"
   .. " reviewRequests(first: 20) { nodes { asCodeOwner requestedReviewer {"
   .. " ... on User { login name } ... on Team { slug members(first: 100) { nodes { login name } } } } } }"
@@ -312,7 +312,7 @@ end
 
 -- One menu row for PR `p` (a GraphQL node) under `section`, with its state
 -- (open, draft, merged, closed: the menu draws GitHub's icon for it), its
--- page (for ⌘⇧O), M.approved, M.reviewers and M.gates. The open PR whose head is `branch` (checked out in the tab's worktree) is live:
+-- page (for ⌘⇧O), M.approved, M.reviewers, M.gates and M.description. The open PR whose head is `branch` (checked out in the tab's worktree) is live:
 -- that worktree against its parent (remember_live maps it to the PR, for its
 -- review comments and ⌘M); every other PR is M.view's kitchen-pr-<N> checkout.
 function M.is_live(p, branch)
@@ -340,6 +340,7 @@ local function row(tab, p, section, place, branch, dflt)
     approved = M.approved(p),
     reviewers = p.state == "OPEN" and M.reviewers(p) or {},
     gates = p.state == "OPEN" and M.gates(p) or {},
+    description = M.description(p),
     view = view,
   }
 end
@@ -687,19 +688,11 @@ kitchen.command("own_changes", function(ctx)
   kitchen.view({ tab = ctx.tab })
 end, { desc = "show this tab's own worktree in its viewer again" })
 
--- The PR description (⌘⇧D) ------------------------------------------------
+-- The PR description ------------------------------------------------------
 
--- Where the viewer was before ⌘⇧D showed a description, by tab: { path, line, dir }.
-local before = {}
-
--- The description file of PR `n` in a worktree (`.kitchen/` is git-excluded).
-local function description_path(n)
-  return ".kitchen/pr-" .. n .. ".md"
-end
-
--- The description page for PR `info` (gh's JSON): title, a line of facts,
--- then the body. The viewer renders it as GitHub does, in the workspace's
--- repo (its #12, @al and SHAs linked).
+-- The description page for PR `info` (a GraphQL node): title, a line of
+-- facts, then the body. The file list's Description row shows it, rendered
+-- as GitHub does in the workspace's repo (its #12, @al and SHAs linked).
 function M.description(info)
   local state = info.isDraft and "draft" or (info.state or ""):lower()
   local facts = {
@@ -723,29 +716,7 @@ function M.description(info)
   return "# " .. (info.title or ("PR #" .. info.number)) .. "\n\n" .. table.concat(line, " · ") .. url .. "\n\n---\n\n" .. body .. "\n"
 end
 
--- Write PR `ref`'s description into `worktree` on `host` and show it rendered.
-local function show_description(ctx, slug, ref)
-  local fields = "number,title,body,author,state,isDraft,baseRefName,headRefName,additions,deletions,url"
-  gh({ "pr", "view", tostring(ref), "-R", slug, "--json", fields }, function(res)
-    local ok, info = pcall(kitchen.json.decode, res.code == 0 and res.stdout or "")
-    if not (ok and type(info) == "table" and info.number) then
-      return kitchen.notify("couldn't read the PR's description: " .. why(res), "warn")
-    end
-    local rel = description_path(info.number)
-    local abs = ctx.viewer.worktree .. "/" .. rel
-    local sh = "mkdir -p " .. q(ctx.viewer.worktree .. "/.kitchen") .. " && cat > " .. q(abs)
-    kitchen.run({ sh = sh, host = ctx.host, stdin = M.description(info), timeout = 15 }, function(w)
-      if w.code ~= 0 then
-        return kitchen.notify("couldn't write the description: " .. why(w), "error")
-      end
-      before[ctx.tab] = { path = ctx.viewer.path, line = ctx.viewer.line, dir = ctx.viewer.dir }
-      -- The viewer's mode stays: a git-ignored file shows plain in diff
-      -- mode too, and the files opened after it keep their diffs.
-      kitchen.open(abs)
-      kitchen.render.show(ctx.tab, true)
-    end)
-  end)
-end
+-- Opening a PR on GitHub (⌘⇧O) ---------------------------------------------
 
 -- The PR the viewer shows: cb(slug, ref), `ref` its number when the viewer
 -- shows its kitchen-pr-<N> checkout, else the branch checked out in the
@@ -772,33 +743,6 @@ local function shown_pr(ctx, cb)
     cb(slug, branch)
   end)
 end
-
--- ⌘⇧D: the shown PR's description, rendered; again, back to where the
--- viewer was.
-kitchen.command("description", function(ctx)
-  local v = ctx.viewer
-  if not v then
-    return
-  end
-  if v.path and v.path:match("^%.kitchen/pr%-%d+%.md$") then
-    local b = before[ctx.tab] or {}
-    before[ctx.tab] = nil
-    kitchen.render.show(ctx.tab, false)
-    if b.path then
-      kitchen.open(v.worktree .. "/" .. b.path, b.line)
-    else
-      kitchen.open(v.worktree .. "/" .. ((b.dir or "") ~= "" and b.dir .. "/" or ""))
-    end
-    return
-  end
-  shown_pr(ctx, function(slug, ref)
-    show_description(ctx, slug, ref)
-  end)
-end, { desc = "show the PR's description rendered, as on GitHub (again: back)" })
-
-kitchen.keymap("cmd+shift+d", "github.description", { when = "viewer" })
-
--- Opening a PR on GitHub (⌘⇧O) ---------------------------------------------
 
 -- Opens argv[1] in a new tab of Chrome's front window and keeps the app that
 -- was in front there. Chrome brings itself to the front whenever it loads a

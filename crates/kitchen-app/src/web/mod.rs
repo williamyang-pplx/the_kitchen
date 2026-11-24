@@ -1,7 +1,7 @@
 //! Markdown drawn as GitHub draws it: GitHub's HTML (comrak's until it
 //! arrives, or when it can't), GitHub's CSS, laid out by WebKit in an
 //! off-screen page and drawn by egui as an image. Cards (review threads,
-//! ⌘⇧A answers, plan comments) and rendered documents (⌘⇧V, ⌘⇧D) use it.
+//! ⌘⇧A answers, plan comments) and rendered documents (⌘⇧V, a PR's description) use it.
 
 pub mod html;
 #[cfg(target_os = "macos")]

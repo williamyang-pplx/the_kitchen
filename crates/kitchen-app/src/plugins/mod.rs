@@ -1235,8 +1235,8 @@ mod tests {
         assert_eq!(gates(serde_json::json!([])), vec![], "no checks at all");
     }
 
-    /// github ⌘⇧D: a PR's description as the page the viewer renders, its
-    /// body as it is (the viewer renders it as GitHub does).
+    /// github: a PR's description as the page the file list's Description
+    /// row shows, its body as it is (the viewer renders it as GitHub does).
     #[test]
     fn github_plugin_description() {
         use mlua::LuaSerdeExt;

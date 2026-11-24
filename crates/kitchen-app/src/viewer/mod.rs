@@ -209,6 +209,11 @@ pub struct Viewer {
     dir: String,
     /// The main area shows `dir` instead of the current file (`-` goes up).
     browsing: bool,
+    /// The main area shows the PR's description (the file list's row above
+    /// its changed files); no file is open.
+    describing: bool,
+    /// The description `doc` was built from.
+    description_shown: Option<String>,
     /// Rows of the folder doc while browsing.
     entries: Vec<Entry>,
     /// Entry to put the cursor on once the folder doc is built.
@@ -358,6 +363,8 @@ impl Viewer {
             current: None,
             dir: String::new(),
             browsing: true,
+            describing: false,
+            description_shown: None,
             entries: Vec::new(),
             select_entry: None,
             routed: false,
@@ -525,8 +532,8 @@ impl Viewer {
 
     /// Whether diff mode shows `path` as a diff. Not a file outside the
     /// worktree (an installed package), nor one git knows neither at the
-    /// base nor among the changes: a git-ignored file, such as ⌘⇧D's PR
-    /// description, would show all added. Those show plain, and the viewer
+    /// base nor among the changes: a git-ignored file would show all
+    /// added. Those show plain, and the viewer
     /// stays in diff mode for the next file.
     fn diffable(&self, path: &str) -> bool {
         !path.starts_with('/') && (self.changed.iter().any(|c| c.path == path) || self.bases.get(path).is_none_or(|b| b.text.is_some()))
@@ -702,6 +709,7 @@ impl Viewer {
             }
         }
         self.browsing = false;
+        self.describing = false;
         self.goto_raw = false;
         // Files outside the worktree (an installed package) keep the list where it was.
         if !path.starts_with('/') {
@@ -750,6 +758,7 @@ impl Viewer {
     fn browse(&mut self, dir: &str, select: Option<String>) {
         self.dir = dir.trim_matches('/').to_string();
         self.browsing = true;
+        self.describing = false;
         self.outline = false;
         self.vim.anchor = None;
         self.doc_key = None;
@@ -816,19 +825,72 @@ impl Viewer {
         self.goto_loc(loc);
     }
 
-    /// ⌘⇧J / ⌘⇧K, `]f` / `[f`: the next / previous changed file (wrapping).
+    /// ⌘⇧J / ⌘⇧K, `]f` / `[f`: the next / previous changed file (wrapping),
+    /// the PR's description before the first one.
     fn step_file(&mut self, delta: isize) {
-        let n = self.changed.len();
+        let n = self.described() + self.changed.len();
         if n == 0 {
             self.status = Some(("no changed files".into(), false));
             return;
         }
-        let next = match self.current_changed() {
+        let next = match self.current_slot() {
             Some(i) => (i as isize + delta).rem_euclid(n as isize) as usize,
             None if delta < 0 => n - 1,
             None => 0,
         };
-        self.open_changed(next, true);
+        self.open_slot(next, true);
+    }
+
+    /// 1 when the file list has a Description row (the PR on screen has a
+    /// description) above its changed files, else 0: the slot of the first
+    /// changed file.
+    fn described(&self) -> usize {
+        self.described_entry().is_some() as usize
+    }
+
+    /// What the main area shows among the description (slot 0, when there is
+    /// one) and the changed files after it.
+    fn current_slot(&self) -> Option<usize> {
+        let d = self.described();
+        if self.describing && d == 1 {
+            return Some(0);
+        }
+        self.current_changed().map(|i| d + i)
+    }
+
+    /// Show slot `i` (see [`Self::current_slot`]).
+    fn open_slot(&mut self, i: usize, record: bool) {
+        match i.checked_sub(self.described()) {
+            Some(f) => self.open_changed(f, record),
+            None => self.describe(record),
+        }
+    }
+
+    /// Show the PR's description in the main area, rendered: no file is open.
+    fn describe(&mut self, record: bool) {
+        if record {
+            if let Some(here) = self.here() {
+                if self.back.last() != Some(&here) {
+                    self.back.push(here);
+                }
+                self.fwd.clear();
+            }
+        }
+        self.abandon_nav();
+        self.describing = true;
+        self.browsing = false;
+        self.outline = false;
+        // A late file list doesn't route the viewer away from it.
+        self.routed = true;
+        self.current = None;
+        self.editor = None;
+        self.vim.anchor = None;
+        self.pending_goto = None;
+        self.hunk_goto = None;
+        self.doc_key = None;
+        self.vim.set_cursor(0, 0);
+        self.view.scroll_to(0);
+        self.list_scroll = true;
     }
 
     /// Index of the open file among the changed files.
@@ -927,6 +989,21 @@ impl Viewer {
     // ------------------------------------------------------------ doc
 
     fn rebuild_doc(&mut self) {
+        if self.describing {
+            let entry = self.described_entry();
+            let md = entry.as_ref().and_then(|(menu, i)| menu[*i].0.description.as_deref());
+            let key = ("\0description".to_string(), false, false, true);
+            if self.doc_key.as_ref() == Some(&key) && self.description_shown.as_deref() == md {
+                return;
+            }
+            self.doc_key = Some(key);
+            self.description_shown = md.map(str::to_string);
+            self.doc = md.map(description_doc).unwrap_or_default();
+            self.doc_rev += 1;
+            self.doc_shown = None;
+            self.render_shown = None;
+            return;
+        }
         if self.browsing {
             let key = (format!("\0{}", self.dir), false, false, self.files_state.is_some());
             if self.doc_key.as_ref() != Some(&key) {
@@ -1206,7 +1283,7 @@ impl Viewer {
                     self.status = Some((format!("files open in {mode} mode"), false));
                 }
             }
-            PanelCmd::ToggleOutline if self.browsing => self.status = Some(("open a file for its outline".into(), false)),
+            PanelCmd::ToggleOutline if self.browsing || self.describing => self.status = Some(("open a file for its outline".into(), false)),
             PanelCmd::ToggleOutline => {
                 self.outline = !self.outline;
                 self.doc_key = None;
@@ -1321,13 +1398,15 @@ impl Viewer {
         header_ui.add_space(theme::SPACE_M);
         let path = if self.browsing {
             format!("{}/", self.dir)
+        } else if self.describing {
+            "PR description".to_string()
         } else {
             self.current.clone().unwrap_or_else(|| keybindings::labelled("no file", &[(Place::Viewer, Action::FilePicker.into(), "to pick")]))
         };
         header_ui.label(widgets::path_job(&path, 12.5));
         header_ui.add_space(theme::SPACE_XS);
         let has_base = self.current.as_ref().is_some_and(|p| self.diffable(p));
-        let (mode, color) = mode_pill(self.browsing, self.outline, self.render_shown.is_some(), self.diff, has_base);
+        let (mode, color) = mode_pill(self.browsing, self.outline, self.render_shown.is_some() || self.describing, self.diff, has_base);
         widgets::pill(&mut header_ui, mode, color);
         if mode == "DIFF" {
             let (a, d) = self.doc.changed_count();
@@ -1419,6 +1498,7 @@ impl Viewer {
             (_, None) if self.browsing => Some(("loading files…".to_string(), true)),
             (_, Some(Err(e))) if self.browsing => Some((format!("cannot list files: {e}"), false)),
             _ if self.browsing => None,
+            _ if self.describing => self.description_shown.is_none().then(|| ("the PR on screen has no description".to_string(), false)),
             (None, _) => Some((match keybindings::hint(Place::Viewer, Action::FilePicker) {
                 k if k.is_empty() => "open a file from the file list".into(),
                 k => format!("{k} to open a file"),
@@ -1541,26 +1621,36 @@ impl Viewer {
         !self.list_all && !self.changed.is_empty()
     }
 
-    /// Where the list cursor lands on ⌘⇧H: the open file, else the first folder entry.
+    /// Where the list cursor lands on ⌘⇧H: the description or the open
+    /// file, else the first folder entry.
     fn list_home(&self) -> usize {
         let entries = self.list_entries();
-        let pr = self.changed.len();
+        let d = self.described();
+        let pr = d + self.changed.len();
+        if self.describing && d == 1 {
+            return 0;
+        }
         let cur = self.current.as_deref().filter(|_| !self.browsing);
         if let Some(i) = cur.and_then(|c| entries.iter().position(|e| e.path == c)) {
             return pr + i;
         }
         if let Some(i) = cur.and_then(|c| self.changed.iter().position(|e| e.path == c)) {
-            return i;
+            return d + i;
         }
         let skip_up = entries.first().is_some_and(|e| e.label == "../") && entries.len() > 1;
         pr + skip_up as usize
     }
 
-    /// Open list row `idx` (a changed file or a folder entry).
+    /// Open list row `idx` (the description, a changed file or a folder entry).
     fn activate_row(&mut self, idx: usize, entries: &[Entry]) {
-        let pr = self.changed.len();
+        let d = self.described();
+        let pr = d + self.changed.len();
+        if idx < d {
+            self.describe(true);
+            return;
+        }
         if idx < pr {
-            let c = &self.changed[idx];
+            let c = &self.changed[idx - d];
             if c.status == 'D' {
                 self.status = Some((format!("{} was deleted", c.path), false));
                 return;
@@ -1618,7 +1708,8 @@ impl Viewer {
 
     /// `[file_list]` keys for the folder list: move, open, up a folder.
     fn list_keys(&mut self, ui: &mut Ui, entries: &[Entry]) {
-        let rows = self.changed.len() + entries.len();
+        let pr = self.described() + self.changed.len();
+        let rows = pr + entries.len();
         if rows == 0 {
             return;
         }
@@ -1652,7 +1743,6 @@ impl Viewer {
             self.activate_row(self.list_cursor, entries);
         } else if up && !self.dir.is_empty() {
             let parent = parent_dir(&self.dir).to_string();
-            let pr = self.changed.len();
             let up_row = entries.iter().position(|e| e.label == "../").map(|i| pr + i);
             match up_row {
                 Some(r) => self.activate_row(r, entries),
@@ -1662,12 +1752,12 @@ impl Viewer {
     }
 
     /// `[file_list]` keys for the changed-files tree: moving opens the next /
-    /// previous changed file right away; open and leave go to the code,
-    /// switch to the folder list.
+    /// previous changed file (or the description, above them) right away;
+    /// open and leave go to the code, switch to the folder list.
     fn tree_keys(&mut self, ui: &mut Ui) {
-        let last = self.changed.len().saturating_sub(1);
+        let last = (self.described() + self.changed.len()).saturating_sub(1);
         for c in self.list_cmds(ui) {
-            let at = self.current_changed();
+            let at = self.current_slot();
             let target = match c {
                 ListCmd::Down => Some(at.map_or(0, |i| (i + 1).min(last))),
                 ListCmd::Up => Some(at.map_or(0, |i| i.saturating_sub(1))),
@@ -1688,7 +1778,7 @@ impl Viewer {
                 }
             };
             if let Some(t) = target.filter(|t| Some(*t) != at) {
-                self.open_changed(t, false);
+                self.open_slot(t, false);
             }
         }
     }
@@ -1715,11 +1805,20 @@ impl Viewer {
         let scroll = std::mem::take(&mut self.list_scroll);
         let rows = self.tree_rows();
         let mut clicked: Option<usize> = None;
+        let mut describe = false;
         let mut all = false;
         let (reviewers, gates) = self.shown_review();
+        let described = self.described_entry();
         egui::ScrollArea::vertical().id_salt(("changes", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(theme::SPACE_S);
             review_section(ui, &reviewers, &gates);
+            if let Some((menu, i)) = &described {
+                let resp = description_row(ui, &menu[*i].0.label, self.describing && self.list_focus, self.describing);
+                if scroll && self.describing {
+                    resp.scroll_to_me(None);
+                }
+                describe = resp.clicked_by(egui::PointerButton::Primary);
+            }
             ui.horizontal(|ui| {
                 ui.add_space(theme::SPACE_M);
                 changed_header(ui, &self.changed);
@@ -1751,6 +1850,9 @@ impl Viewer {
         if let Some(i) = clicked {
             self.open_changed(i, true);
         }
+        if describe {
+            self.describe(true);
+        }
         if all {
             self.list_all = true;
             self.list_cursor = self.list_home();
@@ -1774,7 +1876,9 @@ impl Viewer {
         }
         // The keys may have changed folders.
         let entries = self.list_entries();
-        let pr = self.changed.len();
+        let described = self.described_entry();
+        let d = described.is_some() as usize;
+        let pr = d + self.changed.len();
         self.list_cursor = self.list_cursor.min((pr + entries.len()).saturating_sub(1));
         let cursor = self.list_focus.then_some(self.list_cursor);
         let scroll = std::mem::take(&mut self.list_scroll);
@@ -1784,6 +1888,15 @@ impl Viewer {
         egui::ScrollArea::vertical().id_salt(("files", &self.tab_id)).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(theme::SPACE_S);
             review_section(ui, &reviewers, &gates);
+            if let Some((menu, i)) = &described {
+                let r = description_row(ui, &menu[*i].0.label, cursor == Some(0), self.describing);
+                if scroll && cursor == Some(0) {
+                    r.scroll_to_me(None);
+                }
+                if r.clicked_by(egui::PointerButton::Primary) {
+                    clicked = Some(0);
+                }
+            }
             if !self.changed.is_empty() {
                 ui.horizontal(|ui| {
                     ui.add_space(theme::SPACE_M);
@@ -1794,12 +1907,12 @@ impl Viewer {
             for (i, c) in self.changed.iter().enumerate() {
                 let open = self.current.as_deref() == Some(c.path.as_str()) && !self.browsing;
                 let name = c.path.rsplit('/').next().unwrap_or(&c.path);
-                let r = row(ui, cursor == Some(i), open, changed_row(c, name, 0.0, open)).on_hover_text(&c.path);
-                if scroll && cursor == Some(i) {
+                let r = row(ui, cursor == Some(d + i), open, changed_row(c, name, 0.0, open)).on_hover_text(&c.path);
+                if scroll && cursor == Some(d + i) {
                     r.scroll_to_me(None);
                 }
                 if r.clicked_by(egui::PointerButton::Primary) {
-                    clicked = Some(i);
+                    clicked = Some(d + i);
                 }
             }
             ui.add_space(8.0);
@@ -1921,6 +2034,26 @@ fn review_section(ui: &mut Ui, reviewers: &[crate::engine::Reviewer], gates: &[c
         }
         ui.add_space(theme::SPACE_S);
     }
+}
+
+/// The PR's "DESCRIPTION": one row with its menu `label` ("#12 add
+/// retries"), which shows the description; `open` while it is shown.
+fn description_row(ui: &mut Ui, label: &str, cursor: bool, open: bool) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.add_space(theme::SPACE_M);
+        ui.label(widgets::section_label("Description", theme::SUBTLE));
+    });
+    ui.add_space(2.0);
+    let text = RichText::new(label).font(theme::ui_font(theme::TEXT_BODY)).color(if open { theme::TEXT } else { theme::MUTED });
+    let r = row(ui, cursor, open, text).on_hover_text("The PR's description, as on GitHub");
+    ui.add_space(theme::SPACE_S);
+    r
+}
+
+/// PR description `md` as a doc: one row, rendered as GitHub renders it.
+fn description_doc(md: &str) -> Doc {
+    let rows = [crate::plugins::decor::RenderRow { line: 1, end_line: Some(md.lines().count().max(1)), markdown: md.to_string() }];
+    Doc::rendered(&Doc::plain(md, None), &rows)
 }
 
 /// "CHANGED FILES  n" and the lines the changes add and remove in all.
@@ -2478,13 +2611,13 @@ mod tests {
         assert!(v.diff && folds(&v).is_empty());
     }
 
-    /// A git-ignored file (⌘⇧D's PR description) shows plain in diff mode,
+    /// A git-ignored file shows plain in diff mode,
     /// and the viewer stays in diff mode: the changed file opened next is a
     /// diff again.
     #[test]
     fn ignored_files_show_plain_and_keep_diff_mode() {
         let h = Harness::new(TestRepo::new("echo 1 > a.rs"));
-        h.repo.sh("echo 2 > a.rs && git commit -qam change && echo .kitchen/ >> .git/info/exclude && mkdir .kitchen && printf '# PR\\n\\nbody\\n' > .kitchen/pr-7.md");
+        h.repo.sh("echo 2 > a.rs && git commit -qam change && echo .kitchen/ >> .git/info/exclude && mkdir .kitchen && printf '# PR\\n\\nbody\\n' > .kitchen/notes.md");
         let mut v = h.viewer();
         let settle = |v: &mut Viewer, p: &'static str| {
             h.settle(v, &|v| v.current.as_deref() == Some(p) && v.files.contains_key(p) && v.bases.contains_key(p));
@@ -2494,8 +2627,8 @@ mod tests {
         settle(&mut v, "a.rs");
         assert!(v.diff && added(&v) == 1, "the change opens as a diff");
 
-        v.command(PanelCmd::Open { path: Some(".kitchen/pr-7.md".into()), line: None, diff: None });
-        settle(&mut v, ".kitchen/pr-7.md");
+        v.command(PanelCmd::Open { path: Some(".kitchen/notes.md".into()), line: None, diff: None });
+        settle(&mut v, ".kitchen/notes.md");
         assert_eq!((v.doc.lines.len(), added(&v)), (3, 0), "plain, not all added");
         assert!(v.diff, "still in diff mode");
 

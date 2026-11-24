@@ -33,8 +33,10 @@ A cmux-style macOS workspace manager for agent-driven PR work, written in Rust
   edits, followed live) ⌘. opens straight on the first changed file's diff,
   next to a tree of just the changed files: j/k in the tree, or ⌘⇧J/⌘⇧K and
   `]c`/`[c` in the code, step through them; `a` in the list switches to the
-  whole repo, ⌘B hides the list. On a PR its review comments show
-  under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
+  whole repo, ⌘B hides the list. On a PR the list starts with its
+  reviewers, the checks blocking its merge and a Description row that shows
+  the PR's description rendered (⌘⇧K from the first changed file). Its
+  review comments show under their lines, and ⌘M … ⌘Enter posts a comment (or a reply, on a
   commented line) to the PR on GitHub. Comments and ⌘⇧A answers render as
   Markdown, as GitHub renders them (GitHub's renderer and CSS, laid out by
   WebKit). ⌘⇧A asks the tab's agent about the cursor
@@ -117,7 +119,7 @@ which Claude Code attaches (on a devbox the files are first copied to
 `~/.kitchen/attachments` there).
 
 Plugin keys (`kitchen.keymap`) are defaults too: `[plugins]` in your file
-replaces them, e.g. `"github.description" = ["cmd+shift+d"]`.
+replaces them, e.g. `"github.open_in_browser" = ["cmd+shift+o"]`.
 
 ## Layout
 

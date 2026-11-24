@@ -172,4 +172,4 @@ redo = ["cmd+shift+z", "cmd+y"]
 
 [plugins]              # "<plugin>.<command>" = keys; replaces the plugin's own keys
 # "ruff.explain" = ["<leader>e"]
-# "github.description" = ["cmd+shift+d"]
+# "github.open_in_browser" = ["cmd+shift+o"]

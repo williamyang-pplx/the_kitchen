@@ -311,6 +311,7 @@ kitchen.on("views", function(ev)   -- ⌘⇧S: the tab's command ctx, plus ev.pr
         reviewers = { { state = "waiting", name = "pplx_aster", team = true, status = "requested", members = { "Paul Fryzel", "@max" } },
                       { state = "done", name = "@al", status = "approved" } },
         gates = { { state = "needed", label = "atlantis/apply-gate", note = "…still need a confirmed successful apply." } },
+        description = "# use them\n\n…",
         view = { base = "origin/william/a" } },   -- no rev: the tab's own worktree
     },
   }
@@ -330,7 +331,9 @@ author), a `name` (`team = true` draws it in that team's own color), a
 `status` beside it, and `members` (a team's: their count below it, the names
 on hover). Its `gates` follow under "Checks": what blocks the PR's merge,
 each a `state`, a `label`, and a `note` shown on hover, or one done row
-saying nothing does. A viewer on screen sends `views` itself too (when it
+saying nothing does. Its `description` (Markdown) adds a "Description"
+row above the changed files that shows it rendered as GitHub does; ⌘⇧K
+from the first changed file goes there. A viewer on screen sends `views` itself too (when it
 opens, when it shows a view the menu lacks, and every 2 minutes), so these
 keep up without ⌘⇧S. Rows with the same `section` go together under that header. The kitchen adds a last row for the tab's
 worktree against its diff base, unless an entry already shows exactly that.
